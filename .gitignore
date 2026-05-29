@@ -1,0 +1,38 @@
+# === СЕКРЕТЫ И ДОСТУПЫ — НИКОГДА не коммитить ===
+.env
+*.session
+*.session-journal
+*.session.dead.*
+
+# === Личные данные и состояние (создаётся ботом при работе) ===
+channels.json
+allowed_users.json
+auto_reply.json
+model_state.json
+digest_state.json
+media_cache.json
+media_cache_ts.json
+asks/
+
+# === Логи ===
+bot.log
+bot.log.*
+*.log
+
+# === Базы данных ===
+*.db
+*.db-shm
+*.db-wal
+
+# === Python ===
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+env/
+*.egg-info/
+
+# === Прочее ===
+.DS_Store
+*.bak
+.claude/
