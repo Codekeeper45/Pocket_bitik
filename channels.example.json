@@ -1,0 +1,12 @@
+[
+  {
+    "id": 2394760599,
+    "title": "Пример канала про ИИ",
+    "username": "example_ai_channel"
+  },
+  {
+    "id": -1001234567890,
+    "title": "Пример закрытого канала (без username)",
+    "username": null
+  }
+]
