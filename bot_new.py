@@ -177,6 +177,7 @@ AUTO_REPLY_PATH = "auto_reply.json"
 ALLOWED_PATH = "allowed_users.json"
 ALLOWED_ASK_TEXT_LIMIT = 500  # для гостей: запрос > этого числа → vision переключается на free
 MEDIA_HIDETAIL_MAX_N = 200    # .ask с N больше этого → описываем фото в detail="low" (дешевле)
+DIRECT_VISION_MAX_IMAGES = 10 # .ask -g: макс. картинок, отдаваемых модели напрямую (берём самые свежие)
 ASKS_KEEP = 100               # кол-во последних .ask -d дампов, хранимых в asks/
 REPLY_NETWORK_BUDGET = 200    # макс сетевых get_reply_message() за один .ask (когда target вне выборки)
 ASK_MAX_TOKENS = 16000        # потолок completion для .ask (thinking-модели тратят на reasoning до тысяч токенов)
@@ -472,6 +473,19 @@ def _client_for_media_model(model_id: str):
     """Клиент для медиа-модели по её id: OpenCode для слугов из MEDIA_OPENCODE_SLUGS,
     иначе OpenRouter (пресеты Gemini/Qwen и кастомные OpenRouter-id). None — если провайдер не настроен."""
     return opencode_client if model_id in MEDIA_OPENCODE_SLUGS else openrouter_client
+
+
+def active_model_supports_vision():
+    """Умеет ли АКТИВНАЯ отвечающая модель принимать картинки напрямую (для .ask -g).
+    True/False — известно; None — кастомная OpenRouter-модель без сохранённого флага
+    (вызывающий проверит вживую через _openrouter_model_info)."""
+    if ACTIVE_MODEL in MEDIA_OPENCODE_SLUGS:
+        return True  # vision-слуги OpenCode (kimi/glm/qwen/mimo)
+    spec = MODEL_REGISTRY.get(ACTIVE_MODEL)
+    provider = spec[0] if spec else None
+    if provider == "openrouter":
+        return CUSTOM_MODELS.get(ACTIVE_MODEL, {}).get("vision")  # bool или None если не сохранено
+    return False  # DeepSeek и прочие текстовые
 
 
 async def _openrouter_model_info(model_id: str):
@@ -1234,10 +1248,11 @@ async def generate_auto_reply(combined_text: str, history: list = None) -> str:
     return result if result else "Понял"
 
 
-async def ask_agentic(context: str, question: str, must_search: bool = False, caller: str = None, ctx_tokens_est: int = None, voice_mode: str = "off") -> str:
+async def ask_agentic(context: str, question: str, must_search: bool = False, caller: str = None, ctx_tokens_est: int = None, voice_mode: str = "off", images: list = None) -> str:
     """Agentic ask: модель сама решает, искать ли информацию в каналах.
     ctx_tokens_est — tiktoken-оценка контекста (для логирования Δ с реальным API).
-    voice_mode: "off" — обычный текст; "force" — ответ под озвучку (флаг -v); "auto" — модель сама может выбрать голос (маркер [[VOICE]])."""
+    voice_mode: "off" — обычный текст; "force" — ответ под озвучку (флаг -v); "auto" — модель сама может выбрать голос (маркер [[VOICE]]).
+    images — список {"bytes":...} для прямого vision (.ask -g): кладутся в user-сообщение как image_url."""
     llm, model_id, label = get_active_model()
     if llm is None:
         return "Модель не настроена (проверь ключ провайдера)"
@@ -1256,9 +1271,18 @@ async def ask_agentic(context: str, question: str, must_search: bool = False, ca
     elif voice_mode == "auto":
         system_prompt += VOICE_AUTO_HINT
 
+    user_text = _build_ask_user_content(context, question, caller)
+    if images:
+        # Мультимодальный content: текст + сами картинки (.ask -g)
+        user_content = [{"type": "text", "text": user_text}]
+        for im in images:
+            b64 = base64.b64encode(im["bytes"]).decode("utf-8")
+            user_content.append({"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{b64}", "detail": "high"}})
+    else:
+        user_content = user_text
     messages = [
         {"role": "system", "content": system_prompt},
-        {"role": "user", "content": _build_ask_user_content(context, question, caller)},
+        {"role": "user", "content": user_content},
     ]
 
     max_iterations = 10
@@ -1491,15 +1515,32 @@ def _media_key(m):
     return f"file:{mid}" if mid else f"{m.chat_id}:{m.id}"
 
 
-async def process_media_cached(m, vision_model: str = None, detail: str = "high", mstats: dict = None):
+async def process_media_cached(m, vision_model: str = None, detail: str = "high", mstats: dict = None, inline_ids: set = None, inline_images: list = None):
     """Текст медиа (описание/транскрипт) с кэшем по file-id. None — если медиа нет.
-    mstats — опциональный аккумулятор статистики (photos/voice/audio/video_note + hit/miss)."""
+    mstats — опциональный аккумулятор статистики (photos/voice/audio/video_note + hit/miss).
+    inline_ids/inline_images (режим .ask -g): фото НЕ описываются, а сами байты собираются
+    в inline_images, в тексте — плейсхолдер [Картинка #k]. Голос/аудио/кружок — без изменений."""
     def _bump(kind):
         if mstats is not None:
             mstats[kind] = mstats.get(kind, 0) + 1
     key = _media_key(m)
     if m.photo:
         _bump("photos")
+        # Direct-vision: вместо описания собираем сами картинки (самые свежие, до лимита)
+        if inline_ids is not None:
+            cap_txt = f" {m.raw_text}" if m.raw_text else ""
+            if getattr(m, "id", None) in inline_ids and len(inline_images) < DIRECT_VISION_MAX_IMAGES:
+                try:
+                    img = await m.download_media(bytes)
+                except Exception as e:
+                    log("ASK", f"-g: не удалось скачать фото: {e}")
+                    img = None
+                if img:
+                    idx = len(inline_images)
+                    inline_images.append({"bytes": img, "caption": m.raw_text or ""})
+                    return f"[Картинка #{idx}{cap_txt}]"
+                return f"[Картинка (не скачалась){cap_txt}]"
+            return f"[Картинка (пропущена — лимит {DIRECT_VISION_MAX_IMAGES}){cap_txt}]"
         vm = vision_model or get_active_media_model()
         # Ключ модель-НЕзависимый: описал один раз — переиспользуем любой моделью (не описываем заново при смене модели)
         cached = MEDIA_CACHE.get(key)
@@ -1656,7 +1697,7 @@ def _assemble_body(msg, media_body) -> str:
     return cap or ""
 
 
-async def _render_unit(msg, text_only: bool, anchor_id=None, vision_model: str = None, detail: str = "high", mstats: dict = None, by_id: dict = None, net_budget: dict = None, rep_stats: dict = None) -> dict:
+async def _render_unit(msg, text_only: bool, anchor_id=None, vision_model: str = None, detail: str = "high", mstats: dict = None, by_id: dict = None, net_budget: dict = None, rep_stats: dict = None, inline_ids: set = None, inline_images: list = None) -> dict:
     """Рендерит одно сообщение в части для последующей сборки блоков."""
     sender = None if msg.out else (msg.sender if text_only else (msg.sender or await msg.get_sender()))
     label = _label_for(msg, sender)
@@ -1677,7 +1718,7 @@ async def _render_unit(msg, text_only: bool, anchor_id=None, vision_model: str =
     media_body = None
     if not text_only:
         try:
-            media_body = await process_media_cached(msg, vision_model, detail=detail, mstats=mstats)
+            media_body = await process_media_cached(msg, vision_model, detail=detail, mstats=mstats, inline_ids=inline_ids, inline_images=inline_images)
         except Exception as e:
             log("ASK", f"Ошибка обработки медиа в контексте: {e}")
     body = _assemble_body(msg, media_body)
@@ -1714,7 +1755,7 @@ def _group_segments(messages):
     return segs
 
 
-async def _render_album_segment(group, text_only: bool, anchor_id=None, vision_model: str = None, detail: str = "high", mstats: dict = None, by_id: dict = None, net_budget: dict = None, rep_stats: dict = None) -> dict:
+async def _render_album_segment(group, text_only: bool, anchor_id=None, vision_model: str = None, detail: str = "high", mstats: dict = None, by_id: dict = None, net_budget: dict = None, rep_stats: dict = None, inline_ids: set = None, inline_images: list = None) -> dict:
     """Альбом (несколько сообщений с общим grouped_id) → один юнит, фото описываются одним запросом."""
     first = group[0]
     sender = None if first.out else (first.sender if text_only else (first.sender or await first.get_sender()))
@@ -1736,7 +1777,27 @@ async def _render_album_segment(group, text_only: bool, anchor_id=None, vision_m
     others = [m for m in group if not getattr(m, "photo", None)]
     tags = [f"[{_media_tag(m)}]" for m in others if _media_tag(m)]
 
-    if text_only or not photos:
+    if inline_ids is not None:
+        # direct-vision (.ask -g): собираем фото альбома сами, без описания
+        parts = []
+        for m in photos:
+            cap_txt = f" {m.raw_text}" if m.raw_text else ""
+            if getattr(m, "id", None) in inline_ids and len(inline_images) < DIRECT_VISION_MAX_IMAGES:
+                try:
+                    img = await m.download_media(bytes)
+                except Exception as e:
+                    log("ASK", f"-g альбом: не удалось скачать фото: {e}")
+                    img = None
+                if img:
+                    idx = len(inline_images)
+                    inline_images.append({"bytes": img, "caption": m.raw_text or ""})
+                    parts.append(f"[Картинка #{idx}{cap_txt}]")
+                else:
+                    parts.append(f"[Картинка (не скачалась){cap_txt}]")
+            else:
+                parts.append(f"[Картинка (пропущена — лимит {DIRECT_VISION_MAX_IMAGES}){cap_txt}]")
+        desc = "\n".join(parts)
+    elif text_only or not photos:
         desc = ""
     else:
         vm = vision_model or get_active_media_model()
@@ -1790,12 +1851,12 @@ async def _render_album_segment(group, text_only: bool, anchor_id=None, vision_m
     }
 
 
-async def _render_segment(seg, text_only: bool, anchor_id=None, vision_model: str = None, detail: str = "high", mstats: dict = None, by_id: dict = None, net_budget: dict = None, rep_stats: dict = None) -> dict:
+async def _render_segment(seg, text_only: bool, anchor_id=None, vision_model: str = None, detail: str = "high", mstats: dict = None, by_id: dict = None, net_budget: dict = None, rep_stats: dict = None, inline_ids: set = None, inline_images: list = None) -> dict:
     if len(seg) == 1:
-        u = await _render_unit(seg[0], text_only, anchor_id, vision_model, detail, mstats=mstats, by_id=by_id, net_budget=net_budget, rep_stats=rep_stats)
+        u = await _render_unit(seg[0], text_only, anchor_id, vision_model, detail, mstats=mstats, by_id=by_id, net_budget=net_budget, rep_stats=rep_stats, inline_ids=inline_ids, inline_images=inline_images)
         u.pop("gid", None)  # gid больше не используется на этапе склейки
         return u
-    return await _render_album_segment(seg, text_only, anchor_id, vision_model, detail, mstats=mstats, by_id=by_id, net_budget=net_budget, rep_stats=rep_stats)
+    return await _render_album_segment(seg, text_only, anchor_id, vision_model, detail, mstats=mstats, by_id=by_id, net_budget=net_budget, rep_stats=rep_stats, inline_ids=inline_ids, inline_images=inline_images)
 
 
 def _needs_media(m) -> bool:
@@ -1803,7 +1864,7 @@ def _needs_media(m) -> bool:
                 or getattr(m, "audio", None) or getattr(m, "video_note", None))
 
 
-async def assemble_context(messages, text_only: bool, anchor_id=None, progress_cb=None, vision_model: str = None, detail: str = "high", safety_override: float = None):
+async def assemble_context(messages, text_only: bool, anchor_id=None, progress_cb=None, vision_model: str = None, detail: str = "high", safety_override: float = None, inline_ids: set = None, inline_images: list = None):
     """Строит контекст: параллельный рендер + склейка альбомов и подряд идущих реплик автора.
     Возвращает (context_str, dropped_blocks, failed_media, ctx_tokens). progress_cb(done, total, failed).
     safety_override — если задан, перебивает per-model safety (используется при ретрае overflow)."""
@@ -1851,7 +1912,7 @@ async def assemble_context(messages, text_only: bool, anchor_id=None, progress_c
     async def render(seg):
         nonlocal done, failed_total
         async with sem:
-            u = await _render_segment(seg, text_only, anchor_id, vision_model, detail, mstats=mstats, by_id=by_id, net_budget=net_budget, rep_stats=rep_stats)
+            u = await _render_segment(seg, text_only, anchor_id, vision_model, detail, mstats=mstats, by_id=by_id, net_budget=net_budget, rep_stats=rep_stats, inline_ids=inline_ids, inline_images=inline_images)
         failed_total += u.get("failed", 0)
         if not text_only and any(_needs_media(m) for m in seg):
             done += 1
@@ -1981,14 +2042,15 @@ async def _collect_history_parallel(chat_id, n, base_offset_id, from_user=None):
     return workers, merged
 
 
-@client.on(events.NewMessage(pattern=r"^\.ask\s+(\d+)((?:\s+-[tcdv]+)+)?((?:\s+!?@\w+)+)?\s+(.+)"))
+@client.on(events.NewMessage(pattern=r"^\.ask\s+(\d+)((?:\s+-[tcdvg]+)+)?((?:\s+!?@\w+)+)?\s+(.+)"))
 async def ask_command(event):
     is_owner = event.out
     if not is_owner and event.sender_id not in ALLOWED_USERS:
         return  # не владелец и не в списке разрешённых
     n = int(event.pattern_match.group(1))
     flags = event.pattern_match.group(2) or ""
-    text_only = "t" in flags
+    direct_vision = "g" in flags  # -g: отдать картинки напрямую отвечающей модели (её vision)
+    text_only = "t" in flags and not direct_vision  # -g включает медиа-обработку для фото
     must_search = "c" in flags
     debug = "d" in flags  # дамп полного user-message в asks/<ts>_<event_id>.txt
     want_voice = "v" in flags  # -v: ответить голосом (озвучка через Gemini TTS)
@@ -2020,11 +2082,28 @@ async def ask_command(event):
     else:
         caller = _user_label(event.sender or await event.get_sender())
     _, _, model_label = get_active_model()
-    flags_str = " ".join(f for f, on in [("-t", text_only), ("-c", must_search), ("-d", debug)] if on) or "—"
+    flags_str = " ".join(f for f, on in [("-t", text_only), ("-c", must_search), ("-d", debug), ("-v", want_voice), ("-g", direct_vision)] if on) or "—"
     users_str = ", ".join("@" + u for u in usernames) if usernames else "—"
     excludes_str = ", ".join("!@" + u for u in exclude_users) if exclude_users else "—"
     vision_label = "free" if vision_model == FREE_MEDIA_MODEL else (vision_model or get_active_media_model())
     log("ASK", f"Старт от {caller}: N={n} · флаги=[{flags_str}] · users=[{users_str}] · excludes=[{excludes_str}] · модель={model_label} · vision={vision_label} · detail={detail}")
+
+    # .ask -g: проверяем, что активная отвечающая модель умеет vision напрямую
+    if direct_vision:
+        sv = active_model_supports_vision()
+        if sv is None:  # кастомная OpenRouter без сохранённого флага — проверяем вживую
+            _, _mid, _ = get_active_model()
+            try:
+                _ex, sv, _ctx, _nm = await _openrouter_model_info(_mid)
+            except Exception:
+                sv = False
+        if not sv:
+            await event.respond(
+                f"⚠️ Модель «{model_label}» не умеет смотреть картинки напрямую (флаг `-g`).\n"
+                f"Переключись на vision-модель через `.model` (например GLM-5 / Qwen / Kimi, или vision-модель OpenRouter), либо убери `-g`.")
+            if is_owner:
+                await event.delete()
+            return
 
     if is_owner:
         await event.delete()  # своё сообщение чистим; гостевой вопрос оставляем видимым
@@ -2155,6 +2234,13 @@ async def ask_command(event):
         short = " (чат короче запроса)" if len(ordered) < n else ""
         log("ASK", f"Сбор: запрошено N={n}, фактически {len(ordered)} сообщ.{short}")
 
+        # .ask -g: отбираем самые свежие фото (до лимита) для прямой отдачи модели
+        inline_ids = None
+        if direct_vision:
+            photo_ids = [m.id for m in ordered if getattr(m, "photo", None) and getattr(m, "id", None) is not None]
+            inline_ids = set(photo_ids[-DIRECT_VISION_MAX_IMAGES:])  # ordered хронологичен → хвост = свежие
+            log("ASK", f"-g: фото в выборке {len(photo_ids)}, инлайню до {len(inline_ids)} свежих (лимит {DIRECT_VISION_MAX_IMAGES})")
+
         # Ретрай-цикл на ContextOverflowError: если модель реально насчитала больше токенов,
         # чем tiktoken — пересобираем с агрессивнее обрезкой (safety ×2, ×4).
         base_safety = active_ctx_safety()
@@ -2165,16 +2251,20 @@ async def ask_command(event):
         for retry_idx, safety_override in enumerate(safety_attempts):
             retry_suffix = f" (ретрай ×{safety_override / base_safety:.1f})" if safety_override else ""
             await set_status(f"📥 Собрано {len(ordered)} сообщ. — собираю контекст…{retry_suffix}")
+            inline_images = [] if direct_vision else None  # сбрасываем на каждой ретрай-итерации (без дублей)
             context, dropped, failed, ctx_tokens = await assemble_context(
                 ordered, text_only, anchor_id=anchor_id, progress_cb=progress_cb,
                 vision_model=vision_model, detail=detail, safety_override=safety_override,
+                inline_ids=inline_ids, inline_images=inline_images,
             )
             t_ctx = time.time()
             context = context or "(нет сообщений)"
             save_media_cache()
+            if direct_vision:
+                log("ASK", f"-g: картинок напрямую модели: {len(inline_images)}")
             await set_status(f"🤖 Думаю над ответом…{retry_suffix}")
             try:
-                reply = await ask_agentic(context, question, must_search=must_search, caller=caller, ctx_tokens_est=ctx_tokens, voice_mode=voice_mode)
+                reply = await ask_agentic(context, question, must_search=must_search, caller=caller, ctx_tokens_est=ctx_tokens, voice_mode=voice_mode, images=(inline_images if direct_vision else None))
                 t_llm = time.time()
                 break  # успех
             except ContextOverflowError as e:
@@ -2767,7 +2857,7 @@ async def model_command(event):
         # Не номер и не известный slug → пробуем как id модели OpenRouter (vendor/model, с валидацией)
         if "/" in arg:
             await event.edit(f"🔎 Проверяю `{arg}` в OpenRouter…")
-            exists, _img, ctx_len, name = await _openrouter_model_info(arg)
+            exists, supports_img, ctx_len, name = await _openrouter_model_info(arg)
             if exists is None:
                 await event.edit(f"⚠️ Не удалось проверить `{arg}` (OpenRouter недоступен). Модель не изменена.")
                 return
@@ -2779,7 +2869,7 @@ async def model_command(event):
                 return
             ctx = int(ctx_len or 128000)
             label = name or arg
-            CUSTOM_MODELS[arg] = {"label": label, "ctx": ctx, "safety": 1.3}  # safety консервативно: токенайзер неизвестен
+            CUSTOM_MODELS[arg] = {"label": label, "ctx": ctx, "safety": 1.3, "vision": bool(supports_img)}  # vision — для .ask -g
             MODEL_REGISTRY[arg] = ("openrouter", arg, label, ctx, 1.3)
             ACTIVE_MODEL = arg
             _save_model_state()
@@ -3114,7 +3204,7 @@ _HELP_SECTIONS = {
         "```\n"
         "1️⃣ `.ask` — сама команда.\n"
         "2️⃣ `N` — **обязательно**, число: сколько последних сообщений взять (напр. `200`).\n"
-        "3️⃣ `[флаги]` — необязательно: `-t`, `-c`, `-d`, `-v` (см. ниже).\n"
+        "3️⃣ `[флаги]` — необязательно: `-t`, `-c`, `-d`, `-v`, `-g` (см. ниже).\n"
         "4️⃣ `[@юзеры]` — необязательно: `@имя` (только эти) или `!@имя` (исключить).\n"
         "5️⃣ `вопрос` — **обязательно**, любой текст до конца строки.\n"
         "\n"
@@ -3132,6 +3222,9 @@ _HELP_SECTIONS = {
         "   `-c` — обязательно искать по подключённым каналам перед ответом.\n"
         "   `-d` — дамп: выгрузить собранный контекст отдельным файлом (для отладки).\n"
         "   `-v` — ответить **голосом** (озвучка через Gemini TTS). См. `.help voice`.\n"
+        "   `-g` — отдать **картинки напрямую** отвечающей модели (её vision), а не описания.\n"
+        "        Нужна vision-модель (`.model` → GLM-5/Qwen/Kimi или OpenRouter-vision), иначе понятная ошибка.\n"
+        "        Голос/аудио всегда через Chirp-3. До 10 свежих картинок за запрос.\n"
         "   _Пример:_ `.ask 1000 -t -d что обсуждали вчера?` · `.ask 30 -v расскажи анекдот`\n"
         "\n"
         "**Фильтры по людям** (шаг 4):\n"
