@@ -103,7 +103,8 @@ GEMINI_TTS_MODEL = os.getenv("GEMINI_TTS_MODEL", "gemini-3.1-flash-tts-preview")
 GEMINI_TTS_URL = "https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
 TTS_DEFAULT_VOICE = "Leda"     # дефолтный голос (см. VOICE_PROFILES)
 TTS_PCM_RATE = 24000           # Gemini TTS отдаёт PCM s16le 24kHz mono
-TTS_VOICE_CHAR_CAP = 1500      # потолок длины озвучиваемого текста (длиннее режем)
+TTS_VOICE_CHAR_CAP = 600       # потолок длины озвучиваемого текста. У TTS-preview есть предел
+                               # длительности аудио за запрос: >~900 симв. → HTTP 400. 600 — надёжно.
 
 # 30 встроенных голосов Gemini TTS (порт из Bot_opekyn/src/voice/tts.ts).
 # Каждый: name (для API), tone, pitch, personality (рус.), gender, emoji.
@@ -281,7 +282,7 @@ VOICE_STYLE_PROMPT = """
 ━━ РЕЖИМ ГОЛОСОВОГО ОТВЕТА ━━
 Твой ответ будет ОЗВУЧЕН (text-to-speech) и отправлен как голосовое сообщение. Поэтому:
 - Пиши как живую устную речь от первого лица, разговорно и эмоционально. НЕ как текст-статью.
-- Коротко: до ~1500 символов (примерно минута речи). Без длинных перечислений и таблиц.
+- ОЧЕНЬ коротко: 2–4 фразы, максимум ~500 символов (это голосовое на 20–40 секунд). НЕ перечисляй много пунктов, не здоровайся с каждым по списку — это превысит лимит озвучки. Скажи главное живо и сжато.
 - НЕ используй HTML, markdown, эмодзи, ссылки, код — только произносимые слова.
 - Управляй интонацией аудио-тегами в квадратных скобках — они НЕ произносятся, а задают подачу:
   [радостно] [взволнованно] [смеётся] [усмехается] [вздыхает] [шёпотом] [тихо] [серьёзно]
@@ -947,11 +948,6 @@ def _strip_for_tts(text: str) -> str:
     return t
 
 
-def _tts_is_quota_error(e: Exception) -> bool:
-    s = str(e).lower()
-    return "429" in s or "resource_exhausted" in s or "quota" in s or "rate" in s
-
-
 def _sync_tts(text: str, voice: str, api_key: str) -> bytes:
     """Один синхронный запрос к Gemini TTS. Возвращает PCM (s16le, 24kHz, mono). Бросает при ошибке."""
     url = GEMINI_TTS_URL.format(model=GEMINI_TTS_MODEL)
@@ -995,34 +991,72 @@ async def _pcm_to_ogg(pcm: bytes) -> bytes:
     return ogg
 
 
-async def synthesize_voice(text: str, voice: str):
-    """Озвучивает text голосом voice. Ротация ключей с фолбэком при quota.
-    Возвращает bytes OGG/Opus или None (при полном провале — вызывающий откатывается на текст)."""
+def _tts_err_kind(e) -> str:
+    """Классификация ошибки TTS: quota (лимит ключа) / transient (перегрузка-503/таймаут) /
+    badreq (400 — обычно слишком длинный текст) / other."""
+    s = str(e).lower()
+    if "429" in s or "resource_exhausted" in s or "quota" in s or "rate" in s:
+        return "quota"
+    if "503" in s or "unavailable" in s or "high demand" in s or "timed out" in s or "timeout" in s:
+        return "transient"
+    if "400" in s or "invalid_argument" in s or "invalid argument" in s:
+        return "badreq"
+    return "other"
+
+
+async def _tts_once(text: str, voice: str) -> bytes:
+    """Один проход озвучки: ротация ключей при quota, ретрай при перегрузке (503). Бросает последнюю ошибку."""
     global _tts_key_idx
+    last_err = None
+    for _ in range(len(GOOGLE_TTS_KEYS)):
+        key = GOOGLE_TTS_KEYS[_tts_key_idx % len(GOOGLE_TTS_KEYS)]
+        _tts_key_idx = (_tts_key_idx + 1) % len(GOOGLE_TTS_KEYS)
+        for attempt in range(2):  # ретрай transient на том же ключе
+            try:
+                pcm = await asyncio.to_thread(_sync_tts, text, voice, key)
+                return await _pcm_to_ogg(pcm)
+            except Exception as e:
+                last_err = e
+                if _tts_err_kind(e) == "transient" and attempt == 0:
+                    log("TTS", "перегрузка модели (503/таймаут), повтор через 2с…")
+                    await asyncio.sleep(2)
+                    continue
+                break
+        if _tts_err_kind(last_err) == "quota" and len(GOOGLE_TTS_KEYS) > 1:
+            log("TTS", "лимит ключа, пробую следующий")
+            continue
+        break
+    raise last_err if last_err else RuntimeError("TTS: неизвестная ошибка")
+
+
+async def synthesize_voice(text: str, voice: str):
+    """Озвучивает text голосом voice. Ключи ротируются при quota, ретрай при 503,
+    а при 400 (обычно «слишком длинно») — повтор с укороченным текстом.
+    Возвращает bytes OGG/Opus или None (при провале — вызывающий откатывается на текст)."""
     if not GOOGLE_TTS_KEYS:
         return None
     voice = _validate_voice(voice)
     spoken = _strip_for_tts(text)
     if not spoken:
         return None
+    # Варианты текста: полный, затем укороченный — страховка от 400 (лимит длительности аудио).
+    variants = [spoken]
+    if len(spoken) > 350:
+        short = spoken[:350].rsplit(" ", 1)[0].rstrip() + "…"
+        variants.append(short)
     last_err = None
-    for _ in range(len(GOOGLE_TTS_KEYS)):
-        key = GOOGLE_TTS_KEYS[_tts_key_idx % len(GOOGLE_TTS_KEYS)]
-        _tts_key_idx = (_tts_key_idx + 1) % len(GOOGLE_TTS_KEYS)
+    for i, variant in enumerate(variants):
         try:
-            pcm = await asyncio.to_thread(_sync_tts, spoken, voice, key)
-            ogg = await _pcm_to_ogg(pcm)
-            log("TTS", f"Озвучено: voice={voice}, текст={len(spoken)} симв., ogg={len(ogg)} байт")
+            ogg = await _tts_once(variant, voice)
+            log("TTS", f"Озвучено: voice={voice}, текст={len(variant)} симв.{' (укорочено)' if i else ''}, ogg={len(ogg)} байт")
             return ogg
         except Exception as e:
             last_err = e
-            if _tts_is_quota_error(e) and len(GOOGLE_TTS_KEYS) > 1:
-                log("TTS", f"Лимит ключа, пробую следующий: {e}")
+            if _tts_err_kind(e) == "badreq" and i + 1 < len(variants):
+                log("TTS", f"400 (вероятно слишком длинно), пробую укоротить до {len(variants[i + 1])} симв.")
                 continue
-            log("TTS", f"Ошибка синтеза: {e}")
             break
-    if last_err:
-        log("TTS", f"Озвучка не удалась ({last_err}) — фолбэк на текст")
+    log("TTS", f"Озвучка не удалась ({last_err}) — фолбэк на текст")
     return None
 
 
@@ -3076,7 +3110,7 @@ _HELP_SECTIONS = {
         "   `[смеётся]`, `[шёпотом]`, `[взволнованно]`, `[с теплотой]`, `[серьёзно]`,\n"
         "   `[вздыхает]`, паузы — многоточием. Теги не произносятся, а задают подачу.\n"
         "\n"
-        "ℹ️ Голосовой ответ короткий (~до 1500 симв.) и идёт **только голосом**; если\n"
+        "ℹ️ Голосовой ответ короткий (2–4 фразы, ~до 500 симв. — предел длительности TTS) и идёт **только голосом**; если\n"
         "   TTS не сработал — бот автоматически пришлёт текст.\n"
         "🔑 Нужен ключ `GOOGLE_GENAI_API_KEY` (см. `.help keys`). Без него `.voice`\n"
         "   сообщит, что голос недоступен, а `.ask` будет отвечать текстом."
