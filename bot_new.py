@@ -4,6 +4,7 @@ from telethon.errors.rpcerrorlist import MessageNotModifiedError, FloodWaitError
 from dotenv import load_dotenv
 from openai import OpenAI
 import os
+import re
 import asyncio
 import base64
 import time
@@ -70,6 +71,9 @@ MEDIA_MODEL_REGISTRY = {
     "free":    ("openrouter/free", "OpenRouter Free (авто)"),
 }
 FREE_MEDIA_MODEL = "openrouter/free"  # авто-фоллбэк для гостей при N>500
+# OpenCode-Go модели, доступные как медиа (vision). slug == api_model_id в MODEL_REGISTRY,
+# поэтому медиа-пайплайн отличает их по самому id и роутит описание в opencode_client.
+MEDIA_OPENCODE_SLUGS = ["kimi-k2.5", "kimi-k2.6", "glm-5", "glm-5.1", "qwen3.5-plus", "qwen3.6-plus", "mimo-v2-omni"]
 DEEPSEEK_BASE_URL = "https://api.deepseek.com/v1"
 DEEPSEEK_MODEL = os.getenv("DEEPSEEK_MODEL", "deepseek-v4-pro")
 OPENCODE_BASE_URL = "https://opencode.ai/zen/go/v1"
@@ -89,6 +93,9 @@ ASK_MAX_TOKENS = 16000        # потолок completion для .ask (thinking-
 MEDIA_CONCURRENCY = 10    # параллельная обработка медиа (Gemini выдерживает)
 SEARCH_CONCURRENCY = 5    # параллельный поиск по каналам
 AUTO_REPLY_HISTORY_MAX = 20  # сообщений (≈10 реплик) на чат
+COLLECT_WORKERS = 4           # параллельные окна сбора истории (.ask). Консервативно — низкий риск FloodWait.
+COLLECT_MIN_PER_WORKER = 500  # минимум сообщений на воркер; при меньшем N — меньше воркеров (мелкие .ask не дробим зря)
+COLLECT_OVERFETCH = 1.2       # запас позиций на скип сервисных/команд/исключённых
 
 # Реестр моделей: slug -> (provider, api_model_id, label, context_window_tokens, ctx_safety_mult)
 # ctx_safety_mult: множитель «осторожности» бюджета — учитывает, что токенизатор
@@ -305,6 +312,11 @@ def save_tracked(lst):
 # --- Выбор модели для ответов ---
 
 _model_state = load_json(MODEL_STATE_PATH, {})
+# Кастомные OpenRouter-модели для ответов (заданы через .model <vendor/model>) — восстанавливаем в реестр,
+# чтобы они стали полноценными записями (провайдер "openrouter") и пережили рестарт.
+CUSTOM_MODELS = _model_state.get("custom_models", {})  # {id: {"label","ctx","safety"}}
+for _cid, _ci in CUSTOM_MODELS.items():
+    MODEL_REGISTRY[_cid] = ("openrouter", _cid, (_ci.get("label") or _cid), int(_ci.get("ctx") or 128000), float(_ci.get("safety") or 1.3))
 ACTIVE_MODEL = _model_state.get("active", "deepseek")
 if ACTIVE_MODEL not in MODEL_REGISTRY:
     ACTIVE_MODEL = "deepseek"
@@ -316,7 +328,7 @@ ACTIVE_MEDIA_MODEL = _model_state.get("active_media") or "lite"
 def get_active_model():
     """Возвращает (client, api_model_id, label) для активной модели. client=None если провайдер не настроен."""
     provider, model_id, label, _ctx, _safety = MODEL_REGISTRY.get(ACTIVE_MODEL, MODEL_REGISTRY["deepseek"])
-    client_obj = deepseek_client if provider == "deepseek" else opencode_client
+    client_obj = deepseek_client if provider == "deepseek" else (openrouter_client if provider == "openrouter" else opencode_client)
     return client_obj, model_id, label
 
 
@@ -335,12 +347,18 @@ def get_active_media_model() -> str:
     spec = MEDIA_MODEL_REGISTRY.get(ACTIVE_MEDIA_MODEL)
     if spec:
         return spec[0]
-    # кастомная модель — ACTIVE_MEDIA_MODEL это сам model_id OpenRouter
+    # OpenCode-слуг или кастомный OpenRouter id — ACTIVE_MEDIA_MODEL это сам model_id
     return ACTIVE_MEDIA_MODEL or MEDIA_MODEL_REGISTRY["lite"][0]
 
 
+def _client_for_media_model(model_id: str):
+    """Клиент для медиа-модели по её id: OpenCode для слугов из MEDIA_OPENCODE_SLUGS,
+    иначе OpenRouter (пресеты Gemini/Qwen и кастомные OpenRouter-id). None — если провайдер не настроен."""
+    return opencode_client if model_id in MEDIA_OPENCODE_SLUGS else openrouter_client
+
+
 async def _openrouter_model_info(model_id: str):
-    """Проверяет модель в OpenRouter. Возвращает (exists, supports_image).
+    """Проверяет модель в OpenRouter. Возвращает (exists, supports_image, context_length, name).
     exists=None если не удалось проверить (сеть/нет ключа)."""
     def _fetch():
         headers = {"Authorization": f"Bearer {openrouter_api_key}"} if openrouter_api_key else {}
@@ -352,11 +370,12 @@ async def _openrouter_model_info(model_id: str):
         for m in data:
             if m.get("id") == model_id:
                 mods = (m.get("architecture") or {}).get("input_modalities") or []
-                return True, ("image" in mods)
-        return False, False
+                ctx = m.get("context_length") or (m.get("top_provider") or {}).get("context_length") or 0
+                return True, ("image" in mods), int(ctx or 0), (m.get("name") or model_id)
+        return False, False, 0, None
     except Exception as e:
         log("MODEL", f"Проверка {model_id} в OpenRouter: {e}")
-        return None, False
+        return None, False, 0, None
 
 
 def _fmt_ctx(n: int) -> str:
@@ -380,7 +399,7 @@ def count_tokens(text: str) -> int:
 
 
 def _save_model_state():
-    save_json(MODEL_STATE_PATH, {"active": ACTIVE_MODEL, "tools_support": MODEL_TOOLS_SUPPORT, "active_media": ACTIVE_MEDIA_MODEL})
+    save_json(MODEL_STATE_PATH, {"active": ACTIVE_MODEL, "tools_support": MODEL_TOOLS_SUPPORT, "active_media": ACTIVE_MEDIA_MODEL, "custom_models": CUSTOM_MODELS})
 
 
 def _set_tools_support(slug, ok):
@@ -522,6 +541,46 @@ async def send_long(chat_id, text, prefix="", parse_mode=_PARSE_UNSET):
         await asyncio.sleep(0.3)
 
 
+def _html_clean_markdown(text: str) -> str:
+    """Чистит ответ модели от markdown-мусора (#/*), который ломает Telegram-HTML.
+    На больших запросах модель путает HTML и markdown. Конвертируем частые конструкции
+    в HTML-теги (жирный/заголовки/буллеты), затем удаляем оставшиеся одиночные # и *.
+    Содержимое <pre>/<code> не трогаем (там #/* могут быть валидным кодом)."""
+    if not text:
+        return text
+    # 1) Отложить защищённые код-участки, заменив плейсхолдерами \x00N\x00
+    stash = []
+    def _stash(m):
+        stash.append(m.group(0))
+        return f"\x00{len(stash) - 1}\x00"
+    body = re.sub(r"<(pre|code)\b[^>]*>.*?</\1>", _stash, text, flags=re.DOTALL | re.IGNORECASE)
+
+    # 2) Построчно: markdown-заголовки и буллеты
+    out_lines = []
+    for line in body.split("\n"):
+        h = re.match(r"^\s{0,3}#{1,6}\s+(.+?)\s*#*\s*$", line)  # ## Заголовок → <b>…</b>
+        if h:
+            out_lines.append(f"<b>{h.group(1)}</b>")
+            continue
+        line = re.sub(r"^(\s*)[\*\-]\s+", r"\1• ", line)  # * пункт / - пункт → • пункт
+        out_lines.append(line)
+    body = "\n".join(out_lines)
+
+    # 3) Инлайн: сначала жирный (**/__), потом курсив (одиночные */_)
+    body = re.sub(r"\*\*(.+?)\*\*", r"<b>\1</b>", body)
+    body = re.sub(r"__(.+?)__", r"<b>\1</b>", body)
+    body = re.sub(r"(?<![\w*])\*(?!\s)(.+?)(?<!\s)\*(?![\w*])", r"<i>\1</i>", body)
+    body = re.sub(r"(?<![\w_])_(?!\s)(.+?)(?<!\s)_(?![\w_])", r"<i>\1</i>", body)
+
+    # 4) Удалить оставшиеся одиночные # и * (звёздочки/решётки-мусор)
+    body = body.replace("*", "").replace("#", "")
+    # Подчистить пустые теги, возникшие из вырожденного markdown (напр. «***»)
+    body = re.sub(r"<([bi])>\s*</\1>", "", body)
+
+    # 5) Вернуть код-участки на место
+    return re.sub(r"\x00(\d+)\x00", lambda m: stash[int(m.group(1))], body)
+
+
 def build_msg_link(entity, msg_id) -> str:
     username = getattr(entity, "username", None)
     if username:
@@ -594,15 +653,16 @@ _is_tool_choice_unsupported = _is_thinking_mode_quirk
 
 
 async def describe_image(image_bytes: bytes, caption: str = "", model: str = None, detail: str = "high") -> str:
-    if not openrouter_client:
-        return caption or "[изображение]"
     model = model or get_active_media_model()
+    media_client = _client_for_media_model(model)  # OpenRouter или OpenCode-Go по id модели
+    if not media_client:
+        return caption or "[изображение]"
     b64 = base64.b64encode(image_bytes).decode("utf-8")
     prompt_text = f"Опиши это изображение подробно на русском языке. Подпись к фото: \"{caption}\"" if caption else "Опиши это изображение подробно на русском языке."
     for attempt in range(3):
         try:
             response = await asyncio.to_thread(
-                openrouter_client.chat.completions.create,
+                media_client.chat.completions.create,
                 model=model,
                 messages=[{"role": "user", "content": [
                     {"type": "text", "text": prompt_text},
@@ -623,10 +683,13 @@ async def describe_image(image_bytes: bytes, caption: str = "", model: str = Non
 
 
 async def describe_album(images: list, caption: str = "", model: str = None, detail: str = "high") -> str:
-    # Описывает несколько фото альбома ОДНИМ запросом к Gemini. "" при сбое (→ фоллбэк).
-    if not openrouter_client or not images:
+    # Описывает несколько фото альбома ОДНИМ запросом к vision-модели. "" при сбое (→ фоллбэк).
+    if not images:
         return ""
     model = model or get_active_media_model()
+    media_client = _client_for_media_model(model)  # OpenRouter или OpenCode-Go по id модели
+    if not media_client:
+        return ""
     cap = f", подпись: \"{caption}\"" if caption else ""
     prompt_text = (
         f"Это {len(images)} фото из одного Telegram-альбома{cap}. "
@@ -639,7 +702,7 @@ async def describe_album(images: list, caption: str = "", model: str = None, det
     for attempt in range(3):
         try:
             response = await asyncio.to_thread(
-                openrouter_client.chat.completions.create,
+                media_client.chat.completions.create,
                 model=model,
                 messages=[{"role": "user", "content": content}],
                 max_tokens=4096,
@@ -1557,6 +1620,34 @@ async def search_channels(query: str, per_channel: int = 5, total: int = 10, sin
     return results[:total]
 
 
+async def _collect_history_parallel(chat_id, n, base_offset_id, from_user=None):
+    """Собирает ~n сообщений старше base_offset_id (0=с конца) ПАРАЛЛЕЛЬНЫМИ окнами через add_offset
+    (позиционный сдвиг — надёжен при дырках id от удалённых). Возвращает список Message (с возможными
+    дублями на стыках окон — дедуп у вызывающего). FloodWait в окне → ждём и возвращаем частичное.
+    Самомасштабируется: при малом n — меньше воркеров (мелкие .ask не дробим зря)."""
+    target = int(n * COLLECT_OVERFETCH) + 10
+    workers = max(1, min(COLLECT_WORKERS, -(-target // COLLECT_MIN_PER_WORKER)))  # ceil(target/min_per)
+    per = -(-target // workers)  # ceil — сообщений на окно
+
+    async def _window(k):
+        out = []
+        try:
+            async for m in client.iter_messages(chat_id, offset_id=base_offset_id,
+                                                 add_offset=k * per, limit=per, from_user=from_user):
+                out.append(m)
+        except FloodWaitError as e:
+            log("ASK", f"Сбор: окно {k} FloodWait {e.seconds}с — жду и возвращаю частичное ({len(out)})")
+            await asyncio.sleep(e.seconds + 1)
+        except Exception as e:
+            log("ASK", f"Сбор: окно {k} ошибка: {e} (собрано {len(out)})")
+        return out
+
+    chunks = await asyncio.gather(*[_window(k) for k in range(workers)])
+    merged = [m for c in chunks for m in c]
+    log("ASK", f"Параллельный сбор: воркеров={workers}, окно={per}, чанки={[len(c) for c in chunks]} → {len(merged)} (с дублями)")
+    return workers, merged
+
+
 @client.on(events.NewMessage(pattern=r"^\.ask\s+(\d+)((?:\s+-[tcd]+)+)?((?:\s+!?@\w+)+)?\s+(.+)"))
 async def ask_command(event):
     is_owner = event.out
@@ -1653,7 +1744,9 @@ async def ask_command(event):
             not_found = []
             for u in usernames:
                 try:
-                    async for m in client.iter_messages(event.chat_id, from_user=u, limit=n):
+                    # Параллельный сбор и под фильтром from_user (позиционные окна работают в messages.search).
+                    _w, raw = await _collect_history_parallel(event.chat_id, n, 0, from_user=u)
+                    for m in raw:
                         by_id[m.id] = m
                 except Exception as e:
                     not_found.append(u)
@@ -1683,20 +1776,38 @@ async def ask_command(event):
                 offset = 0
             # Диагностика: считаем СКОЛЬКО Telegram реально отдал и куда делись скипы.
             diag = {"raw": 0, "service": 0, "self_cmd": 0, "excluded": 0}
-            async for m in client.iter_messages(event.chat_id, offset_id=offset, limit=n * 3 + 10):
+            seen = {anchor.id} if anchor_id else set()  # якорь уже в messages — не дублируем
+
+            def _keep(m):
+                """Учитывает m в diag и messages; True если оставлено."""
+                mid = getattr(m, "id", None)
+                if mid is None or mid in seen:
+                    return False
+                seen.add(mid)
                 diag["raw"] += 1
-                if m.id == event.id:
-                    diag["self_cmd"] += 1
-                    continue
+                if mid == event.id:
+                    diag["self_cmd"] += 1; return False
                 if getattr(m, "action", None) is not None:
-                    diag["service"] += 1
-                    continue
+                    diag["service"] += 1; return False
                 if _is_excluded(m):
-                    diag["excluded"] += 1
-                    continue
+                    diag["excluded"] += 1; return False
                 messages.append(m)
-                if len(messages) >= n:
-                    break
+                return True
+
+            # Параллельный сбор позиционными окнами (быстрее последовательной пагинации Telegram).
+            workers, raw_msgs = await _collect_history_parallel(event.chat_id, n, offset)
+            await set_status(f"📥 Тяну историю в {workers} {'поток' if workers == 1 else 'потока' if workers < 5 else 'потоков'}…")
+            for m in raw_msgs:
+                _keep(m)
+            messages.sort(key=lambda m: m.id, reverse=True)  # после стыковки окон порядок мог нарушиться
+            # Страховка-добор: если из-за FloodWait/скипов собрали < n — добираем последовательно от старого края.
+            if len(messages) < n:
+                tail_offset = min((m.id for m in messages), default=offset)
+                async for m in client.iter_messages(event.chat_id, offset_id=tail_offset, limit=(n - len(messages)) * 2 + 50):
+                    if _keep(m) and len(messages) >= n:
+                        break
+                messages.sort(key=lambda m: m.id, reverse=True)
+            messages = messages[:n]
             log("ASK", f"iter_messages diag: raw={diag['raw']} · skip service={diag['service']} · команда={diag['self_cmd']} · excludes={diag['excluded']} → попало {len(messages) - (1 if anchor_id else 0)} (+якорь {1 if anchor_id else 0})")
             if anchor is not None:
                 aut = _owner_label() if anchor.out else _user_label(anchor.sender)
@@ -1792,6 +1903,8 @@ async def ask_command(event):
             notes.append(f"⚠️ {failed} медиа не распознано")
         note = (" — " + "; ".join(notes)) if notes else ""
         prefix = f"{label}{note}:\n\n"
+        # Чистим markdown-мусор (#/*) ДО нарезки на части — модель путает HTML и markdown.
+        reply = _html_clean_markdown(reply)
         # Сначала отправляем ответ, потом удаляем статус — иначе сбой delete съест ответ.
         await send_long(event.chat_id, reply, prefix=prefix, parse_mode="html")
         t_sent = time.time()
@@ -2155,7 +2268,11 @@ async def model_command(event):
     slugs = list(MODEL_REGISTRY.keys())
 
     def is_available(provider):
-        return (deepseek_client if provider == "deepseek" else opencode_client) is not None
+        if provider == "deepseek":
+            return deepseek_client is not None
+        if provider == "openrouter":
+            return openrouter_client is not None
+        return opencode_client is not None
 
     def tool_mark(slug):
         ts = MODEL_TOOLS_SUPPORT.get(slug)
@@ -2164,40 +2281,46 @@ async def model_command(event):
     # --- выбор медиа-модели (vision): .model media [N|slug] ---
     if arg.lower().startswith("media"):
         marg = arg[len("media"):].strip()
-        mslugs = list(MEDIA_MODEL_REGISTRY.keys())
+        # Единый нумерованный список: OpenRouter-пресеты + OpenCode-Go vision-модели.
+        # Элемент: (provider, slug, model_id, label)
+        media_items = [("openrouter", ms, MEDIA_MODEL_REGISTRY[ms][0], MEDIA_MODEL_REGISTRY[ms][1]) for ms in MEDIA_MODEL_REGISTRY]
+        media_items += [("opencode", ms, MODEL_REGISTRY[ms][1], MODEL_REGISTRY[ms][2]) for ms in MEDIA_OPENCODE_SLUGS if ms in MODEL_REGISTRY]
+        media_by_slug = {ms: (prov, mid, mlabel) for prov, ms, mid, mlabel in media_items}
         if not marg:
             lines = ["🖼 **Медиа-модели (vision)** — ▶ активная:"]
-            for i, ms in enumerate(mslugs, 1):
-                mid, mlabel = MEDIA_MODEL_REGISTRY[ms]
+            for i, (prov, ms, mid, mlabel) in enumerate(media_items, 1):
                 mk = f"▶{i}." if ms == ACTIVE_MEDIA_MODEL else f"{i}."
-                avail = "" if openrouter_client else " ⚠️нет ключа"
-                lines.append(f"{mk} `{ms}` — {mlabel}  (`{mid}`){avail}")
-            if ACTIVE_MEDIA_MODEL not in MEDIA_MODEL_REGISTRY:
-                lines.append(f"▶ (кастомная) `{ACTIVE_MEDIA_MODEL}`")
-            lines.append("\nАудио/голос — всегда Chirp-3.")
+                cl = openrouter_client if prov == "openrouter" else opencode_client
+                avail = "" if cl else " ⚠️нет ключа"
+                ptag = "OR" if prov == "openrouter" else "OC"
+                lines.append(f"{mk} `{ms}` — {mlabel} [{ptag}] (`{mid}`){avail}")
+            if ACTIVE_MEDIA_MODEL not in media_by_slug:
+                lines.append(f"▶ (кастомная OpenRouter) `{ACTIVE_MEDIA_MODEL}`")
+            lines.append("\n[OR]=OpenRouter · [OC]=OpenCode Go · аудио/голос — всегда Chirp-3.")
             lines.append("`.model media N` / `.model media <slug>` — выбрать")
             lines.append("`.model media <model-id>` — любая модель OpenRouter (с проверкой)")
             await event.edit("\n".join(lines)[:4000])
             return
-        # 1) по номеру  2) по slug из реестра  3) кастомный id OpenRouter (с валидацией)
-        if marg.isdigit() and 1 <= int(marg) <= len(mslugs):
-            chosen_m = mslugs[int(marg) - 1]
+        # 1) по номеру  2) по slug из объединённого списка  3) кастомный id OpenRouter (с валидацией)
+        if marg.isdigit() and 1 <= int(marg) <= len(media_items):
+            prov, chosen_m, mid, mlabel = media_items[int(marg) - 1]
             ACTIVE_MEDIA_MODEL = chosen_m
             _save_model_state()
-            mid, mlabel = MEDIA_MODEL_REGISTRY[chosen_m]
-            log("MODEL", f"Активная медиа-модель: {chosen_m} ({mid})")
-            await event.edit(f"✅ Медиа-модель (vision): {mlabel} (`{mid}`)")
+            ptag = "OpenRouter" if prov == "openrouter" else "OpenCode Go"
+            log("MODEL", f"Активная медиа-модель: {chosen_m} ({mid}, {ptag})")
+            await event.edit(f"✅ Медиа-модель (vision): {mlabel} (`{mid}`, {ptag})")
             return
-        if marg in MEDIA_MODEL_REGISTRY:
+        if marg in media_by_slug:
+            prov, mid, mlabel = media_by_slug[marg]
             ACTIVE_MEDIA_MODEL = marg
             _save_model_state()
-            mid, mlabel = MEDIA_MODEL_REGISTRY[marg]
-            log("MODEL", f"Активная медиа-модель: {marg} ({mid})")
-            await event.edit(f"✅ Медиа-модель (vision): {mlabel} (`{mid}`)")
+            ptag = "OpenRouter" if prov == "openrouter" else "OpenCode Go"
+            log("MODEL", f"Активная медиа-модель: {marg} ({mid}, {ptag})")
+            await event.edit(f"✅ Медиа-модель (vision): {mlabel} (`{mid}`, {ptag})")
             return
         # кастомный id — проверяем в OpenRouter
         await event.edit(f"🔎 Проверяю `{marg}` в OpenRouter…")
-        exists, supports_img = await _openrouter_model_info(marg)
+        exists, supports_img, _ctx_len, _name = await _openrouter_model_info(marg)
         if exists is None:
             await event.edit(f"⚠️ Не удалось проверить `{marg}` (OpenRouter недоступен). Модель не изменена.")
             return
@@ -2223,13 +2346,18 @@ async def model_command(event):
             provider, _mid, label, ctx, _safety = MODEL_REGISTRY[slug]
             if provider != cur_provider:
                 cur_provider = provider
-                title = "━━ Прямой API ━━" if provider == "deepseek" else "━━ OpenCode Go ━━"
+                title = {"deepseek": "━━ Прямой API ━━", "opencode": "━━ OpenCode Go ━━",
+                         "openrouter": "━━ OpenRouter (кастом) ━━"}.get(provider, f"━━ {provider} ━━")
                 lines.append(f"\n{title}")
             mark = f"▶{i}." if slug == ACTIVE_MODEL else f"{i}."
             warn = " ⚠️нет ключа" if not is_available(provider) else ""
             lines.append(f"{mark} `{slug}` — {label} · 🪟{_fmt_ctx(ctx)}{tool_mark(slug)}{warn}")
-        _mspec = MEDIA_MODEL_REGISTRY.get(ACTIVE_MEDIA_MODEL)
-        media_label = _mspec[1] if _mspec else f"{ACTIVE_MEDIA_MODEL} (кастомная)"
+        if ACTIVE_MEDIA_MODEL in MEDIA_MODEL_REGISTRY:
+            media_label = MEDIA_MODEL_REGISTRY[ACTIVE_MEDIA_MODEL][1]
+        elif ACTIVE_MEDIA_MODEL in MEDIA_OPENCODE_SLUGS and ACTIVE_MEDIA_MODEL in MODEL_REGISTRY:
+            media_label = f"{MODEL_REGISTRY[ACTIVE_MEDIA_MODEL][2]} [OpenCode]"
+        else:
+            media_label = f"{ACTIVE_MEDIA_MODEL} (кастомная)"
         lines.append(f"\n🖼 медиа-модель: {media_label} · `.model media` — сменить")
         lines.append("`.model N` / `.model <slug>` — выбрать · `.model probe` — проверить поиск")
         await event.edit("\n".join(lines)[:4000])
@@ -2240,7 +2368,7 @@ async def model_command(event):
         tested = 0
         for slug in slugs:
             provider, mid, _label, _ctx, _safety = MODEL_REGISTRY[slug]
-            cl = deepseek_client if provider == "deepseek" else opencode_client
+            cl = deepseek_client if provider == "deepseek" else (openrouter_client if provider == "openrouter" else opencode_client)
             if cl is None:
                 continue
             try:
@@ -2271,7 +2399,29 @@ async def model_command(event):
     elif arg in MODEL_REGISTRY:
         chosen = arg
     if not chosen:
-        await event.edit(f"Нет такой модели: {arg}. `.model` — список.")
+        # Не номер и не известный slug → пробуем как id модели OpenRouter (vendor/model, с валидацией)
+        if "/" in arg:
+            await event.edit(f"🔎 Проверяю `{arg}` в OpenRouter…")
+            exists, _img, ctx_len, name = await _openrouter_model_info(arg)
+            if exists is None:
+                await event.edit(f"⚠️ Не удалось проверить `{arg}` (OpenRouter недоступен). Модель не изменена.")
+                return
+            if not exists:
+                await event.edit(f"❌ Модель `{arg}` не найдена в OpenRouter. Проверь точный id (см. openrouter.ai/models).")
+                return
+            if not openrouter_client:
+                await event.edit("Модель найдена, но нет ключа OpenRouter — добавь OPENROUTER_API_KEY в .env.")
+                return
+            ctx = int(ctx_len or 128000)
+            label = name or arg
+            CUSTOM_MODELS[arg] = {"label": label, "ctx": ctx, "safety": 1.3}  # safety консервативно: токенайзер неизвестен
+            MODEL_REGISTRY[arg] = ("openrouter", arg, label, ctx, 1.3)
+            ACTIVE_MODEL = arg
+            _save_model_state()
+            log("MODEL", f"Активная модель (кастомная OpenRouter): {arg}, окно {ctx}")
+            await event.edit(f"✅ Модель ответов: {label} (`{arg}`, OpenRouter, окно 🪟{_fmt_ctx(ctx)})")
+            return
+        await event.edit(f"Нет такой модели: {arg}. `.model` — список, либо укажи id модели OpenRouter (vendor/model).")
         return
 
     provider, _mid, label, ctx, _safety = MODEL_REGISTRY[chosen]
@@ -2466,7 +2616,8 @@ async def help_command(event):
         "\n"
         "🧠 **МОДЕЛЬ ОТВЕТОВ**\n"
         "   `.model` — список · `.model N` — выбрать\n"
-        "   `.model media` — vision-модель (или `.model media <id>` — любая OpenRouter)\n"
+        "   `.model vendor/model` — любая модель OpenRouter для ответа (с проверкой)\n"
+        "   `.model media` — vision-модель (OpenRouter + OpenCode Go, по номеру; или `.model media <id>` — любая OpenRouter)\n"
         "   `.model probe` — проверить поиск у моделей\n"
         "   `.cache info` · `.cache clear all|older N` — управление медиа-кэшем\n"
         "\n"
