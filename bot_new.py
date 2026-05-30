@@ -5,6 +5,7 @@ from dotenv import load_dotenv
 from openai import OpenAI
 import os
 import re
+import io
 import asyncio
 import base64
 import time
@@ -54,6 +55,25 @@ openrouter_api_key = os.getenv("OPENROUTER_API_KEY")
 deepseek_api_key = os.getenv("DEEPSEEK_API_KEY")
 opencode_api_key = os.getenv("OPENCODE_API_KEY")
 
+
+def _collect_google_tts_keys() -> list:
+    """Ключи Google GenAI (TTS) из GOOGLE_GENAI_API_KEY и GOOGLE_GENAI_API_KEYS.
+    Оба поля могут содержать список через запятую. Дедуп, порядок сохраняем."""
+    raw = []
+    for var in ("GOOGLE_GENAI_API_KEY", "GOOGLE_GENAI_API_KEYS"):
+        val = os.getenv(var) or ""
+        raw += [k.strip() for k in val.split(",") if k.strip()]
+    seen, out = set(), []
+    for k in raw:
+        if k not in seen:
+            seen.add(k)
+            out.append(k)
+    return out
+
+
+GOOGLE_TTS_KEYS = _collect_google_tts_keys()
+tts_available = bool(GOOGLE_TTS_KEYS)
+
 # Константы
 AUTO_REPLY_ACCUMULATE_WINDOW = 1.5
 OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1"
@@ -77,6 +97,65 @@ MEDIA_OPENCODE_SLUGS = ["kimi-k2.5", "kimi-k2.6", "glm-5", "glm-5.1", "qwen3.5-p
 DEEPSEEK_BASE_URL = "https://api.deepseek.com/v1"
 DEEPSEEK_MODEL = os.getenv("DEEPSEEK_MODEL", "deepseek-v4-pro")
 OPENCODE_BASE_URL = "https://opencode.ai/zen/go/v1"
+
+# --- Google Gemini Flash TTS (голосовые ответы в .ask) ---
+GEMINI_TTS_MODEL = os.getenv("GEMINI_TTS_MODEL", "gemini-3.1-flash-tts-preview")
+GEMINI_TTS_URL = "https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
+TTS_DEFAULT_VOICE = "Leda"     # дефолтный голос (см. VOICE_PROFILES)
+TTS_PCM_RATE = 24000           # Gemini TTS отдаёт PCM s16le 24kHz mono
+TTS_VOICE_CHAR_CAP = 1500      # потолок длины озвучиваемого текста (длиннее режем)
+
+# 30 встроенных голосов Gemini TTS (порт из Bot_opekyn/src/voice/tts.ts).
+# Каждый: name (для API), tone, pitch, personality (рус.), gender, emoji.
+VOICE_PROFILES = [
+    {"name": "Achernar",      "tone": "Soft",          "pitch": "Higher pitch",       "personality": "Мягкий, нежный, для утешения и ласки",        "gender": "female", "emoji": "🌙"},
+    {"name": "Achird",        "tone": "Friendly",      "pitch": "Lower middle pitch", "personality": "Дружелюбный, тёплый, универсальный",          "gender": "female", "emoji": "🌟"},
+    {"name": "Algenib",       "tone": "Gravelly",      "pitch": "Lower pitch",        "personality": "Хриплый, харизматичный, для серьёзных тем",    "gender": "male",   "emoji": "🔮"},
+    {"name": "Algieba",       "tone": "Smooth",        "pitch": "Lower pitch",        "personality": "Плавный, спокойный, для объяснений",          "gender": "male",   "emoji": "💫"},
+    {"name": "Alnilam",       "tone": "Firm",          "pitch": "Lower middle pitch", "personality": "Твёрдый, уверенный, для мотивации",           "gender": "male",   "emoji": "⚔️"},
+    {"name": "Aoede",         "tone": "Breezy",        "pitch": "Middle pitch",       "personality": "Лёгкий, воздушный, для повседневных бесед",    "gender": "female", "emoji": "🍃"},
+    {"name": "Autonoe",       "tone": "Bright",        "pitch": "Middle pitch",       "personality": "Яркий, энергичный, для радостных новостей",    "gender": "female", "emoji": "✨"},
+    {"name": "Callirrhoe",    "tone": "Easy-going",    "pitch": "Middle pitch",       "personality": "Непринуждённый, расслабленный, дружеский тон", "gender": "female", "emoji": "🌊"},
+    {"name": "Charon",        "tone": "Informative",   "pitch": "Lower pitch",        "personality": "Информативный, взвешенный, для фактов",        "gender": "male",   "emoji": "🚢"},
+    {"name": "Despina",       "tone": "Smooth",        "pitch": "Middle pitch",       "personality": "Гладкий, ровный, универсальный",              "gender": "female", "emoji": "💎"},
+    {"name": "Enceladus",     "tone": "Breathy",       "pitch": "Lower pitch",        "personality": "Дыхательный, интимный, для тихих моментов",    "gender": "male",   "emoji": "🪐"},
+    {"name": "Erinome",       "tone": "Clear",         "pitch": "Middle pitch",       "personality": "Чёткий, ясный, для объяснений и обучения",     "gender": "female", "emoji": "📖"},
+    {"name": "Fenrir",        "tone": "Excitable",     "pitch": "Lower middle pitch", "personality": "Возбудимый, эмоциональный, для шуток",         "gender": "male",   "emoji": "🐺"},
+    {"name": "Gacrux",        "tone": "Mature",        "pitch": "Middle pitch",       "personality": "Зрелый, мудрый, для советов и размышлений",    "gender": "male",   "emoji": "🦉"},
+    {"name": "Iapetus",       "tone": "Clear",         "pitch": "Lower middle pitch", "personality": "Чёткий, глубокий, для деловых разговоров",     "gender": "male",   "emoji": "🏛️"},
+    {"name": "Kore",          "tone": "Firm",          "pitch": "Middle pitch",       "personality": "Твёрдый, сбалансированный, хороший дефолт",    "gender": "female", "emoji": "🌺"},
+    {"name": "Laomedeia",     "tone": "Upbeat",        "pitch": "Higher pitch",       "personality": "Жизнерадостный, бодрый, для приветствий",      "gender": "female", "emoji": "☀️"},
+    {"name": "Leda",          "tone": "Youthful",      "pitch": "Higher pitch",       "personality": "Молодой, игривый, энергичный (дефолт)",        "gender": "female", "emoji": "🦢"},
+    {"name": "Orus",          "tone": "Firm",          "pitch": "Lower middle pitch", "personality": "Твёрдый, уверенный, для мотивации",           "gender": "male",   "emoji": "🌋"},
+    {"name": "Puck",          "tone": "Upbeat",        "pitch": "Middle pitch",       "personality": "Весёлый, оживлённый, для шуток",               "gender": "male",   "emoji": "🎭"},
+    {"name": "Pulcherrima",   "tone": "Forward",       "pitch": "Middle pitch",       "personality": "Напористый, прямой, для важных напоминаний",   "gender": "female", "emoji": "⚡"},
+    {"name": "Rasalgethi",    "tone": "Informative",   "pitch": "Middle pitch",       "personality": "Информативный, нейтральный, для новостей",     "gender": "male",   "emoji": "📡"},
+    {"name": "Sadachbia",     "tone": "Lively",        "pitch": "Lower pitch",        "personality": "Живой, динамичный, для активных обсуждений",   "gender": "male",   "emoji": "🔥"},
+    {"name": "Sadaltager",    "tone": "Knowledgeable", "pitch": "Middle pitch",       "personality": "Знающий, экспертный, для обучения",            "gender": "male",   "emoji": "🎓"},
+    {"name": "Schedar",       "tone": "Even",          "pitch": "Lower middle pitch", "personality": "Ровный, стабильный, для долгих бесед",         "gender": "female", "emoji": "🍁"},
+    {"name": "Sulafat",       "tone": "Warm",          "pitch": "Middle pitch",       "personality": "Тёплый, уютный, для поддержки и заботы",       "gender": "female", "emoji": "🧣"},
+    {"name": "Umbriel",       "tone": "Easy-going",    "pitch": "Lower middle pitch", "personality": "Непринуждённый, мягкий, для вечерних бесед",   "gender": "male",   "emoji": "🌙"},
+    {"name": "Vindemiatrix",  "tone": "Gentle",        "pitch": "Middle pitch",       "personality": "Нежный, ласковый, для утешения",              "gender": "female", "emoji": "💌"},
+    {"name": "Zephyr",        "tone": "Current",       "pitch": "Bright",             "personality": "Современный, яркий, молодёжный тон",           "gender": "male",   "emoji": "💨"},
+    {"name": "Zubenelgenubi", "tone": "Casual",        "pitch": "Lower middle pitch", "personality": "Неформальный, расслабленный, для друзей",      "gender": "male",   "emoji": "🛋️"},
+]
+
+
+def _voice_profile(name: str):
+    """Профиль голоса по имени (регистронезависимо) или None."""
+    if not name:
+        return None
+    low = name.strip().lower()
+    for p in VOICE_PROFILES:
+        if p["name"].lower() == low:
+            return p
+    return None
+
+
+def _validate_voice(name: str) -> str:
+    """Имя существующего голоса или дефолт TTS_DEFAULT_VOICE."""
+    p = _voice_profile(name)
+    return p["name"] if p else TTS_DEFAULT_VOICE
 MSK = timezone(timedelta(hours=3))
 CHANNELS_PATH = "channels.json"
 DIGEST_STATE_PATH = "digest_state.json"
@@ -194,6 +273,29 @@ AUTO_REPLY_SYSTEM_PROMPT = """Ты — собеседник в личной пе
 - Если нечего сказать — лучше короткий живой ответ, чем вода.
 
 Входящие сообщения даны в формате [время автор]: текст. Метки: «↩ автор» — ответ на чьё-то сообщение, «⤷ из X» — переслано. [Фото: …]/[Аудио: …] — содержимое медиа."""
+
+# Стиль голосового ответа: как писать текст, который будет ОЗВУЧЕН (TTS).
+# Это инструкция модели по эмоциям/аудио-тегам для живой подачи.
+VOICE_STYLE_PROMPT = """
+
+━━ РЕЖИМ ГОЛОСОВОГО ОТВЕТА ━━
+Твой ответ будет ОЗВУЧЕН (text-to-speech) и отправлен как голосовое сообщение. Поэтому:
+- Пиши как живую устную речь от первого лица, разговорно и эмоционально. НЕ как текст-статью.
+- Коротко: до ~1500 символов (примерно минута речи). Без длинных перечислений и таблиц.
+- НЕ используй HTML, markdown, эмодзи, ссылки, код — только произносимые слова.
+- Управляй интонацией аудио-тегами в квадратных скобках — они НЕ произносятся, а задают подачу:
+  [радостно] [взволнованно] [смеётся] [усмехается] [вздыхает] [шёпотом] [тихо] [серьёзно]
+  [саркастично] [с теплотой] [задумчиво] [удивлённо] [с сожалением]
+- Паузы — многоточием «…». Передавай эмоцию голосом и тегами, а не смайликами.
+- Пример: «[усмехается] Ну ты даёшь… [с теплотой] на самом деле, это отличная идея.»"""
+
+# Подсказка для авто-режима: модель сама решает, отвечать ли голосом.
+VOICE_AUTO_HINT = """
+
+━━ ВОЗМОЖНОСТЬ ОТВЕТИТЬ ГОЛОСОМ ━━
+По умолчанию отвечай ТЕКСТОМ по правилам выше (Telegram-HTML). НО если ответ будет уместнее и живее голосом (эмоциональная реакция, короткий личный ответ, шутка, поддержка) — ты можешь ответить голосовым.
+Чтобы ответить голосом: начни самую первую строку ответа с маркера [[VOICE]] на отдельной строке, а дальше дай текст строго по правилам режима голосового ответа (ниже). Если голос не нужен — просто отвечай текстом без маркера.
+""" + VOICE_STYLE_PROMPT
 
 SONG_TEXT = """I am not a baby anymore
 I am not as innocent as before
@@ -323,6 +425,10 @@ if ACTIVE_MODEL not in MODEL_REGISTRY:
 MODEL_TOOLS_SUPPORT = _model_state.get("tools_support", {})  # {slug: True|False} — обучается на лету
 # slug из реестра ИЛИ произвольный model_id OpenRouter (кастомная медиа-модель)
 ACTIVE_MEDIA_MODEL = _model_state.get("active_media") or "lite"
+# Голос для озвучки ответов (.ask) и режим авто-голоса (модель сама решает озвучивать)
+ACTIVE_VOICE = _validate_voice(_model_state.get("active_voice") or TTS_DEFAULT_VOICE)
+VOICE_AUTO = bool(_model_state.get("voice_auto", False))
+_tts_key_idx = 0  # round-robin указатель по GOOGLE_TTS_KEYS
 
 
 def get_active_model():
@@ -399,7 +505,7 @@ def count_tokens(text: str) -> int:
 
 
 def _save_model_state():
-    save_json(MODEL_STATE_PATH, {"active": ACTIVE_MODEL, "tools_support": MODEL_TOOLS_SUPPORT, "active_media": ACTIVE_MEDIA_MODEL, "custom_models": CUSTOM_MODELS})
+    save_json(MODEL_STATE_PATH, {"active": ACTIVE_MODEL, "tools_support": MODEL_TOOLS_SUPPORT, "active_media": ACTIVE_MEDIA_MODEL, "custom_models": CUSTOM_MODELS, "active_voice": ACTIVE_VOICE, "voice_auto": VOICE_AUTO})
 
 
 def _set_tools_support(slug, ok):
@@ -802,6 +908,124 @@ async def extract_video_note_content(msg) -> str:
     return "[видео кружок]"
 
 
+# --- Озвучка ответов (Google Gemini Flash TTS) ---
+
+def _build_tts_prompt(text: str, voice: str) -> str:
+    """Промпт-режиссёр для TTS: задаёт профиль голоса и подачу. Аудио-теги [..] в тексте
+    управляют интонацией и НЕ зачитываются. Порт buildTtsPrompt из Bot_opekyn/src/voice/tts.ts."""
+    p = _voice_profile(voice) or {}
+    return "\n".join([
+        f"# AUDIO PROFILE: {voice}",
+        "Роль: живой собеседник с характером, говорит по-русски естественно и эмоционально.",
+        f"Voice: {voice} ({p.get('tone', 'unknown')}, {p.get('pitch', 'unknown')}).",
+        f"Personality: {p.get('personality', 'Универсальный')}.",
+        "",
+        "## СЦЕНА",
+        "Личная переписка в Telegram. Это голосовое сообщение в ответ собеседнику.",
+        "",
+        "## РЕЖИССЁРСКИЕ ЗАМЕТКИ",
+        "- Говори живо, с интонацией и эмоцией, как настоящий человек в голосовом.",
+        "- Аудио-теги в квадратных скобках ([смеётся], [вздыхает], [шёпотом], [взволнованно] и т.п.) — это РЕЖИССУРА интонации, НЕ зачитывай их вслух.",
+        "- Многоточие — естественная пауза. Сохраняй смысл точно.",
+        "- Верни только произносимый текст, без пояснений.",
+        "",
+        "## ТЕКСТ",
+        text,
+    ])
+
+
+def _strip_for_tts(text: str) -> str:
+    """Готовит текст к озвучке: убирает HTML-теги и markdown-мусор, СОХРАНЯЕТ аудио-теги [..],
+    схлопывает пробелы и режет до TTS_VOICE_CHAR_CAP."""
+    t = text or ""
+    t = re.sub(r"<[^>]+>", "", t)              # HTML-теги прочь
+    t = re.sub(r"[*#`_]+", "", t)              # markdown-мусор (звёздочки/решётки/бэктики/подчёрки)
+    t = re.sub(r"[ \t]+", " ", t)
+    t = re.sub(r"\n{3,}", "\n\n", t).strip()
+    if len(t) > TTS_VOICE_CHAR_CAP:
+        t = t[:TTS_VOICE_CHAR_CAP].rsplit(" ", 1)[0].rstrip() + "…"
+    return t
+
+
+def _tts_is_quota_error(e: Exception) -> bool:
+    s = str(e).lower()
+    return "429" in s or "resource_exhausted" in s or "quota" in s or "rate" in s
+
+
+def _sync_tts(text: str, voice: str, api_key: str) -> bytes:
+    """Один синхронный запрос к Gemini TTS. Возвращает PCM (s16le, 24kHz, mono). Бросает при ошибке."""
+    url = GEMINI_TTS_URL.format(model=GEMINI_TTS_MODEL)
+    payload = {
+        "contents": [{"parts": [{"text": _build_tts_prompt(text, voice)}]}],
+        "generationConfig": {
+            "responseModalities": ["AUDIO"],
+            "speechConfig": {"voiceConfig": {"prebuiltVoiceConfig": {"voiceName": voice}}},
+        },
+    }
+    r = requests.post(url, headers={"x-goog-api-key": api_key, "Content-Type": "application/json"},
+                      json=payload, timeout=120)
+    if r.status_code != 200:
+        raise RuntimeError(f"TTS HTTP {r.status_code}: {r.text[:200]}")
+    data = r.json()
+    parts = (((data.get("candidates") or [{}])[0].get("content") or {}).get("parts") or [])
+    b64 = None
+    for part in parts:
+        inline = part.get("inlineData") or part.get("inline_data")
+        if inline and inline.get("data"):
+            b64 = inline["data"]
+            break
+    if not b64:
+        raise RuntimeError("TTS: в ответе нет аудио-данных")
+    return base64.b64decode(b64)
+
+
+async def _pcm_to_ogg(pcm: bytes) -> bytes:
+    """PCM s16le 24kHz mono → OGG/Opus (формат голосовых Telegram) через ffmpeg (уже есть на сервере)."""
+    proc = await asyncio.create_subprocess_exec(
+        "ffmpeg", "-f", "s16le", "-ar", str(TTS_PCM_RATE), "-ac", "1", "-i", "pipe:0",
+        "-c:a", "libopus", "-b:a", "24k", "-vbr", "on", "-application", "voip",
+        "-f", "ogg", "pipe:1",
+        stdin=asyncio.subprocess.PIPE,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.DEVNULL,
+    )
+    ogg, _ = await proc.communicate(input=pcm)
+    if not ogg:
+        raise RuntimeError("ffmpeg не вернул OGG (libopus?)")
+    return ogg
+
+
+async def synthesize_voice(text: str, voice: str):
+    """Озвучивает text голосом voice. Ротация ключей с фолбэком при quota.
+    Возвращает bytes OGG/Opus или None (при полном провале — вызывающий откатывается на текст)."""
+    global _tts_key_idx
+    if not GOOGLE_TTS_KEYS:
+        return None
+    voice = _validate_voice(voice)
+    spoken = _strip_for_tts(text)
+    if not spoken:
+        return None
+    last_err = None
+    for _ in range(len(GOOGLE_TTS_KEYS)):
+        key = GOOGLE_TTS_KEYS[_tts_key_idx % len(GOOGLE_TTS_KEYS)]
+        _tts_key_idx = (_tts_key_idx + 1) % len(GOOGLE_TTS_KEYS)
+        try:
+            pcm = await asyncio.to_thread(_sync_tts, spoken, voice, key)
+            ogg = await _pcm_to_ogg(pcm)
+            log("TTS", f"Озвучено: voice={voice}, текст={len(spoken)} симв., ogg={len(ogg)} байт")
+            return ogg
+        except Exception as e:
+            last_err = e
+            if _tts_is_quota_error(e) and len(GOOGLE_TTS_KEYS) > 1:
+                log("TTS", f"Лимит ключа, пробую следующий: {e}")
+                continue
+            log("TTS", f"Ошибка синтеза: {e}")
+            break
+    if last_err:
+        log("TTS", f"Озвучка не удалась ({last_err}) — фолбэк на текст")
+    return None
+
+
 def _extract_content(message) -> str:
     # Финальный ответ в .content; у reasoning-моделей при пустом .content берём .reasoning_content
     content = (getattr(message, "content", None) or "").strip()
@@ -906,9 +1130,10 @@ async def generate_auto_reply(combined_text: str, history: list = None) -> str:
     return result if result else "Понял"
 
 
-async def ask_agentic(context: str, question: str, must_search: bool = False, caller: str = None, ctx_tokens_est: int = None) -> str:
+async def ask_agentic(context: str, question: str, must_search: bool = False, caller: str = None, ctx_tokens_est: int = None, voice_mode: str = "off") -> str:
     """Agentic ask: модель сама решает, искать ли информацию в каналах.
-    ctx_tokens_est — tiktoken-оценка контекста (для логирования Δ с реальным API)."""
+    ctx_tokens_est — tiktoken-оценка контекста (для логирования Δ с реальным API).
+    voice_mode: "off" — обычный текст; "force" — ответ под озвучку (флаг -v); "auto" — модель сама может выбрать голос (маркер [[VOICE]])."""
     llm, model_id, label = get_active_model()
     if llm is None:
         return "Модель не настроена (проверь ключ провайдера)"
@@ -922,6 +1147,10 @@ async def ask_agentic(context: str, question: str, must_search: bool = False, ca
         system_prompt += "\n\nУ тебя есть доступ к инструменту telegram_search для поиска в Telegram-каналах. Используй его если вопрос требует актуальной информации, которой нет в контексте переписки. Формулируй точные поисковые запросы. Для свежих новостей указывай параметр days."
     if must_search and has_channels:
         system_prompt += "\n\nОБЯЗАТЕЛЬНО используй telegram_search хотя бы один раз перед тем как ответить."
+    if voice_mode == "force":
+        system_prompt += VOICE_STYLE_PROMPT
+    elif voice_mode == "auto":
+        system_prompt += VOICE_AUTO_HINT
 
     messages = [
         {"role": "system", "content": system_prompt},
@@ -1648,7 +1877,7 @@ async def _collect_history_parallel(chat_id, n, base_offset_id, from_user=None):
     return workers, merged
 
 
-@client.on(events.NewMessage(pattern=r"^\.ask\s+(\d+)((?:\s+-[tcd]+)+)?((?:\s+!?@\w+)+)?\s+(.+)"))
+@client.on(events.NewMessage(pattern=r"^\.ask\s+(\d+)((?:\s+-[tcdv]+)+)?((?:\s+!?@\w+)+)?\s+(.+)"))
 async def ask_command(event):
     is_owner = event.out
     if not is_owner and event.sender_id not in ALLOWED_USERS:
@@ -1658,6 +1887,9 @@ async def ask_command(event):
     text_only = "t" in flags
     must_search = "c" in flags
     debug = "d" in flags  # дамп полного user-message в asks/<ts>_<event_id>.txt
+    want_voice = "v" in flags  # -v: ответить голосом (озвучка через Gemini TTS)
+    # Режим голоса для промпта: force (флаг -v) / auto (включён .voice auto) / off
+    voice_mode = "force" if (want_voice and tts_available) else ("auto" if (VOICE_AUTO and tts_available) else "off")
     user_tokens = (event.pattern_match.group(3) or "").split()
     usernames = [t.lstrip("@") for t in user_tokens if not t.startswith("!")]
     exclude_users = [t.lstrip("!").lstrip("@") for t in user_tokens if t.startswith("!")]
@@ -1838,7 +2070,7 @@ async def ask_command(event):
             save_media_cache()
             await set_status(f"🤖 Думаю над ответом…{retry_suffix}")
             try:
-                reply = await ask_agentic(context, question, must_search=must_search, caller=caller, ctx_tokens_est=ctx_tokens)
+                reply = await ask_agentic(context, question, must_search=must_search, caller=caller, ctx_tokens_est=ctx_tokens, voice_mode=voice_mode)
                 t_llm = time.time()
                 break  # успех
             except ContextOverflowError as e:
@@ -1901,8 +2133,36 @@ async def ask_command(event):
             notes.append(f"✂️ обрезано {dropped} стар. сообщ.")
         if failed:
             notes.append(f"⚠️ {failed} медиа не распознано")
+
+        # Решаем, идёт ли ответ голосом: force (флаг -v) или auto (модель начала с маркера [[VOICE]]).
+        go_voice, spoken = False, reply
+        if voice_mode == "force":
+            go_voice, spoken = True, reply
+        elif voice_mode == "auto" and reply.lstrip().startswith("[[VOICE]]"):
+            go_voice = True
+            spoken = reply.lstrip()[len("[[VOICE]]"):].lstrip()
+
+        if go_voice:
+            await set_status("🎙 Озвучиваю ответ…")
+            ogg = await synthesize_voice(spoken, ACTIVE_VOICE)
+            if ogg:
+                bio = io.BytesIO(ogg)
+                bio.name = "voice.ogg"
+                await client.send_file(event.chat_id, bio, voice_note=True)
+                t_sent = time.time()
+                try:
+                    await status.delete()
+                except Exception:
+                    pass
+                log("ASK", f"Голосовой ответ на '{question[:60]}' отправлен (voice={ACTIVE_VOICE}, mode={voice_mode})")
+                return
+            notes.append("🔇 голос не сгенерировался")  # фолбэк на текст
+
         note = (" — " + "; ".join(notes)) if notes else ""
         prefix = f"{label}{note}:\n\n"
+        # На текстовом пути срезаем возможный ведущий маркер [[VOICE]] (если авто-режим выбрал голос, но он упал).
+        if reply.lstrip().startswith("[[VOICE]]"):
+            reply = reply.lstrip()[len("[[VOICE]]"):].lstrip()
         # Чистим markdown-мусор (#/*) ДО нарезки на части — модель путает HTML и markdown.
         reply = _html_clean_markdown(reply)
         # Сначала отправляем ответ, потом удаляем статус — иначе сбой delete съест ответ.
@@ -2436,6 +2696,77 @@ async def model_command(event):
     await event.edit(f"✅ Модель ответов: {label} (окно 🪟{_fmt_ctx(ctx)})")
 
 
+@client.on(events.NewMessage(outgoing=True, pattern=r"^\.voice(?:\s+(.+))?$", from_users="me"))
+async def voice_command(event):
+    """Выбор голоса и режима озвучки для голосовых ответов в .ask (Gemini TTS)."""
+    global ACTIVE_VOICE, VOICE_AUTO
+    arg = (event.pattern_match.group(1) or "").strip()
+
+    if not tts_available:
+        await event.edit("⚠️ Голос недоступен: нет ключа `GOOGLE_GENAI_API_KEY` в .env.\nДобавь ключ Google GenAI и перезапусти бота.")
+        return
+
+    low = arg.lower()
+
+    # .voice auto on|off — переключатель авто-голоса
+    if low.startswith("auto"):
+        rest = arg[len("auto"):].strip().lower()
+        if rest in ("on", "вкл", "1", "true"):
+            VOICE_AUTO = True
+        elif rest in ("off", "выкл", "0", "false"):
+            VOICE_AUTO = False
+        else:
+            VOICE_AUTO = not VOICE_AUTO  # тоггл, если без аргумента
+        _save_model_state()
+        await event.edit(f"🔁 Авто-голос: {'ВКЛ ✅' if VOICE_AUTO else 'выкл'}\n(модель {'может сама' if VOICE_AUTO else 'не будет'} отвечать голосом; флаг `-v` форсит всегда)")
+        return
+
+    # .voice test [текст] — синтез примера текущим голосом
+    if low == "test" or low.startswith("test "):
+        sample = arg[len("test"):].strip() or "Привет! Так звучит мой голос. [с теплотой] Рад, что ты меня слышишь."
+        await event.edit(f"🎙 Синтезирую пример голосом {ACTIVE_VOICE}…")
+        ogg = await synthesize_voice(sample, ACTIVE_VOICE)
+        if ogg:
+            bio = io.BytesIO(ogg)
+            bio.name = "voice.ogg"
+            await client.send_file(event.chat_id, bio, voice_note=True)
+            await event.delete()
+        else:
+            await event.edit("🔇 Не удалось синтезировать пример (проверь ключ/лимиты Google).")
+        return
+
+    # без аргумента — список голосов
+    if not arg:
+        lines = ["🎙 **Голоса (Gemini TTS)** — ▶ активный:"]
+        for i, p in enumerate(VOICE_PROFILES, 1):
+            mk = f"▶{i}." if p["name"] == ACTIVE_VOICE else f"{i}."
+            g = "♀" if p["gender"] == "female" else "♂"
+            lines.append(f"{mk} {p['emoji']} `{p['name']}` {g} — {p['personality']}")
+        lines.append(f"\nАвто-голос: {'ВКЛ ✅' if VOICE_AUTO else 'выкл'} · флаг `-v` в .ask форсит голос всегда")
+        lines.append("`.voice N` / `.voice <имя>` — выбрать · `.voice auto on|off` · `.voice test [текст]` — прослушать")
+        await event.edit("\n".join(lines)[:4000])
+        return
+
+    # выбор по номеру или имени
+    chosen = None
+    if arg.isdigit():
+        idx = int(arg) - 1
+        if 0 <= idx < len(VOICE_PROFILES):
+            chosen = VOICE_PROFILES[idx]["name"]
+    else:
+        p = _voice_profile(arg)
+        if p:
+            chosen = p["name"]
+    if not chosen:
+        await event.edit(f"Нет такого голоса: `{arg}`. `.voice` — список (номер или имя).")
+        return
+    ACTIVE_VOICE = chosen
+    _save_model_state()
+    prof = _voice_profile(chosen)
+    log("TTS", f"Активный голос: {chosen}")
+    await event.edit(f"✅ Голос: {prof['emoji']} **{chosen}** — {prof['personality']}\n`.voice test` — прослушать · `-v` в .ask — ответить голосом")
+
+
 def _human_bytes(n):
     for unit in ("Б", "КБ", "МБ", "ГБ"):
         if n < 1024:
@@ -2613,6 +2944,7 @@ def _help_index(active_label):
         "   `ask`       💬 вопросы к AI по чату — главная функция\n"
         "   `model`     🧠 выбор модели для текстовых ответов\n"
         "   `media`     🖼 vision-модели (картинки/видео-кружки) + метки [OR]/[OC]\n"
+        "   `voice`     🎙 голосовые ответы: выбор голоса, флаг `-v`, эмоции\n"
         "   `keys`      🔑 какие API-ключи за что отвечают (что обязательно)\n"
         "   `channels`  📡 каналы, поиск, дайджест\n"
         "   `auto`      🔁 авто-ответ\n"
@@ -2645,7 +2977,7 @@ _HELP_SECTIONS = {
         "```\n"
         "1️⃣ `.ask` — сама команда.\n"
         "2️⃣ `N` — **обязательно**, число: сколько последних сообщений взять (напр. `200`).\n"
-        "3️⃣ `[флаги]` — необязательно: `-t`, `-c`, `-d` (см. ниже).\n"
+        "3️⃣ `[флаги]` — необязательно: `-t`, `-c`, `-d`, `-v` (см. ниже).\n"
         "4️⃣ `[@юзеры]` — необязательно: `@имя` (только эти) или `!@имя` (исключить).\n"
         "5️⃣ `вопрос` — **обязательно**, любой текст до конца строки.\n"
         "\n"
@@ -2662,7 +2994,8 @@ _HELP_SECTIONS = {
         "   `-t` — текст без медиа: не распознаёт фото/голос/кружки → **быстрее и дешевле**.\n"
         "   `-c` — обязательно искать по подключённым каналам перед ответом.\n"
         "   `-d` — дамп: выгрузить собранный контекст отдельным файлом (для отладки).\n"
-        "   _Пример:_ `.ask 1000 -t -d что обсуждали вчера?`\n"
+        "   `-v` — ответить **голосом** (озвучка через Gemini TTS). См. `.help voice`.\n"
+        "   _Пример:_ `.ask 1000 -t -d что обсуждали вчера?` · `.ask 30 -v расскажи анекдот`\n"
         "\n"
         "**Фильтры по людям** (шаг 4):\n"
         "   `@user1 @user2` — взять сообщения **только** этих авторов.\n"
@@ -2722,6 +3055,32 @@ _HELP_SECTIONS = {
         "    этот список на голос не влияет.\n"
         "⚡ Хочешь быстрее/дешевле — флаг `-t` в `.ask` вообще пропускает медиа."
     ),
+    "voice": (
+        "🎙 **Голосовые ответы** (`.voice` + флаг `-v`)\n"
+        "\n"
+        "Бот может отвечать на `.ask` не текстом, а **живым голосовым** — через Google\n"
+        "Gemini Flash TTS. Голос выбираешь ты; озвучка эмоциональная (с интонацией).\n"
+        "\n"
+        "**Выбор голоса:**\n"
+        "   `.voice` — список 30 голосов; `▶` — активный.\n"
+        "   `.voice N` — выбрать по номеру.\n"
+        "   `.voice <имя>` — выбрать по имени (напр. `.voice Kore`).\n"
+        "   `.voice test [текст]` — прислать пример текущим голосом.\n"
+        "\n"
+        "**Когда бот отвечает голосом — два способа:**\n"
+        "   1) Флаг `-v` в `.ask` — **форсит голос всегда**: `.ask 30 -v расскажи анекдот`.\n"
+        "   2) Авто-режим — `.voice auto on`: модель сама решает, где голос уместнее\n"
+        "      (эмоция, короткий личный ответ). `.voice auto off` — выключить.\n"
+        "\n"
+        "**Эмоции:** модель управляет интонацией аудио-тегами в тексте —\n"
+        "   `[смеётся]`, `[шёпотом]`, `[взволнованно]`, `[с теплотой]`, `[серьёзно]`,\n"
+        "   `[вздыхает]`, паузы — многоточием. Теги не произносятся, а задают подачу.\n"
+        "\n"
+        "ℹ️ Голосовой ответ короткий (~до 1500 симв.) и идёт **только голосом**; если\n"
+        "   TTS не сработал — бот автоматически пришлёт текст.\n"
+        "🔑 Нужен ключ `GOOGLE_GENAI_API_KEY` (см. `.help keys`). Без него `.voice`\n"
+        "   сообщит, что голос недоступен, а `.ask` будет отвечать текстом."
+    ),
     "keys": (
         "🔑 **Какие API-ключи за что отвечают** (в файле `.env`)\n"
         "\n"
@@ -2734,6 +3093,8 @@ _HELP_SECTIONS = {
         "      • распознавание картинок/кружков в `.ask` (vision-модели `[OR]`);\n"
         "      • возможность ставить любую модель OpenRouter для ответов (`.model vendor/model`).\n"
         "   `OPENCODE_API_KEY` — даёт vision-модели `[OC]` (Kimi / GLM / Qwen / MiMo) в `.model media`.\n"
+        "   `GOOGLE_GENAI_API_KEY` — даёт **голосовые ответы** (`.voice`, флаг `-v`). Можно\n"
+        "      указать несколько ключей через запятую или в `GOOGLE_GENAI_API_KEYS` (ротация).\n"
         "\n"
         "**Что будет без необязательных ключей:**\n"
         "   • Нет OpenRouter и OpenCode → текст разбирается нормально, но фото/кружки в `.ask`\n"
@@ -2798,7 +3159,7 @@ _HELP_SECTIONS = {
         "   `.help all` — вывести ВСЕ разделы подряд (длинно).\n"
         "\n"
         "**Доступные разделы:**\n"
-        "   `ask` · `model` · `media` · `keys` · `channels` · `auto` · `allow` · `song` · `help`\n"
+        "   `ask` · `model` · `media` · `voice` · `keys` · `channels` · `auto` · `allow` · `song` · `help`\n"
         "\n"
         "_Примеры:_\n"
         "   `.help ask`   — всё про вопросы к AI\n"
@@ -2820,7 +3181,7 @@ async def help_command(event):
         return
 
     if arg == "all":
-        order = ["ask", "model", "media", "keys", "channels", "auto", "allow", "song", "help"]
+        order = ["ask", "model", "media", "voice", "keys", "channels", "auto", "allow", "song", "help"]
         full = "\n\n━━━━━━━━━━━━━━━━━━━━━\n\n".join(_HELP_SECTIONS[k] for k in order)
         # Telegram лимит ~4096 на сообщение — режем безопасно по разделам.
         chunk, buf = "", []
