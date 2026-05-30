@@ -36,3 +36,4 @@ env/
 .DS_Store
 *.bak
 .claude/
+voice_samples/

@@ -113,6 +113,8 @@ TTS_DEFAULT_VOICE = "Leda"     # дефолтный голос (см. VOICE_PROF
 TTS_PCM_RATE = 24000           # Gemini TTS отдаёт PCM s16le 24kHz mono
 TTS_VOICE_CHAR_CAP = 1500      # потолок длины озвучиваемого текста (~1–1.5 мин речи). Длиннее
                                # режем. Очень длинные аудио у preview-модели деградируют/могут дать 400.
+VOICE_SAMPLES_DIR = "voice_samples"  # кэш озвученных примеров голосов: voice_samples/<Имя>.ogg
+VOICE_SAMPLE_TEXT = "Привет! Это мой голос. [с теплотой] Рада с тобой пообщаться."  # фраза-пример (одна на все голоса — удобно сравнивать)
 
 # 30 встроенных голосов Gemini TTS (порт из Bot_opekyn/src/voice/tts.ts).
 # Каждый: name (для API), tone, pitch, personality (рус.), gender, emoji.
@@ -1104,6 +1106,28 @@ async def synthesize_voice(text: str, voice: str):
 
     log("TTS", f"Озвучка не удалась ({last_err}) — фолбэк на текст")
     return None
+
+
+async def _ensure_voice_sample(name: str):
+    """OGG-пример голоса name из кэша voice_samples/<name>.ogg. Если нет — синтезирует
+    фразой VOICE_SAMPLE_TEXT и кэширует на диск. Возвращает bytes OGG или None."""
+    name = _validate_voice(name)
+    path = os.path.join(VOICE_SAMPLES_DIR, f"{name}.ogg")
+    try:
+        if os.path.exists(path) and os.path.getsize(path) > 0:
+            with open(path, "rb") as f:
+                return f.read()
+    except Exception:
+        pass
+    ogg = await synthesize_voice(VOICE_SAMPLE_TEXT, name)
+    if ogg:
+        try:
+            os.makedirs(VOICE_SAMPLES_DIR, exist_ok=True)
+            with open(path, "wb") as f:
+                f.write(ogg)
+        except Exception as e:
+            log("TTS", f"Не удалось сохранить сэмпл {name}: {e}")
+    return ogg
 
 
 def _extract_content(message) -> str:
@@ -2801,6 +2825,38 @@ async def voice_command(event):
         await event.edit(f"🔁 Авто-голос: {'ВКЛ ✅' if VOICE_AUTO else 'выкл'}\n(модель {'может сама' if VOICE_AUTO else 'не будет'} отвечать голосом; флаг `-v` форсит всегда)")
         return
 
+    # .voice samples [N|имя] — прислать озвученные примеры (все 30 или один)
+    if low == "samples" or low.startswith("samples"):
+        rest = arg[len("samples"):].strip()
+        if rest:  # один конкретный голос
+            prof = (VOICE_PROFILES[int(rest) - 1] if rest.isdigit() and 1 <= int(rest) <= len(VOICE_PROFILES)
+                    else _voice_profile(rest))
+            if not prof:
+                await event.edit(f"Нет такого голоса: `{rest}`.")
+                return
+            targets = [(VOICE_PROFILES.index(prof) + 1, prof)]
+        else:
+            targets = list(enumerate(VOICE_PROFILES, 1))
+        total = len(targets)
+        await event.edit(f"🎙 Готовлю примеры голосов ({total})… первый раз дольше (озвучиваю и кэширую), потом — мгновенно.")
+        sent = fail = 0
+        for idx, p in targets:
+            ogg = await _ensure_voice_sample(p["name"])
+            if ogg:
+                bio = io.BytesIO(ogg)
+                bio.name = "voice.ogg"
+                g = "♀" if p["gender"] == "female" else "♂"
+                mark = "▶ " if p["name"] == ACTIVE_VOICE else ""
+                await client.send_file(event.chat_id, bio, voice_note=True,
+                                       caption=f"{mark}{idx}. {p['emoji']} {p['name']} {g} — {p['personality']}")
+                sent += 1
+                await asyncio.sleep(0.6)  # против FloodWait при пачке
+            else:
+                fail += 1
+        await event.edit(f"✅ Примеры голосов: отправлено {sent}/{total}" + (f", не удалось {fail} (лимит/ошибка)" if fail else "") +
+                         "\nВыбрать: `.voice N` или `.voice <имя>`.")
+        return
+
     # .voice test [текст] — синтез примера текущим голосом
     if low == "test" or low.startswith("test "):
         sample = arg[len("test"):].strip() or "Привет! Так звучит мой голос. [с теплотой] Рад, что ты меня слышишь."
@@ -2823,7 +2879,8 @@ async def voice_command(event):
             g = "♀" if p["gender"] == "female" else "♂"
             lines.append(f"{mk} {p['emoji']} `{p['name']}` {g} — {p['personality']}")
         lines.append(f"\nАвто-голос: {'ВКЛ ✅' if VOICE_AUTO else 'выкл'} · флаг `-v` в .ask форсит голос всегда")
-        lines.append("`.voice N` / `.voice <имя>` — выбрать · `.voice auto on|off` · `.voice test [текст]` — прослушать")
+        lines.append("🎧 `.voice samples` — прислать озвученные примеры ВСЕХ голосов (послушать)")
+        lines.append("`.voice N` / `.voice <имя>` — выбрать · `.voice samples N` — пример одного · `.voice auto on|off`")
         await event.edit("\n".join(lines)[:4000])
         return
 
@@ -3145,7 +3202,8 @@ _HELP_SECTIONS = {
         "   `.voice` — список 30 голосов; `▶` — активный.\n"
         "   `.voice N` — выбрать по номеру.\n"
         "   `.voice <имя>` — выбрать по имени (напр. `.voice Kore`).\n"
-        "   `.voice test [текст]` — прислать пример текущим голосом.\n"
+        "   `.voice samples` — прислать озвученные примеры ВСЕХ голосов (послушать и выбрать).\n"
+        "   `.voice samples N` — пример одного голоса; `.voice test [текст]` — пример текущим голосом.\n"
         "\n"
         "**Когда бот отвечает голосом — два способа:**\n"
         "   1) Флаг `-v` в `.ask` — **форсит голос всегда**: `.ask 30 -v расскажи анекдот`.\n"
