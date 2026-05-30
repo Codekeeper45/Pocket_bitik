@@ -1051,11 +1051,29 @@ async def _tts_try_model(text: str, voice: str, model: str, max_attempts: int = 
     raise last_err if last_err else RuntimeError("TTS: неизвестная ошибка")
 
 
+async def _tts_try_openrouter(text: str, voice: str) -> bytes:
+    """Озвучка через OpenRouter (та же 3.1-модель) с ретраем на transient/classifier. Бросает при провале."""
+    last_err = None
+    for attempt in range(2):
+        try:
+            pcm = await asyncio.to_thread(_sync_tts_openrouter, text, voice)
+            return await _pcm_to_ogg(pcm)
+        except Exception as e:
+            last_err = e
+            if _tts_err_kind(e) in ("transient", "classifier") and attempt == 0:
+                log("TTS", f"OpenRouter: повтор ({str(e)[:50]})")
+                await asyncio.sleep(1.5)
+                continue
+            break
+    raise last_err if last_err else RuntimeError("OpenRouter TTS: неизвестная ошибка")
+
+
 async def synthesize_voice(text: str, voice: str):
-    """Озвучивает text голосом voice. Цепочка фолбэков:
-      1) Google direct: gemini-3.1-flash-tts-preview (с ретраями);
-      2) Google direct: gemini-2.5-flash-preview-tts (стабильная);
-      3) OpenRouter: та же 3.1-модель (другой транспорт/квота — если Google-ключи выдохлись).
+    """Озвучивает text голосом voice. Приоритет — по МОДЕЛИ (сначала выбранная 3.1
+    через оба транспорта, потом фолбэк на другую модель):
+      1) Google direct:  gemini-3.1-flash-tts-preview (с ретраями);
+      2) OpenRouter:      та же gemini-3.1-flash-tts-preview (другой транспорт/квота);
+      3) Google direct:  gemini-2.5-flash-preview-tts (фолбэк на другую модель).
     Возвращает bytes OGG/Opus или None (тогда вызывающий откатывается на текст)."""
     voice = _validate_voice(voice)
     spoken = _strip_for_tts(text)
@@ -1065,37 +1083,24 @@ async def synthesize_voice(text: str, voice: str):
         return None
     last_err = None
 
-    # 1–2) Google direct: основная + фолбэк модели
-    if GOOGLE_TTS_KEYS:
-        models = [GEMINI_TTS_MODEL]
-        if GEMINI_TTS_FALLBACK_MODEL and GEMINI_TTS_FALLBACK_MODEL != GEMINI_TTS_MODEL:
-            models.append(GEMINI_TTS_FALLBACK_MODEL)
-        for model in models:
-            try:
-                ogg = await _tts_try_model(spoken, voice, model)
-                log("TTS", f"Озвучено: Google/{model}, voice={voice}, текст={len(spoken)} симв., ogg={len(ogg)} байт")
-                return ogg
-            except Exception as e:
-                last_err = e
-                log("TTS", f"Google/{model} не дала аудио ({str(e)[:80]})")
+    # Шаги в порядке приоритета: (метка, awaitable-фабрика, условие доступности)
+    steps = [
+        (f"Google/{GEMINI_TTS_MODEL}",        lambda: _tts_try_model(spoken, voice, GEMINI_TTS_MODEL),          bool(GOOGLE_TTS_KEYS)),
+        (f"OpenRouter/{GEMINI_TTS_OPENROUTER_MODEL}", lambda: _tts_try_openrouter(spoken, voice),               bool(openrouter_api_key)),
+    ]
+    if GEMINI_TTS_FALLBACK_MODEL and GEMINI_TTS_FALLBACK_MODEL != GEMINI_TTS_MODEL:
+        steps.append((f"Google/{GEMINI_TTS_FALLBACK_MODEL}", lambda: _tts_try_model(spoken, voice, GEMINI_TTS_FALLBACK_MODEL), bool(GOOGLE_TTS_KEYS)))
 
-    # 3) OpenRouter: та же модель через другой транспорт (другая квота)
-    if openrouter_api_key:
-        for attempt in range(2):
-            try:
-                pcm = await asyncio.to_thread(_sync_tts_openrouter, spoken, voice)
-                ogg = await _pcm_to_ogg(pcm)
-                log("TTS", f"Озвучено: OpenRouter/{GEMINI_TTS_OPENROUTER_MODEL}, voice={voice}, текст={len(spoken)} симв., ogg={len(ogg)} байт")
-                return ogg
-            except Exception as e:
-                last_err = e
-                kind = _tts_err_kind(e)
-                if kind in ("transient", "classifier") and attempt == 0:
-                    log("TTS", f"OpenRouter: {kind} ({str(e)[:60]}) — повтор")
-                    await asyncio.sleep(1.5)
-                    continue
-                log("TTS", f"OpenRouter не дала аудио ({str(e)[:80]})")
-                break
+    for label, factory, available in steps:
+        if not available:
+            continue
+        try:
+            ogg = await factory()
+            log("TTS", f"Озвучено: {label}, voice={voice}, текст={len(spoken)} симв., ogg={len(ogg)} байт")
+            return ogg
+        except Exception as e:
+            last_err = e
+            log("TTS", f"{label} не дала аудио ({str(e)[:80]})")
 
     log("TTS", f"Озвучка не удалась ({last_err}) — фолбэк на текст")
     return None
