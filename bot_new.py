@@ -1526,18 +1526,19 @@ async def process_media_cached(m, vision_model: str = None, detail: str = "high"
     key = _media_key(m)
     if m.photo:
         _bump("photos")
-        # Direct-vision: вместо описания собираем сами картинки (самые свежие, до лимита)
+        # Direct-vision: вместо описания собираем сами картинки. inline_ids — dict {msg_id: idx}
+        # (idx = детерминированная позиция в хронологии); собираем только отобранные (самые свежие).
         if inline_ids is not None:
             cap_txt = f" {m.raw_text}" if m.raw_text else ""
-            if getattr(m, "id", None) in inline_ids and len(inline_images) < DIRECT_VISION_MAX_IMAGES:
+            idx = inline_ids.get(getattr(m, "id", None))
+            if idx is not None:
                 try:
                     img = await m.download_media(bytes)
                 except Exception as e:
                     log("ASK", f"-g: не удалось скачать фото: {e}")
                     img = None
                 if img:
-                    idx = len(inline_images)
-                    inline_images.append({"bytes": img, "caption": m.raw_text or ""})
+                    inline_images.append({"idx": idx, "bytes": img, "caption": m.raw_text or ""})
                     return f"[Картинка #{idx}{cap_txt}]"
                 return f"[Картинка (не скачалась){cap_txt}]"
             return f"[Картинка (пропущена — лимит {DIRECT_VISION_MAX_IMAGES}){cap_txt}]"
@@ -1782,15 +1783,15 @@ async def _render_album_segment(group, text_only: bool, anchor_id=None, vision_m
         parts = []
         for m in photos:
             cap_txt = f" {m.raw_text}" if m.raw_text else ""
-            if getattr(m, "id", None) in inline_ids and len(inline_images) < DIRECT_VISION_MAX_IMAGES:
+            idx = inline_ids.get(getattr(m, "id", None))
+            if idx is not None:
                 try:
                     img = await m.download_media(bytes)
                 except Exception as e:
                     log("ASK", f"-g альбом: не удалось скачать фото: {e}")
                     img = None
                 if img:
-                    idx = len(inline_images)
-                    inline_images.append({"bytes": img, "caption": m.raw_text or ""})
+                    inline_images.append({"idx": idx, "bytes": img, "caption": m.raw_text or ""})
                     parts.append(f"[Картинка #{idx}{cap_txt}]")
                 else:
                     parts.append(f"[Картинка (не скачалась){cap_txt}]")
@@ -2234,12 +2235,14 @@ async def ask_command(event):
         short = " (чат короче запроса)" if len(ordered) < n else ""
         log("ASK", f"Сбор: запрошено N={n}, фактически {len(ordered)} сообщ.{short}")
 
-        # .ask -g: отбираем самые свежие фото (до лимита) для прямой отдачи модели
+        # .ask -g: отбираем самые свежие фото (до лимита) для прямой отдачи модели.
+        # inline_ids — dict {msg_id: idx}, где idx = детерминированная позиция в хронологии (0..K-1).
         inline_ids = None
         if direct_vision:
             photo_ids = [m.id for m in ordered if getattr(m, "photo", None) and getattr(m, "id", None) is not None]
-            inline_ids = set(photo_ids[-DIRECT_VISION_MAX_IMAGES:])  # ordered хронологичен → хвост = свежие
-            log("ASK", f"-g: фото в выборке {len(photo_ids)}, инлайню до {len(inline_ids)} свежих (лимит {DIRECT_VISION_MAX_IMAGES})")
+            recent = photo_ids[-DIRECT_VISION_MAX_IMAGES:]  # ordered хронологичен → хвост = свежие
+            inline_ids = {mid: i for i, mid in enumerate(recent)}
+            log("ASK", f"-g: фото в выборке {len(photo_ids)}, инлайню {len(inline_ids)} свежих (лимит {DIRECT_VISION_MAX_IMAGES})")
 
         # Ретрай-цикл на ContextOverflowError: если модель реально насчитала больше токенов,
         # чем tiktoken — пересобираем с агрессивнее обрезкой (safety ×2, ×4).
@@ -2260,11 +2263,13 @@ async def ask_command(event):
             t_ctx = time.time()
             context = context or "(нет сообщений)"
             save_media_cache()
+            images_sorted = None
             if direct_vision:
-                log("ASK", f"-g: картинок напрямую модели: {len(inline_images)}")
+                images_sorted = sorted(inline_images, key=lambda e: e["idx"])  # порядок = #idx в тексте
+                log("ASK", f"-g: картинок напрямую модели: {len(images_sorted)}")
             await set_status(f"🤖 Думаю над ответом…{retry_suffix}")
             try:
-                reply = await ask_agentic(context, question, must_search=must_search, caller=caller, ctx_tokens_est=ctx_tokens, voice_mode=voice_mode, images=(inline_images if direct_vision else None))
+                reply = await ask_agentic(context, question, must_search=must_search, caller=caller, ctx_tokens_est=ctx_tokens, voice_mode=voice_mode, images=images_sorted)
                 t_llm = time.time()
                 break  # успех
             except ContextOverflowError as e:
