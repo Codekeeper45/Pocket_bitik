@@ -105,6 +105,10 @@ GEMINI_TTS_MODEL = os.getenv("GEMINI_TTS_MODEL", "gemini-3.1-flash-tts-preview")
 # отклоняет — переключаемся на стабильную 2.5-flash-preview-tts. Google рекомендует retry-логику.
 GEMINI_TTS_FALLBACK_MODEL = os.getenv("GEMINI_TTS_FALLBACK_MODEL", "gemini-2.5-flash-preview-tts")
 GEMINI_TTS_URL = "https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
+# Последний фолбэк — ТА ЖЕ модель, но через OpenRouter (другой транспорт и квота: кредиты
+# OpenRouter, а не Google-ключи). Эндпоинт OpenAI-совместимый /audio/speech, отдаёт сырой PCM.
+GEMINI_TTS_OPENROUTER_MODEL = os.getenv("GEMINI_TTS_OPENROUTER_MODEL", "google/gemini-3.1-flash-tts-preview")
+OPENROUTER_TTS_URL = "https://openrouter.ai/api/v1/audio/speech"
 TTS_DEFAULT_VOICE = "Leda"     # дефолтный голос (см. VOICE_PROFILES)
 TTS_PCM_RATE = 24000           # Gemini TTS отдаёт PCM s16le 24kHz mono
 TTS_VOICE_CHAR_CAP = 600       # потолок длины озвучиваемого текста. У TTS-preview есть предел
@@ -963,6 +967,27 @@ def _sync_tts(text: str, voice: str, api_key: str, model: str) -> bytes:
     return base64.b64decode(b64)
 
 
+def _sync_tts_openrouter(text: str, voice: str) -> bytes:
+    """Озвучка через OpenRouter (та же модель google/gemini-3.1-flash-tts-preview, другой
+    транспорт/квота). OpenAI-совместимый /audio/speech, response_format=pcm → сырой PCM
+    s16le 24kHz mono (как у Google direct). Бросает при ошибке."""
+    payload = {
+        "model": GEMINI_TTS_OPENROUTER_MODEL,
+        "input": _build_tts_prompt(text, voice),
+        "voice": voice,
+        "response_format": "pcm",
+    }
+    r = requests.post(OPENROUTER_TTS_URL,
+                      headers={"Authorization": f"Bearer {openrouter_api_key}", "Content-Type": "application/json"},
+                      json=payload, timeout=120)
+    ct = r.headers.get("content-type", "")
+    if r.status_code != 200 or ct.startswith("application/json"):
+        raise RuntimeError(f"OR TTS HTTP {r.status_code}: {r.text[:200]}")
+    if not r.content:
+        raise RuntimeError("OR TTS: пустой ответ")
+    return r.content  # PCM s16le 24kHz mono
+
+
 async def _pcm_to_ogg(pcm: bytes) -> bytes:
     """PCM s16le 24kHz mono → OGG/Opus (формат голосовых Telegram) через ffmpeg (уже есть на сервере)."""
     proc = await asyncio.create_subprocess_exec(
@@ -1026,28 +1051,51 @@ async def _tts_try_model(text: str, voice: str, model: str, max_attempts: int = 
 
 
 async def synthesize_voice(text: str, voice: str):
-    """Озвучивает text голосом voice. Сначала основная модель (3.1-preview) с ретраями,
-    при упорном провале — стабильная фолбэк-модель (2.5-flash-preview-tts).
+    """Озвучивает text голосом voice. Цепочка фолбэков:
+      1) Google direct: gemini-3.1-flash-tts-preview (с ретраями);
+      2) Google direct: gemini-2.5-flash-preview-tts (стабильная);
+      3) OpenRouter: та же 3.1-модель (другой транспорт/квота — если Google-ключи выдохлись).
     Возвращает bytes OGG/Opus или None (тогда вызывающий откатывается на текст)."""
-    if not GOOGLE_TTS_KEYS:
-        return None
     voice = _validate_voice(voice)
     spoken = _strip_for_tts(text)
     if not spoken:
         return None
+    if not GOOGLE_TTS_KEYS and not openrouter_api_key:
+        return None
     last_err = None
-    models = [GEMINI_TTS_MODEL]
-    if GEMINI_TTS_FALLBACK_MODEL and GEMINI_TTS_FALLBACK_MODEL != GEMINI_TTS_MODEL:
-        models.append(GEMINI_TTS_FALLBACK_MODEL)
-    for mi, model in enumerate(models):
-        try:
-            ogg = await _tts_try_model(spoken, voice, model)
-            log("TTS", f"Озвучено: model={model}, voice={voice}, текст={len(spoken)} симв., ogg={len(ogg)} байт")
-            return ogg
-        except Exception as e:
-            last_err = e
-            if mi + 1 < len(models):
-                log("TTS", f"{model} не дала аудио ({str(e)[:80]}) — пробую фолбэк-модель {models[mi + 1]}")
+
+    # 1–2) Google direct: основная + фолбэк модели
+    if GOOGLE_TTS_KEYS:
+        models = [GEMINI_TTS_MODEL]
+        if GEMINI_TTS_FALLBACK_MODEL and GEMINI_TTS_FALLBACK_MODEL != GEMINI_TTS_MODEL:
+            models.append(GEMINI_TTS_FALLBACK_MODEL)
+        for model in models:
+            try:
+                ogg = await _tts_try_model(spoken, voice, model)
+                log("TTS", f"Озвучено: Google/{model}, voice={voice}, текст={len(spoken)} симв., ogg={len(ogg)} байт")
+                return ogg
+            except Exception as e:
+                last_err = e
+                log("TTS", f"Google/{model} не дала аудио ({str(e)[:80]})")
+
+    # 3) OpenRouter: та же модель через другой транспорт (другая квота)
+    if openrouter_api_key:
+        for attempt in range(2):
+            try:
+                pcm = await asyncio.to_thread(_sync_tts_openrouter, spoken, voice)
+                ogg = await _pcm_to_ogg(pcm)
+                log("TTS", f"Озвучено: OpenRouter/{GEMINI_TTS_OPENROUTER_MODEL}, voice={voice}, текст={len(spoken)} симв., ogg={len(ogg)} байт")
+                return ogg
+            except Exception as e:
+                last_err = e
+                kind = _tts_err_kind(e)
+                if kind in ("transient", "classifier") and attempt == 0:
+                    log("TTS", f"OpenRouter: {kind} ({str(e)[:60]}) — повтор")
+                    await asyncio.sleep(1.5)
+                    continue
+                log("TTS", f"OpenRouter не дала аудио ({str(e)[:80]})")
+                break
+
     log("TTS", f"Озвучка не удалась ({last_err}) — фолбэк на текст")
     return None
 
@@ -3105,7 +3153,9 @@ _HELP_SECTIONS = {
         "ℹ️ Голосовой ответ короткий (2–4 фразы, ~до 500 симв. — предел длительности TTS) и идёт **только голосом**; если\n"
         "   TTS не сработал — бот автоматически пришлёт текст.\n"
         "🔑 Нужен ключ `GOOGLE_GENAI_API_KEY` (см. `.help keys`). Без него `.voice`\n"
-        "   сообщит, что голос недоступен, а `.ask` будет отвечать текстом."
+        "   сообщит, что голос недоступен, а `.ask` будет отвечать текстом.\n"
+        "♻️ Если Google-квота исчерпана/недоступна — бот автоматически озвучит через\n"
+        "   OpenRouter (та же модель, нужен `OPENROUTER_API_KEY`)."
     ),
     "keys": (
         "🔑 **Какие API-ключи за что отвечают** (в файле `.env`)\n"
