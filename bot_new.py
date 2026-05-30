@@ -100,6 +100,10 @@ OPENCODE_BASE_URL = "https://opencode.ai/zen/go/v1"
 
 # --- Google Gemini Flash TTS (голосовые ответы в .ask) ---
 GEMINI_TTS_MODEL = os.getenv("GEMINI_TTS_MODEL", "gemini-3.1-flash-tts-preview")
+# Фолбэк-модель: у 3.1-preview документированная проблема «prompt classifier false rejections»
+# (ложные 400 INVALID_ARGUMENT) и «occasional text token returns» (500). Если 3.1 упорно
+# отклоняет — переключаемся на стабильную 2.5-flash-preview-tts. Google рекомендует retry-логику.
+GEMINI_TTS_FALLBACK_MODEL = os.getenv("GEMINI_TTS_FALLBACK_MODEL", "gemini-2.5-flash-preview-tts")
 GEMINI_TTS_URL = "https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
 TTS_DEFAULT_VOICE = "Leda"     # дефолтный голос (см. VOICE_PROFILES)
 TTS_PCM_RATE = 24000           # Gemini TTS отдаёт PCM s16le 24kHz mono
@@ -912,27 +916,14 @@ async def extract_video_note_content(msg) -> str:
 # --- Озвучка ответов (Google Gemini Flash TTS) ---
 
 def _build_tts_prompt(text: str, voice: str) -> str:
-    """Промпт-режиссёр для TTS: задаёт профиль голоса и подачу. Аудио-теги [..] в тексте
-    управляют интонацией и НЕ зачитываются. Порт buildTtsPrompt из Bot_opekyn/src/voice/tts.ts."""
+    """Лёгкая стилевая директива для TTS в формате, который рекомендует Google
+    («Say cheerfully: …»). Намеренно короткая: документация предупреждает, что
+    громоздкие/расплывчатые промпты у 3.1-preview чаще ловят ложный отказ
+    классификатора (400). Аудио-теги [..] в тексте управляют интонацией."""
     p = _voice_profile(voice) or {}
-    return "\n".join([
-        f"# AUDIO PROFILE: {voice}",
-        "Роль: живой собеседник с характером, говорит по-русски естественно и эмоционально.",
-        f"Voice: {voice} ({p.get('tone', 'unknown')}, {p.get('pitch', 'unknown')}).",
-        f"Personality: {p.get('personality', 'Универсальный')}.",
-        "",
-        "## СЦЕНА",
-        "Личная переписка в Telegram. Это голосовое сообщение в ответ собеседнику.",
-        "",
-        "## РЕЖИССЁРСКИЕ ЗАМЕТКИ",
-        "- Говори живо, с интонацией и эмоцией, как настоящий человек в голосовом.",
-        "- Аудио-теги в квадратных скобках ([смеётся], [вздыхает], [шёпотом], [взволнованно] и т.п.) — это РЕЖИССУРА интонации, НЕ зачитывай их вслух.",
-        "- Многоточие — естественная пауза. Сохраняй смысл точно.",
-        "- Верни только произносимый текст, без пояснений.",
-        "",
-        "## ТЕКСТ",
-        text,
-    ])
+    persona = p.get("personality", "живой собеседник")
+    return f"Скажи живо и эмоционально, как настоящий человек в голосовом ({persona}). " \
+           f"Скобки вроде [радостно] или [смеётся] — это интонация, не произноси их:\n{text}"
 
 
 def _strip_for_tts(text: str) -> str:
@@ -948,9 +939,9 @@ def _strip_for_tts(text: str) -> str:
     return t
 
 
-def _sync_tts(text: str, voice: str, api_key: str) -> bytes:
+def _sync_tts(text: str, voice: str, api_key: str, model: str) -> bytes:
     """Один синхронный запрос к Gemini TTS. Возвращает PCM (s16le, 24kHz, mono). Бросает при ошибке."""
-    url = GEMINI_TTS_URL.format(model=GEMINI_TTS_MODEL)
+    url = GEMINI_TTS_URL.format(model=model)
     payload = {
         "contents": [{"parts": [{"text": _build_tts_prompt(text, voice)}]}],
         "generationConfig": {
@@ -992,70 +983,74 @@ async def _pcm_to_ogg(pcm: bytes) -> bytes:
 
 
 def _tts_err_kind(e) -> str:
-    """Классификация ошибки TTS: quota (лимит ключа) / transient (перегрузка-503/таймаут) /
-    badreq (400 — обычно слишком длинный текст) / other."""
+    """Классификация ошибки TTS (по докам Google):
+    quota — лимит ключа (429) → сменить ключ;
+    transient — перегрузка/таймаут (503/500/«text token returns») → повторить;
+    classifier — 400 INVALID_ARGUMENT: у 3.1-preview это ЛОЖНЫЙ отказ классификатора,
+                 документировано как flaky → повторить, затем сменить модель;
+    prohibited — реальный отказ по контенту → не долбить;
+    other — прочее."""
     s = str(e).lower()
-    if "429" in s or "resource_exhausted" in s or "quota" in s or "rate" in s:
+    if "429" in s or "resource_exhausted" in s or "quota" in s or "rate limit" in s:
         return "quota"
-    if "503" in s or "unavailable" in s or "high demand" in s or "timed out" in s or "timeout" in s:
+    if "prohibited" in s or "safety" in s or "blocked" in s:
+        return "prohibited"
+    if "503" in s or "500" in s or "unavailable" in s or "high demand" in s or "internal" in s \
+            or "timed out" in s or "timeout" in s:
         return "transient"
     if "400" in s or "invalid_argument" in s or "invalid argument" in s:
-        return "badreq"
+        return "classifier"
     return "other"
 
 
-async def _tts_once(text: str, voice: str) -> bytes:
-    """Один проход озвучки: ротация ключей при quota, ретрай при перегрузке (503). Бросает последнюю ошибку."""
+async def _tts_try_model(text: str, voice: str, model: str, max_attempts: int = 4) -> bytes:
+    """Пытается озвучить одной моделью: до max_attempts попыток с ротацией ключей.
+    Повторяет при quota (другой ключ), transient (503/500) и classifier (ложный 400 у 3.1).
+    Бросает последнюю ошибку, если не вышло."""
     global _tts_key_idx
     last_err = None
-    for _ in range(len(GOOGLE_TTS_KEYS)):
+    for attempt in range(max_attempts):
         key = GOOGLE_TTS_KEYS[_tts_key_idx % len(GOOGLE_TTS_KEYS)]
         _tts_key_idx = (_tts_key_idx + 1) % len(GOOGLE_TTS_KEYS)
-        for attempt in range(2):  # ретрай transient на том же ключе
-            try:
-                pcm = await asyncio.to_thread(_sync_tts, text, voice, key)
-                return await _pcm_to_ogg(pcm)
-            except Exception as e:
-                last_err = e
-                if _tts_err_kind(e) == "transient" and attempt == 0:
-                    log("TTS", "перегрузка модели (503/таймаут), повтор через 2с…")
-                    await asyncio.sleep(2)
-                    continue
-                break
-        if _tts_err_kind(last_err) == "quota" and len(GOOGLE_TTS_KEYS) > 1:
-            log("TTS", "лимит ключа, пробую следующий")
-            continue
-        break
+        try:
+            pcm = await asyncio.to_thread(_sync_tts, text, voice, key, model)
+            return await _pcm_to_ogg(pcm)
+        except Exception as e:
+            last_err = e
+            kind = _tts_err_kind(e)
+            if kind == "prohibited":
+                break  # реальный отказ — повторять бессмысленно
+            if kind in ("quota", "transient", "classifier") and attempt + 1 < max_attempts:
+                log("TTS", f"{model}: {kind} ({str(e)[:60]}) — попытка {attempt + 2}/{max_attempts}")
+                await asyncio.sleep(1.5 if kind != "quota" else 0.3)
+                continue
+            break
     raise last_err if last_err else RuntimeError("TTS: неизвестная ошибка")
 
 
 async def synthesize_voice(text: str, voice: str):
-    """Озвучивает text голосом voice. Ключи ротируются при quota, ретрай при 503,
-    а при 400 (обычно «слишком длинно») — повтор с укороченным текстом.
-    Возвращает bytes OGG/Opus или None (при провале — вызывающий откатывается на текст)."""
+    """Озвучивает text голосом voice. Сначала основная модель (3.1-preview) с ретраями,
+    при упорном провале — стабильная фолбэк-модель (2.5-flash-preview-tts).
+    Возвращает bytes OGG/Opus или None (тогда вызывающий откатывается на текст)."""
     if not GOOGLE_TTS_KEYS:
         return None
     voice = _validate_voice(voice)
     spoken = _strip_for_tts(text)
     if not spoken:
         return None
-    # Варианты текста: полный, затем укороченный — страховка от 400 (лимит длительности аудио).
-    variants = [spoken]
-    if len(spoken) > 350:
-        short = spoken[:350].rsplit(" ", 1)[0].rstrip() + "…"
-        variants.append(short)
     last_err = None
-    for i, variant in enumerate(variants):
+    models = [GEMINI_TTS_MODEL]
+    if GEMINI_TTS_FALLBACK_MODEL and GEMINI_TTS_FALLBACK_MODEL != GEMINI_TTS_MODEL:
+        models.append(GEMINI_TTS_FALLBACK_MODEL)
+    for mi, model in enumerate(models):
         try:
-            ogg = await _tts_once(variant, voice)
-            log("TTS", f"Озвучено: voice={voice}, текст={len(variant)} симв.{' (укорочено)' if i else ''}, ogg={len(ogg)} байт")
+            ogg = await _tts_try_model(spoken, voice, model)
+            log("TTS", f"Озвучено: model={model}, voice={voice}, текст={len(spoken)} симв., ogg={len(ogg)} байт")
             return ogg
         except Exception as e:
             last_err = e
-            if _tts_err_kind(e) == "badreq" and i + 1 < len(variants):
-                log("TTS", f"400 (вероятно слишком длинно), пробую укоротить до {len(variants[i + 1])} симв.")
-                continue
-            break
+            if mi + 1 < len(models):
+                log("TTS", f"{model} не дала аудио ({str(e)[:80]}) — пробую фолбэк-модель {models[mi + 1]}")
     log("TTS", f"Озвучка не удалась ({last_err}) — фолбэк на текст")
     return None
 
