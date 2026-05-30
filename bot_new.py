@@ -2359,7 +2359,8 @@ async def model_command(event):
         else:
             media_label = f"{ACTIVE_MEDIA_MODEL} (кастомная)"
         lines.append(f"\n🖼 медиа-модель: {media_label} · `.model media` — сменить")
-        lines.append("`.model N` / `.model <slug>` — выбрать · `.model probe` — проверить поиск")
+        lines.append("`.model N` / `.model <slug>` — выбрать · `.model probe` — проверить поиск (❔→🔧/🚫)")
+        lines.append("`.model vendor/model` — поставить ЛЮБУЮ модель OpenRouter по id (напр. `.model openai/gpt-4o`)")
         await event.edit("\n".join(lines)[:4000])
         return
 
