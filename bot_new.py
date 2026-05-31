@@ -101,7 +101,7 @@ OPENCODE_BASE_URL = "https://opencode.ai/zen/go/v1"
 # Oylan (ISSAI) — stateful assistant API (НЕ OpenAI-совместим): создать ассистента → interaction → ответ.
 # Авторизация: заголовок "Authorization: Api-Key <ключ>". Спека: oylan.nu.edu.kz/api/v1/swagger.json
 OYLAN_BASE_URL = (os.getenv("OYLAN_BASE_URL", "https://oylan.nu.edu.kz/api/v1")).rstrip("/")
-OYLAN_MODEL = os.getenv("OYLAN_MODEL", "Oylan3.0")
+OYLAN_MODEL = os.getenv("OYLAN_MODEL", "Oylan")  # реальное имя модели в API (GET /assistant/models/)
 
 # --- Google Gemini Flash TTS (голосовые ответы в .ask) ---
 GEMINI_TTS_MODEL = os.getenv("GEMINI_TTS_MODEL", "gemini-3.1-flash-tts-preview")
@@ -1243,10 +1243,12 @@ def _extract_content(message) -> str:
 
 
 def _sync_oylan_answer(system_prompt: str, user_text: str, websearch: bool, max_tokens: int) -> str:
-    """Oylan (ISSAI): создать ассистента → отправить interaction → вернуть текст ответа.
-    Авторизация Api-Key; interaction — multipart form-data; ответ 200 = строка. Ассистент удаляется."""
+    """Oylan (ISSAI): создать ассистента → стримовый interaction → собрать текст → удалить ассистента.
+    Важно: НЕстримовый путь у Oylan возвращает 500, поэтому используем stream=true (SSE):
+    события chunk накапливаем, финальный текст берём из события complete. Авторизация Api-Key."""
     h = {"Authorization": f"Api-Key {oylan_api_key}"}
-    payload = {"name": "davinchik", "model": OYLAN_MODEL, "temperature": 1.0,
+    # Имя ассистента должно быть уникальным (Oylan: 400 «already exists»). Ассистент временный, удаляется.
+    payload = {"name": f"davinchik-{time.time_ns()}", "model": OYLAN_MODEL, "temperature": 1.0,
                "max_tokens": int(max_tokens), "system_instructions": system_prompt,
                "websearch_enabled": bool(websearch)}
     r = requests.post(f"{OYLAN_BASE_URL}/assistant/", headers=h, json=payload, timeout=60)
@@ -1256,21 +1258,33 @@ def _sync_oylan_answer(system_prompt: str, user_text: str, websearch: bool, max_
     if not aid:
         raise RuntimeError("Oylan: ассистент без id")
     try:
-        r2 = requests.post(f"{OYLAN_BASE_URL}/assistant/{aid}/interactions/", headers=h,
-                           data={"content": user_text, "stream": "false"}, timeout=180)
-        if r2.status_code not in (200, 201):
-            raise RuntimeError(f"Oylan interaction HTTP {r2.status_code}: {r2.text[:200]}")
-        try:
-            j = r2.json()
-            if isinstance(j, str):
-                reply = j
-            elif isinstance(j, dict):
-                reply = j.get("content") or j.get("response") or j.get("text") or j.get("message") or r2.text
-            else:
-                reply = r2.text
-        except Exception:
-            reply = r2.text
-        return (reply or "").strip()
+        rr = requests.post(f"{OYLAN_BASE_URL}/assistant/{aid}/interactions/", headers=h,
+                           data={"content": user_text, "stream": "true"}, timeout=180, stream=True)
+        if rr.status_code != 200:
+            raise RuntimeError(f"Oylan interaction HTTP {rr.status_code}: {rr.text[:200]}")
+        chunks, final = [], None
+        for raw in rr.iter_lines():  # bytes (UTF-8)
+            if not raw:
+                continue
+            s = raw.decode("utf-8", "replace")
+            if s.startswith("data:"):
+                s = s[5:].strip()
+            try:
+                obj = json.loads(s)
+            except Exception:
+                continue
+            t = obj.get("type")
+            if t == "chunk":
+                chunks.append(obj.get("content", ""))
+            elif t == "complete":
+                mm = obj.get("model_message") or {}
+                final = (mm.get("content") if isinstance(mm, dict) else None) or final
+            elif t == "error":
+                raise RuntimeError(f"Oylan stream error: {str(obj)[:160]}")
+        reply = (final or "".join(chunks)).strip()
+        if not reply:
+            raise RuntimeError("Oylan: пустой ответ потока")
+        return reply
     finally:
         try:
             requests.delete(f"{OYLAN_BASE_URL}/assistant/{aid}/", headers=h, timeout=30)
@@ -3584,7 +3598,7 @@ _HELP_SECTIONS = {
         "   `.model fav` — список добавленных кастомных моделей (быстрый выбор по номеру).\n"
         "   `.model remove <N|id>` — удалить кастомную модель из избранного.\n"
         "\n"
-        "**Oylan (ISSAI):** провайдер `oylan` (модель Oylan3.0). Это свой assistant-API\n"
+        "**Oylan (ISSAI):** провайдер `oylan` (модель Oylan). Это свой assistant-API\n"
         "   (не OpenAI): без tool-поиска через `-c` → используется встроенный websearch.\n"
         "   Нужен `OYLAN_API_KEY`. Выбор: `.model oylan`.\n"
         "\n"
