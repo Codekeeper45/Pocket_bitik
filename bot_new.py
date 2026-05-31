@@ -1072,7 +1072,7 @@ async def _pcm_to_ogg(pcm: bytes) -> bytes:
     """PCM s16le 24kHz mono → OGG/Opus (формат голосовых Telegram) через ffmpeg (уже есть на сервере)."""
     proc = await asyncio.create_subprocess_exec(
         "ffmpeg", "-f", "s16le", "-ar", str(TTS_PCM_RATE), "-ac", "1", "-i", "pipe:0",
-        "-c:a", "libopus", "-b:a", "24k", "-vbr", "on", "-application", "voip",
+        "-c:a", "libopus", "-b:a", "32k", "-vbr", "on", "-application", "audio",
         "-f", "ogg", "pipe:1",
         stdin=asyncio.subprocess.PIPE,
         stdout=asyncio.subprocess.PIPE,
@@ -1087,8 +1087,8 @@ async def _pcm_to_ogg(pcm: bytes) -> bytes:
 async def _to_ogg_opus(data: bytes) -> bytes:
     """Любой аудио-вход (wav/mp3/…) → OGG/Opus через ffmpeg (автоопределение формата). Для Fish Audio."""
     proc = await asyncio.create_subprocess_exec(
-        "ffmpeg", "-i", "pipe:0", "-c:a", "libopus", "-b:a", "24k", "-vbr", "on",
-        "-application", "voip", "-f", "ogg", "pipe:1",
+        "ffmpeg", "-i", "pipe:0", "-ar", "48000", "-c:a", "libopus", "-b:a", "48k", "-vbr", "on",
+        "-application", "audio", "-f", "ogg", "pipe:1",
         stdin=asyncio.subprocess.PIPE,
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.DEVNULL,
