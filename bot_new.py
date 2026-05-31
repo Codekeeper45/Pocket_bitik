@@ -3228,14 +3228,22 @@ async def _voice_fish_command(event, rest: str):
         return
 
     if not rest:
-        # список избранного
+        # список избранного, сгруппированный по категориям (cat); номер = позиция в FISH_FAVORITES
         lines = [f"🐟 **Fish Audio — избранные голоса** (движок сейчас: {TTS_ENGINE}):"]
         if not FISH_FAVORITES:
-            lines.append("  (пусто) — найди через `.voice fish search <запрос>` и добавь `.voice fish add <id> [имя]`.")
+            lines.append("  (пусто) — найди через `.voice fish search <запрос>` и добавь `.voice fish add <N>`.")
+        groups, order = {}, []
         for i, f in enumerate(FISH_FAVORITES, 1):
-            mk = "▶" if f["id"] == FISH_VOICE else " "
-            lines.append(f"{mk}{i}. {f['title']} — `{f['id']}`")
-        lines.append("\n`.voice fish search <q>` — найти · `.voice fish add <id> [имя]` · `.voice fish remove <N>`")
+            cat = f.get("cat") or "📦 Разное"
+            if cat not in groups:
+                groups[cat] = []; order.append(cat)
+            groups[cat].append((i, f))
+        for cat in order:
+            lines.append(f"\n**{cat}:**")
+            for i, f in groups[cat]:
+                mk = "▶" if f["id"] == FISH_VOICE else " "
+                lines.append(f"{mk}{i}. {f['title']}")
+        lines.append("\n`.voice fish search <q>` — найти · `.voice fish add <N>` · `.voice fish remove <N>`")
         lines.append("`.voice fish <N|id>` — выбрать · `.voice fish test` — прослушать · `.voice engine fish` — включить движок")
         await event.edit("\n".join(lines)[:4000])
         return
