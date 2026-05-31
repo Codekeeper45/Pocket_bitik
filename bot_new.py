@@ -94,7 +94,9 @@ MEDIA_MODEL_REGISTRY = {
 FREE_MEDIA_MODEL = "openrouter/free"  # авто-фоллбэк для гостей при N>500
 # OpenCode-Go модели, доступные как медиа (vision). slug == api_model_id в MODEL_REGISTRY,
 # поэтому медиа-пайплайн отличает их по самому id и роутит описание в opencode_client.
-MEDIA_OPENCODE_SLUGS = ["kimi-k2.5", "kimi-k2.6", "glm-5", "glm-5.1", "qwen3.5-plus", "qwen3.6-plus", "mimo-v2-omni"]
+# NB: GLM-5/5.1 у opencode (эндпоинт frank/GLM-*) — ТЕКСТОВЫЕ, картинки не принимают
+# (400 "does not accept image or video input"), поэтому в vision-список НЕ входят.
+MEDIA_OPENCODE_SLUGS = ["kimi-k2.5", "kimi-k2.6", "qwen3.5-plus", "qwen3.6-plus", "mimo-v2-omni"]
 DEEPSEEK_BASE_URL = "https://api.deepseek.com/v1"
 DEEPSEEK_MODEL = os.getenv("DEEPSEEK_MODEL", "deepseek-v4-pro")
 OPENCODE_BASE_URL = "https://opencode.ai/zen/go/v1"
@@ -2309,7 +2311,8 @@ async def ask_command(event):
         if not sv:
             await event.respond(
                 f"⚠️ Модель «{model_label}» не умеет смотреть картинки напрямую (флаг `-g`).\n"
-                f"Переключись на vision-модель через `.model` (например GLM-5 / Qwen / Kimi, или vision-модель OpenRouter), либо убери `-g`.")
+                f"Переключись на vision-модель через `.model` (например Qwen / Kimi / MiMo Omni, или vision-модель OpenRouter), либо убери `-g`.\n"
+                f"ℹ️ GLM-5/5.1 у этого провайдера — текстовые (картинки не принимают), поэтому для `-g` не подходят.")
             if is_owner:
                 await event.delete()
             return
@@ -3614,7 +3617,8 @@ _HELP_SECTIONS = {
         "   `-d` — дамп: выгрузить собранный контекст отдельным файлом (для отладки).\n"
         "   `-v` — ответить **голосом** (озвучка через Gemini TTS). См. `.help voice`.\n"
         "   `-g` — отдать **картинки напрямую** отвечающей модели (её vision), а не описания.\n"
-        "        Нужна vision-модель (`.model` → GLM-5/Qwen/Kimi или OpenRouter-vision), иначе понятная ошибка.\n"
+        "        Нужна vision-модель (`.model` → Qwen/Kimi/MiMo Omni или OpenRouter-vision), иначе понятная ошибка.\n"
+        "        ⚠️ GLM-5/5.1 у этого провайдера — текстовые, картинки не принимают (для `-g` не годятся).\n"
         "        Голос/аудио всегда через Chirp-3. До 10 свежих картинок за запрос.\n"
         "   _Пример:_ `.ask 1000 -t -d что обсуждали вчера?` · `.ask 30 -v расскажи анекдот`\n"
         "\n"
