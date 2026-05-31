@@ -408,6 +408,7 @@ AUTO_REPLY_BUSY: set = set()     # чаты в фазе LLM/отправки —
 AUTO_REPLY_HISTORY: dict = {}   # {chat_id: [{"role","content"}, ...]}
 # AUTO_REPLY_ACTIVE_CHATS загружается из файла ниже (после load_json)
 LAST_SCAN: list = []
+LAST_FISH_SEARCH: list = []     # [{_id,title,languages}] последнего .voice fish search — для add по номеру
 _ENTITY_CACHE: dict = {}        # кэш зарезолвленных каналов
 ACTIVE_MODEL = "deepseek"       # перезаписывается из model_state.json при старте
 OWNER_ID = None                 # заполняется из get_me() при старте
@@ -3145,7 +3146,7 @@ def _sync_fish_search(query: str):
 
 async def _voice_fish_command(event, rest: str):
     """Подкоманды Fish: список избранного / search / add / remove / test / выбор."""
-    global FISH_VOICE, FISH_FAVORITES, TTS_ENGINE
+    global FISH_VOICE, FISH_FAVORITES, TTS_ENGINE, LAST_FISH_SEARCH
     if not fish_available:
         await event.edit("⚠️ Fish недоступен: нет `FISH_AUDIO_API_KEY` в .env.")
         return
@@ -3165,21 +3166,27 @@ async def _voice_fish_command(event, rest: str):
         if not items:
             await event.edit(f"Ничего не найдено по «{q}».")
             return
+        LAST_FISH_SEARCH = items[:10]
         lines = [f"🔎 **Fish — результаты по «{q}»:**"]
-        for it in items[:10]:
+        for i, it in enumerate(LAST_FISH_SEARCH, 1):
             langs = ",".join(it.get("languages") or [])
-            lines.append(f"• {it.get('title','?')} — `{it.get('_id','')}`" + (f" ({langs})" if langs else ""))
-        lines.append("\nДобавить: `.voice fish add <id> [имя]` → потом `.voice fish` для выбора.")
+            lines.append(f"{i}. {it.get('title','?')} — `{it.get('_id','')}`" + (f" ({langs})" if langs else ""))
+        lines.append("\nВ избранное: `.voice fish add <N>` — по номеру из списка (или `.voice fish add <id> [имя]`).")
         await event.edit("\n".join(lines)[:4000])
         return
 
     if low.startswith("add"):
         parts = rest[len("add"):].strip().split(maxsplit=1)
         if not parts:
-            await event.edit("Использование: `.voice fish add <reference_id> [имя]`.")
+            await event.edit("Использование: `.voice fish add <N>` (номер из поиска) или `.voice fish add <reference_id> [имя]`.")
             return
-        ref = parts[0]
-        name = parts[1] if len(parts) > 1 else ref
+        if parts[0].isdigit() and 1 <= int(parts[0]) <= len(LAST_FISH_SEARCH):
+            item = LAST_FISH_SEARCH[int(parts[0]) - 1]
+            ref = item.get("_id", "")
+            name = parts[1] if len(parts) > 1 else item.get("title", ref)
+        else:
+            ref = parts[0]
+            name = parts[1] if len(parts) > 1 else ref
         if any(f["id"] == ref for f in FISH_FAVORITES):
             await event.edit(f"Голос `{ref}` уже в избранном.")
             return
@@ -3692,8 +3699,9 @@ _HELP_SECTIONS = {
         "\n"
         "**Движки TTS (Gemini / Fish Audio):**\n"
         "   `.voice engine fish|gemini` — выбрать движок (при сбое — автофолбэк на другой).\n"
-        "   `.voice fish search <запрос>` — найти голоса Fish (покажет название + id + языки).\n"
-        "   `.voice fish add <id> [имя]` — добавить голос в избранное; `.voice fish` — список избранного.\n"
+        "   `.voice fish search <запрос>` — найти голоса Fish (пронумерованный список: № + название + id + языки).\n"
+        "   `.voice fish add <N>` — добавить в избранное результат поиска по номеру (имя и id подставятся сами);\n"
+        "      либо `.voice fish add <id> [имя]` вручную. `.voice fish` — список избранного.\n"
         "   `.voice fish <N|id>` — выбрать голос (номер из избранного ИЛИ прямой id).\n"
         "   `.voice fish remove <N|id>` — убрать из избранного; `.voice fish test [текст]` — прослушать.\n"
         "   Голоса берутся с fish.audio (id = reference_id). Нужен `FISH_AUDIO_API_KEY`.\n"
