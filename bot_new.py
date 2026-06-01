@@ -15,6 +15,7 @@ import subprocess
 import json
 import glob
 import logging
+from types import SimpleNamespace
 from logging.handlers import RotatingFileHandler
 from datetime import datetime, timedelta, timezone
 
@@ -99,6 +100,9 @@ FREE_MEDIA_MODEL = "openrouter/free"  # авто-фоллбэк для гост�
 MEDIA_OPENCODE_SLUGS = ["kimi-k2.5", "kimi-k2.6", "qwen3.5-plus", "qwen3.6-plus", "mimo-v2-omni"]
 DEEPSEEK_BASE_URL = "https://api.deepseek.com/v1"
 DEEPSEEK_MODEL = os.getenv("DEEPSEEK_MODEL", "deepseek-v4-pro")
+# opencode-go отдаёт некоторые модели (qwen3.7-max) ТОЛЬКО в формате Anthropic Messages
+# (на OpenAI-формат → 401 "not supported for format oa-compat"). Свой эндпоинт + ключ в x-api-key.
+OPENCODE_ANTHROPIC_URL = "https://opencode.ai/zen/go/v1/messages"
 OPENCODE_BASE_URL = "https://opencode.ai/zen/go/v1"
 # Oylan (ISSAI) — stateful assistant API (НЕ OpenAI-совместим): создать ассистента → interaction → ответ.
 # Авторизация: заголовок "Authorization: Api-Key <ключ>". Спека: oylan.nu.edu.kz/api/v1/swagger.json
@@ -231,6 +235,9 @@ for _mid, _label, _ctx, _safety in [
     ("hy3-preview",      "Hunyuan 3 Preview",  256000, 1.50),
 ]:
     MODEL_REGISTRY[_mid] = ("opencode", _mid, _label, _ctx, _safety)
+# qwen3.7-max — opencode отдаёт её только в формате Anthropic Messages → провайдер "oc_anthropic"
+# (свой адаптер-обёртка под OpenAI-интерфейс; полноценный tool-loop/голос, как у прочих).
+MODEL_REGISTRY["qwen3.7-max"] = ("oc_anthropic", "qwen3.7-max", "Qwen3.7 Max", 262000, 1.15)
 # Oylan (ISSAI) — провайдер "oylan" (свой адаптер, не OpenAI). Окно ~32k, safety 1.3.
 MODEL_REGISTRY["oylan"] = ("oylan", OYLAN_MODEL, "Oylan 3", 32000, 1.3)
 # Автообрезка контекста под окно модели
@@ -407,6 +414,106 @@ opencode_client = OpenAI(api_key=opencode_api_key, base_url=OPENCODE_BASE_URL) i
 # Oylan не OpenAI-совместим (свой requests-адаптер) — клиента нет, держим строку-маркер доступности.
 oylan_client = "oylan" if oylan_api_key else None
 
+
+# ── opencode-go в формате Anthropic Messages (для qwen3.7-max и подобных) ──
+# Утиная обёртка под интерфейс OpenAI-клиента: `.chat.completions.create(...)`.
+# Переводит OpenAI-формат (messages/tools/tool_calls) ↔ Anthropic Messages, чтобы
+# модель шла через ТОТ ЖЕ ask_agentic, что Kimi/DeepSeek (tool-loop, голос и т.д.).
+class _OCAnthropicClient:
+    _UA = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0 Safari/537.36"
+
+    def __init__(self, api_key):
+        self._key = api_key
+        self.chat = SimpleNamespace(completions=SimpleNamespace(create=self._create))
+
+    @staticmethod
+    def _to_anthropic(messages):
+        """OpenAI messages → (system_str, anthropic_messages)."""
+        system_parts, amsgs = [], []
+        for m in messages:
+            role, content = m.get("role"), m.get("content")
+            if role == "system":
+                if isinstance(content, str):
+                    system_parts.append(content)
+            elif role == "tool":
+                block = {"type": "tool_result", "tool_use_id": m.get("tool_call_id"), "content": m.get("content") or ""}
+                if amsgs and amsgs[-1]["role"] == "user" and isinstance(amsgs[-1]["content"], list) \
+                        and amsgs[-1]["content"] and amsgs[-1]["content"][0].get("type") == "tool_result":
+                    amsgs[-1]["content"].append(block)  # склеиваем подряд идущие tool-результаты
+                else:
+                    amsgs.append({"role": "user", "content": [block]})
+            elif role == "assistant":
+                blocks = []
+                if m.get("reasoning_content"):
+                    blocks.append({"type": "thinking", "thinking": m["reasoning_content"], "signature": ""})
+                if isinstance(content, str) and content.strip():
+                    blocks.append({"type": "text", "text": content})
+                for tc in m.get("tool_calls") or []:
+                    fn = tc.get("function") or {}
+                    try:
+                        inp = json.loads(fn.get("arguments") or "{}")
+                    except Exception:
+                        inp = {}
+                    blocks.append({"type": "tool_use", "id": tc.get("id"), "name": fn.get("name"), "input": inp})
+                amsgs.append({"role": "assistant", "content": blocks or [{"type": "text", "text": ""}]})
+            else:  # user
+                if isinstance(content, list):
+                    blocks = []
+                    for part in content:
+                        if not isinstance(part, dict):
+                            continue
+                        if part.get("type") == "text":
+                            blocks.append({"type": "text", "text": part.get("text", "")})
+                        elif part.get("type") == "image_url":
+                            url = (part.get("image_url") or {}).get("url", "")
+                            if url.startswith("data:") and "," in url:
+                                meta, b64 = url.split(",", 1)
+                                mt = meta.split(";")[0].split(":")[-1] or "image/jpeg"
+                                blocks.append({"type": "image", "source": {"type": "base64", "media_type": mt, "data": b64}})
+                    amsgs.append({"role": "user", "content": blocks or [{"type": "text", "text": ""}]})
+                else:
+                    amsgs.append({"role": "user", "content": content if isinstance(content, str) else str(content)})
+        return "\n\n".join(system_parts), amsgs
+
+    def _create(self, *, model, messages, max_tokens=4096, temperature=1.0, tools=None, tool_choice=None, **_ignore):
+        system, amsgs = self._to_anthropic(messages)
+        body = {"model": model, "max_tokens": int(max_tokens), "temperature": float(temperature), "messages": amsgs}
+        if system:
+            body["system"] = system
+        if tools:
+            body["tools"] = [{"name": (t.get("function") or {}).get("name"),
+                              "description": (t.get("function") or {}).get("description", ""),
+                              "input_schema": (t.get("function") or {}).get("parameters") or {"type": "object", "properties": {}}}
+                             for t in tools]
+            # Gateway (DashScope/qwen) НЕ поддерживает принудительный выбор инструмента
+            # (400 "tool_choice ... does not support ... required") — всегда auto; под auto модель
+            # сама вызывает telegram_search, когда нужно (системный промпт это поощряет).
+            body["tool_choice"] = {"type": "auto"}
+        headers = {"Content-Type": "application/json", "anthropic-version": "2023-06-01",
+                   "x-api-key": self._key, "User-Agent": self._UA}
+        r = requests.post(OPENCODE_ANTHROPIC_URL, headers=headers, json=body, timeout=300)
+        if r.status_code != 200:
+            raise RuntimeError(f"opencode-anthropic HTTP {r.status_code}: {r.text[:200]}")
+        data = r.json()
+        blocks = data.get("content") or []
+        text = "".join(b.get("text", "") for b in blocks if b.get("type") == "text")
+        thinking = "".join(b.get("thinking", "") for b in blocks if b.get("type") == "thinking")
+        tool_uses = [b for b in blocks if b.get("type") == "tool_use"]
+        tcs = [SimpleNamespace(id=b.get("id"), type="function",
+                               function=SimpleNamespace(name=b.get("name"),
+                                                        arguments=json.dumps(b.get("input") or {}, ensure_ascii=False)))
+               for b in tool_uses] or None
+        fr = {"tool_use": "tool_calls", "end_turn": "stop", "max_tokens": "length",
+              "stop_sequence": "stop"}.get(data.get("stop_reason"), data.get("stop_reason") or "stop")
+        u = data.get("usage") or {}
+        msg = SimpleNamespace(role="assistant", content=text, tool_calls=tcs, reasoning_content=(thinking or None))
+        return SimpleNamespace(choices=[SimpleNamespace(message=msg, finish_reason=fr)],
+                               usage=SimpleNamespace(prompt_tokens=u.get("input_tokens", 0),
+                                                     completion_tokens=u.get("output_tokens", 0)))
+
+
+opencode_anthropic_client = _OCAnthropicClient(opencode_api_key) if opencode_api_key else None
+
 AUTO_REPLY_BUFFERS: dict = {}
 AUTO_REPLY_TASKS: dict = {}
 AUTO_REPLY_BUSY: set = set()     # чаты в фазе LLM/отправки — не отменяем их таску (иначе теряем сообщения)
@@ -515,6 +622,8 @@ def _client_for_provider(provider):
         return openrouter_client
     if provider == "oylan":
         return oylan_client
+    if provider == "oc_anthropic":
+        return opencode_anthropic_client
     return opencode_client
 
 
@@ -3070,6 +3179,7 @@ async def model_command(event):
             if provider != cur_provider:
                 cur_provider = provider
                 title = {"deepseek": "━━ Прямой API ━━", "opencode": "━━ OpenCode Go ━━",
+                         "oc_anthropic": "━━ OpenCode Go (нативный) ━━",
                          "openrouter": "━━ OpenRouter (кастом) ━━", "oylan": "━━ Oylan (ISSAI) ━━"}.get(provider, f"━━ {provider} ━━")
                 lines.append(f"\n{title}")
             mark = f"▶{i}." if slug == ACTIVE_MODEL else f"{i}."
@@ -3095,6 +3205,8 @@ async def model_command(event):
             provider, mid, _label, _ctx, _safety = MODEL_REGISTRY[slug]
             if provider == "oylan":
                 continue  # Oylan не OpenAI tool-calling — пропускаем проверку поиска
+            if provider == "oc_anthropic":
+                continue  # qwen3.7-max: tools работают (Anthropic-формат), но короткий пробник режет thinking — флаг учится на лету
             cl = _client_for_provider(provider)
             if cl is None:
                 continue
