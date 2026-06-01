@@ -96,7 +96,7 @@ FREE_MEDIA_MODEL = "openrouter/free"  # авто-фоллбэк для гост�
 # поэтому медиа-пайплайн отличает их по самому id и роутит описание в opencode_client.
 # NB: GLM-5/5.1 у opencode (эндпоинт frank/GLM-*) — ТЕКСТОВЫЕ, картинки не принимают
 # (400 "does not accept image or video input"), поэтому в vision-список НЕ входят.
-MEDIA_OPENCODE_SLUGS = ["kimi-k2.5", "kimi-k2.6", "qwen3.5-plus", "qwen3.6-plus", "mimo-v2-omni"]
+MEDIA_OPENCODE_SLUGS = ["kimi-k2.5", "kimi-k2.6", "qwen3.5-plus", "qwen3.6-plus", "mimo-v2-omni", "minimax-m3"]
 DEEPSEEK_BASE_URL = "https://api.deepseek.com/v1"
 DEEPSEEK_MODEL = os.getenv("DEEPSEEK_MODEL", "deepseek-v4-pro")
 # opencode-go отдаёт некоторые модели (qwen3.7-max) ТОЛЬКО в формате Anthropic Messages
@@ -218,7 +218,7 @@ for _mid, _label, _ctx, _safety in [
     ("kimi-k2.6",        "Kimi K2.6",          262000, 2.50),
     ("minimax-m2.5",     "MiniMax M2.5",       205000, 1.30),
     ("minimax-m2.7",     "MiniMax M2.7",       205000, 1.30),
-    ("minimax-m3",       "MiniMax M3",         205000, 1.30),
+    ("minimax-m3",       "MiniMax M3",        1000000, 1.30),
     ("qwen3.5-plus",     "Qwen3.5 Plus",       262000, 1.15),
     ("qwen3.6-plus",     "Qwen3.6 Plus",       262000, 1.15),
     # qwen3.7-max ИСКЛЮЧЕНА: opencode отдаёт её только в native-формате
@@ -969,7 +969,7 @@ async def describe_image(image_bytes: bytes, caption: str = "", model: str = Non
                 ]}],
                 max_tokens=4096,
             )
-            return (response.choices[0].message.content or "").strip() or "[изображение]"
+            return _strip_think((response.choices[0].message.content or "").strip()) or "[изображение]"
         except Exception as e:
             if not _is_retriable(e):
                 log("MEDIA", f"describe_image: неисправимая ошибка (код {getattr(e, 'status_code', '?')}), не ретраю: {e}")
@@ -1006,7 +1006,7 @@ async def describe_album(images: list, caption: str = "", model: str = None, det
                 messages=[{"role": "user", "content": content}],
                 max_tokens=4096,
             )
-            return (response.choices[0].message.content or "").strip()
+            return _strip_think((response.choices[0].message.content or "").strip())
         except Exception as e:
             if not _is_retriable(e):
                 log("MEDIA", f"describe_album: неисправимая ошибка (код {getattr(e, 'status_code', '?')}), не ретраю: {e}")
