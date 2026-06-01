@@ -55,7 +55,6 @@ api_hash = os.getenv("api_hash") or ""
 openrouter_api_key = os.getenv("OPENROUTER_API_KEY")
 deepseek_api_key = os.getenv("DEEPSEEK_API_KEY")
 opencode_api_key = os.getenv("OPENCODE_API_KEY")
-oylan_api_key = os.getenv("OYLAN_API_KEY")  # ISSAI Oylan (provider "oylan", не OpenAI-совместим)
 
 
 def _collect_google_tts_keys() -> list:
@@ -104,10 +103,6 @@ DEEPSEEK_MODEL = os.getenv("DEEPSEEK_MODEL", "deepseek-v4-pro")
 # (на OpenAI-формат → 401 "not supported for format oa-compat"). Свой эндпоинт + ключ в x-api-key.
 OPENCODE_ANTHROPIC_URL = "https://opencode.ai/zen/go/v1/messages"
 OPENCODE_BASE_URL = "https://opencode.ai/zen/go/v1"
-# Oylan (ISSAI) — stateful assistant API (НЕ OpenAI-совместим): создать ассистента → interaction → ответ.
-# Авторизация: заголовок "Authorization: Api-Key <ключ>". Спека: oylan.nu.edu.kz/api/v1/swagger.json
-OYLAN_BASE_URL = (os.getenv("OYLAN_BASE_URL", "https://oylan.nu.edu.kz/api/v1")).rstrip("/")
-OYLAN_MODEL = os.getenv("OYLAN_MODEL", "Oylan")  # реальное имя модели в API (GET /assistant/models/)
 
 # --- Google Gemini Flash TTS (голосовые ответы в .ask) ---
 GEMINI_TTS_MODEL = os.getenv("GEMINI_TTS_MODEL", "gemini-3.1-flash-tts-preview")
@@ -238,8 +233,6 @@ for _mid, _label, _ctx, _safety in [
 # qwen3.7-max — opencode отдаёт её только в формате Anthropic Messages → провайдер "oc_anthropic"
 # (свой адаптер-обёртка под OpenAI-интерфейс; полноценный tool-loop/голос, как у прочих).
 MODEL_REGISTRY["qwen3.7-max"] = ("oc_anthropic", "qwen3.7-max", "Qwen3.7 Max", 262000, 1.15)
-# Oylan (ISSAI) — провайдер "oylan" (свой адаптер, не OpenAI). Окно ~32k, safety 1.3.
-MODEL_REGISTRY["oylan"] = ("oylan", OYLAN_MODEL, "Oylan 3", 32000, 1.3)
 # Автообрезка контекста под окно модели
 CTX_RESERVE_TOKENS = 8000   # запас на ответ (4096) + системку + вопрос
 CTX_CHARS_PER_TOKEN = 2.0   # фоллбэк-оценка, если tiktoken недоступен
@@ -411,8 +404,6 @@ client = TelegramClient("session_name", api_id, api_hash)
 openrouter_client = OpenAI(api_key=openrouter_api_key, base_url=OPENROUTER_BASE_URL) if openrouter_api_key else None
 deepseek_client = OpenAI(api_key=deepseek_api_key, base_url=DEEPSEEK_BASE_URL) if deepseek_api_key else None
 opencode_client = OpenAI(api_key=opencode_api_key, base_url=OPENCODE_BASE_URL) if opencode_api_key else None
-# Oylan не OpenAI-совместим (свой requests-адаптер) — клиента нет, держим строку-маркер доступности.
-oylan_client = "oylan" if oylan_api_key else None
 
 
 # ── opencode-go в формате Anthropic Messages (для qwen3.7-max и подобных) ──
@@ -620,8 +611,6 @@ def _client_for_provider(provider):
         return deepseek_client
     if provider == "openrouter":
         return openrouter_client
-    if provider == "oylan":
-        return oylan_client
     if provider == "oc_anthropic":
         return opencode_anthropic_client
     return opencode_client
@@ -1407,78 +1396,11 @@ def _extract_content(message) -> str:
     return (getattr(message, "reasoning_content", None) or "").strip()
 
 
-def _sync_oylan_answer(system_prompt: str, user_text: str, websearch: bool, max_tokens: int) -> str:
-    """Oylan (ISSAI): создать ассистента → стримовый interaction → собрать текст → удалить ассистента.
-    Важно: НЕстримовый путь у Oylan возвращает 500, поэтому используем stream=true (SSE):
-    события chunk накапливаем, финальный текст берём из события complete. Авторизация Api-Key."""
-    h = {"Authorization": f"Api-Key {oylan_api_key}"}
-    # Имя ассистента должно быть уникальным (Oylan: 400 «already exists»). Ассистент временный, удаляется.
-    payload = {"name": f"davinchik-{time.time_ns()}", "model": OYLAN_MODEL, "temperature": 1.0,
-               "max_tokens": int(max_tokens), "system_instructions": system_prompt,
-               "websearch_enabled": bool(websearch)}
-    r = requests.post(f"{OYLAN_BASE_URL}/assistant/", headers=h, json=payload, timeout=60)
-    if r.status_code not in (200, 201):
-        raise RuntimeError(f"Oylan create HTTP {r.status_code}: {r.text[:200]}")
-    aid = (r.json() or {}).get("id")
-    if not aid:
-        raise RuntimeError("Oylan: ассистент без id")
-    try:
-        rr = requests.post(f"{OYLAN_BASE_URL}/assistant/{aid}/interactions/", headers=h,
-                           data={"content": user_text, "stream": "true"}, timeout=180, stream=True)
-        if rr.status_code != 200:
-            raise RuntimeError(f"Oylan interaction HTTP {rr.status_code}: {rr.text[:200]}")
-        chunks, final = [], None
-        for raw in rr.iter_lines():  # bytes (UTF-8)
-            if not raw:
-                continue
-            s = raw.decode("utf-8", "replace")
-            if s.startswith("data:"):
-                s = s[5:].strip()
-            try:
-                obj = json.loads(s)
-            except Exception:
-                continue
-            t = obj.get("type")
-            if t == "chunk":
-                chunks.append(obj.get("content", ""))
-            elif t == "complete":
-                mm = obj.get("model_message") or {}
-                final = (mm.get("content") if isinstance(mm, dict) else None) or final
-            elif t == "error":
-                raise RuntimeError(f"Oylan stream error: {str(obj)[:160]}")
-        reply = (final or "".join(chunks)).strip()
-        if not reply:
-            raise RuntimeError("Oylan: пустой ответ потока")
-        return reply
-    finally:
-        try:
-            requests.delete(f"{OYLAN_BASE_URL}/assistant/{aid}/", headers=h, timeout=30)
-        except Exception:
-            pass
-
-
-async def _oylan_answer(system_prompt: str, user_text: str, websearch: bool = False, max_tokens: int = 4096) -> str:
-    return await asyncio.to_thread(_sync_oylan_answer, system_prompt, user_text, websearch, max_tokens)
-
-
-def _active_provider() -> str:
-    return MODEL_REGISTRY.get(ACTIVE_MODEL, MODEL_REGISTRY["deepseek"])[0]
-
-
 async def _llm_create(messages: list, max_tokens: int = 4096, temperature: float = 1.0):
     client_obj, model_id, label = get_active_model()
     if client_obj is None:
         log("AI", f"Активная модель {ACTIVE_MODEL} недоступна (нет ключа провайдера)")
         return None
-    # Oylan — свой адаптер (не OpenAI): склеиваем system + последний user-текст.
-    if _active_provider() == "oylan":
-        sys_p = next((m["content"] for m in messages if m.get("role") == "system" and isinstance(m.get("content"), str)), "")
-        user_parts = [m["content"] for m in messages if m.get("role") in ("user", "assistant") and isinstance(m.get("content"), str)]
-        try:
-            return await _oylan_answer(sys_p, "\n\n".join(user_parts), websearch=False, max_tokens=max_tokens)
-        except Exception as e:
-            log("AI", f"Oylan ошибка: {e}")
-            return None
     # Логируем входящий контекст (обрезаем длинные сообщения)
     for i, m in enumerate(messages):
         role = m.get("role", "?")
@@ -1583,21 +1505,6 @@ async def ask_agentic(context: str, question: str, must_search: bool = False, ca
     has_channels = len(channels) > 0
 
     now_str = datetime.now(MSK).strftime("%d.%m.%Y %H:%M")
-
-    # Oylan (ISSAI) — свой assistant-API, не OpenAI tool-loop. Поиск — через websearch_enabled (флаг -c).
-    if _active_provider() == "oylan":
-        sys_p = ASK_SYSTEM_PROMPT.replace("{model}", label) + f"\n\nТекущая дата и время: {now_str} МСК."
-        if voice_mode == "force":
-            sys_p += _voice_style_text(TTS_ENGINE, FISH_TTS_MODEL)
-        elif voice_mode == "auto":
-            sys_p += _voice_auto_hint(TTS_ENGINE, FISH_TTS_MODEL)
-        try:
-            reply = await _oylan_answer(sys_p, _build_ask_user_content(context, question, caller),
-                                        websearch=must_search, max_tokens=ASK_MAX_TOKENS)
-            return reply or "Oylan вернул пустой ответ."
-        except Exception as e:
-            log("ASK", f"Oylan ошибка: {e}")
-            return f"⚠️ Oylan не ответил: {str(e)[:150]}"
 
     system_prompt = ASK_SYSTEM_PROMPT.replace("{model}", label) + f"\n\nТекущая дата и время: {now_str} МСК. Учитывай актуальность: оценивай свежесть постов по их дате, для вопросов о новостях опирайся на самые недавние."
     if has_channels:
@@ -3180,7 +3087,7 @@ async def model_command(event):
                 cur_provider = provider
                 title = {"deepseek": "━━ Прямой API ━━", "opencode": "━━ OpenCode Go ━━",
                          "oc_anthropic": "━━ OpenCode Go (нативный) ━━",
-                         "openrouter": "━━ OpenRouter (кастом) ━━", "oylan": "━━ Oylan (ISSAI) ━━"}.get(provider, f"━━ {provider} ━━")
+                         "openrouter": "━━ OpenRouter (кастом) ━━"}.get(provider, f"━━ {provider} ━━")
                 lines.append(f"\n{title}")
             mark = f"▶{i}." if slug == ACTIVE_MODEL else f"{i}."
             warn = " ⚠️нет ключа" if not is_available(provider) else ""
@@ -3203,8 +3110,6 @@ async def model_command(event):
         tested = 0
         for slug in slugs:
             provider, mid, _label, _ctx, _safety = MODEL_REGISTRY[slug]
-            if provider == "oylan":
-                continue  # Oylan не OpenAI tool-calling — пропускаем проверку поиска
             if provider == "oc_anthropic":
                 continue  # qwen3.7-max: tools работают (Anthropic-формат), но короткий пробник режет thinking — флаг учится на лету
             cl = _client_for_provider(provider)
@@ -3785,10 +3690,6 @@ _HELP_SECTIONS = {
         "   `.model fav` — список добавленных кастомных моделей (быстрый выбор по номеру).\n"
         "   `.model remove <N|id>` — удалить кастомную модель из избранного.\n"
         "\n"
-        "**Oylan (ISSAI):** провайдер `oylan` (модель Oylan). Это свой assistant-API\n"
-        "   (не OpenAI): без tool-поиска через `-c` → используется встроенный websearch.\n"
-        "   Нужен `OYLAN_API_KEY`. Выбор: `.model oylan`.\n"
-        "\n"
         "**Медиа-кэш** (распознанные картинки/голос хранятся, чтобы не платить дважды):\n"
         "   `.cache info` — сколько занято.\n"
         "   `.cache clear all` — очистить весь кэш.\n"
@@ -3879,7 +3780,6 @@ _HELP_SECTIONS = {
         "      указать несколько ключей через запятую или в `GOOGLE_GENAI_API_KEYS` (ротация).\n"
         "   `FISH_AUDIO_API_KEY` — альтернативный TTS-движок Fish Audio (`.voice engine fish`,\n"
         "      `.voice fish` — поиск/избранное голосов).\n"
-        "   `OYLAN_API_KEY` — провайдер ответов **Oylan (ISSAI)**, модель Oylan (`.model oylan`).\n"
         "\n"
         "**Что будет без необязательных ключей:**\n"
         "   • Нет OpenRouter и OpenCode → текст разбирается нормально, но фото/кружки в `.ask`\n"
