@@ -219,9 +219,11 @@ for _mid, _label, _ctx, _safety in [
     ("kimi-k2.6",        "Kimi K2.6",          262000, 2.50),
     ("minimax-m2.5",     "MiniMax M2.5",       205000, 1.30),
     ("minimax-m2.7",     "MiniMax M2.7",       205000, 1.30),
+    ("minimax-m3",       "MiniMax M3",         205000, 1.30),
     ("qwen3.5-plus",     "Qwen3.5 Plus",       262000, 1.15),
     ("qwen3.6-plus",     "Qwen3.6 Plus",       262000, 1.15),
-    ("qwen3.7-max",      "Qwen3.7 Max",        262000, 1.15),
+    # qwen3.7-max ИСКЛЮЧЕНА: opencode отдаёт её только в native-формате
+    # (401 "not supported for format oa-compat"), наш OpenAI-клиент её не вызовет.
     ("mimo-v2.5",        "MiMo V2.5",         1000000, 1.50),
     ("mimo-v2.5-pro",    "MiMo V2.5 Pro",     1000000, 1.50),
     ("mimo-v2-pro",      "MiMo V2 Pro",       1000000, 1.50),
@@ -689,10 +691,11 @@ def _fmt_date(dt) -> str:
 _PARSE_UNSET = object()  # «не передан» — send_message использует дефолт клиента (markdown)
 
 
-async def send_long(chat_id, text, prefix="", parse_mode=_PARSE_UNSET):
+async def send_long(chat_id, text, prefix="", parse_mode=_PARSE_UNSET, reply_to=None):
     # Разбивает длинный текст на части ≤ лимита Telegram (4096), режет по абзацам/строкам/словам.
     # parse_mode: не передан → дефолт клиента (md); "html"/"md"/None — явно. При ошибке парсинга
     # (кривая разметка от модели) чанк переотправляется как обычный текст, чтобы не потерять ответ.
+    # reply_to: если задан — ПЕРВЫЙ чанк уходит реплаем на это сообщение (остальные — продолжением).
     LIMIT = 4000
     text = text or ""
     remaining = text
@@ -701,20 +704,21 @@ async def send_long(chat_id, text, prefix="", parse_mode=_PARSE_UNSET):
     _can_fallback = (parse_mode is _PARSE_UNSET) or bool(parse_mode)
 
     async def _send(msg):
+        rt = {"reply_to": reply_to} if (reply_to and first) else {}
         try:
-            await client.send_message(chat_id, msg, **_kwargs)
+            await client.send_message(chat_id, msg, **_kwargs, **rt)
         except FloodWaitError as e:
             await asyncio.sleep(e.seconds + 1)
-            await client.send_message(chat_id, msg, **_kwargs)
+            await client.send_message(chat_id, msg, **_kwargs, **rt)
         except Exception as e:
             if not _can_fallback:
                 raise
             log("SEND", f"Разметка не распозналась ({e}) — шлю как обычный текст")
             try:
-                await client.send_message(chat_id, msg, parse_mode=None)
+                await client.send_message(chat_id, msg, parse_mode=None, **rt)
             except FloodWaitError as e2:
                 await asyncio.sleep(e2.seconds + 1)
-                await client.send_message(chat_id, msg, parse_mode=None)
+                await client.send_message(chat_id, msg, parse_mode=None, **rt)
 
     while True:
         budget = LIMIT - (len(prefix) if first else 0)
@@ -1271,9 +1275,24 @@ async def _ensure_voice_sample(name: str):
     return ogg
 
 
+_THINK_RE = re.compile(r"<think>.*?</think>\s*", re.DOTALL | re.IGNORECASE)
+
+
+def _strip_think(text: str) -> str:
+    """Вырезает reasoning-блок <think>…</think> из content (MiniMax M3 и др. кладут
+    размышления прямо в content). Незакрытый <think> (ответ обрезан по длине) → пусто,
+    чтобы сработал фолбэк/ретрай, а не показ голых размышлений."""
+    if not text or "<think>" not in text.lower():
+        return text
+    t = _THINK_RE.sub("", text)
+    if "<think>" in t.lower():  # открыт, но не закрыт — режем от тега до конца
+        t = re.sub(r"<think>.*$", "", t, flags=re.DOTALL | re.IGNORECASE)
+    return t.strip()
+
+
 def _extract_content(message) -> str:
     # Финальный ответ в .content; у reasoning-моделей при пустом .content берём .reasoning_content
-    content = (getattr(message, "content", None) or "").strip()
+    content = _strip_think((getattr(message, "content", None) or "").strip())
     if content:
         return content
     return (getattr(message, "reasoning_content", None) or "").strip()
@@ -2259,6 +2278,7 @@ async def ask_command(event):
     if not is_owner and event.sender_id not in ALLOWED_USERS:
         return  # не владелец и не в списке разрешённых
     n = int(event.pattern_match.group(1))
+    reply_target_id = getattr(event, "reply_to_msg_id", None)  # если .ask — ответ на сообщение, шлём ответ реплаем на него
     flags = event.pattern_match.group(2) or ""
     direct_vision = "g" in flags  # -g: отдать картинки напрямую отвечающей модели (её vision)
     text_only = "t" in flags and not direct_vision  # -g включает медиа-обработку для фото
@@ -2558,7 +2578,7 @@ async def ask_command(event):
             if ogg:
                 bio = io.BytesIO(ogg)
                 bio.name = "voice.ogg"
-                await client.send_file(event.chat_id, bio, voice_note=True)
+                await client.send_file(event.chat_id, bio, voice_note=True, reply_to=reply_target_id)
                 t_sent = time.time()
                 try:
                     await status.delete()
@@ -2576,7 +2596,7 @@ async def ask_command(event):
         # Чистим markdown-мусор (#/*) ДО нарезки на части — модель путает HTML и markdown.
         reply = _html_clean_markdown(reply)
         # Сначала отправляем ответ, потом удаляем статус — иначе сбой delete съест ответ.
-        await send_long(event.chat_id, reply, prefix=prefix, parse_mode="html")
+        await send_long(event.chat_id, reply, prefix=prefix, parse_mode="html", reply_to=reply_target_id)
         t_sent = time.time()
         try:
             await status.delete()
@@ -3008,8 +3028,10 @@ async def model_command(event):
         lines = ["⭐ **Избранные OpenRouter-модели:**"]
         for i, (mid, ci) in enumerate(CUSTOM_MODELS.items(), 1):
             mk = "▶" if mid == ACTIVE_MODEL else " "
-            lines.append(f"{mk}{i}. {ci.get('label') or mid} — `{mid}`")
-        lines.append("\n`.model <vendor/model>` — выбрать/добавить · `.model remove <N|id>` — удалить")
+            n = slugs.index(mid) + 1 if mid in slugs else None  # номер в общем списке .model
+            num = f" · быстрый выбор `.model {n}`" if n else ""
+            lines.append(f"{mk}{i}. {ci.get('label') or mid} — `{mid}`{num}")
+        lines.append("\n`.model N` — выбрать по номеру из общего списка · `.model <vendor/model>` — добавить · `.model remove <N|id>` — удалить")
         await event.edit("\n".join(lines)[:4000])
         return
 
