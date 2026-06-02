@@ -3949,7 +3949,7 @@ async def status_command(event):
     # — ключи —
     keys = []
     for p, nm in [("deepseek", "DeepSeek"), ("openrouter", "OpenRouter"), ("opencode", "OpenCode")]:
-        keys.append(f"{nm} {'✅' if is_available(p) else '❌'}")
+        keys.append(f"{nm} {'✅' if _client_for_provider(p) is not None else '❌'}")
     keys.append(f"Google TTS {'✅' if tts_available else '❌'}")
     keys.append(f"Fish {'✅' if fish_available else '❌'}")
     L.append(f"🔑 **Ключи:** " + " · ".join(keys))
