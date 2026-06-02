@@ -3187,6 +3187,22 @@ def _sync_fish_search(query: str):
     return (r.json() or {}).get("items", [])
 
 
+def _sync_fish_get(reference_id: str):
+    """Метаданные одного Fish-голоса по id: GET /model/{id} → {title, languages, ...}."""
+    r = requests.get(f"{FISH_MODELS_URL}/{reference_id}",
+                     headers={"Authorization": f"Bearer {fish_audio_api_key}"}, timeout=30)
+    r.raise_for_status()
+    return r.json() or {}
+
+
+def _fish_ref_from(s: str) -> str:
+    """Извлекает reference_id из ссылки fish.audio/m/<id> (или возвращает строку как есть)."""
+    s = s.strip()
+    if "fish.audio" in s or s.startswith("http"):
+        s = s.split("?")[0].split("#")[0].rstrip("/").split("/")[-1]
+    return s
+
+
 async def _voice_fish_command(event, rest: str):
     """Подкоманды Fish: список избранного / search / add / remove / test / выбор."""
     global FISH_VOICE, FISH_FAVORITES, TTS_ENGINE, LAST_FISH_SEARCH
@@ -3221,21 +3237,33 @@ async def _voice_fish_command(event, rest: str):
     if low.startswith("add"):
         parts = rest[len("add"):].strip().split(maxsplit=1)
         if not parts:
-            await event.edit("Использование: `/voice fish add <N>` (номер из поиска) или `/voice fish add <reference_id> [имя]`.")
+            await event.edit("Использование: `/voice fish add <N>` (номер из поиска), `/voice fish add <ссылка fish.audio>` или `/voice fish add <reference_id> [имя]`.")
             return
-        if parts[0].isdigit() and 1 <= int(parts[0]) <= len(LAST_FISH_SEARCH):
-            item = LAST_FISH_SEARCH[int(parts[0]) - 1]
+        first = parts[0]
+        override = parts[1] if len(parts) > 1 else None
+        note = ""
+        if first.isdigit() and 1 <= int(first) <= len(LAST_FISH_SEARCH):
+            item = LAST_FISH_SEARCH[int(first) - 1]
             ref = item.get("_id", "")
-            name = parts[1] if len(parts) > 1 else item.get("title", ref)
+            name = override or item.get("title", ref)
         else:
-            ref = parts[0]
-            name = parts[1] if len(parts) > 1 else ref
+            ref = _fish_ref_from(first)  # из ссылки fish.audio/m/<id> или сырой id
+            if override:
+                name = override
+            else:
+                try:
+                    name = (await asyncio.to_thread(_sync_fish_get, ref)).get("title") or ref
+                except Exception:
+                    name = ref
+                    note = " (имя с платформы не получено — проверь id/ссылку)"
         if any(f["id"] == ref for f in FISH_FAVORITES):
             await event.edit(f"Голос `{ref}` уже в избранном.")
             return
         FISH_FAVORITES.append({"id": ref, "title": name})
         _save_model_state()
-        await event.edit(f"✅ Добавлен в избранное Fish: **{name}** (`{ref}`). Всего: {len(FISH_FAVORITES)}.\n`/voice fish` — список и выбор.")
+        num = len(FISH_FAVORITES)
+        eng = "" if TTS_ENGINE == "fish" else "\n⚠️ Сейчас движок gemini — для озвучки им включи `/voice engine fish`."
+        await event.edit(f"✅ Добавлен в избранное Fish: **{name}** (`{ref}`).{note}\n👉 Быстро сделать активным: `/voice fish {num}` · послушать: `/voice fish test`{eng}")
         return
 
     if low.startswith("remove"):
@@ -3609,6 +3637,7 @@ def _help_index(active_label):
         "   `channels`  📡 каналы, поиск, дайджест\n"
         "   `auto`      🔁 авто-ответ\n"
         "   `allow`     👥 доступ к `/ask` для других\n"
+        "   `status`    📊 все текущие настройки разом (`/status`)\n"
         "   `song`      🎵 печать с эффектом набора\n"
         "   `help`      ℹ️ как устроена сама эта команда\n"
         "   `all`       📖 показать ВСЁ сразу\n"
@@ -3749,7 +3778,8 @@ _HELP_SECTIONS = {
         "   `/voice engine fish|gemini` — выбрать движок (при сбое — автофолбэк на другой).\n"
         "   `/voice fish search <запрос>` — найти голоса Fish (пронумерованный список: № + название + id + языки).\n"
         "   `/voice fish add <N>` — добавить в избранное результат поиска по номеру (имя и id подставятся сами);\n"
-        "      либо `/voice fish add <id> [имя]` вручную. `/voice fish` — список избранного.\n"
+        "      либо `/voice fish add <ссылка fish.audio/m/...>` — имя подтянется с платформы; либо `/voice fish add <id> [имя]` вручную.\n"
+        "      После добавления бот подскажет номер для быстрого выбора (`/voice fish <N>`). `/voice fish` — список избранного.\n"
         "   `/voice fish <N|id>` — выбрать голос (номер из избранного ИЛИ прямой id).\n"
         "   `/voice fish remove <N|id>` — убрать из избранного; `/voice fish test [текст]` — прослушать.\n"
         "   Голоса берутся с fish.audio (id = reference_id). Нужен `FISH_AUDIO_API_KEY`.\n"
@@ -3853,7 +3883,78 @@ _HELP_SECTIONS = {
         "\n"
         "💡 Регистр и лишние пробелы не важны: `/help  MEDIA` сработает как `/help media`."
     ),
+    "status": (
+        "📊 **`/status` — все текущие настройки разом**\n"
+        "\n"
+        "Показывает одной командой: активную модель ответов (провайдер, окно контекста,\n"
+        "поддержку поиска 🔧 и vision), медиа-модель, TTS-движок и выбранный голос,\n"
+        "режим авто-голоса, у кого есть доступ к `/ask`, число чатов с авто-ответом,\n"
+        "сколько каналов подключено и время дайджеста, а также какие API-ключи активны.\n"
+        "Только для тебя (владельца). Ничего не меняет — просто сводка."
+    ),
 }
+
+
+@client.on(events.NewMessage(outgoing=True, pattern=r"^[./]status$", from_users="me"))
+async def status_command(event):
+    """Сводка всех текущих настроек бота (только владелец)."""
+    L = []
+    # — модель ответов —
+    provider, _mid, label, ctx, _ = MODEL_REGISTRY.get(ACTIVE_MODEL, MODEL_REGISTRY["deepseek"])
+    prov_name = {"deepseek": "DeepSeek", "openrouter": "OpenRouter", "opencode": "OpenCode Go",
+                 "oc_anthropic": "OpenCode (нативный)"}.get(provider, provider)
+    ts = MODEL_TOOLS_SUPPORT.get(ACTIVE_MODEL)
+    search_mark = "🔧 есть" if ts is True else ("🚫 нет" if ts is False else "❔ не проверен")
+    sv = active_model_supports_vision()
+    vis_mark = "✅ да" if sv is True else ("❌ нет" if sv is False else "❔ неизвестно")
+    L.append("📊 **СТАТУС БОТА**")
+    L.append(f"\n🧠 **Модель ответов:** {label} (`{ACTIVE_MODEL}`)")
+    L.append(f"   провайдер: {prov_name} · окно: 🪟{_fmt_ctx(ctx)} · поиск по каналам: {search_mark} · vision (`-g`): {vis_mark}")
+    # — медиа-модель —
+    if ACTIVE_MEDIA_MODEL in MEDIA_MODEL_REGISTRY:
+        media_label = MEDIA_MODEL_REGISTRY[ACTIVE_MEDIA_MODEL][1]
+    elif ACTIVE_MEDIA_MODEL in MEDIA_OPENCODE_SLUGS and ACTIVE_MEDIA_MODEL in MODEL_REGISTRY:
+        media_label = f"{MODEL_REGISTRY[ACTIVE_MEDIA_MODEL][2]} [OpenCode]"
+    else:
+        media_label = f"{ACTIVE_MEDIA_MODEL} (кастомная)"
+    L.append(f"🖼 **Медиа-модель (vision):** {media_label}")
+    # — голос —
+    if not tts_available and not fish_available:
+        L.append("🎙 **Голос:** недоступен (нет ключей Google TTS / Fish)")
+    else:
+        if TTS_ENGINE == "fish":
+            fname = next((f["title"] for f in FISH_FAVORITES if f["id"] == FISH_VOICE), FISH_VOICE or "—")
+            L.append(f"🎙 **Голос:** движок **Fish** ({FISH_TTS_MODEL}) · голос: {fname}" + (f" (`{FISH_VOICE}`)" if FISH_VOICE else " (не выбран)"))
+        else:
+            L.append(f"🎙 **Голос:** движок **Gemini** · голос: {ACTIVE_VOICE}")
+        L.append(f"   авто-голос: {'🟢 вкл' if VOICE_AUTO else '⚪ выкл'} · Google TTS: {'✅' if tts_available else '❌'} · Fish: {'✅' if fish_available else '❌'}")
+    # — доступ к /ask —
+    owner_who = (("@" + OWNER_USERNAME) if OWNER_USERNAME else (OWNER_NAME or "владелец"))
+    L.append(f"\n👤 **Доступ к `/ask`:** ты ({owner_who})")
+    if ALLOWED_USERS:
+        L.append(f"   + ещё {len(ALLOWED_USERS)}:")
+        for uid, rec in list(ALLOWED_USERS.items())[:15]:
+            uname = rec.get("username") if isinstance(rec, dict) else rec
+            lim = rec.get("limit") if isinstance(rec, dict) else None
+            who = ("@" + uname) if uname else str(uid)
+            L.append(f"     • {who} · лимит: {_fmt_allow_limit(lim)}")
+    else:
+        L.append("   (больше ни у кого — `/allow @user` чтобы дать)")
+    # — авто-ответ / каналы / дайджест —
+    L.append(f"\n🔁 **Авто-ответ:** включён в {len(AUTO_REPLY_ACTIVE_CHATS)} чат(ах)")
+    _dig = load_json(DIGEST_STATE_PATH, {}).get("digest_time", "09:00")
+    L.append(f"📡 **Каналы:** подключено {len(get_tracked())} · дайджест в {_dig}")
+    # — избранное —
+    L.append(f"⭐ **Избранное:** {len(FISH_FAVORITES)} Fish-голос(ов) · {len(CUSTOM_MODELS)} кастомных моделей")
+    # — ключи —
+    keys = []
+    for p, nm in [("deepseek", "DeepSeek"), ("openrouter", "OpenRouter"), ("opencode", "OpenCode")]:
+        keys.append(f"{nm} {'✅' if is_available(p) else '❌'}")
+    keys.append(f"Google TTS {'✅' if tts_available else '❌'}")
+    keys.append(f"Fish {'✅' if fish_available else '❌'}")
+    L.append(f"🔑 **Ключи:** " + " · ".join(keys))
+    L.append("\n⚙️ Сменить: `/model` · `/voice` · `/allow` · подробности — `/help`")
+    await event.edit("\n".join(L)[:4000])
 
 
 @client.on(events.NewMessage(outgoing=True, pattern=r"^[./]help(?:\s+(\S+))?\s*$", from_users="me"))
@@ -3866,7 +3967,7 @@ async def help_command(event):
         return
 
     if arg == "all":
-        order = ["ask", "model", "media", "voice", "keys", "channels", "auto", "allow", "song", "help"]
+        order = ["ask", "model", "media", "voice", "keys", "channels", "auto", "allow", "status", "song", "help"]
         full = "\n\n━━━━━━━━━━━━━━━━━━━━━\n\n".join(_HELP_SECTIONS[k] for k in order)
         # Telegram лимит ~4096 на сообщение — режем безопасно по разделам.
         chunk, buf = "", []
