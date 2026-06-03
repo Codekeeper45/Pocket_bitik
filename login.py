@@ -2,7 +2,7 @@
 """Одноразовый вход в Telegram для создания свежего session_name.session.
 Запусти интерактивно: python3 login.py — введёшь телефон и код из Telegram."""
 import os
-from telethon import TelegramClient
+from telethon.sync import TelegramClient  # .sync — чтобы client.get_me() и `with` работали синхронно (без await)
 from dotenv import load_dotenv
 
 load_dotenv()
