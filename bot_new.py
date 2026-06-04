@@ -1,4 +1,3 @@
-import telethon as tg
 from telethon import TelegramClient, events, utils
 from telethon.errors.rpcerrorlist import MessageNotModifiedError, FloodWaitError
 from dotenv import load_dotenv
@@ -11,7 +10,6 @@ import base64
 import time
 import traceback
 import requests
-import subprocess
 import json
 import glob
 import logging
@@ -2288,8 +2286,25 @@ async def _collect_history_parallel(chat_id, n, base_offset_id, from_user=None):
     return workers, merged
 
 
+async def _slash_for_other_bot(event) -> bool:
+    """True, если /команда написана в личке с ботом (например @gick_hunterhermess_bot):
+    там слэш адресован этому боту, а не юзерботу — пропускаем, чтобы не мешать.
+    Команды через точку (.ask, .model, .voice …) продолжают работать и в чатах с ботами."""
+    if not (event.raw_text or "").startswith("/"):
+        return False
+    if not event.is_private:
+        return False
+    try:
+        chat = await event.get_chat()
+    except Exception:
+        return False
+    return bool(getattr(chat, "bot", False))
+
+
 @client.on(events.NewMessage(pattern=r"^[./]ask\s+(\d+)((?:\s+-[tcdvg]+)+)?((?:\s+!?@\w+)+)?\s+(.+)"))
 async def ask_command(event):
+    if await _slash_for_other_bot(event):
+        return  # /команда в личке с ботом адресована ему, не юзерботу (используй .ask)
     is_owner = event.out
     if not is_owner and event.sender_id not in ALLOWED_USERS:
         return  # не владелец и не в списке разрешённых
@@ -2630,6 +2645,8 @@ async def ask_command(event):
 
 @client.on(events.NewMessage(outgoing=True, pattern=r"^[./]auto_reply$", from_users="me"))
 async def auto_reply_on(event):
+    if await _slash_for_other_bot(event):
+        return
     AUTO_REPLY_ACTIVE_CHATS.add(event.chat_id)
     _save_auto_reply()
     log("AUTO", f"Авто-ответ включён в чате {event.chat_id}")
@@ -2640,6 +2657,8 @@ async def auto_reply_on(event):
 
 @client.on(events.NewMessage(outgoing=True, pattern=r"^[./]auto_reply\s+off$", from_users="me"))
 async def auto_reply_off(event):
+    if await _slash_for_other_bot(event):
+        return
     AUTO_REPLY_ACTIVE_CHATS.discard(event.chat_id)
     _save_auto_reply()
     AUTO_REPLY_BUFFERS.pop(event.chat_id, None)
@@ -2738,6 +2757,8 @@ async def auto_reply_incoming(event):
 
 @client.on(events.NewMessage(outgoing=True, pattern=r"^[./]song(?: |$)(.*)", from_users="me"))
 async def song_command(event):
+    if await _slash_for_other_bot(event):
+        return
     custom_text = event.pattern_match.group(1).strip()
     text_to_print = custom_text if custom_text else SONG_TEXT
     await event.delete()
@@ -2746,6 +2767,8 @@ async def song_command(event):
 
 @client.on(events.NewMessage(outgoing=True, pattern=r"^[./]channels(?:\s+(\w+))?(?:\s+(.+))?$", from_users="me"))
 async def channels_command(event):
+    if await _slash_for_other_bot(event):
+        return
     global LAST_SCAN
     sub = (event.pattern_match.group(1) or "").lower()
     arg = (event.pattern_match.group(2) or "").strip()
@@ -2842,6 +2865,8 @@ async def channels_command(event):
 
 @client.on(events.NewMessage(outgoing=True, pattern=r"^[./]search\s+(.+)$", from_users="me"))
 async def search_command(event):
+    if await _slash_for_other_bot(event):
+        return
     query = event.pattern_match.group(1).strip()
     if not get_tracked():
         await event.edit("Нет отслеживаемых каналов. `/channels scan`")
@@ -2933,6 +2958,8 @@ async def send_digest(manual: bool):
 
 @client.on(events.NewMessage(outgoing=True, pattern=r"^[./]digest$", from_users="me"))
 async def digest_command(event):
+    if await _slash_for_other_bot(event):
+        return
     await event.edit("📰 Собираю дайджест…")
     try:
         await send_digest(manual=True)
@@ -2944,6 +2971,8 @@ async def digest_command(event):
 
 @client.on(events.NewMessage(outgoing=True, pattern=r"^[./]digest\s+time\s+(\d{1,2}:\d{2})$", from_users="me"))
 async def digest_time_command(event):
+    if await _slash_for_other_bot(event):
+        return
     t = event.pattern_match.group(1)
     state = load_json(DIGEST_STATE_PATH, {})
     state["digest_time"] = t
@@ -2969,6 +2998,8 @@ async def scheduler_loop():
 
 @client.on(events.NewMessage(outgoing=True, pattern=r"^[./]model(?:\s+(.+))?$", from_users="me"))
 async def model_command(event):
+    if await _slash_for_other_bot(event):
+        return
     global ACTIVE_MODEL, ACTIVE_MEDIA_MODEL
     arg = (event.pattern_match.group(1) or "").strip()
     slugs = list(MODEL_REGISTRY.keys())
@@ -3205,7 +3236,7 @@ def _fish_ref_from(s: str) -> str:
 
 async def _voice_fish_command(event, rest: str):
     """Подкоманды Fish: список избранного / search / add / remove / test / выбор."""
-    global FISH_VOICE, FISH_FAVORITES, TTS_ENGINE, LAST_FISH_SEARCH
+    global FISH_VOICE, LAST_FISH_SEARCH  # FISH_FAVORITES/TTS_ENGINE здесь только читаются/мутируются
     if not fish_available:
         await event.edit("⚠️ Fish недоступен: нет `FISH_AUDIO_API_KEY` в .env.")
         return
@@ -3334,7 +3365,9 @@ async def _voice_fish_command(event, rest: str):
 @client.on(events.NewMessage(outgoing=True, pattern=r"^[./]voice(?:\s+(.+))?$", from_users="me"))
 async def voice_command(event):
     """Выбор голоса и режима озвучки для голосовых ответов в /ask (Gemini + Fish Audio)."""
-    global ACTIVE_VOICE, VOICE_AUTO, TTS_ENGINE, FISH_VOICE, FISH_FAVORITES
+    if await _slash_for_other_bot(event):
+        return
+    global ACTIVE_VOICE, VOICE_AUTO, TTS_ENGINE  # FISH_* меняются в _voice_fish_command
     arg = (event.pattern_match.group(1) or "").strip()
 
     if not tts_available and not fish_available:
@@ -3465,6 +3498,8 @@ def _human_bytes(n):
 
 @client.on(events.NewMessage(outgoing=True, pattern=r"^[./]cache(?:\s+(\w+))?(?:\s+(\S+))?$", from_users="me"))
 async def cache_command(event):
+    if await _slash_for_other_bot(event):
+        return
     sub = (event.pattern_match.group(1) or "info").lower()
     arg = (event.pattern_match.group(2) or "").strip()
 
@@ -3515,6 +3550,8 @@ async def cache_command(event):
 # Отдельный обработчик для `/cache clear older N` (3 аргумента, регулярка с 2 группами не покрывает)
 @client.on(events.NewMessage(outgoing=True, pattern=r"^[./]cache\s+clear\s+older\s+(\d+)$", from_users="me"))
 async def cache_clear_older_command(event):
+    if await _slash_for_other_bot(event):
+        return
     days = int(event.pattern_match.group(1))
     cutoff = time.time() - days * 86400
     to_remove = [k for k, ts in MEDIA_CACHE_TS.items() if ts < cutoff]
@@ -3537,6 +3574,8 @@ def _fmt_allow_limit(limit):
 
 @client.on(events.NewMessage(outgoing=True, pattern=r"^[./]allow(?:\s+(.+))?$", from_users="me"))
 async def allow_command(event):
+    if await _slash_for_other_bot(event):
+        return
     arg = (event.pattern_match.group(1) or "").strip()
 
     # список
@@ -3550,7 +3589,7 @@ async def allow_command(event):
             limit = rec.get("limit") if isinstance(rec, dict) else None
             who = ('@' + uname) if uname else str(uid)
             lines.append(f"{i}. {who} (id {uid}) · лимит: {_fmt_allow_limit(limit)}")
-        lines.append(f"\nПри N > лимита — vision переключается на free-модель (текст остаётся).")
+        lines.append("\nПри N > лимита — vision переключается на free-модель (текст остаётся).")
         lines.append("`/allow @name <N|unlimited>` — задать лимит · `/allow remove @name|<id>`")
         await event.edit("\n".join(lines))
         return
@@ -3627,6 +3666,9 @@ def _help_index(active_label):
         "\n"
         "Это «оглавление». Каждый раздел можно открыть подробно — допиши его\n"
         "название после `/help`. Пример: `/help media`.\n"
+        "Команды работают и через `/`, и через `.` (например `.help`).\n"
+        "❗ В личке с ботами `/команды` юзербот игнорирует (они адресованы боту) —\n"
+        "   там используй вариант с точкой: `.ask`, `.model`, …\n"
         "\n"
         "📂 **Разделы справки** (`/help <раздел>`):\n"
         "   `ask`       💬 вопросы к AI по чату — главная функция\n"
@@ -3881,7 +3923,11 @@ _HELP_SECTIONS = {
         "   `/help media` — про vision-модели и метки [OR]/[OC]\n"
         "   `/help keys`  — какой ключ обязателен, а какой нет\n"
         "\n"
-        "💡 Регистр и лишние пробелы не важны: `/help  MEDIA` сработает как `/help media`."
+        "💡 Регистр и лишние пробелы не важны: `/help  MEDIA` сработает как `/help media`.\n"
+        "\n"
+        "**Префиксы:** каждая команда работает и через `/`, и через `.` (`.help` = `/help`).\n"
+        "❗ Исключение: в личке с ботом (например @some\\_bot) слэш-команды юзербот\n"
+        "пропускает — они адресованы тому боту. Там используй точку: `.ask 50 …`."
     ),
     "status": (
         "📊 **`/status` — все текущие настройки разом**\n"
@@ -3898,6 +3944,8 @@ _HELP_SECTIONS = {
 @client.on(events.NewMessage(outgoing=True, pattern=r"^[./]status$", from_users="me"))
 async def status_command(event):
     """Сводка всех текущих настроек бота (только владелец)."""
+    if await _slash_for_other_bot(event):
+        return
     L = []
     # — модель ответов —
     provider, _mid, label, ctx, _ = MODEL_REGISTRY.get(ACTIVE_MODEL, MODEL_REGISTRY["deepseek"])
@@ -3952,13 +4000,15 @@ async def status_command(event):
         keys.append(f"{nm} {'✅' if _client_for_provider(p) is not None else '❌'}")
     keys.append(f"Google TTS {'✅' if tts_available else '❌'}")
     keys.append(f"Fish {'✅' if fish_available else '❌'}")
-    L.append(f"🔑 **Ключи:** " + " · ".join(keys))
+    L.append("🔑 **Ключи:** " + " · ".join(keys))
     L.append("\n⚙️ Сменить: `/model` · `/voice` · `/allow` · подробности — `/help`")
     await event.edit("\n".join(L)[:4000])
 
 
 @client.on(events.NewMessage(outgoing=True, pattern=r"^[./]help(?:\s+(\S+))?\s*$", from_users="me"))
 async def help_command(event):
+    if await _slash_for_other_bot(event):
+        return
     _, _, active_label = get_active_model()
     arg = (event.pattern_match.group(1) or "").strip().lower()
 
