@@ -1,5 +1,8 @@
 from telethon import TelegramClient, events, utils
 from telethon.errors.rpcerrorlist import MessageNotModifiedError, FloodWaitError
+from telethon.extensions import html as tl_html
+from telethon.helpers import add_surrogate
+from telethon.tl.types import MessageEntityBlockquote
 from dotenv import load_dotenv
 from openai import OpenAI
 import os
@@ -789,11 +792,25 @@ def _fmt_date(dt) -> str:
 _PARSE_UNSET = object()  # «не передан» — send_message использует дефолт клиента (markdown)
 
 
-async def send_long(chat_id, text, prefix="", parse_mode=_PARSE_UNSET, reply_to=None):
+def _collapsed_entities(text: str, parse_html: bool = True):
+    """(text, entities) для отправки текста целиком СВЁРНУТОЙ цитатой (как в Notion/Discord).
+    Telegram показывает первые ~3 строки и стрелку раскрытия. HTML-разметку (если есть)
+    парсим парсером Telethon, затем накрываем всё entity-цитатой с collapsed=True
+    (HTML-парсер сам флаг collapsed не ставит — поэтому вручную)."""
+    if parse_html:
+        clean, ents = tl_html.parse(text)
+    else:
+        clean, ents = text, []
+    ents = list(ents) + [MessageEntityBlockquote(0, len(add_surrogate(clean)), collapsed=True)]
+    return clean, ents
+
+
+async def send_long(chat_id, text, prefix="", parse_mode=_PARSE_UNSET, reply_to=None, collapse_threshold=None):
     # Разбивает длинный текст на части ≤ лимита Telegram (4096), режет по абзацам/строкам/словам.
     # parse_mode: не передан → дефолт клиента (md); "html"/"md"/None — явно. При ошибке парсинга
     # (кривая разметка от модели) чанк переотправляется как обычный текст, чтобы не потерять ответ.
     # reply_to: если задан — ПЕРВЫЙ чанк уходит реплаем на это сообщение (остальные — продолжением).
+    # collapse_threshold: если задан и чанк длиннее — отправляется свёрнутой цитатой (тап = раскрыть).
     LIMIT = 4000
     text = text or ""
     remaining = text
@@ -803,6 +820,22 @@ async def send_long(chat_id, text, prefix="", parse_mode=_PARSE_UNSET, reply_to=
 
     async def _send(msg):
         rt = {"reply_to": reply_to} if (reply_to and first) else {}
+        if collapse_threshold is not None and len(msg) > collapse_threshold:
+            try:
+                clean, ents = _collapsed_entities(msg, parse_html=(parse_mode == "html"))
+                await client.send_message(chat_id, clean, formatting_entities=ents, **rt)
+                return
+            except FloodWaitError as e:
+                await asyncio.sleep(e.seconds + 1)
+                try:
+                    clean, ents = _collapsed_entities(msg, parse_html=(parse_mode == "html"))
+                    await client.send_message(chat_id, clean, formatting_entities=ents, **rt)
+                    return
+                except Exception as e2:
+                    log("SEND", f"Свёрнутая цитата не отправилась после FloodWait ({e2}) — обычная отправка")
+            except Exception as e:
+                log("SEND", f"Свёрнутая цитата не отправилась ({e}) — обычная отправка")
+            # фоллбек ниже — обычный путь
         try:
             await client.send_message(chat_id, msg, **_kwargs, **rt)
         except FloodWaitError as e:
@@ -1050,10 +1083,17 @@ async def _transcribe_with(model: str, audio_bytes: bytes, fmt: str) -> str:
     return ""
 
 
+class GenRejected(Exception):
+    """Провайдер отклонил запрос генерации (4xx/422 или ответ без картинки) — ретрай тем же
+    промптом бессмыслен; помогает только правка промпта (repair) или переформулировка."""
+
+
 def _sync_generate_image(prompt: str, input_images_b64: list = None) -> tuple:
     """Генерация/редактирование изображения через OpenRouter (Riverflow). Возвращает (байты, mime).
     Проверено живьём: modalities строго ["image"] (с "text" — 404), ответ приходит как webp data-URL.
-    modalities/message.images — нестандарт OpenAI, поэтому requests, а не SDK-клиент."""
+    modalities/message.images — нестандарт OpenAI, поэтому requests, а не SDK-клиент.
+    Ошибки: 5xx/сеть/таймаут — обычные исключения (временные, можно ретраить);
+    4xx и «нет картинки в ответе» — GenRejected (нужна правка промпта)."""
     content = [{"type": "text", "text": prompt}]
     for b64 in (input_images_b64 or []):
         content.append({"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{b64}"}})
@@ -1067,12 +1107,19 @@ def _sync_generate_image(prompt: str, input_images_b64: list = None) -> tuple:
         },
         timeout=300,  # генерация медленная (reasoning-модель, в тесте ~2.5 мин)
     )
-    resp.raise_for_status()
+    if resp.status_code >= 500:
+        resp.raise_for_status()  # 5xx — временная ошибка провайдера → ретрай тем же промптом
+    if not resp.ok:  # 4xx (вкл. 422) — запрос отклонён (модерация/невалидный вход)
+        try:
+            detail = resp.json().get("error", {}).get("message") or resp.text
+        except Exception:
+            detail = resp.text
+        raise GenRejected(f"HTTP {resp.status_code}: {str(detail)[:200]}")
     data = resp.json()
     images = (data.get("choices") or [{}])[0].get("message", {}).get("images") or []
     if not images:
         err = (data.get("choices") or [{}])[0].get("message", {}).get("content") or data.get("error", {}).get("message") or "пустой ответ"
-        raise RuntimeError(f"модель не вернула изображение: {str(err)[:200]}")
+        raise GenRejected(f"модель не вернула изображение: {str(err)[:200]}")
     url = images[0]["image_url"]["url"]
     head, b64_out = url.split(",", 1)
     mime = head.split(":", 1)[-1].split(";", 1)[0] or "image/webp"  # "data:image/webp;base64"
@@ -1122,6 +1169,37 @@ def _sync_image_prompt(user_prompt: str, context_text: str = None) -> str:
     except Exception as e:
         log("GEN", f"DeepSeek-промпт не получился ({e}), использую исходный")
         return user_prompt
+
+
+_IMAGE_REPAIR_SYSTEM = (
+    "Промпт для модели генерации изображений был отклонён провайдером (модерация или некорректные "
+    "формулировки). Перепиши промпт: сохрани суть, композицию и стиль изображения, но убери или замени "
+    "формулировки и контент, которые могли нарушить правила провайдера (насилие, NSFW, известные личности, "
+    "торговые марки и т.п.). Сделай промпт безопасным и допустимым. Верни ТОЛЬКО новый промпт на английском, "
+    "без пояснений."
+)
+
+
+def _sync_repair_image_prompt(bad_prompt: str, user_prompt: str) -> str:
+    """Правка отклонённого промпта через DeepSeek (в сторону соответствия правилам провайдера).
+    При недоступности DeepSeek возвращает исходный — repair-цикл тогда завершится отказом."""
+    if deepseek_client is None:
+        return bad_prompt
+    try:
+        resp = deepseek_client.chat.completions.create(
+            model=DEEPSEEK_MODEL,
+            messages=[
+                {"role": "system", "content": _IMAGE_REPAIR_SYSTEM},
+                {"role": "user", "content": f"Изначальный запрос пользователя: {user_prompt}\n\nОтклонённый промпт:\n{bad_prompt}"},
+            ],
+            max_tokens=600,
+            temperature=0.7,
+        )
+        out = (resp.choices[0].message.content or "").strip()
+        return out or bad_prompt
+    except Exception as e:
+        log("GEN", f"DeepSeek-repair не получился ({e})")
+        return bad_prompt
 
 
 def _audio_format(m) -> str:
@@ -2703,7 +2781,7 @@ async def ask_command(event):
         # Чистим markdown-мусор (#/*) ДО нарезки на части — модель путает HTML и markdown.
         reply = _html_clean_markdown(reply)
         # Сначала отправляем ответ, потом удаляем статус — иначе сбой delete съест ответ.
-        await send_long(event.chat_id, reply, prefix=prefix, parse_mode="html", reply_to=reply_target_id)
+        await send_long(event.chat_id, reply, prefix=prefix, parse_mode="html", reply_to=reply_target_id, collapse_threshold=700)
         t_sent = time.time()
         try:
             await status.delete()
@@ -2719,10 +2797,59 @@ async def ask_command(event):
         log("ASK", f"Тайминги: сбор={t_collected-t0:.1f}с · контекст(медиа)={t_ctx-t_collected:.1f}с · LLM={t_llm-t_ctx:.1f}с · отправка={t_sent-t_llm:.1f}с · итого={t_end-t0:.1f}с")
 
 
+async def _gen_collect_input_images(event, reply_msg):
+    """Референс-фото для /gen: из самого сообщения с командой (включая его альбом) и из реплая
+    (включая альбом реплая). Возвращает (list_b64, skipped): максимум 10 фото, суммарно
+    ≤ GEN_IMAGE_MAX_INPUT сырых байт (лимит запроса API 4.5 МБ); лишние пропускаются."""
+    sources, seen = [], set()
+
+    async def _add_with_album(msg):
+        if msg is None:
+            return
+        batch = []
+        if getattr(msg, "photo", None) and msg.id not in seen:
+            seen.add(msg.id)
+            batch.append(msg)
+        gid = getattr(msg, "grouped_id", None)
+        if gid:  # альбом: соседние сообщения с тем же grouped_id (id всегда рядом)
+            try:
+                async for m in client.iter_messages(event.chat_id, min_id=msg.id - 12, max_id=msg.id + 12):
+                    if getattr(m, "grouped_id", None) == gid and getattr(m, "photo", None) and m.id not in seen:
+                        seen.add(m.id)
+                        batch.append(m)
+            except Exception as e:
+                log("GEN", f"Альбом не дочитал: {e}")
+        batch.sort(key=lambda m: m.id)
+        sources.extend(batch)
+
+    await _add_with_album(event.message)  # сначала мои приложенные фото, потом фото реплая
+    await _add_with_album(reply_msg)
+    out, total, skipped = [], 0, 0
+    for m in sources:
+        if len(out) >= 10:
+            skipped += 1
+            continue
+        try:
+            img = await m.download_media(bytes)
+        except Exception as e:
+            log("GEN", f"Фото id={m.id} не скачалось: {e}")
+            img = None
+        if not img:
+            continue
+        if total + len(img) > GEN_IMAGE_MAX_INPUT:
+            skipped += 1
+            continue
+        total += len(img)
+        out.append(base64.b64encode(img).decode("utf-8"))
+    if sources:
+        log("GEN", f"Референсы: найдено {len(sources)} фото → взято {len(out)} ({total / 1024:.0f} КБ), пропущено {skipped}")
+    return out, skipped
+
+
 @client.on(events.NewMessage(pattern=r"^[./]gen(?:\s+(\d+))?((?:\s+-(?:improve|i))+)?\s+(.+)$"))
 async def gen_command(event):
     """Генерация изображений (Riverflow via OpenRouter). Промпт как есть, либо его строит/улучшает DeepSeek
-    из контекста (N последних сообщений / текст reply / флаг -i). Фото в reply → image-to-image."""
+    из контекста (N последних сообщений / текст reply / флаг -i). Фото в сообщении/reply → image-to-image."""
     if await _slash_for_other_bot(event):
         return  # /команда в личке с ботом адресована ему, не юзерботу (используй .gen)
     is_owner = event.out
@@ -2739,8 +2866,11 @@ async def gen_command(event):
     caller = _owner_label() if is_owner else _user_label(event.sender or await event.get_sender())
     log("GEN", f"Старт от {caller}: N={n or '—'} · improve={improve} · reply={'да' if reply_msg else 'нет'} · «{user_prompt[:80]}»")
 
-    if is_owner:
-        await event.delete()  # своё сообщение чистим (как в /ask); гостевой запрос оставляем
+    # — референс-фото (моё сообщение + альбом, reply + альбом) собираем ДО удаления команды —
+    input_b64s, skipped_imgs = await _gen_collect_input_images(event, reply_msg)
+
+    if is_owner and not event.message.media:
+        await event.delete()  # своё сообщение чистим (как в /ask); с приложенным фото — оставляем (это референс)
     status = await client.send_message(event.chat_id, "🎨 Готовлю генерацию…")
 
     async def set_status(text):
@@ -2752,15 +2882,11 @@ async def gen_command(event):
             pass
 
     try:
-        # — входное фото из reply (image-to-image) —
-        input_b64 = None
-        if reply_msg is not None and getattr(reply_msg, "photo", None):
-            img = await reply_msg.download_media(bytes)
-            if img and len(img) > GEN_IMAGE_MAX_INPUT:
-                await set_status(f"⚠️ Фото в reply слишком большое ({len(img) / 1e6:.1f} МБ > 3 МБ — лимит API). Сожми и попробуй снова.")
-                return
-            if img:
-                input_b64 = base64.b64encode(img).decode("utf-8")
+        if skipped_imgs and not input_b64s:
+            await set_status("⚠️ Фото слишком большие: ни одно не влезло в лимит 3 МБ суммарно. Сожми и попробуй снова.")
+            return
+        if skipped_imgs:
+            await set_status(f"ℹ️ Взял {len(input_b64s)} фото, пропустил {skipped_imgs} (лимит 3 МБ суммарно / макс. 10).")
 
         # — финальный промпт —
         final_prompt, prompt_by_ai = user_prompt, False
@@ -2780,18 +2906,52 @@ async def gen_command(event):
             final_prompt = await asyncio.to_thread(_sync_image_prompt, user_prompt, context_text)
             prompt_by_ai = final_prompt != user_prompt
 
-        # — генерация —
+        # — генерация (ретраи: временные сбои — тем же промптом; отказ — DeepSeek правит AI-промпт) —
         await set_status("🎨 Генерирую изображение… (может занять до пары минут)")
         t0 = time.time()
-        raw, mime = await asyncio.to_thread(_sync_generate_image, final_prompt, [input_b64] if input_b64 else None)
+        transient_left = 2
+        repair_left = 2 if prompt_by_ai else 0
+        while True:
+            try:
+                raw, mime = await asyncio.to_thread(_sync_generate_image, final_prompt, input_b64s or None)
+                break
+            except GenRejected as e:
+                log("GEN", f"Отклонено провайдером: {e} (repair_left={repair_left})")
+                if repair_left > 0:
+                    repair_left -= 1
+                    await set_status("🔁 Промпт отклонён провайдером — DeepSeek правит его и пробуем снова…")
+                    new_prompt = await asyncio.to_thread(_sync_repair_image_prompt, final_prompt, user_prompt)
+                    if new_prompt != final_prompt:
+                        final_prompt = new_prompt
+                        continue
+                await set_status(
+                    "❌ Запрос отклонён провайдером (политика контента или некорректный вход).\n"
+                    f"Переформулируй промпт и попробуй снова: `/gen {user_prompt[:200]}`")
+                return
+            except Exception as e:
+                if transient_left > 0:
+                    transient_left -= 1
+                    log("GEN", f"Временный сбой: {e} — ретрай (осталось {transient_left})")
+                    await set_status("⏳ Временный сбой провайдера — повторяю…")
+                    await asyncio.sleep(5)
+                    continue
+                raise
         log("GEN", f"Готово за {time.time() - t0:.1f}с · {len(raw) / 1024:.0f} КБ · {mime} · prompt_by_ai={prompt_by_ai}")
         if "webp" in mime:
             raw = await _webp_to_png(raw)  # webp Telegram шлёт стикером — конвертим
 
         bio = io.BytesIO(raw)
         bio.name = "gen.png" if raw[:8].startswith(b"\x89PNG") else "gen.webp"
-        caption = f"🎨 {final_prompt[:900]}" if prompt_by_ai else None
-        await client.send_file(event.chat_id, bio, caption=caption, reply_to=reply_target_id)
+        if prompt_by_ai:  # промпт от DeepSeek — в подписи СВЁРНУТОЙ цитатой, чтобы не засорять чат
+            try:
+                cap, cap_ents = _collapsed_entities("🎨 " + final_prompt[:900], parse_html=False)
+                await client.send_file(event.chat_id, bio, caption=cap, formatting_entities=cap_ents, reply_to=reply_target_id)
+            except Exception as e:
+                log("GEN", f"Свёрнутая подпись не отправилась ({e}) — шлю обычной")
+                bio.seek(0)
+                await client.send_file(event.chat_id, bio, caption=f"🎨 {final_prompt[:900]}", reply_to=reply_target_id)
+        else:
+            await client.send_file(event.chat_id, bio, reply_to=reply_target_id)
         await status.delete()
     except Exception as e:
         log("GEN", f"Ошибка /gen: {e}")
@@ -3857,6 +4017,7 @@ _HELP_SECTIONS = {
         "💬 **`/ask` — вопрос к AI по истории чата**\n"
         "\n"
         "Бот читает последние сообщения этого чата и отвечает на твой вопрос с опорой на них.\n"
+        "Длинные ответы приходят **свёрнутой цитатой** — занимают 3 строки, тап раскрывает целиком.\n"
         "\n"
         "📐 **СИНТАКСИС (порядок строго слева направо):**\n"
         "```\n"
@@ -4003,13 +4164,15 @@ _HELP_SECTIONS = {
         "   `/gen -i закат над морем` — DeepSeek сначала улучшит промпт (флаг `-i` или `-improve`)\n"
         "   `/gen 100 нарисуй о чём мы спорим` — DeepSeek составит промпт по последним 100 сообщениям чата\n"
         "\n"
-        "**Через reply (ответ на сообщение):**\n"
-        "   • текст реплая идёт в контекст — промпт построит DeepSeek;\n"
-        "   • если в реплае **фото** — оно подаётся модели на вход (редактирование!):\n"
-        "     reply на фото + `/gen сделай фон ночным` → отредактированная картинка.\n"
-        "   ⚠️ Входное фото до 3 МБ (лимит API).\n"
+        "**Референс-изображения (image-to-image):**\n"
+        "   • прикрепи **фото прямо к сообщению** с `/gen` (можно альбомом) — они уйдут модели на вход;\n"
+        "   • reply на **фото** + `/gen сделай фон ночным` → редактирование этой картинки;\n"
+        "   • можно совместить: своё фото + reply на чужое — все референсы объединяются.\n"
+        "   ⚠️ До 10 фото, суммарно до 3 МБ (лимит API); текст реплая тоже идёт в контекст промпта.\n"
         "\n"
-        "Если промпт составлял/улучшал DeepSeek — он будет в подписи к картинке.\n"
+        "Если промпт составлял/улучшал DeepSeek — он будет в подписи **свёрнутой цитатой** (тап = раскрыть).\n"
+        "♻️ При временном сбое провайдера — авто-повтор; если провайдер отклонил AI-промпт —\n"
+        "   DeepSeek сам поправит формулировки и попробует снова.\n"
         "Доступ: владелец и пользователи из `/allow`. Генерация занимает до пары минут."
     ),
     "keys": (
