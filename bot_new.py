@@ -1204,6 +1204,8 @@ def _sync_image_prompt(user_prompt: str, context_text: str = None, image_desc: s
             temperature=0.4 if edit_mode else 0.7,  # редактирование — точность, создание — креатив
         )
         out = (resp.choices[0].message.content or "").strip()
+        if not out:  # пустой ответ = тихий отказ DeepSeek (контент-фильтр) — фиксируем в логе
+            log("GEN", "DeepSeek вернул пустой промпт (вероятно, контент-фильтр) — использую исходный")
         return out or user_prompt
     except Exception as e:
         log("GEN", f"DeepSeek-промпт не получился ({e}), использую исходный")
@@ -2964,12 +2966,16 @@ async def gen_command(event):
             final_prompt = await asyncio.to_thread(
                 _sync_image_prompt, user_prompt, context_text, image_desc, bool(input_b64s))
             prompt_by_ai = final_prompt != user_prompt
+            log("GEN", f"Промпт: by_ai={prompt_by_ai} · vision_desc={'есть' if image_desc else 'нет'} · len={len(final_prompt)}")
 
-        # — генерация (ретраи: временные сбои — тем же промптом; отказ — DeepSeek правит AI-промпт) —
+        # — генерация (ретраи: временные сбои — тем же промптом; отказ провайдера — DeepSeek правит промпт).
+        # Repair доступен, если DeepSeek был ЗАПРОШЕН (число/-i/текст-контекст) — даже когда его первая
+        # попытка не удалась (вернул пустое/упал) и промпт ушёл исходным. Без участия DeepSeek — без repair.
+        deepseek_requested = bool(context_text or improve)
         await set_status("🎨 Генерирую изображение… (может занять до пары минут)")
         t0 = time.time()
         transient_left = 2
-        repair_left = 2 if prompt_by_ai else 0
+        repair_left = 2 if (prompt_by_ai or deepseek_requested) else 0
         while True:
             try:
                 raw, mime = await asyncio.to_thread(_sync_generate_image, final_prompt, input_b64s or None)
