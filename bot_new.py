@@ -2,7 +2,7 @@ from telethon import TelegramClient, events, utils
 from telethon.errors.rpcerrorlist import MessageNotModifiedError, FloodWaitError
 from telethon.extensions import html as tl_html
 from telethon.helpers import add_surrogate
-from telethon.tl.types import MessageEntityBlockquote
+from telethon.tl.types import MessageEntityBlockquote, MessageEntityPre
 from dotenv import load_dotenv
 from openai import OpenAI
 import os
@@ -793,15 +793,37 @@ _PARSE_UNSET = object()  # «не передан» — send_message исполь
 
 
 def _collapsed_entities(text: str, parse_html: bool = True):
-    """(text, entities) для отправки текста целиком СВЁРНУТОЙ цитатой (как в Notion/Discord).
+    """(text, entities) для отправки текста СВЁРНУТОЙ цитатой (как в Notion/Discord).
     Telegram показывает первые ~3 строки и стрелку раскрытия. HTML-разметку (если есть)
-    парсим парсером Telethon, затем накрываем всё entity-цитатой с collapsed=True
-    (HTML-парсер сам флаг collapsed не ставит — поэтому вручную)."""
+    парсим парсером Telethon, затем накрываем текст entity-цитатами с collapsed=True
+    (HTML-парсер сам флаг collapsed не ставит — поэтому вручную).
+    ВАЖНО: код-блок (pre) внутри цитаты Telegram не держит — цитата обрывается на нём,
+    а хвост текста вываливается без свёртки. Поэтому цитаты строятся СЕГМЕНТАМИ:
+    текст между код-блоками — в свёрнутых цитатах, сами код-блоки — снаружи (с подсветкой)."""
     if parse_html:
         clean, ents = tl_html.parse(text)
     else:
         clean, ents = text, []
-    ents = list(ents) + [MessageEntityBlockquote(0, len(add_surrogate(clean)), collapsed=True)]
+    ents = list(ents)
+    s = add_surrogate(clean)  # offsets/lengths entities — в UTF-16 юнитах
+    total = len(s)
+    pres = sorted((e.offset, e.offset + e.length) for e in ents if isinstance(e, MessageEntityPre))
+    segs, cur = [], 0
+    for a, b in pres:  # сегменты текста ВНЕ код-блоков
+        if a > cur:
+            segs.append((cur, a))
+        cur = max(cur, b)
+    if cur < total:
+        segs.append((cur, total))
+    for a, b in segs:
+        # поджимаем границы: пустые строки вокруг код-блоков в цитату не берём
+        # (пробельные символы — BMP, суррогатные пары не разрезаем)
+        while a < b and s[a] in " \t\r\n":
+            a += 1
+        while b > a and s[b - 1] in " \t\r\n":
+            b -= 1
+        if b > a:
+            ents.append(MessageEntityBlockquote(a, b - a, collapsed=True))
     return clean, ents
 
 
@@ -4061,6 +4083,7 @@ _HELP_SECTIONS = {
         "\n"
         "Бот читает последние сообщения этого чата и отвечает на твой вопрос с опорой на них.\n"
         "Длинные ответы приходят **свёрнутой цитатой** — занимают 3 строки, тап раскрывает целиком.\n"
+        "Код-блоки при этом остаются снаружи цитаты с подсветкой (Telegram не прячет код в цитату).\n"
         "\n"
         "📐 **СИНТАКСИС (порядок строго слева направо):**\n"
         "```\n"
