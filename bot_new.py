@@ -79,6 +79,8 @@ OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1"
 OPENROUTER_VISION_MODEL = "google/gemini-3.1-flash-lite"  # дефолт vision (можно сменить /model media)
 OPENROUTER_AUDIO_MODEL = "google/chirp-3"
 OPENROUTER_AUDIO_FALLBACK = "openai/whisper-large-v3-turbo"  # запасная транскрипция, если Chirp-3 не отвечает
+OPENROUTER_IMAGE_MODEL = "sourceful/riverflow-v2.5-pro:free"  # /gen: text→image и image→image, бесплатная
+GEN_IMAGE_MAX_INPUT = 3_000_000  # Sourceful лимитирует запрос 4.5 МБ; base64 ×1.33 → входное фото до ~3 МБ
 
 # Медиа-модели (vision) для выбора в /model media: slug -> (model_id, label)
 MEDIA_MODEL_REGISTRY = {
@@ -1046,6 +1048,80 @@ async def _transcribe_with(model: str, audio_bytes: bytes, fmt: str) -> str:
             if attempt < 2:
                 await asyncio.sleep(wait)
     return ""
+
+
+def _sync_generate_image(prompt: str, input_images_b64: list = None) -> tuple:
+    """Генерация/редактирование изображения через OpenRouter (Riverflow). Возвращает (байты, mime).
+    Проверено живьём: modalities строго ["image"] (с "text" — 404), ответ приходит как webp data-URL.
+    modalities/message.images — нестандарт OpenAI, поэтому requests, а не SDK-клиент."""
+    content = [{"type": "text", "text": prompt}]
+    for b64 in (input_images_b64 or []):
+        content.append({"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{b64}"}})
+    resp = requests.post(
+        f"{OPENROUTER_BASE_URL}/chat/completions",
+        headers={"Authorization": f"Bearer {openrouter_api_key}", "Content-Type": "application/json"},
+        json={
+            "model": OPENROUTER_IMAGE_MODEL,
+            "messages": [{"role": "user", "content": content}],
+            "modalities": ["image"],
+        },
+        timeout=300,  # генерация медленная (reasoning-модель, в тесте ~2.5 мин)
+    )
+    resp.raise_for_status()
+    data = resp.json()
+    images = (data.get("choices") or [{}])[0].get("message", {}).get("images") or []
+    if not images:
+        err = (data.get("choices") or [{}])[0].get("message", {}).get("content") or data.get("error", {}).get("message") or "пустой ответ"
+        raise RuntimeError(f"модель не вернула изображение: {str(err)[:200]}")
+    url = images[0]["image_url"]["url"]
+    head, b64_out = url.split(",", 1)
+    mime = head.split(":", 1)[-1].split(";", 1)[0] or "image/webp"  # "data:image/webp;base64"
+    return base64.b64decode(b64_out), mime
+
+
+async def _webp_to_png(raw: bytes) -> bytes:
+    """Telegram шлёт webp как стикер — конвертируем в PNG через ffmpeg (он уже нужен боту для голосовых).
+    При сбое возвращаем исходные байты (уйдёт документом)."""
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            "ffmpeg", "-i", "pipe:0", "-f", "image2", "-c:v", "png", "pipe:1",
+            stdin=asyncio.subprocess.PIPE,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.DEVNULL,
+        )
+        out, _ = await proc.communicate(input=raw)
+        if out:
+            return out
+    except Exception as e:
+        log("GEN", f"ffmpeg webp→png не сработал: {e}")
+    return raw
+
+
+_IMAGE_PROMPT_SYSTEM = (
+    "Ты — промпт-инженер для генерации изображений. По запросу пользователя (и контексту чата, если он дан) "
+    "составь ОДИН финальный промпт для модели генерации изображений: детальный, визуальный (композиция, стиль, "
+    "свет, атмосфера), на английском языке. Верни ТОЛЬКО сам промпт, без пояснений, кавычек и преамбул."
+)
+
+
+def _sync_image_prompt(user_prompt: str, context_text: str = None) -> str:
+    """Финальный промпт генерации через DeepSeek (официальный). При недоступности — исходный промпт."""
+    if deepseek_client is None:
+        return user_prompt
+    user = (f"Контекст чата:\n{context_text}\n\nЗапрос на генерацию: {user_prompt}" if context_text
+            else f"Запрос на генерацию: {user_prompt}")
+    try:
+        resp = deepseek_client.chat.completions.create(
+            model=DEEPSEEK_MODEL,
+            messages=[{"role": "system", "content": _IMAGE_PROMPT_SYSTEM}, {"role": "user", "content": user}],
+            max_tokens=600,
+            temperature=0.7,
+        )
+        out = (resp.choices[0].message.content or "").strip()
+        return out or user_prompt
+    except Exception as e:
+        log("GEN", f"DeepSeek-промпт не получился ({e}), использую исходный")
+        return user_prompt
 
 
 def _audio_format(m) -> str:
@@ -2643,6 +2719,86 @@ async def ask_command(event):
         log("ASK", f"Тайминги: сбор={t_collected-t0:.1f}с · контекст(медиа)={t_ctx-t_collected:.1f}с · LLM={t_llm-t_ctx:.1f}с · отправка={t_sent-t_llm:.1f}с · итого={t_end-t0:.1f}с")
 
 
+@client.on(events.NewMessage(pattern=r"^[./]gen(?:\s+(\d+))?((?:\s+-(?:improve|i))+)?\s+(.+)$"))
+async def gen_command(event):
+    """Генерация изображений (Riverflow via OpenRouter). Промпт как есть, либо его строит/улучшает DeepSeek
+    из контекста (N последних сообщений / текст reply / флаг -i). Фото в reply → image-to-image."""
+    if await _slash_for_other_bot(event):
+        return  # /команда в личке с ботом адресована ему, не юзерботу (используй .gen)
+    is_owner = event.out
+    if not is_owner and event.sender_id not in ALLOWED_USERS:
+        return
+    if openrouter_client is None:
+        await event.reply("⚠️ Генерация недоступна: нет `OPENROUTER_API_KEY` в .env.")
+        return
+    n = int(event.pattern_match.group(1)) if event.pattern_match.group(1) else 0
+    improve = bool(event.pattern_match.group(2))  # -i / -improve
+    user_prompt = event.pattern_match.group(3).strip()
+    reply_msg = await event.get_reply_message() if getattr(event, "reply_to", None) else None
+    reply_target_id = getattr(event, "reply_to_msg_id", None)
+    caller = _owner_label() if is_owner else _user_label(event.sender or await event.get_sender())
+    log("GEN", f"Старт от {caller}: N={n or '—'} · improve={improve} · reply={'да' if reply_msg else 'нет'} · «{user_prompt[:80]}»")
+
+    if is_owner:
+        await event.delete()  # своё сообщение чистим (как в /ask); гостевой запрос оставляем
+    status = await client.send_message(event.chat_id, "🎨 Готовлю генерацию…")
+
+    async def set_status(text):
+        try:
+            await status.edit(text)
+        except (MessageNotModifiedError, FloodWaitError):
+            pass
+        except Exception:
+            pass
+
+    try:
+        # — входное фото из reply (image-to-image) —
+        input_b64 = None
+        if reply_msg is not None and getattr(reply_msg, "photo", None):
+            img = await reply_msg.download_media(bytes)
+            if img and len(img) > GEN_IMAGE_MAX_INPUT:
+                await set_status(f"⚠️ Фото в reply слишком большое ({len(img) / 1e6:.1f} МБ > 3 МБ — лимит API). Сожми и попробуй снова.")
+                return
+            if img:
+                input_b64 = base64.b64encode(img).decode("utf-8")
+
+        # — финальный промпт —
+        final_prompt, prompt_by_ai = user_prompt, False
+        context_text = None
+        if n > 0:
+            await set_status(f"📥 Собираю последние {n} сообщений для контекста…")
+            _, raw_msgs = await _collect_history_parallel(event.chat_id, n, 0)
+            msgs = [m for m in raw_msgs if getattr(m, "id", None) is not None and m.id != event.id and getattr(m, "action", None) is None]
+            msgs.sort(key=lambda m: m.id, reverse=True)
+            ordered = list(reversed(msgs[:n]))
+            context_text, _, _, _ = await assemble_context(ordered, True)  # text-only: медиа не разбираем
+        elif reply_msg is not None and (reply_msg.raw_text or "").strip():
+            context_text = (reply_msg.raw_text or "").strip()[:4000]
+
+        if context_text or improve:
+            await set_status("🧠 DeepSeek готовит промпт…")
+            final_prompt = await asyncio.to_thread(_sync_image_prompt, user_prompt, context_text)
+            prompt_by_ai = final_prompt != user_prompt
+
+        # — генерация —
+        await set_status("🎨 Генерирую изображение… (может занять до пары минут)")
+        t0 = time.time()
+        raw, mime = await asyncio.to_thread(_sync_generate_image, final_prompt, [input_b64] if input_b64 else None)
+        log("GEN", f"Готово за {time.time() - t0:.1f}с · {len(raw) / 1024:.0f} КБ · {mime} · prompt_by_ai={prompt_by_ai}")
+        if "webp" in mime:
+            raw = await _webp_to_png(raw)  # webp Telegram шлёт стикером — конвертим
+
+        bio = io.BytesIO(raw)
+        bio.name = "gen.png" if raw[:8].startswith(b"\x89PNG") else "gen.webp"
+        caption = f"🎨 {final_prompt[:900]}" if prompt_by_ai else None
+        await client.send_file(event.chat_id, bio, caption=caption, reply_to=reply_target_id)
+        await status.delete()
+    except Exception as e:
+        log("GEN", f"Ошибка /gen: {e}")
+        traceback.print_exc()
+        await set_status(f"❌ Генерация не удалась: {e}\nПопробуй ещё раз: `/gen {user_prompt[:200]}`")
+
+
 @client.on(events.NewMessage(outgoing=True, pattern=r"^[./]auto_reply$", from_users="me"))
 async def auto_reply_on(event):
     if await _slash_for_other_bot(event):
@@ -3675,6 +3831,7 @@ def _help_index(active_label):
         "   `model`     🧠 выбор модели для текстовых ответов\n"
         "   `media`     🖼 vision-модели (картинки/видео-кружки) + метки [OR]/[OC]\n"
         "   `voice`     🎙 голосовые ответы: выбор голоса, флаг `-v`, эмоции\n"
+        "   `gen`       🎨 генерация и редактирование изображений\n"
         "   `keys`      🔑 какие API-ключи за что отвечают (что обязательно)\n"
         "   `channels`  📡 каналы, поиск, дайджест\n"
         "   `auto`      🔁 авто-ответ\n"
@@ -3836,6 +3993,25 @@ _HELP_SECTIONS = {
         "♻️ Если Google-квота исчерпана/недоступна — бот автоматически озвучит через\n"
         "   OpenRouter (та же модель, нужен `OPENROUTER_API_KEY`)."
     ),
+    "gen": (
+        "🎨 **`/gen` — генерация и редактирование изображений**\n"
+        "\n"
+        "Модель: Riverflow V2.5 Pro (OpenRouter, бесплатная). Нужен `OPENROUTER_API_KEY`.\n"
+        "\n"
+        "**Синтаксис:** `/gen [N] [-i] <промпт>`\n"
+        "   `/gen аниме кот в очках` — генерация ровно по твоему промпту\n"
+        "   `/gen -i закат над морем` — DeepSeek сначала улучшит промпт (флаг `-i` или `-improve`)\n"
+        "   `/gen 100 нарисуй о чём мы спорим` — DeepSeek составит промпт по последним 100 сообщениям чата\n"
+        "\n"
+        "**Через reply (ответ на сообщение):**\n"
+        "   • текст реплая идёт в контекст — промпт построит DeepSeek;\n"
+        "   • если в реплае **фото** — оно подаётся модели на вход (редактирование!):\n"
+        "     reply на фото + `/gen сделай фон ночным` → отредактированная картинка.\n"
+        "   ⚠️ Входное фото до 3 МБ (лимит API).\n"
+        "\n"
+        "Если промпт составлял/улучшал DeepSeek — он будет в подписи к картинке.\n"
+        "Доступ: владелец и пользователи из `/allow`. Генерация занимает до пары минут."
+    ),
     "keys": (
         "🔑 **Какие API-ключи за что отвечают** (в файле `.env`)\n"
         "\n"
@@ -3916,7 +4092,7 @@ _HELP_SECTIONS = {
         "   `/help all` — вывести ВСЕ разделы подряд (длинно).\n"
         "\n"
         "**Доступные разделы:**\n"
-        "   `ask` · `model` · `media` · `voice` · `keys` · `channels` · `auto` · `allow` · `song` · `help`\n"
+        "   `ask` · `model` · `media` · `voice` · `gen` · `keys` · `channels` · `auto` · `allow` · `song` · `help`\n"
         "\n"
         "_Примеры:_\n"
         "   `/help ask`   — всё про вопросы к AI\n"
@@ -3992,6 +4168,8 @@ async def status_command(event):
     L.append(f"\n🔁 **Авто-ответ:** включён в {len(AUTO_REPLY_ACTIVE_CHATS)} чат(ах)")
     _dig = load_json(DIGEST_STATE_PATH, {}).get("digest_time", "09:00")
     L.append(f"📡 **Каналы:** подключено {len(get_tracked())} · дайджест в {_dig}")
+    # — генерация изображений —
+    L.append(f"🎨 **Генерация (`/gen`):** Riverflow V2.5 Pro (free) {'✅' if openrouter_client is not None else '❌ нет OPENROUTER_API_KEY'}")
     # — избранное —
     L.append(f"⭐ **Избранное:** {len(FISH_FAVORITES)} Fish-голос(ов) · {len(CUSTOM_MODELS)} кастомных моделей")
     # — ключи —
@@ -4017,7 +4195,7 @@ async def help_command(event):
         return
 
     if arg == "all":
-        order = ["ask", "model", "media", "voice", "keys", "channels", "auto", "allow", "status", "song", "help"]
+        order = ["ask", "model", "media", "voice", "gen", "keys", "channels", "auto", "allow", "status", "song", "help"]
         full = "\n\n━━━━━━━━━━━━━━━━━━━━━\n\n".join(_HELP_SECTIONS[k] for k in order)
         # Telegram лимит ~4096 на сообщение — режем безопасно по разделам.
         chunk, buf = "", []
