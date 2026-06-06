@@ -2899,7 +2899,11 @@ async def gen_command(event):
             ordered = list(reversed(msgs[:n]))
             context_text, _, _, _ = await assemble_context(ordered, True)  # text-only: медиа не разбираем
         elif reply_msg is not None and (reply_msg.raw_text or "").strip():
-            context_text = (reply_msg.raw_text or "").strip()[:4000]
+            # Reply на сообщение С ФОТО: без -i DeepSeek не вмешивается (промпт дословный, фото на вход);
+            # с -i — улучшает промпт, учитывая текст/подпись реплая. Reply на чистый текст — как раньше.
+            reply_with_photo = bool(getattr(reply_msg, "photo", None) or getattr(reply_msg, "grouped_id", None))
+            if not reply_with_photo or improve:
+                context_text = (reply_msg.raw_text or "").strip()[:4000]
 
         if context_text or improve:
             await set_status("🧠 DeepSeek готовит промпт…")
@@ -4166,9 +4170,11 @@ _HELP_SECTIONS = {
         "\n"
         "**Референс-изображения (image-to-image):**\n"
         "   • прикрепи **фото прямо к сообщению** с `/gen` (можно альбомом) — они уйдут модели на вход;\n"
-        "   • reply на **фото** + `/gen сделай фон ночным` → редактирование этой картинки;\n"
+        "   • reply на **фото** + `/gen сделай фон ночным` → редактирование этой картинки\n"
+        "     (промпт идёт дословно; добавь `-i` — DeepSeek улучшит его, учитывая подпись к фото);\n"
+        "   • reply на **текстовое** сообщение — его текст идёт в контекст, промпт строит DeepSeek;\n"
         "   • можно совместить: своё фото + reply на чужое — все референсы объединяются.\n"
-        "   ⚠️ До 10 фото, суммарно до 3 МБ (лимит API); текст реплая тоже идёт в контекст промпта.\n"
+        "   ⚠️ До 10 фото, суммарно до 3 МБ (лимит API).\n"
         "\n"
         "Если промпт составлял/улучшал DeepSeek — он будет в подписи **свёрнутой цитатой** (тап = раскрыть).\n"
         "♻️ При временном сбое провайдера — авто-повтор; если провайдер отклонил AI-промпт —\n"
