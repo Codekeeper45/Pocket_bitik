@@ -1150,19 +1150,36 @@ _IMAGE_PROMPT_SYSTEM = (
     "свет, атмосфера), на английском языке. Верни ТОЛЬКО сам промпт, без пояснений, кавычек и преамбул."
 )
 
+_IMAGE_EDIT_SYSTEM = (
+    "Ты — промпт-инженер для РЕДАКТИРОВАНИЯ существующего изображения. Модели генерации будут поданы "
+    "референсные изображения (их текстовые описания даны ниже) и твой промпт. Твоя задача — только уточнить "
+    "формулировку запроса пользователя: что КОНКРЕТНО изменить, согласовав с содержимым референса. "
+    "СТРОГО: не добавляй новых объектов, персонажей, деталей и стилей, которых нет в запросе пользователя; "
+    "не выдумывай ничего от себя; всё, что пользователь не просил менять, должно остаться как на референсе "
+    "(можешь явно написать keep everything else unchanged). Верни ТОЛЬКО промпт на английском, кратко и точно "
+    "(до 80 слов), без пояснений и кавычек."
+)
 
-def _sync_image_prompt(user_prompt: str, context_text: str = None) -> str:
-    """Финальный промпт генерации через DeepSeek (официальный). При недоступности — исходный промпт."""
+
+def _sync_image_prompt(user_prompt: str, context_text: str = None, image_desc: str = None, edit_mode: bool = False) -> str:
+    """Финальный промпт генерации через DeepSeek (официальный). При недоступности — исходный промпт.
+    edit_mode (есть референсы) — только уточнение формулировок, без отсебятины;
+    иначе — творческий детальный промпт. image_desc — vision-описания референсов (DeepSeek сам не видит)."""
     if deepseek_client is None:
         return user_prompt
-    user = (f"Контекст чата:\n{context_text}\n\nЗапрос на генерацию: {user_prompt}" if context_text
-            else f"Запрос на генерацию: {user_prompt}")
+    parts = []
+    if context_text:
+        parts.append(f"Контекст чата:\n{context_text}")
+    if image_desc:
+        parts.append(f"Описание референсных изображений (поданы модели на вход):\n{image_desc}")
+    parts.append(f"Запрос пользователя: {user_prompt}")
     try:
         resp = deepseek_client.chat.completions.create(
             model=DEEPSEEK_MODEL,
-            messages=[{"role": "system", "content": _IMAGE_PROMPT_SYSTEM}, {"role": "user", "content": user}],
+            messages=[{"role": "system", "content": _IMAGE_EDIT_SYSTEM if edit_mode else _IMAGE_PROMPT_SYSTEM},
+                      {"role": "user", "content": "\n\n".join(parts)}],
             max_tokens=600,
-            temperature=0.7,
+            temperature=0.4 if edit_mode else 0.7,  # редактирование — точность, создание — креатив
         )
         out = (resp.choices[0].message.content or "").strip()
         return out or user_prompt
@@ -2906,8 +2923,24 @@ async def gen_command(event):
                 context_text = (reply_msg.raw_text or "").strip()[:4000]
 
         if context_text or improve:
+            # DeepSeek сам не видит картинки → референсы сначала описывает vision-модель (с кэшем),
+            # и при наличии референсов DeepSeek работает в режиме РЕДАКТИРОВАНИЯ (только уточнение
+            # формулировок, без добавления своих деталей); без референсов — творческий режим как раньше.
+            image_desc = None
+            if input_b64s:
+                await set_status("👁 Изучаю референсы (vision)…")
+                descs = []
+                for i, _b64 in enumerate(input_b64s[:3], 1):  # описываем до 3 первых — этого хватает для контекста
+                    try:
+                        d = await describe_image(base64.b64decode(_b64))
+                        if d and d != "[изображение]":
+                            descs.append(f"Референс {i}: {d}")
+                    except Exception as e:
+                        log("GEN", f"Описание референса {i} не удалось: {e}")
+                image_desc = "\n".join(descs) or None
             await set_status("🧠 DeepSeek готовит промпт…")
-            final_prompt = await asyncio.to_thread(_sync_image_prompt, user_prompt, context_text)
+            final_prompt = await asyncio.to_thread(
+                _sync_image_prompt, user_prompt, context_text, image_desc, bool(input_b64s))
             prompt_by_ai = final_prompt != user_prompt
 
         # — генерация (ретраи: временные сбои — тем же промптом; отказ — DeepSeek правит AI-промпт) —
@@ -2946,14 +2979,20 @@ async def gen_command(event):
 
         bio = io.BytesIO(raw)
         bio.name = "gen.png" if raw[:8].startswith(b"\x89PNG") else "gen.webp"
-        if prompt_by_ai:  # промпт от DeepSeek — в подписи СВЁРНУТОЙ цитатой, чтобы не засорять чат
-            try:
-                cap, cap_ents = _collapsed_entities("🎨 " + final_prompt[:900], parse_html=False)
-                await client.send_file(event.chat_id, bio, caption=cap, formatting_entities=cap_ents, reply_to=reply_target_id)
-            except Exception as e:
-                log("GEN", f"Свёрнутая подпись не отправилась ({e}) — шлю обычной")
-                bio.seek(0)
-                await client.send_file(event.chat_id, bio, caption=f"🎨 {final_prompt[:900]}", reply_to=reply_target_id)
+        if prompt_by_ai:  # промпт от DeepSeek — СВЁРНУТОЙ цитатой и БЕЗ обрезки
+            cap_text = "🎨 " + final_prompt
+            if len(cap_text) <= 1000:  # влезает в лимит подписи Telegram (1024)
+                try:
+                    cap, cap_ents = _collapsed_entities(cap_text, parse_html=False)
+                    await client.send_file(event.chat_id, bio, caption=cap, formatting_entities=cap_ents, reply_to=reply_target_id)
+                except Exception as e:
+                    log("GEN", f"Свёрнутая подпись не отправилась ({e}) — шлю обычной")
+                    bio.seek(0)
+                    await client.send_file(event.chat_id, bio, caption=cap_text, reply_to=reply_target_id)
+            else:  # длинный промпт: картинка без подписи + полный промпт отдельной свёрнутой цитатой
+                sent = await client.send_file(event.chat_id, bio, reply_to=reply_target_id)
+                await send_long(event.chat_id, cap_text, parse_mode=None,
+                                reply_to=getattr(sent, "id", None), collapse_threshold=0)
         else:
             await client.send_file(event.chat_id, bio, reply_to=reply_target_id)
         await status.delete()
@@ -4171,7 +4210,8 @@ _HELP_SECTIONS = {
         "**Референс-изображения (image-to-image):**\n"
         "   • прикрепи **фото прямо к сообщению** с `/gen` (можно альбомом) — они уйдут модели на вход;\n"
         "   • reply на **фото** + `/gen сделай фон ночным` → редактирование этой картинки\n"
-        "     (промпт идёт дословно; добавь `-i` — DeepSeek улучшит его, учитывая подпись к фото);\n"
+        "     (промпт идёт дословно; добавь `-i` — DeepSeek уточнит формулировку, «увидев» референс\n"
+        "     через vision-модель, и ничего не добавит от себя — меняется только то, что просишь);\n"
         "   • reply на **текстовое** сообщение — его текст идёт в контекст, промпт строит DeepSeek;\n"
         "   • можно совместить: своё фото + reply на чужое — все референсы объединяются.\n"
         "   ⚠️ До 10 фото, суммарно до 3 МБ (лимит API).\n"
