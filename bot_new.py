@@ -1006,6 +1006,26 @@ def _is_thinking_mode_quirk(exc) -> bool:
 _is_tool_choice_unsupported = _is_thinking_mode_quirk
 
 
+_REFUSAL_MARKERS = (
+    "не могу", "не буду", "не в состоянии", "извините", "к сожалению", "не могу помочь",
+    "не могу описать", "против правил", "против моих принципов", "нарушает", "недопустим",
+    "i cannot", "i can't", "i'm sorry", "i am sorry", "i'm unable", "i am unable", "unable to",
+    "as an ai", "i won't", "i will not", "against my", "violates", "not able to", "can't assist",
+)
+
+
+def _looks_like_refusal(text: str) -> bool:
+    """True, если текст похож на отказ модели (цензура), а не на описание.
+    Эвристика: настоящее описание подробное и длинное; отказ — короткий и содержит маркеры.
+    Длинные тексты (>400 симв.) считаем валидными описаниями даже при наличии маркера."""
+    if not text:
+        return False
+    low = text.lower()
+    if len(text) > 400:
+        return False
+    return any(m in low for m in _REFUSAL_MARKERS)
+
+
 async def describe_image(image_bytes: bytes, caption: str = "", model: str = None, detail: str = "high") -> str:
     model = model or get_active_media_model()
     media_client = _client_for_media_model(model)  # OpenRouter или OpenCode-Go по id модели
@@ -2953,15 +2973,23 @@ async def gen_command(event):
             image_desc = None
             if input_b64s:
                 await set_status("👁 Изучаю референсы (vision)…")
-                descs = []
+                descs, refused = [], 0
                 for i, _b64 in enumerate(input_b64s[:3], 1):  # описываем до 3 первых — этого хватает для контекста
                     try:
                         d = await describe_image(base64.b64decode(_b64))
-                        if d and d != "[изображение]":
-                            descs.append(f"Референс {i}: {d}")
+                        if not d or d == "[изображение]":
+                            continue
+                        if _looks_like_refusal(d):  # vision отказался (цензура) — НЕ суём отказ в промпт
+                            refused += 1
+                            log("GEN", f"Vision отказался описать референс {i}: «{d[:80]}»")
+                            continue
+                        descs.append(f"Референс {i}: {d}")
                     except Exception as e:
                         log("GEN", f"Описание референса {i} не удалось: {e}")
                 image_desc = "\n".join(descs) or None
+                # Фото всё равно уходят модели на вход — без описания DeepSeek-промпт будет обобщённее.
+                if refused and not descs:
+                    await set_status("👁 Vision не смог описать фото (фильтр) — генерирую по фото и тексту без описания…")
             await set_status("🧠 DeepSeek готовит промпт…")
             final_prompt = await asyncio.to_thread(
                 _sync_image_prompt, user_prompt, context_text, image_desc, bool(input_b64s))
