@@ -80,10 +80,10 @@ tts_available = bool(GOOGLE_TTS_KEYS)
 AUTO_REPLY_ACCUMULATE_WINDOW = 1.5
 OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1"
 OPENROUTER_VISION_MODEL = "google/gemini-3.1-flash-lite"  # дефолт vision (можно сменить /model media)
-# Транскрипция: OpenRouter удалил /audio/transcriptions (chirp-3/whisper → 400 на всё, 2026-06).
-# Теперь аудио идёт через chat completions (input_audio, формат ogg — проверено живьём).
-OPENROUTER_AUDIO_MODEL = "google/gemini-2.5-flash-lite"
-OPENROUTER_AUDIO_FALLBACK = "google/gemini-3.1-flash-lite"  # запасная, если основная не отвечает
+# Транскрипция (STT через /audio/transcriptions): chirp-3/whisper стали отдавать 400 (2026-06),
+# заменены на дешёвые STT (проверено живьём: HTTP 200, ogg напрямую). Gemini для STT дорог.
+OPENROUTER_AUDIO_MODEL = "nvidia/parakeet-tdt-0.6b-v3"
+OPENROUTER_AUDIO_FALLBACK = "microsoft/mai-transcribe-1.5"  # запасная, если Parakeet не отвечает
 OPENROUTER_IMAGE_MODEL = "sourceful/riverflow-v2.5-pro:free"  # /gen: text→image и image→image, бесплатная
 GEN_IMAGE_MAX_INPUT = 3_000_000  # Sourceful лимитирует запрос 4.5 МБ; base64 ×1.33 → входное фото до ~3 МБ
 
@@ -1098,34 +1098,21 @@ async def describe_album(images: list, caption: str = "", model: str = None, det
 
 
 def _sync_transcribe_audio(audio_bytes: bytes, fmt: str, model: str) -> str:
-    """Транскрипция через chat completions (input_audio): /audio/transcriptions OpenRouter убрал."""
+    """STT через /audio/transcriptions. Parakeet/MAI работают ТОЛЬКО на этом эндпоинте:
+    через chat completions с input_audio они отдают 500/404 (проверено живьём)."""
     if not openrouter_api_key:
         return "[аудио сообщение]"
     b64 = base64.b64encode(audio_bytes).decode("utf-8")
     resp = requests.post(
-        f"{OPENROUTER_BASE_URL}/chat/completions",
+        f"{OPENROUTER_BASE_URL}/audio/transcriptions",
         headers={"Authorization": f"Bearer {openrouter_api_key}", "Content-Type": "application/json"},
-        json={
-            "model": model,
-            "messages": [{"role": "user", "content": [
-                {"type": "text", "text": "Транскрибируй это аудио дословно (язык сохрани как в записи). "
-                                          "Верни ТОЛЬКО текст речи без комментариев. Если речи нет — верни [нет речи]."},
-                {"type": "input_audio", "input_audio": {"data": b64, "format": fmt}},
-            ]}],
-            "max_tokens": 4096,
-        },
+        json={"model": model, "input_audio": {"data": b64, "format": fmt}},
         timeout=120,
     )
     if resp.status_code >= 500:
         resp.raise_for_status()  # 5xx — временная ошибка → пусть ретрайнется
     if resp.ok:
-        try:
-            text = ((resp.json().get("choices") or [{}])[0].get("message", {}).get("content") or "").strip()
-        except Exception:
-            text = ""
-        if text and "[нет речи]" not in text.lower():
-            return text
-        return "[аудио сообщение]"
+        return resp.json().get("text", "").strip() or "[аудио сообщение]"
     log("MEDIA", f"Ошибка транскрипции {model}: {resp.status_code} {resp.text[:200]}")
     return "[аудио сообщение]"  # 4xx — не ретраим этой моделью
 
@@ -2585,7 +2572,7 @@ async def ask_command(event):
     usernames = [t.lstrip("@") for t in user_tokens if not t.startswith("!")]
     exclude_users = [t.lstrip("!").lstrip("@") for t in user_tokens if t.startswith("!")]
     question = event.pattern_match.group(4).strip()
-    # Гостям: запрос > лимита → медиа НЕ режем, но vision-модель бесплатная (аудио — Gemini как всегда)
+    # Гостям: запрос > лимита → медиа НЕ режем, но vision-модель бесплатная (аудио — Parakeet как всегда)
     vision_model = None
     if not is_owner:
         guest_record = ALLOWED_USERS.get(event.sender_id) or {}
@@ -3492,7 +3479,7 @@ async def model_command(event):
                 lines.append(f"{mk} `{ms}` — {mlabel} [{ptag}] (`{mid}`){avail}")
             if ACTIVE_MEDIA_MODEL not in media_by_slug:
                 lines.append(f"▶ (кастомная OpenRouter) `{ACTIVE_MEDIA_MODEL}`")
-            lines.append("\n[OR]=OpenRouter · [OC]=OpenCode Go · аудио/голос — всегда Gemini Flash Lite.")
+            lines.append("\n[OR]=OpenRouter · [OC]=OpenCode Go · аудио/голос — всегда Parakeet (STT).")
             lines.append("`/model media N` / `/model media <slug>` — выбрать")
             lines.append("`/model media <model-id>` — любая модель OpenRouter (с проверкой)")
             await event.edit("\n".join(lines)[:4000])
@@ -3526,7 +3513,7 @@ async def model_command(event):
         ACTIVE_MEDIA_MODEL = marg
         _save_model_state()
         log("MODEL", f"Активная медиа-модель (кастомная): {marg}, vision={supports_img}")
-        warn = "" if supports_img else "\n⚠️ Модель не поддерживает изображения — описание фото работать не будет (голос/аудио идут через Gemini)."
+        warn = "" if supports_img else "\n⚠️ Модель не поддерживает изображения — описание фото работать не будет (голос/аудио идут через Parakeet)."
         await event.edit(f"✅ Медиа-модель (vision): `{marg}` (кастомная, OpenRouter){warn}")
         return
 
@@ -4195,7 +4182,7 @@ _HELP_SECTIONS = {
         "   `-g` — отдать **картинки напрямую** отвечающей модели (её vision), а не описания.\n"
         "        Нужна vision-модель (`/model` → Qwen/Kimi/MiMo Omni или OpenRouter-vision), иначе понятная ошибка.\n"
         "        ⚠️ GLM-5/5.1 у этого провайдера — текстовые, картинки не принимают (для `-g` не годятся).\n"
-        "        Голос/аудио всегда через Gemini Flash Lite. До 10 свежих картинок за запрос.\n"
+        "        Голос/аудио всегда через Parakeet (STT). До 10 свежих картинок за запрос.\n"
         "   _Пример:_ `/ask 1000 -t -d что обсуждали вчера?` · `/ask 30 -v расскажи анекдот`\n"
         "\n"
         "**Фильтры по людям** (шаг 4):\n"
@@ -4257,7 +4244,7 @@ _HELP_SECTIONS = {
         "   • Нет пометки → модель доступна, бери любую.\n"
         "   • Выберешь без ключа — бот не сломается, просто откажет и оставит прежнюю.\n"
         "\n"
-        "🎙 **Аудио и голосовые** распознаются ВСЕГДА отдельной моделью **Gemini Flash Lite** —\n"
+        "🎙 **Аудио и голосовые** распознаются ВСЕГДА отдельной STT-моделью **NVIDIA Parakeet** —\n"
         "    этот список на голос не влияет.\n"
         "⚡ Хочешь быстрее/дешевле — флаг `-t` в `/ask` вообще пропускает медиа."
     ),
@@ -4350,7 +4337,7 @@ _HELP_SECTIONS = {
         "\n"
         "**Что будет без необязательных ключей:**\n"
         "   • Нет OpenRouter и OpenCode → текст разбирается нормально, но фото/кружки в `/ask`\n"
-        "     не читаются (голос всё равно работает через Gemini).\n"
+        "     не читаются (голос всё равно работает через Parakeet).\n"
         "   • В списках `/model` / `/model media` недоступные модели помечены `⚠️нет ключа`.\n"
         "\n"
         "📌 Telegram-доступ (`api_id` / `api_hash`) — тоже обязателен, без него бот не запустится."
