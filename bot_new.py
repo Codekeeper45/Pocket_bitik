@@ -56,6 +56,7 @@ api_hash = os.getenv("api_hash") or ""
 openrouter_api_key = os.getenv("OPENROUTER_API_KEY")
 deepseek_api_key = os.getenv("DEEPSEEK_API_KEY")
 opencode_api_key = os.getenv("OPENCODE_API_KEY")
+llama_cloud_api_key = os.getenv("LLAMA_CLOUD_API_KEY")  # OCR фото (LlamaParse); без него фото идут через vision
 
 
 def _collect_google_tts_keys() -> list:
@@ -86,6 +87,11 @@ OPENROUTER_AUDIO_MODEL = "nvidia/parakeet-tdt-0.6b-v3"
 OPENROUTER_AUDIO_FALLBACK = "mistralai/voxtral-mini-transcribe"  # запасная, если Parakeet не отвечает
 OPENROUTER_IMAGE_MODEL = "sourceful/riverflow-v2.5-pro:free"  # /gen: text→image и image→image, бесплатная
 GEN_IMAGE_MAX_INPUT = 3_000_000  # Sourceful лимитирует запрос 4.5 МБ; base64 ×1.33 → входное фото до ~3 МБ
+# OCR фото в /ask по умолчанию (cost-effective вместо vision-модели; флаг -m возвращает vision).
+# Проверено живьём: v2-поток (files → parse tier=cost_effective → poll → markdown_full), ~11с/фото,
+# русский распознаёт отлично. ВАЖНО: text_full отдаёт мусор латиницей — читать markdown_full.
+LLAMA_PARSE_BASE = "https://api.cloud.llamaindex.ai"
+LLAMA_PARSE_TIER = "cost_effective"
 
 # Медиа-модели (vision) для выбора в /model media: slug -> (model_id, label)
 MEDIA_MODEL_REGISTRY = {
@@ -1320,6 +1326,72 @@ async def transcribe_audio(audio_bytes: bytes, fmt: str = "ogg") -> str:
     return "[аудио сообщение]"
 
 
+def _sync_llama_ocr(image_bytes: bytes) -> str:
+    """OCR одного фото через LlamaParse v2: upload файла → parse (tier=cost_effective) → поллинг →
+    markdown_full. Возвращает распознанный текст ("" — текста на фото нет). Ошибки — исключениями."""
+    H = {"Authorization": f"Bearer {llama_cloud_api_key}"}
+    r = requests.post(f"{LLAMA_PARSE_BASE}/api/v1/files", headers=H,
+                      files={"upload_file": ("photo.jpg", io.BytesIO(image_bytes), "image/jpeg")}, timeout=60)
+    r.raise_for_status()
+    file_id = r.json()["id"]
+    r2 = requests.post(f"{LLAMA_PARSE_BASE}/api/v2/parse",
+                       headers={**H, "Content-Type": "application/json"},
+                       json={"file_id": file_id, "tier": LLAMA_PARSE_TIER, "version": "latest"}, timeout=60)
+    r2.raise_for_status()
+    job = r2.json().get("job") or r2.json()
+    job_id = job["id"]
+    deadline = time.time() + 90  # в тесте COMPLETED за ~11с; 90с — щедрый потолок
+    status = None
+    while time.time() < deadline:
+        time.sleep(2)
+        s = requests.get(f"{LLAMA_PARSE_BASE}/api/v2/parse/{job_id}", headers=H, timeout=30).json()
+        status = (s.get("job") or s).get("status")
+        if status not in ("PENDING", "RUNNING"):
+            break
+    if status != "COMPLETED":
+        raise RuntimeError(f"LlamaParse job {status or 'timeout'}")
+    res = requests.get(f"{LLAMA_PARSE_BASE}/api/v2/parse/{job_id}?expand=markdown_full", headers=H, timeout=30)
+    res.raise_for_status()
+    md = (res.json().get("markdown_full") or "").strip()
+    # схлопываем избыточные пустые строки от markdown-разметки
+    return re.sub(r"\n{3,}", "\n\n", md)
+
+
+# Предохранитель OCR (по образцу транскрипции): системный отказ → фолбэк фото на vision,
+# изредка пробуем снова.
+_OCR_FAILS = 0
+_OCR_SKIPS = 0
+
+
+async def llama_ocr(image_bytes: bytes) -> str:
+    """OCR с ретраями. Возвращает текст с фото ("" — текста нет) или None, если OCR недоступен
+    (нет ключа / предохранитель / все ретраи неудачны) — тогда вызывающий уходит на vision."""
+    global _OCR_FAILS, _OCR_SKIPS
+    if not llama_cloud_api_key:
+        return None
+    if _OCR_FAILS >= 8:
+        _OCR_SKIPS += 1
+        if _OCR_SKIPS % 25 != 1:  # редкие пробы «ожило?»
+            return None
+        log("MEDIA", f"OCR в отказе ({_OCR_FAILS} подряд, пропущено {_OCR_SKIPS}) — пробный запрос")
+    for attempt in range(2):
+        try:
+            text = await asyncio.to_thread(_sync_llama_ocr, image_bytes)
+            if _OCR_FAILS >= 8:
+                log("MEDIA", "OCR ожил — предохранитель сброшен")
+            _OCR_FAILS = 0
+            _OCR_SKIPS = 0
+            return text
+        except Exception as e:
+            log("MEDIA", f"llama_ocr попытка {attempt + 1}/2: {e}")
+            if attempt == 0:
+                await asyncio.sleep(3)
+    _OCR_FAILS += 1
+    if _OCR_FAILS == 8:
+        log("MEDIA", "⚠️ OCR падает системно (8 подряд) — фото временно идут через vision")
+    return None
+
+
 async def extract_video_note_content(msg) -> str:
     try:
         video_bytes = await msg.download_media(file=bytes)
@@ -2000,11 +2072,14 @@ def _media_key(m):
     return f"file:{mid}" if mid else f"{m.chat_id}:{m.id}"
 
 
-async def process_media_cached(m, vision_model: str = None, detail: str = "high", mstats: dict = None, inline_ids: set = None, inline_images: list = None):
+async def process_media_cached(m, vision_model: str = None, detail: str = "high", mstats: dict = None, inline_ids: set = None, inline_images: list = None, photo_mode: str = "ocr"):
     """Текст медиа (описание/транскрипт) с кэшем по file-id. None — если медиа нет.
     mstats — опциональный аккумулятор статистики (photos/voice/audio/video_note + hit/miss).
     inline_ids/inline_images (режим /ask -g): фото НЕ описываются, а сами байты собираются
-    в inline_images, в тексте — плейсхолдер [Картинка #k]. Голос/аудио/кружок — без изменений."""
+    в inline_images, в тексте — плейсхолдер [Картинка #k]. Голос/аудио/кружок — без изменений.
+    photo_mode: "ocr" (дефолт, дёшево — LlamaParse вытаскивает текст с фото; без текста — плейсхолдер)
+    или "vision" (флаг -m в /ask — полное описание vision-моделью, как раньше).
+    Голос/аудио/кружки от photo_mode НЕ зависят (всегда STT)."""
     def _bump(kind):
         if mstats is not None:
             mstats[kind] = mstats.get(kind, 0) + 1
@@ -2027,6 +2102,28 @@ async def process_media_cached(m, vision_model: str = None, detail: str = "high"
                     return f"[Картинка #{idx}{cap_txt}]"
                 return f"[Картинка (не скачалась){cap_txt}]"
             return f"[Картинка (пропущена — лимит {DIRECT_VISION_MAX_IMAGES}){cap_txt}]"
+        text_part = f" {m.raw_text}" if m.raw_text else ""
+        if photo_mode == "ocr" and llama_cloud_api_key:
+            # OCR-режим (дефолт): берём только ТЕКСТ с фото. Свой кэш-ключ "ocr:*" —
+            # vision-описания живут на старых ключах, кэши не смешиваются.
+            okey = "ocr:" + key
+            cached = MEDIA_CACHE.get(okey)
+            if cached is None:
+                _bump("miss")
+                img = await m.download_media(bytes)
+                ocr = await llama_ocr(img) if img else None
+                if ocr is None:  # OCR недоступен/упал → фолбэк на vision (деградация в качество)
+                    cached = await describe_image(img, m.raw_text or "", model=vision_model or get_active_media_model(), detail=detail)
+                    if cached and cached not in MEDIA_FAILURE_MARKERS and cached != (m.raw_text or ""):
+                        _media_cache_set(key, cached)  # vision-ключ: пригодится и для -m
+                    return f"[Фото: {cached}]{text_part}"
+                cached = ocr or "[без текста]"
+                _media_cache_set(okey, cached)
+            else:
+                _bump("hit")
+            if cached == "[без текста]":
+                return f"[Фото (без текста)]{text_part}"
+            return f"[Фото, текст: {cached}]{text_part}"
         vm = vision_model or get_active_media_model()
         # Ключ модель-НЕзависимый: описал один раз — переиспользуем любой моделью (не описываем заново при смене модели)
         cached = MEDIA_CACHE.get(key)
@@ -2038,7 +2135,6 @@ async def process_media_cached(m, vision_model: str = None, detail: str = "high"
                 _media_cache_set(key, cached)
         else:
             _bump("hit")
-        text_part = f" {m.raw_text}" if m.raw_text else ""
         return f"[Фото: {cached}]{text_part}"
     if m.voice or m.audio:
         _bump("voice" if m.voice else "audio")
@@ -2183,7 +2279,7 @@ def _assemble_body(msg, media_body) -> str:
     return cap or ""
 
 
-async def _render_unit(msg, text_only: bool, anchor_id=None, vision_model: str = None, detail: str = "high", mstats: dict = None, by_id: dict = None, net_budget: dict = None, rep_stats: dict = None, inline_ids: set = None, inline_images: list = None) -> dict:
+async def _render_unit(msg, text_only: bool, anchor_id=None, vision_model: str = None, detail: str = "high", mstats: dict = None, by_id: dict = None, net_budget: dict = None, rep_stats: dict = None, inline_ids: set = None, inline_images: list = None, photo_mode: str = "ocr") -> dict:
     """Рендерит одно сообщение в части для последующей сборки блоков."""
     sender = None if msg.out else (msg.sender if text_only else (msg.sender or await msg.get_sender()))
     label = _label_for(msg, sender)
@@ -2204,7 +2300,7 @@ async def _render_unit(msg, text_only: bool, anchor_id=None, vision_model: str =
     media_body = None
     if not text_only:
         try:
-            media_body = await process_media_cached(msg, vision_model, detail=detail, mstats=mstats, inline_ids=inline_ids, inline_images=inline_images)
+            media_body = await process_media_cached(msg, vision_model, detail=detail, mstats=mstats, inline_ids=inline_ids, inline_images=inline_images, photo_mode=photo_mode)
         except Exception as e:
             log("ASK", f"Ошибка обработки медиа в контексте: {e}")
     body = _assemble_body(msg, media_body)
@@ -2241,7 +2337,7 @@ def _group_segments(messages):
     return segs
 
 
-async def _render_album_segment(group, text_only: bool, anchor_id=None, vision_model: str = None, detail: str = "high", mstats: dict = None, by_id: dict = None, net_budget: dict = None, rep_stats: dict = None, inline_ids: set = None, inline_images: list = None) -> dict:
+async def _render_album_segment(group, text_only: bool, anchor_id=None, vision_model: str = None, detail: str = "high", mstats: dict = None, by_id: dict = None, net_budget: dict = None, rep_stats: dict = None, inline_ids: set = None, inline_images: list = None, photo_mode: str = "ocr") -> dict:
     """Альбом (несколько сообщений с общим grouped_id) → один юнит, фото описываются одним запросом."""
     first = group[0]
     sender = None if first.out else (first.sender if text_only else (first.sender or await first.get_sender()))
@@ -2285,6 +2381,15 @@ async def _render_album_segment(group, text_only: bool, anchor_id=None, vision_m
         desc = "\n".join(parts)
     elif text_only or not photos:
         desc = ""
+    elif photo_mode == "ocr" and llama_cloud_api_key:
+        # OCR-режим: альбом обрабатываем пофайлово (describe_album — это vision-описание одним
+        # запросом, для OCR не нужно); кэш per-photo внутри process_media_cached (ключи ocr:*).
+        parts = []
+        for m in photos:
+            pm = await process_media_cached(m, vision_model, detail=detail, mstats=mstats, photo_mode="ocr")
+            if pm:
+                parts.append(pm)
+        desc = "\n".join(parts)
     else:
         vm = vision_model or get_active_media_model()
         key = "album:" + ":".join(_media_key(m) for m in photos)  # модель-независимо
@@ -2337,12 +2442,12 @@ async def _render_album_segment(group, text_only: bool, anchor_id=None, vision_m
     }
 
 
-async def _render_segment(seg, text_only: bool, anchor_id=None, vision_model: str = None, detail: str = "high", mstats: dict = None, by_id: dict = None, net_budget: dict = None, rep_stats: dict = None, inline_ids: set = None, inline_images: list = None) -> dict:
+async def _render_segment(seg, text_only: bool, anchor_id=None, vision_model: str = None, detail: str = "high", mstats: dict = None, by_id: dict = None, net_budget: dict = None, rep_stats: dict = None, inline_ids: set = None, inline_images: list = None, photo_mode: str = "ocr") -> dict:
     if len(seg) == 1:
-        u = await _render_unit(seg[0], text_only, anchor_id, vision_model, detail, mstats=mstats, by_id=by_id, net_budget=net_budget, rep_stats=rep_stats, inline_ids=inline_ids, inline_images=inline_images)
+        u = await _render_unit(seg[0], text_only, anchor_id, vision_model, detail, mstats=mstats, by_id=by_id, net_budget=net_budget, rep_stats=rep_stats, inline_ids=inline_ids, inline_images=inline_images, photo_mode=photo_mode)
         u.pop("gid", None)  # gid больше не используется на этапе склейки
         return u
-    return await _render_album_segment(seg, text_only, anchor_id, vision_model, detail, mstats=mstats, by_id=by_id, net_budget=net_budget, rep_stats=rep_stats, inline_ids=inline_ids, inline_images=inline_images)
+    return await _render_album_segment(seg, text_only, anchor_id, vision_model, detail, mstats=mstats, by_id=by_id, net_budget=net_budget, rep_stats=rep_stats, inline_ids=inline_ids, inline_images=inline_images, photo_mode=photo_mode)
 
 
 def _needs_media(m) -> bool:
@@ -2350,7 +2455,7 @@ def _needs_media(m) -> bool:
                 or getattr(m, "audio", None) or getattr(m, "video_note", None))
 
 
-async def assemble_context(messages, text_only: bool, anchor_id=None, progress_cb=None, vision_model: str = None, detail: str = "high", safety_override: float = None, inline_ids: set = None, inline_images: list = None):
+async def assemble_context(messages, text_only: bool, anchor_id=None, progress_cb=None, vision_model: str = None, detail: str = "high", safety_override: float = None, inline_ids: set = None, inline_images: list = None, photo_mode: str = "ocr"):
     """Строит контекст: параллельный рендер + склейка альбомов и подряд идущих реплик автора.
     Возвращает (context_str, dropped_blocks, failed_media, ctx_tokens). progress_cb(done, total, failed).
     safety_override — если задан, перебивает per-model safety (используется при ретрае overflow)."""
@@ -2406,7 +2511,7 @@ async def assemble_context(messages, text_only: bool, anchor_id=None, progress_c
         nonlocal done, failed_total
         seg_text_only = text_only or (idx in skip_media)  # за потолком — медиа не качаем (плейсхолдер)
         async with sem:
-            u = await _render_segment(seg, seg_text_only, anchor_id, vision_model, detail, mstats=mstats, by_id=by_id, net_budget=net_budget, rep_stats=rep_stats, inline_ids=inline_ids, inline_images=inline_images)
+            u = await _render_segment(seg, seg_text_only, anchor_id, vision_model, detail, mstats=mstats, by_id=by_id, net_budget=net_budget, rep_stats=rep_stats, inline_ids=inline_ids, inline_images=inline_images, photo_mode=photo_mode)
         failed_total += u.get("failed", 0)
         if not seg_text_only and any(_needs_media(m) for m in seg):
             done += 1
@@ -2551,7 +2656,7 @@ async def _slash_for_other_bot(event) -> bool:
     return bool(getattr(chat, "bot", False))
 
 
-@client.on(events.NewMessage(pattern=r"^[./]ask\s+(\d+)((?:\s+-[tcdvg]+)+)?((?:\s+!?@\w+)+)?\s+(.+)"))
+@client.on(events.NewMessage(pattern=r"^[./]ask\s+(\d+)((?:\s+-[tcdvgm]+)+)?((?:\s+!?@\w+)+)?\s+(.+)"))
 async def ask_command(event):
     if await _slash_for_other_bot(event):
         return  # /команда в личке с ботом адресована ему, не юзерботу (используй .ask)
@@ -2566,6 +2671,7 @@ async def ask_command(event):
     must_search = "c" in flags
     debug = "d" in flags  # дамп полного user-message в asks/<ts>_<event_id>.txt
     want_voice = "v" in flags  # -v: ответить голосом (озвучка через Gemini TTS)
+    photo_mode = "vision" if "m" in flags else "ocr"  # -m: фото описывает vision-модель; дефолт — дешёвый OCR
     # Режим голоса для промпта: force (флаг -v) / auto (включён /voice auto) / off
     voice_mode = "force" if (want_voice and tts_available) else ("auto" if (VOICE_AUTO and tts_available) else "off")
     user_tokens = (event.pattern_match.group(3) or "").split()
@@ -2594,7 +2700,7 @@ async def ask_command(event):
     else:
         caller = _user_label(event.sender or await event.get_sender())
     _, _, model_label = get_active_model()
-    flags_str = " ".join(f for f, on in [("-t", text_only), ("-c", must_search), ("-d", debug), ("-v", want_voice), ("-g", direct_vision)] if on) or "—"
+    flags_str = " ".join(f for f, on in [("-t", text_only), ("-c", must_search), ("-d", debug), ("-v", want_voice), ("-g", direct_vision), ("-m", photo_mode == "vision")] if on) or "—"
     users_str = ", ".join("@" + u for u in usernames) if usernames else "—"
     excludes_str = ", ".join("!@" + u for u in exclude_users) if exclude_users else "—"
     vision_label = "free" if vision_model == FREE_MEDIA_MODEL else (vision_model or get_active_media_model())
@@ -2770,7 +2876,7 @@ async def ask_command(event):
             context, dropped, failed, ctx_tokens = await assemble_context(
                 ordered, text_only, anchor_id=anchor_id, progress_cb=progress_cb,
                 vision_model=vision_model, detail=detail, safety_override=safety_override,
-                inline_ids=inline_ids, inline_images=inline_images,
+                inline_ids=inline_ids, inline_images=inline_images, photo_mode=photo_mode,
             )
             t_ctx = time.time()
             context = context or "(нет сообщений)"
@@ -4183,7 +4289,10 @@ _HELP_SECTIONS = {
         "        Нужна vision-модель (`/model` → Qwen/Kimi/MiMo Omni или OpenRouter-vision), иначе понятная ошибка.\n"
         "        ⚠️ GLM-5/5.1 у этого провайдера — текстовые, картинки не принимают (для `-g` не годятся).\n"
         "        Голос/аудио всегда через Parakeet (STT). До 10 свежих картинок за запрос.\n"
-        "   _Пример:_ `/ask 1000 -t -d что обсуждали вчера?` · `/ask 30 -v расскажи анекдот`\n"
+        "   `-m` — фото описывает **vision-модель** (полное описание, как раньше; см. `/model media`).\n"
+        "        Без `-m` фото идут через дешёвый **OCR** (LlamaParse): берётся только ТЕКСТ\n"
+        "        с картинки; фото без текста — пометка [Фото (без текста)]. Голос — без изменений.\n"
+        "   _Пример:_ `/ask 1000 -t -d что обсуждали вчера?` · `/ask 30 -v расскажи анекдот` · `/ask 50 -m что на фото?`\n"
         "\n"
         "**Фильтры по людям** (шаг 4):\n"
         "   `@user1 @user2` — взять сообщения **только** этих авторов.\n"
@@ -4229,6 +4338,10 @@ _HELP_SECTIONS = {
         "Это «глаза» бота: модель, которая разбирает **картинки** внутри `/ask`\n"
         "и описывает **референсы** для `/gen -i` (DeepSeek сам картинки не видит).\n"
         "Это НЕ та же модель, что пишет текст (её меняет `/model`).\n"
+        "\n"
+        "💡 **По умолчанию фото в `/ask` идут через OCR** (LlamaParse, cost-effective):\n"
+        "   с картинки берётся только текст — дёшево. Vision-модель из этого списка\n"
+        "   работает при флаге `-m`, в `/gen -i` и как фолбэк при сбое OCR.\n"
         "\n"
         "   `/model media` — показать список vision-моделей; `▶` — активная.\n"
         "   `/model media N` — выбрать по номеру.\n"
@@ -4334,6 +4447,8 @@ _HELP_SECTIONS = {
         "      указать несколько ключей через запятую или в `GOOGLE_GENAI_API_KEYS` (ротация).\n"
         "   `FISH_AUDIO_API_KEY` — альтернативный TTS-движок Fish Audio (`/voice engine fish`,\n"
         "      `/voice fish` — поиск/избранное голосов).\n"
+        "   `LLAMA_CLOUD_API_KEY` — дешёвый **OCR фото** в `/ask` по умолчанию (LlamaParse).\n"
+        "      Без него фото автоматически описывает vision-модель (как раньше).\n"
         "\n"
         "**Что будет без необязательных ключей:**\n"
         "   • Нет OpenRouter и OpenCode → текст разбирается нормально, но фото/кружки в `/ask`\n"
@@ -4447,7 +4562,7 @@ async def status_command(event):
         media_label = f"{MODEL_REGISTRY[ACTIVE_MEDIA_MODEL][2]} [OpenCode]"
     else:
         media_label = f"{ACTIVE_MEDIA_MODEL} (кастомная)"
-    L.append(f"🖼 **Медиа-модель (vision):** {media_label}")
+    L.append(f"🖼 **Фото в /ask:** OCR LlamaParse (cost-effective) {'✅' if llama_cloud_api_key else '❌ нет ключа → vision'} · vision (`-m`): {media_label}")
     # — голос —
     if not tts_available and not fish_available:
         L.append("🎙 **Голос:** недоступен (нет ключей Google TTS / Fish)")
