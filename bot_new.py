@@ -83,7 +83,7 @@ OPENROUTER_VISION_MODEL = "google/gemini-3.1-flash-lite"  # дефолт vision 
 # Транскрипция (STT через /audio/transcriptions): chirp-3/whisper стали отдавать 400 (2026-06),
 # заменены на дешёвые STT (проверено живьём: HTTP 200, ogg напрямую). Gemini для STT дорог.
 OPENROUTER_AUDIO_MODEL = "nvidia/parakeet-tdt-0.6b-v3"
-OPENROUTER_AUDIO_FALLBACK = "microsoft/mai-transcribe-1.5"  # запасная, если Parakeet не отвечает
+OPENROUTER_AUDIO_FALLBACK = "mistralai/voxtral-mini-transcribe"  # запасная, если Parakeet не отвечает
 OPENROUTER_IMAGE_MODEL = "sourceful/riverflow-v2.5-pro:free"  # /gen: text→image и image→image, бесплатная
 GEN_IMAGE_MAX_INPUT = 3_000_000  # Sourceful лимитирует запрос 4.5 МБ; base64 ×1.33 → входное фото до ~3 МБ
 
