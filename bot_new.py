@@ -86,6 +86,7 @@ OPENROUTER_VISION_MODEL = "google/gemini-3.1-flash-lite"  # дефолт vision 
 OPENROUTER_AUDIO_MODEL = "nvidia/parakeet-tdt-0.6b-v3"
 OPENROUTER_AUDIO_FALLBACK = "mistralai/voxtral-mini-transcribe"  # запасная, если Parakeet не отвечает
 OPENROUTER_IMAGE_MODEL = "sourceful/riverflow-v2.5-pro:free"  # /gen: text→image и image→image, бесплатная
+OPENROUTER_IMAGE_FALLBACK = "sourceful/riverflow-v2.5-fast:free"  # запасная при перегрузке основной
 GEN_IMAGE_MAX_INPUT = 3_000_000  # Sourceful лимитирует запрос 4.5 МБ; base64 ×1.33 → входное фото до ~3 МБ
 # OCR фото в /ask по умолчанию (cost-effective вместо vision-модели; флаг -m возвращает vision).
 # Проверено живьём: v2-поток (files → parse tier=cost_effective → poll → markdown_full), ~11с/фото,
@@ -1158,7 +1159,7 @@ _GEN_TRANSIENT_MARKERS = (
 )
 
 
-def _sync_generate_image(prompt: str, input_images_b64: list = None) -> tuple:
+def _sync_generate_image(prompt: str, input_images_b64: list = None, model: str = None) -> tuple:
     """Генерация/редактирование изображения через OpenRouter (Riverflow). Возвращает (байты, mime).
     Проверено живьём: modalities строго ["image"] (с "text" — 404), ответ приходит как webp data-URL.
     modalities/message.images — нестандарт OpenAI, поэтому requests, а не SDK-клиент.
@@ -1171,7 +1172,7 @@ def _sync_generate_image(prompt: str, input_images_b64: list = None) -> tuple:
         f"{OPENROUTER_BASE_URL}/chat/completions",
         headers={"Authorization": f"Bearer {openrouter_api_key}", "Content-Type": "application/json"},
         json={
-            "model": OPENROUTER_IMAGE_MODEL,
+            "model": model or OPENROUTER_IMAGE_MODEL,
             "messages": [{"role": "user", "content": content}],
             "modalities": ["image"],
         },
@@ -3170,12 +3171,15 @@ async def gen_command(event):
         t0 = time.time()
         # transient_left — перегрузка/лимит провайдера и сеть/5xx (ретрай ТЕМ ЖЕ промптом);
         # repair_left — только реальная МОДЕРАЦИЯ (DeepSeek переписывает промпт).
+        # При исчерпании transient на основной модели — переключаемся на запасную (fast).
+        gen_model = OPENROUTER_IMAGE_MODEL
+        used_fallback = False
         transient_left = 4
         repair_left = 2 if (prompt_by_ai or deepseek_requested) else 0
         attempt = 0
         while True:
             try:
-                raw, mime = await asyncio.to_thread(_sync_generate_image, final_prompt, input_b64s or None)
+                raw, mime = await asyncio.to_thread(_sync_generate_image, final_prompt, input_b64s or None, gen_model)
                 break
             except GenRejected as e:
                 log("GEN", f"Отклонено модерацией: {e} (repair_left={repair_left})")
@@ -3196,15 +3200,23 @@ async def gen_command(event):
                     transient_left -= 1
                     attempt += 1
                     wait = min(20, 5 + 4 * attempt)  # эскалация: 9, 13, 17, 20с
-                    log("GEN", f"Временный сбой провайдера: {e} — ретрай через {wait}с (осталось {transient_left})")
+                    log("GEN", f"Временный сбой провайдера ({gen_model}): {e} — ретрай через {wait}с (осталось {transient_left})")
                     await set_status("⏳ Провайдер генерации перегружен — повторяю…")
                     await asyncio.sleep(wait)
                     continue
+                if not used_fallback and OPENROUTER_IMAGE_FALLBACK and OPENROUTER_IMAGE_FALLBACK != gen_model:
+                    used_fallback = True
+                    gen_model = OPENROUTER_IMAGE_FALLBACK
+                    transient_left = 2
+                    attempt = 0
+                    log("GEN", f"Основная модель не отвечает — переключаюсь на запасную {gen_model}")
+                    await set_status("🔁 Основная модель перегружена — пробую запасную (fast)…")
+                    continue
                 await set_status(
-                    "❌ Провайдер генерации сейчас перегружен или исчерпан дневной лимит бесплатной модели.\n"
+                    "❌ Провайдер генерации сейчас перегружен или исчерпан дневной лимит бесплатных моделей.\n"
                     f"Попробуй ещё раз через минуту: `/gen {user_prompt[:200]}`")
                 return
-        log("GEN", f"Готово за {time.time() - t0:.1f}с · {len(raw) / 1024:.0f} КБ · {mime} · prompt_by_ai={prompt_by_ai}")
+        log("GEN", f"Готово за {time.time() - t0:.1f}с · {len(raw) / 1024:.0f} КБ · {mime} · prompt_by_ai={prompt_by_ai} · модель={'fast(запасная)' if used_fallback else 'pro'}")
         if "webp" in mime:
             raw = await _webp_to_png(raw)  # webp Telegram шлёт стикером — конвертим
 
@@ -4440,7 +4452,7 @@ _HELP_SECTIONS = {
     "gen": (
         "🎨 **`/gen` — генерация и редактирование изображений**\n"
         "\n"
-        "Модель: Riverflow V2.5 Pro (OpenRouter, бесплатная). Нужен `OPENROUTER_API_KEY`.\n"
+        "Модель: Riverflow V2.5 Pro (OpenRouter, бесплатная), при перегрузке — запасная Fast. Нужен `OPENROUTER_API_KEY`.\n"
         "\n"
         "**Синтаксис:** `/gen [N] [-i] <промпт>`\n"
         "   `/gen аниме кот в очках` — генерация ровно по твоему промпту\n"
@@ -4624,7 +4636,7 @@ async def status_command(event):
     _dig = load_json(DIGEST_STATE_PATH, {}).get("digest_time", "09:00")
     L.append(f"📡 **Каналы:** подключено {len(get_tracked())} · дайджест в {_dig}")
     # — генерация изображений —
-    L.append(f"🎨 **Генерация (`/gen`):** Riverflow V2.5 Pro (free) {'✅' if openrouter_client is not None else '❌ нет OPENROUTER_API_KEY'}")
+    L.append(f"🎨 **Генерация (`/gen`):** Riverflow V2.5 Pro → Fast (free, фолбэк) {'✅' if openrouter_client is not None else '❌ нет OPENROUTER_API_KEY'}")
     # — избранное —
     L.append(f"⭐ **Избранное:** {len(FISH_FAVORITES)} Fish-голос(ов) · {len(CUSTOM_MODELS)} кастомных моделей")
     # — ключи —
