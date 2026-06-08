@@ -2,7 +2,7 @@ from telethon import TelegramClient, events, utils
 from telethon.errors.rpcerrorlist import MessageNotModifiedError, FloodWaitError
 from telethon.extensions import html as tl_html
 from telethon.helpers import add_surrogate
-from telethon.tl.types import MessageEntityBlockquote, MessageEntityPre
+from telethon.tl.types import MessageEntityBlockquote, MessageEntityPre, MessageMediaWebPage
 from dotenv import load_dotenv
 from openai import OpenAI
 import os
@@ -3094,6 +3094,15 @@ async def _gen_fetch_link_refs(event, prompt):
     return cleaned, msgs, not_found
 
 
+def _is_attached_photo(msg):
+    """True только для РЕАЛЬНО прикреплённого фото. msg.photo истинно и для фото из ВЕБ-ПРЕВЬЮ
+    ссылки (Telegram авто-превью t.me-ссылки в тексте) — такое исключаем, иначе ссылка-референс
+    задваивается: фото из веб-превью команды + фото из самого сообщения по ссылке."""
+    if not getattr(msg, "photo", None):
+        return False
+    return not isinstance(getattr(msg, "media", None), MessageMediaWebPage)
+
+
 async def _gen_collect_input_images(event, reply_msg, extra_msgs=None):
     """Референс-фото для /gen: из самого сообщения с командой (включая его альбом), из реплая
     (включая альбом реплая) и из extra_msgs (ссылки — ТОЛЬКО указанное фото, без альбома).
@@ -3105,7 +3114,7 @@ async def _gen_collect_input_images(event, reply_msg, extra_msgs=None):
         if msg is None:
             return
         batch = []
-        if getattr(msg, "photo", None) and msg.id not in seen:
+        if _is_attached_photo(msg) and msg.id not in seen:
             seen.add(msg.id)
             batch.append(msg)
         gid = getattr(msg, "grouped_id", None)
@@ -3175,8 +3184,9 @@ async def gen_command(event):
     # — референс-фото (моё сообщение + альбом, reply + альбом, ссылки) собираем ДО удаления команды —
     input_b64s, skipped_imgs = await _gen_collect_input_images(event, reply_msg, extra_msgs=link_ref_msgs)
 
-    if is_owner and not event.message.media:
-        await event.delete()  # своё сообщение чистим (как в /ask); с приложенным фото — оставляем (это референс)
+    if is_owner and not _is_attached_photo(event.message):
+        await event.delete()  # чистим команду; ОСТАВЛЯЕМ только при реально приложенном фото-референсе
+        # (веб-превью t.me-ссылки — не вложение, поэтому команду со ссылками тоже удаляем)
     status = await client.send_message(event.chat_id, "🎨 Готовлю генерацию…")
 
     async def set_status(text):
