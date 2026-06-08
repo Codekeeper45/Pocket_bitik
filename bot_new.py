@@ -3157,7 +3157,7 @@ async def _gen_collect_input_images(event, reply_msg, extra_msgs=None):
     return out, skipped
 
 
-@client.on(events.NewMessage(pattern=r"^[./]gen(?:\s+(\d+))?((?:\s+-(?:improve|i))+)?\s+(.+)$"))
+@client.on(events.NewMessage(pattern=r"^[./]gen(?:\s+(\d+))?((?:\s+-(?:improve|creative|vertical|horizontal|square|sq|i|c|v|h))+)?\s+(.+)$"))
 async def gen_command(event):
     """Генерация изображений (Riverflow via OpenRouter). Промпт как есть, либо его строит/улучшает DeepSeek
     из контекста (N последних сообщений / текст reply / флаг -i). Фото в сообщении/reply → image-to-image."""
@@ -3170,7 +3170,14 @@ async def gen_command(event):
         await event.reply("⚠️ Генерация недоступна: нет `OPENROUTER_API_KEY` в .env.")
         return
     n = int(event.pattern_match.group(1)) if event.pattern_match.group(1) else 0
-    improve = bool(event.pattern_match.group(2))  # -i / -improve
+    toks = (event.pattern_match.group(2) or "").split()
+    improve = any(t in ("-i", "-improve") for t in toks)        # уточнить/улучшить промпт (edit при референсе)
+    creative = any(t in ("-c", "-creative") for t in toks)      # креатив: DeepSeek сочиняет промпт-ОТВЕТ (не редактирует)
+    orient = None                                               # ориентация → суффикс соотношения сторон в промпт
+    for t in toks:
+        if t in ("-v", "-vertical"): orient = "vertical"
+        elif t in ("-h", "-horizontal"): orient = "horizontal"
+        elif t in ("-sq", "-square"): orient = "square"
     user_prompt = event.pattern_match.group(3).strip()
     reply_msg = await event.get_reply_message() if getattr(event, "reply_to", None) else None
     reply_target_id = getattr(event, "reply_to_msg_id", None)
@@ -3179,7 +3186,7 @@ async def gen_command(event):
     user_prompt, link_ref_msgs, link_not_found = await _gen_fetch_link_refs(event, user_prompt)
     if not user_prompt:  # остались одни ссылки без инструкции — даём осмысленный дефолт
         user_prompt = "combine the reference images into one cohesive scene"
-    log("GEN", f"Старт от {caller}: N={n or '—'} · improve={improve} · reply={'да' if reply_msg else 'нет'} · ссылок-реф={len(link_ref_msgs)} · «{user_prompt[:80]}»")
+    log("GEN", f"Старт от {caller}: N={n or '—'} · improve={improve} · creative={creative} · ориент={orient or '—'} · reply={'да' if reply_msg else 'нет'} · ссылок-реф={len(link_ref_msgs)} · «{user_prompt[:80]}»")
 
     # — референс-фото (моё сообщение + альбом, reply + альбом, ссылки) собираем ДО удаления команды —
     input_b64s, skipped_imgs = await _gen_collect_input_images(event, reply_msg, extra_msgs=link_ref_msgs)
@@ -3217,16 +3224,17 @@ async def gen_command(event):
             ordered = list(reversed(msgs[:n]))
             context_text, _, _, _ = await assemble_context(ordered, True)  # text-only: медиа не разбираем
         elif reply_msg is not None and (reply_msg.raw_text or "").strip():
-            # Reply на сообщение С ФОТО: без -i DeepSeek не вмешивается (промпт дословный, фото на вход);
-            # с -i — улучшает промпт, учитывая текст/подпись реплая. Reply на чистый текст — как раньше.
+            # Reply на сообщение С ФОТО: без флагов DeepSeek не вмешивается (промпт дословный, фото на вход);
+            # с -i/-c — берёт текст/подпись реплая в контекст. Reply на чистый текст — как раньше.
             reply_with_photo = bool(getattr(reply_msg, "photo", None) or getattr(reply_msg, "grouped_id", None))
-            if not reply_with_photo or improve:
+            if not reply_with_photo or improve or creative:
                 context_text = (reply_msg.raw_text or "").strip()[:4000]
 
-        if context_text or improve:
-            # DeepSeek сам не видит картинки → референсы сначала описывает vision-модель (с кэшем),
-            # и при наличии референсов DeepSeek работает в режиме РЕДАКТИРОВАНИЯ (только уточнение
-            # формулировок, без добавления своих деталей); без референсов — творческий режим как раньше.
+        if context_text or improve or creative:
+            # DeepSeek сам не видит картинки → референсы сначала описывает vision-модель (с кэшем).
+            # Режим: -c (creative) → DeepSeek СОЧИНЯЕТ промпт-ответ (не редактирует), даже при референсе;
+            # иначе при наличии референсов — РЕДАКТИРОВАНИЕ (только уточнение, без отсебятины);
+            # без референсов — творческий режим. Фото в любом случае уходят генератору на вход.
             image_desc = None
             if input_b64s:
                 await set_status("👁 Изучаю референсы (vision)…")
@@ -3248,15 +3256,23 @@ async def gen_command(event):
                 if refused and not descs:
                     await set_status("👁 Vision не смог описать фото (фильтр) — генерирую по фото и тексту без описания…")
             await set_status("🧠 DeepSeek готовит промпт…")
+            edit_mode = bool(input_b64s) and not creative  # -c заставляет творческий режим даже с референсом
             final_prompt = await asyncio.to_thread(
-                _sync_image_prompt, user_prompt, context_text, image_desc, bool(input_b64s))
+                _sync_image_prompt, user_prompt, context_text, image_desc, edit_mode)
             prompt_by_ai = final_prompt != user_prompt
-            log("GEN", f"Промпт: by_ai={prompt_by_ai} · vision_desc={'есть' if image_desc else 'нет'} · len={len(final_prompt)}")
+            log("GEN", f"Промпт: by_ai={prompt_by_ai} · режим={'edit' if edit_mode else 'creative'} · vision_desc={'есть' if image_desc else 'нет'} · len={len(final_prompt)}")
 
         # — генерация (ретраи: временные сбои — тем же промптом; отказ провайдера — DeepSeek правит промпт).
         # Repair доступен, если DeepSeek был ЗАПРОШЕН (число/-i/текст-контекст) — даже когда его первая
         # попытка не удалась (вернул пустое/упал) и промпт ушёл исходным. Без участия DeepSeek — без repair.
-        deepseek_requested = bool(context_text or improve)
+        deepseek_requested = bool(context_text or improve or creative)
+        # Ориентация — суффикс соотношения сторон, дописывается к промпту НА ВЫЗОВЕ генерации
+        # (переживает repair-переписывание final_prompt). У Riverflow нет параметра размера — это сильный хинт.
+        orient_suffix = {
+            "vertical": " Aspect ratio 9:16, vertical portrait orientation.",
+            "horizontal": " Aspect ratio 16:9, horizontal landscape orientation.",
+            "square": " Aspect ratio 1:1, square format.",
+        }.get(orient, "")
         await set_status("🎨 Генерирую изображение… (может занять до пары минут)")
         t0 = time.time()
         # transient_left — перегрузка/лимит провайдера и сеть/5xx (ретрай ТЕМ ЖЕ промптом);
@@ -3269,7 +3285,7 @@ async def gen_command(event):
         attempt = 0
         while True:
             try:
-                raw, mime = await asyncio.to_thread(_sync_generate_image, final_prompt, input_b64s or None, gen_model)
+                raw, mime = await asyncio.to_thread(_sync_generate_image, final_prompt + orient_suffix, input_b64s or None, gen_model)
                 break
             except GenRejected as e:
                 log("GEN", f"Отклонено модерацией: {e} (repair_left={repair_left})")
@@ -4544,10 +4560,20 @@ _HELP_SECTIONS = {
         "\n"
         "Модель: Riverflow V2.5 Pro (OpenRouter, бесплатная), при перегрузке — запасная Fast. Нужен `OPENROUTER_API_KEY`.\n"
         "\n"
-        "**Синтаксис:** `/gen [N] [-i] <промпт>`\n"
+        "**Синтаксис:** `/gen [N] [-i|-c] [-v|-h|-sq] <промпт>`\n"
         "   `/gen аниме кот в очках` — генерация ровно по твоему промпту\n"
-        "   `/gen -i закат над морем` — DeepSeek сначала улучшит промпт (флаг `-i` или `-improve`)\n"
+        "   `/gen -i закат над морем` — DeepSeek улучшит/уточнит промпт (`-i` или `-improve`)\n"
         "   `/gen 100 нарисуй о чём мы спорим` — DeepSeek составит промпт по последним 100 сообщениям чата\n"
+        "\n"
+        "**Режим `-c` (creative) — спросить DeepSeek, а не редактировать:**\n"
+        "   DeepSeek сам СОЧИНЯЕТ генеративный промпт-ОТВЕТ на твой запрос (даже когда есть референс),\n"
+        "   а не правит твой текст дословно. Полезно, когда хочешь задать вопрос, а не инструкцию:\n"
+        "   `/gen 200 -c что хочет нарисовать чат?` · `/gen -c <ссылка> сделай что-то в этом духе`\n"
+        "   (без `-c` и с референсом DeepSeek в режиме РЕДАКТИРОВАНИЯ — только уточняет, без отсебятины).\n"
+        "\n"
+        "**Ориентация (соотношение сторон):** `-v` вертикаль 9:16 · `-h` горизонталь 16:9 · `-sq` квадрат 1:1\n"
+        "   `/gen -v аниме девушка у окна` · `/gen -h пейзаж гор` · комбинируется: `/gen -c -v <ссылка> …`\n"
+        "   (у модели нет жёсткого размера — это сильный хинт в промпте, не гарантия точных пикселей).\n"
         "\n"
         "**Референс-изображения (image-to-image):**\n"
         "   • прикрепи **фото прямо к сообщению** с `/gen` (можно альбомом) — они уйдут модели на вход;\n"
