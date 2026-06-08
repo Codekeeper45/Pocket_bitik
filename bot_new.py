@@ -1138,8 +1138,24 @@ async def _transcribe_with(model: str, audio_bytes: bytes, fmt: str) -> str:
 
 
 class GenRejected(Exception):
-    """Провайдер отклонил запрос генерации (4xx/422 или ответ без картинки) — ретрай тем же
-    промптом бессмыслен; помогает только правка промпта (repair) или переформулировка."""
+    """Провайдер отклонил запрос ПО СОДЕРЖАНИЮ (4xx/422 или ответ с маркером модерации) — ретрай
+    тем же промптом бессмыслен; помогает только правка промпта (repair) или переформулировка."""
+
+
+class GenTransient(Exception):
+    """Временный сбой генерации (провайдер перегружен/лимит/«Provider returned error», нет инстансов) —
+    НЕ цензура: правка промпта не поможет, нужен ретрай ТЕМ ЖЕ промптом позже."""
+
+
+# Маркеры временного сбоя аптайм-провайдера в теле ответа OpenRouter (HTTP 200 без картинки).
+# Бесплатная riverflow при перегрузке отдаёт «Provider returned error» — это НЕ модерация.
+_GEN_TRANSIENT_MARKERS = (
+    "provider returned error", "provider error", "no instances", "no endpoints",
+    "rate limit", "rate-limit", "ratelimited", "too many requests", "429",
+    "overloaded", "capacity", "unavailable", "temporarily", "timeout", "timed out",
+    "try again", "upstream", "bad gateway", "502", "503", "504", "server error",
+    "busy", "quota", "exhausted", "no available",
+)
 
 
 def _sync_generate_image(prompt: str, input_images_b64: list = None) -> tuple:
@@ -1173,7 +1189,12 @@ def _sync_generate_image(prompt: str, input_images_b64: list = None) -> tuple:
     images = (data.get("choices") or [{}])[0].get("message", {}).get("images") or []
     if not images:
         err = (data.get("choices") or [{}])[0].get("message", {}).get("content") or data.get("error", {}).get("message") or "пустой ответ"
-        raise GenRejected(f"модель не вернула изображение: {str(err)[:200]}")
+        err_s = str(err)
+        # HTTP 200 без картинки бывает двух видов: перегрузка провайдера («Provider returned error»,
+        # лимиты, нет инстансов) — это ВРЕМЕННО (ретрай тем же промптом), либо реальная модерация.
+        if any(mk in err_s.lower() for mk in _GEN_TRANSIENT_MARKERS):
+            raise GenTransient(f"провайдер не отдал картинку (временно): {err_s[:200]}")
+        raise GenRejected(f"модель не вернула изображение: {err_s[:200]}")
     url = images[0]["image_url"]["url"]
     head, b64_out = url.split(",", 1)
     mime = head.split(":", 1)[-1].split(";", 1)[0] or "image/webp"  # "data:image/webp;base64"
@@ -2254,15 +2275,19 @@ async def _reply_info(msg, by_id=None, net_budget=None, rep_stats=None) -> str:
             rep = await msg.get_reply_message()
         except Exception:
             rep = None
+    # Telethon в редких случаях (reply на сообщение в другом канале, reply-to-story,
+    # batch get_messages) возвращает TotalList/list вместо одного Message — нормализуем.
+    if isinstance(rep, (list, tuple)):
+        rep = next((r for r in rep if r is not None), None)
     if rep is None:
         if rep_stats is not None:
             rep_stats["no_quote"] = rep_stats.get("no_quote", 0) + 1
         return "↩"
-    if rep.out:
+    if getattr(rep, "out", False):
         rauthor = _owner_label()
     else:
-        rauthor = _user_label(rep.sender)
-    quote = _preview(rep.raw_text or (_media_tag(rep) or ""), 50)
+        rauthor = _user_label(getattr(rep, "sender", None))
+    quote = _preview(getattr(rep, "raw_text", None) or (_media_tag(rep) or ""), 50)
     head = ("↩ " + rauthor).strip()
     if quote:
         head += f": «{quote}»"
@@ -3143,33 +3168,42 @@ async def gen_command(event):
         deepseek_requested = bool(context_text or improve)
         await set_status("🎨 Генерирую изображение… (может занять до пары минут)")
         t0 = time.time()
-        transient_left = 2
+        # transient_left — перегрузка/лимит провайдера и сеть/5xx (ретрай ТЕМ ЖЕ промптом);
+        # repair_left — только реальная МОДЕРАЦИЯ (DeepSeek переписывает промпт).
+        transient_left = 4
         repair_left = 2 if (prompt_by_ai or deepseek_requested) else 0
+        attempt = 0
         while True:
             try:
                 raw, mime = await asyncio.to_thread(_sync_generate_image, final_prompt, input_b64s or None)
                 break
             except GenRejected as e:
-                log("GEN", f"Отклонено провайдером: {e} (repair_left={repair_left})")
+                log("GEN", f"Отклонено модерацией: {e} (repair_left={repair_left})")
                 if repair_left > 0:
                     repair_left -= 1
-                    await set_status("🔁 Промпт отклонён провайдером — DeepSeek правит его и пробуем снова…")
+                    await set_status("🔁 Промпт отклонён модерацией — DeepSeek правит его и пробуем снова…")
                     new_prompt = await asyncio.to_thread(_sync_repair_image_prompt, final_prompt, user_prompt)
                     if new_prompt != final_prompt:
                         final_prompt = new_prompt
                         continue
+                    log("GEN", "Repair не изменил промпт (DeepSeek недоступен/сам фильтрует) — отказ")
                 await set_status(
-                    "❌ Запрос отклонён провайдером (политика контента или некорректный вход).\n"
+                    "❌ Запрос отклонён модерацией провайдера.\n"
                     f"Переформулируй промпт и попробуй снова: `/gen {user_prompt[:200]}`")
                 return
-            except Exception as e:
+            except (GenTransient, requests.exceptions.RequestException) as e:
                 if transient_left > 0:
                     transient_left -= 1
-                    log("GEN", f"Временный сбой: {e} — ретрай (осталось {transient_left})")
-                    await set_status("⏳ Временный сбой провайдера — повторяю…")
-                    await asyncio.sleep(5)
+                    attempt += 1
+                    wait = min(20, 5 + 4 * attempt)  # эскалация: 9, 13, 17, 20с
+                    log("GEN", f"Временный сбой провайдера: {e} — ретрай через {wait}с (осталось {transient_left})")
+                    await set_status("⏳ Провайдер генерации перегружен — повторяю…")
+                    await asyncio.sleep(wait)
                     continue
-                raise
+                await set_status(
+                    "❌ Провайдер генерации сейчас перегружен или исчерпан дневной лимит бесплатной модели.\n"
+                    f"Попробуй ещё раз через минуту: `/gen {user_prompt[:200]}`")
+                return
         log("GEN", f"Готово за {time.time() - t0:.1f}с · {len(raw) / 1024:.0f} КБ · {mime} · prompt_by_ai={prompt_by_ai}")
         if "webp" in mime:
             raw = await _webp_to_png(raw)  # webp Telegram шлёт стикером — конвертим
