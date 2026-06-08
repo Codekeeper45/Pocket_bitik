@@ -3063,10 +3063,42 @@ async def ask_command(event):
         log("ASK", f"Тайминги: сбор={t_collected-t0:.1f}с · контекст(медиа)={t_ctx-t_collected:.1f}с · LLM={t_llm-t_ctx:.1f}с · отправка={t_sent-t_llm:.1f}с · итого={t_end-t0:.1f}с")
 
 
-async def _gen_collect_input_images(event, reply_msg):
-    """Референс-фото для /gen: из самого сообщения с командой (включая его альбом) и из реплая
-    (включая альбом реплая). Возвращает (list_b64, skipped): максимум 10 фото, суммарно
-    ≤ GEN_IMAGE_MAX_INPUT сырых байт (лимит запроса API 4.5 МБ); лишние пропускаются."""
+# t.me-ссылка на сообщение: c/<internal>/<msg> · c/<internal>/<topic>/<msg> · <username>/<msg>.
+# msg_id — последний числовой сегмент; chat-часть = группа 1 (c/<id> или username).
+_TME_LINK_RE = re.compile(r'(?:https?://)?t\.me/(c/\d+|[A-Za-z]\w{2,})((?:/\d+)+)', re.I)
+
+
+async def _gen_fetch_link_refs(event, prompt):
+    """Находит t.me-ссылки на сообщения в промпте /gen, тянет их фото (ТОЛЬКО указанное, без альбома),
+    вырезает ссылки из текста. Возвращает (cleaned_prompt, [Message…], not_found)."""
+    matches = list(_TME_LINK_RE.finditer(prompt))
+    if not matches:
+        return prompt, [], 0
+    msgs, not_found = [], 0
+    for mt in matches:
+        chat_ref, tail = mt.group(1), mt.group(2)
+        try:
+            msg_id = int(tail.strip("/").split("/")[-1])
+            peer = int("-100" + chat_ref[2:]) if chat_ref.lower().startswith("c/") else chat_ref
+            fetched = await client.get_messages(peer, ids=[msg_id])
+            fm = next((x for x in (fetched or []) if x is not None), None)
+        except Exception as e:
+            log("GEN", f"Ссылка-референс {chat_ref}{tail}: не достал ({e})")
+            fm = None
+        if fm is not None and getattr(fm, "photo", None):
+            msgs.append(fm)
+        else:
+            not_found += 1
+    cleaned = re.sub(r"\s{2,}", " ", _TME_LINK_RE.sub("", prompt)).strip()
+    log("GEN", f"Ссылки-референсы: найдено {len(matches)}, с фото {len(msgs)}, без фото/недоступно {not_found}")
+    return cleaned, msgs, not_found
+
+
+async def _gen_collect_input_images(event, reply_msg, extra_msgs=None):
+    """Референс-фото для /gen: из самого сообщения с командой (включая его альбом), из реплая
+    (включая альбом реплая) и из extra_msgs (ссылки — ТОЛЬКО указанное фото, без альбома).
+    Возвращает (list_b64, skipped): максимум 10 фото, суммарно ≤ GEN_IMAGE_MAX_INPUT сырых байт
+    (лимит запроса API 4.5 МБ); лишние пропускаются."""
     sources, seen = [], set()
 
     async def _add_with_album(msg):
@@ -3090,6 +3122,10 @@ async def _gen_collect_input_images(event, reply_msg):
 
     await _add_with_album(event.message)  # сначала мои приложенные фото, потом фото реплая
     await _add_with_album(reply_msg)
+    for m in (extra_msgs or []):  # ссылки-референсы: ровно указанное фото, без альбома
+        if m is not None and getattr(m, "photo", None) and m.id not in seen:
+            seen.add(m.id)
+            sources.append(m)
     out, total, skipped = [], 0, 0
     for m in sources:
         if len(out) >= 10:
@@ -3130,10 +3166,14 @@ async def gen_command(event):
     reply_msg = await event.get_reply_message() if getattr(event, "reply_to", None) else None
     reply_target_id = getattr(event, "reply_to_msg_id", None)
     caller = _owner_label() if is_owner else _user_label(event.sender or await event.get_sender())
-    log("GEN", f"Старт от {caller}: N={n or '—'} · improve={improve} · reply={'да' if reply_msg else 'нет'} · «{user_prompt[:80]}»")
+    # Ссылки-референсы: t.me-ссылки на сообщения в промпте → их фото на вход, ссылки из текста убираем.
+    user_prompt, link_ref_msgs, link_not_found = await _gen_fetch_link_refs(event, user_prompt)
+    if not user_prompt:  # остались одни ссылки без инструкции — даём осмысленный дефолт
+        user_prompt = "combine the reference images into one cohesive scene"
+    log("GEN", f"Старт от {caller}: N={n or '—'} · improve={improve} · reply={'да' if reply_msg else 'нет'} · ссылок-реф={len(link_ref_msgs)} · «{user_prompt[:80]}»")
 
-    # — референс-фото (моё сообщение + альбом, reply + альбом) собираем ДО удаления команды —
-    input_b64s, skipped_imgs = await _gen_collect_input_images(event, reply_msg)
+    # — референс-фото (моё сообщение + альбом, reply + альбом, ссылки) собираем ДО удаления команды —
+    input_b64s, skipped_imgs = await _gen_collect_input_images(event, reply_msg, extra_msgs=link_ref_msgs)
 
     if is_owner and not event.message.media:
         await event.delete()  # своё сообщение чистим (как в /ask); с приложенным фото — оставляем (это референс)
@@ -3153,6 +3193,8 @@ async def gen_command(event):
             return
         if skipped_imgs:
             await set_status(f"ℹ️ Взял {len(input_b64s)} фото, пропустил {skipped_imgs} (лимит 3 МБ суммарно / макс. 10).")
+        if link_not_found:
+            await set_status(f"⚠️ {link_not_found} ссылк{'а' if link_not_found == 1 else 'и'}-референс без фото или недоступн{'а' if link_not_found == 1 else 'ы'} — пропускаю.")
 
         # — финальный промпт —
         final_prompt, prompt_by_ai = user_prompt, False
@@ -4503,7 +4545,12 @@ _HELP_SECTIONS = {
         "     (промпт идёт дословно; добавь `-i` — DeepSeek уточнит формулировку, «увидев» референс\n"
         "     через vision-модель, и ничего не добавит от себя — меняется только то, что просишь);\n"
         "   • reply на **текстовое** сообщение — его текст идёт в контекст, промпт строит DeepSeek;\n"
-        "   • можно совместить: своё фото + reply на чужое — все референсы объединяются.\n"
+        "   • **ссылки на сообщения** прямо в промпте — фото из них уйдут на вход (для нескольких\n"
+        "     референсов из РАЗНЫХ сообщений за одну команду): на каждом фото «Скопировать ссылку»,\n"
+        "     вставь в `/gen`; ссылки вырезаются из текста — модель видит чистый промпт. Пример:\n"
+        "     `/gen https://t.me/c/123/45 https://t.me/c/123/60 нарисуй их в одной сцене`\n"
+        "     (берётся ровно указанное фото, альбом НЕ подтягивается);\n"
+        "   • можно совместить: своё фото + reply + ссылки — все референсы объединяются.\n"
         "   ⚠️ До 10 фото, суммарно до 3 МБ (лимит API).\n"
         "\n"
         "Если промпт составлял/улучшал DeepSeek — он приходит **целиком** (без обрезки) свёрнутой цитатой:\n"
