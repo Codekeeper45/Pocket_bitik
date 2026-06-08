@@ -1254,12 +1254,15 @@ def _sync_image_prompt(user_prompt: str, context_text: str = None, image_desc: s
             model=DEEPSEEK_MODEL,
             messages=[{"role": "system", "content": _IMAGE_EDIT_SYSTEM if edit_mode else _IMAGE_PROMPT_SYSTEM},
                       {"role": "user", "content": "\n\n".join(parts)}],
-            max_tokens=600,
+            max_tokens=ASK_MAX_TOKENS,  # deepseek-v4-pro — reasoning-модель: 600 токенов съедались размышлениями
             temperature=0.4 if edit_mode else 0.7,  # редактирование — точность, создание — креатив
         )
-        out = (resp.choices[0].message.content or "").strip()
-        if not out:  # пустой ответ = тихий отказ DeepSeek (контент-фильтр) — фиксируем в логе
-            log("GEN", "DeepSeek вернул пустой промпт (вероятно, контент-фильтр) — использую исходный")
+        choice = resp.choices[0]
+        out = _strip_think((choice.message.content or "").strip())  # вырезаем inline <think>, если есть
+        if not out:  # реальная диагностика вместо догадки про «контент-фильтр»
+            fr = getattr(choice, "finish_reason", "?")
+            rc = getattr(choice.message, "reasoning_content", None)
+            log("GEN", f"DeepSeek пустой content (finish_reason={fr}, reasoning={len(rc) if rc else 0} симв) — использую исходный")
         return out or user_prompt
     except Exception as e:
         log("GEN", f"DeepSeek-промпт не получился ({e}), использую исходный")
@@ -1287,10 +1290,10 @@ def _sync_repair_image_prompt(bad_prompt: str, user_prompt: str) -> str:
                 {"role": "system", "content": _IMAGE_REPAIR_SYSTEM},
                 {"role": "user", "content": f"Изначальный запрос пользователя: {user_prompt}\n\nОтклонённый промпт:\n{bad_prompt}"},
             ],
-            max_tokens=600,
+            max_tokens=ASK_MAX_TOKENS,  # reasoning-модель: малый бюджет → пустой content (см. _sync_image_prompt)
             temperature=0.7,
         )
-        out = (resp.choices[0].message.content or "").strip()
+        out = _strip_think((resp.choices[0].message.content or "").strip())
         return out or bad_prompt
     except Exception as e:
         log("GEN", f"DeepSeek-repair не получился ({e})")
