@@ -2867,7 +2867,22 @@ async def ask_command(event):
                     if _keep(m) and len(messages) >= n:
                         break
                 messages.sort(key=lambda m: m.id, reverse=True)
-            messages = messages[:n]
+            # Альбом в Telegram = N отдельных сообщений с общим grouped_id; обрезка ровно по N
+            # рассекала бы его (напр. /ask 1 на альбоме из 9 фото видел бы только последнее).
+            # messages отсортирован по убыванию id → альбом-сиблинги идут подряд; дотягиваем хвост
+            # альбома за границей N (ограничено размером альбома ≤10, сиблинги уже в выборке).
+            kept = messages[:n]
+            if kept and len(messages) > n:
+                boundary_gid = getattr(kept[-1], "grouped_id", None)
+                if boundary_gid is not None:
+                    for m in messages[n:]:
+                        if getattr(m, "grouped_id", None) == boundary_gid:
+                            kept.append(m)
+                        else:
+                            break
+                    if len(kept) > n:
+                        log("ASK", f"Альбом на границе N={n}: дотянул {len(kept) - n} фото (grouped_id={boundary_gid})")
+            messages = kept
             log("ASK", f"iter_messages diag: raw={diag['raw']} · skip service={diag['service']} · команда={diag['self_cmd']} · excludes={diag['excluded']} → попало {len(messages) - (1 if anchor_id else 0)} (+якорь {1 if anchor_id else 0})")
             if anchor is not None:
                 aut = _owner_label() if anchor.out else _user_label(anchor.sender)
