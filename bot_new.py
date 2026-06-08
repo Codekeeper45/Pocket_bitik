@@ -2888,6 +2888,29 @@ async def ask_command(event):
                 aut = _owner_label() if anchor.out else _user_label(anchor.sender)
                 qprev = _preview(anchor.raw_text or (_media_tag(anchor) or ""), 60)
                 log("ASK", f"Reply-якорь: id={anchor.id}, автор {aut}, «{qprev}»" + (" (исключён из контекста)" if anchor_id is None else ""))
+            # Reply на АЛЬБОМ: reply_to указывает на одно сообщение альбома (обычно первое, с подписью),
+            # а остальные фото имеют СОСЕДНИЕ id — часто НОВЕЕ якоря, за пределами окна сбора назад.
+            # Дотягиваем весь альбом якоря явным запросом по диапазону id (альбом ≤10 → ±9 покрывает).
+            if anchor is not None and getattr(anchor, "grouped_id", None) is not None:
+                a_gid = anchor.grouped_id
+                want = [i for i in range(anchor.id - 9, anchor.id + 10) if i > 0 and i != event.id]
+                try:
+                    sib = await client.get_messages(event.chat_id, ids=want)
+                except Exception as e:
+                    sib = []
+                    log("ASK", f"Reply-альбом: не удалось дотянуть сиблингов: {e}")
+                have = {getattr(m, "id", None) for m in messages}
+                added = 0
+                for sm in (sib or []):
+                    if sm is None or getattr(sm, "id", None) in have:
+                        continue
+                    if getattr(sm, "grouped_id", None) == a_gid and not _is_excluded(sm):
+                        messages.append(sm)
+                        have.add(sm.id)
+                        added += 1
+                if added:
+                    messages.sort(key=lambda m: m.id, reverse=True)
+                    log("ASK", f"Reply на альбом: дотянул {added} фото альбома якоря (grouped_id={a_gid})")
 
         ordered = list(reversed(messages))
         t_collected = time.time()
