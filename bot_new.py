@@ -1246,29 +1246,12 @@ _IMAGE_EDIT_SYSTEM = (
 )
 
 
-# «Углы» вариации для пакета (-xN): каждому варианту — свой, чтобы промпты были разными даже параллельно.
-_GEN_VARIATION_ANGLES = [
-    "другой ракурс и угол камеры",
-    "другое настроение и схема освещения",
-    "другая цветовая палитра",
-    "другая композиция и кадрирование",
-    "более крупный план, акцент на деталях",
-    "более общий, широкий план со средой",
-    "другое время суток / погода",
-    "другой стиль или техника исполнения",
-    "другой фон и окружение",
-    "другая поза, динамика, действие",
-    "другой эмоциональный тон сцены",
-    "неожиданный творческий приём, нестандартный взгляд",
-]
-
-
 def _sync_image_prompt(user_prompt: str, context_text: str = None, image_desc: str = None,
-                       edit_mode: bool = False, variation_hint: str = None) -> str:
+                       edit_mode: bool = False, previous_prompts: list = None) -> str:
     """Финальный промпт генерации через DeepSeek (официальный). При недоступности — исходный промпт.
     edit_mode (есть референсы) — только уточнение формулировок, без отсебятины;
     иначе — творческий детальный промпт. image_desc — vision-описания референсов (DeepSeek сам не видит).
-    variation_hint — для пакета: «угол» вариации, чтобы каждый промпт был ЗАМЕТНО другим."""
+    previous_prompts — для пакета: промпты уже сделанных вариантов; DeepSeek сам придумает НЕпохожий."""
     if deepseek_client is None:
         return user_prompt
     parts = []
@@ -1277,17 +1260,19 @@ def _sync_image_prompt(user_prompt: str, context_text: str = None, image_desc: s
     if image_desc:
         parts.append(f"Описание референсных изображений (поданы модели на вход):\n{image_desc}")
     parts.append(f"Запрос пользователя: {user_prompt}")
-    if variation_hint:
-        parts.append(f"ЭТО ОДИН ИЗ НЕСКОЛЬКИХ ВАРИАНТОВ. Сделай его ЗАМЕТНО ОТЛИЧНЫМ от других вариантов "
-                     f"того же запроса: {variation_hint}. Суть запроса сохрани, но подачу/детали поменяй существенно.")
+    if previous_prompts:
+        joined = "\n".join(f"{i}. {p}" for i, p in enumerate(previous_prompts, 1))
+        parts.append("Это ОЧЕРЕДНОЙ вариант того же запроса. Уже придуманы такие промпты — НЕ повторяй их "
+                     "(ни идею, ни композицию, ни ракурс, ни формулировки):\n" + joined +
+                     "\n\nПридумай СВЕЖИЙ, заметно непохожий вариант — доверься своей фантазии, удиви.")
     try:
         resp = deepseek_client.chat.completions.create(
             model=DEEPSEEK_MODEL,
             messages=[{"role": "system", "content": _IMAGE_EDIT_SYSTEM if edit_mode else _IMAGE_PROMPT_SYSTEM},
                       {"role": "user", "content": "\n\n".join(parts)}],
             max_tokens=ASK_MAX_TOKENS,  # deepseek-v4-pro — reasoning-модель: 600 токенов съедались размышлениями
-            # вариация → выше температура для разнообразия; редактирование — точность, создание — креатив
-            temperature=(1.0 if variation_hint else (0.4 if edit_mode else 0.7)),
+            # пакет (есть история) → выше температура для разнообразия; редактирование — точность, создание — креатив
+            temperature=(1.0 if previous_prompts else (0.4 if edit_mode else 0.7)),
         )
         choice = resp.choices[0]
         out = _strip_think((choice.message.content or "").strip())  # вырезаем inline <think>, если есть
@@ -3377,19 +3362,12 @@ async def gen_command(event):
 
         # ── ПАКЕТНАЯ генерация (-xN): N вариантов → в Избранное (Saved Messages), прогресс в текущем чате ──
         if batch_count > 1:
-            await set_status(f"🎨 Пакет: 0/{batch_count} вариантов → в Избранное…")
+            await set_status(f"🎨 Пакет {batch_count} → в Избранное: придумываю уникальные промпты…")
             counter = {"done": 0, "ok": 0}
             sem = asyncio.Semaphore(GEN_BATCH_CONCURRENCY)
 
-            async def _variant(idx):
+            async def _gen_and_send(idx, fp, by_ai):
                 async with sem:
-                    fp, by_ai = user_prompt, False
-                    # В ПАКЕТЕ DeepSeek пишет КАЖДОМУ варианту свой промпт со своим «углом» вариации → все уникальны
-                    # (даже без -c/-i/N). Если DeepSeek недоступен/отказал — фолбэк на исходный промпт.
-                    if deepseek_client is not None:
-                        hint = _GEN_VARIATION_ANGLES[idx % len(_GEN_VARIATION_ANGLES)]
-                        fp = await asyncio.to_thread(_sync_image_prompt, user_prompt, context_text, image_desc, edit_mode, hint)
-                        by_ai = fp != user_prompt
                     raw_i, mime_i, used_fp, _fb = await _gen_one_image(
                         fp, input_b64s, image_size, aspect_ratio, (by_ai or deepseek_requested), user_prompt)
                     counter["done"] += 1
@@ -3403,7 +3381,20 @@ async def gen_command(event):
                         log("GEN", f"Вариант {idx + 1} не сгенерирован ({mime_i})")
                     await set_status(f"🎨 {counter['done']}/{batch_count} готово · {counter['ok']} в Избранном…")
 
-            await asyncio.gather(*[_variant(i) for i in range(batch_count)])
+            # Промпты строим ПОСЛЕДОВАТЕЛЬНО: каждому показываем все предыдущие, и DeepSeek САМ придумывает
+            # непохожий (без навязанных «углов»). Генерацию (медленную) сразу запускаем в фоне → перекрытие.
+            prompts, tasks = [], []
+            for i in range(batch_count):
+                fp, by_ai = user_prompt, False
+                if deepseek_client is not None:
+                    fp = await asyncio.to_thread(_sync_image_prompt, user_prompt, context_text, image_desc, edit_mode, prompts)
+                    by_ai = fp != user_prompt
+                    log("GEN", f"Вариант {i + 1}/{batch_count}: промпт by_ai={by_ai} len={len(fp)}")
+                prompts.append(fp)
+                tasks.append(asyncio.create_task(_gen_and_send(i, fp, by_ai)))
+                if deepseek_client is not None and i + 1 < batch_count:
+                    await set_status(f"🧠 Промпты {i + 1}/{batch_count} · 🎨 {counter['done']}/{batch_count} готово…")
+            await asyncio.gather(*tasks)
             await set_status(f"✅ {counter['ok']}/{batch_count} вариантов отправлено тебе в Избранное (Saved Messages) 📌")
             await asyncio.sleep(6)
             try:
@@ -4671,8 +4662,8 @@ _HELP_SECTIONS = {
         "   но 2K/4K заметно чётче дефолтного 1K. (Запасная Fast не умеет 4K → авто-понижение до 2K.)\n"
         "\n"
         "**Пакет `-xK` — много вариантов в Избранное:** `-x8` → 8 вариантов уйдут тебе в **Saved Messages**\n"
-        "   (не в текущий чат — там только прогресс), макс. 20. В пакете DeepSeek пишет КАЖДОМУ варианту\n"
-        "   свой УНИКАЛЬНЫЙ промпт со своим «углом» (ракурс/свет/палитра/композиция…) — все разные.\n"
+        "   (не в текущий чат — там только прогресс), макс. 20. DeepSeek пишет КАЖДОМУ варианту свой\n"
+        "   промпт, ВИДЯ все предыдущие → сам придумывает непохожие (без навязанных шаблонов), все уникальны.\n"
         "   `/gen -x10 -4k аниме кот` · `/gen 200 -c -x8 что нарисовать?` (только для владельца).\n"
         "\n"
         "**Референс-изображения (image-to-image):**\n"
