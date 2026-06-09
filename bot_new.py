@@ -3253,7 +3253,7 @@ async def _gen_send_image(chat, raw, mime, final_prompt, prompt_by_ai, reply_to)
         await client.send_file(chat, bio, reply_to=reply_to)
 
 
-@client.on(events.NewMessage(pattern=r"^[./]gen(?:\s+(\d+))?((?:\s+-(?:improve|creative|vertical|horizontal|square|sq|4k|2k|1k|x\d+|i|c|v|h))+)?\s+(.+)$"))
+@client.on(events.NewMessage(pattern=r"^[./]gen(?:\s+(\d+))?((?:\s+-(?:improve|creative|vertical|horizontal|square|sq|4k|2k|1k|x\d+|i|c|v|h))+)?((?:\s+!?@\w+)+)?\s+(.+)$"))
 async def gen_command(event):
     """Генерация изображений (Riverflow via OpenRouter). Промпт как есть, либо его строит/улучшает DeepSeek
     из контекста (N последних сообщений / текст reply / флаг -i). Фото в сообщении/reply → image-to-image."""
@@ -3285,7 +3285,10 @@ async def gen_command(event):
             batch_count = max(1, min(GEN_BATCH_MAX, int(t[2:])))
     if not is_owner:
         batch_count = 1  # пакет шлёт в Saved Messages аккаунта-владельца — для гостей бессмыслен
-    user_prompt = event.pattern_match.group(3).strip()
+    user_tokens = (event.pattern_match.group(3) or "").split()  # @юзер (только эти) / !@юзер (исключить) — фильтр контекста
+    include_users = [t.lstrip("@") for t in user_tokens if not t.startswith("!")]
+    exclude_users = [t.lstrip("!").lstrip("@") for t in user_tokens if t.startswith("!")]
+    user_prompt = event.pattern_match.group(4).strip()
     reply_msg = await event.get_reply_message() if getattr(event, "reply_to", None) else None
     reply_target_id = getattr(event, "reply_to_msg_id", None)
     caller = _owner_label() if is_owner else _user_label(event.sender or await event.get_sender())
@@ -3293,7 +3296,8 @@ async def gen_command(event):
     user_prompt, link_ref_msgs, link_not_found = await _gen_fetch_link_refs(event, user_prompt)
     if not user_prompt:  # остались одни ссылки без инструкции — даём осмысленный дефолт
         user_prompt = "combine the reference images into one cohesive scene"
-    log("GEN", f"Старт от {caller}: N={n or '—'} · improve={improve} · creative={creative} · {image_size}/{aspect_ratio or 'авто'} · пакет×{batch_count} · reply={'да' if reply_msg else 'нет'} · ссылок-реф={len(link_ref_msgs)} · «{user_prompt[:80]}»")
+    _flt = (("+@" + ",".join(include_users)) if include_users else "") + (("  -@" + ",".join(exclude_users)) if exclude_users else "")
+    log("GEN", f"Старт от {caller}: N={n or '—'} · improve={improve} · creative={creative} · {image_size}/{aspect_ratio or 'авто'} · пакет×{batch_count} · фильтр={_flt or '—'} · reply={'да' if reply_msg else 'нет'} · ссылок-реф={len(link_ref_msgs)} · «{user_prompt[:80]}»")
 
     # — референс-фото (моё сообщение + альбом, reply + альбом, ссылки) собираем ДО удаления команды —
     input_b64s, skipped_imgs = await _gen_collect_input_images(event, reply_msg, extra_msgs=link_ref_msgs)
@@ -3325,10 +3329,33 @@ async def gen_command(event):
         context_text = None
         if n > 0:
             await set_status(f"📥 Собираю последние {n} сообщений для контекста…")
+            # @юзер/!@юзер → резолвим в id для фильтра контекста (как в /ask)
+            include_ids, exclude_ids, flt_failed = set(), set(), []
+            for u in include_users + exclude_users:
+                try:
+                    ent = await client.get_entity(u)
+                    (exclude_ids if u in exclude_users else include_ids).add(ent.id)
+                except Exception as e:
+                    flt_failed.append(u)
+                    log("GEN", f"Фильтр: не нашёл @{u}: {e}")
+            if flt_failed:
+                await set_status(f"⚠️ Не нашёл для фильтра: {', '.join('@' + u for u in flt_failed)} — игнорирую.")
             _, raw_msgs = await _collect_history_parallel(event.chat_id, n, 0)
-            msgs = [m for m in raw_msgs if getattr(m, "id", None) is not None and m.id != event.id and getattr(m, "action", None) is None]
+
+            def _ctx_keep(m):
+                if getattr(m, "id", None) is None or m.id == event.id or getattr(m, "action", None) is not None:
+                    return False
+                sid = getattr(m, "sender_id", None)
+                if exclude_ids and sid in exclude_ids:
+                    return False
+                if include_ids and sid not in include_ids:
+                    return False
+                return True
+            msgs = [m for m in raw_msgs if _ctx_keep(m)]
             msgs.sort(key=lambda m: m.id, reverse=True)
             ordered = list(reversed(msgs[:n]))
+            if include_ids or exclude_ids:
+                log("GEN", f"Контекст после фильтра: {len(ordered)} сообщ. (вкл={len(include_ids)} искл={len(exclude_ids)})")
             context_text, _, _, _ = await assemble_context(ordered, True)  # text-only: медиа не разбираем
         elif reply_msg is not None and (reply_msg.raw_text or "").strip():
             # Reply на сообщение С ФОТО: без флагов DeepSeek не вмешивается (промпт дословный, фото на вход);
@@ -4642,7 +4669,7 @@ _HELP_SECTIONS = {
         "\n"
         "Модель: Riverflow V2.5 Pro (OpenRouter, бесплатная), при перегрузке — запасная Fast. Нужен `OPENROUTER_API_KEY`.\n"
         "\n"
-        "**Синтаксис:** `/gen [N] [-i|-c] [-v|-h|-sq] [-2k|-4k|-1k] [-xK] <промпт>`\n"
+        "**Синтаксис:** `/gen [N] [-i|-c] [-v|-h|-sq] [-2k|-4k|-1k] [-xK] [@юзер|!@юзер] <промпт>`\n"
         "   `/gen аниме кот в очках` — генерация ровно по твоему промпту\n"
         "   `/gen -i закат над морем` — DeepSeek улучшит/уточнит промпт (`-i` или `-improve`)\n"
         "   `/gen 100 нарисуй о чём мы спорим` — DeepSeek составит промпт по последним 100 сообщениям чата\n"
@@ -4665,6 +4692,10 @@ _HELP_SECTIONS = {
         "   (не в текущий чат — там только прогресс), макс. 20. DeepSeek пишет КАЖДОМУ варианту свой\n"
         "   промпт, ВИДЯ все предыдущие → сам придумывает непохожие (без навязанных шаблонов), все уникальны.\n"
         "   `/gen -x10 -4k аниме кот` · `/gen 200 -c -x8 что нарисовать?` (только для владельца).\n"
+        "\n"
+        "**Фильтр авторов контекста** (как в `/ask`, работает при числе N): `!@юзер` — ИСКЛЮЧИТЬ его сообщения\n"
+        "   из контекста, `@юзер` — взять ТОЛЬКО его. Ставится перед промптом, можно несколько.\n"
+        "   `/gen 2000 -c -x20 !@spambot !@flood арты по чату` — соберёт 2000 сообщений без этих авторов.\n"
         "\n"
         "**Референс-изображения (image-to-image):**\n"
         "   • прикрепи **фото прямо к сообщению** с `/gen` (можно альбомом) — они уйдут модели на вход;\n"
