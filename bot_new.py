@@ -1246,10 +1246,29 @@ _IMAGE_EDIT_SYSTEM = (
 )
 
 
-def _sync_image_prompt(user_prompt: str, context_text: str = None, image_desc: str = None, edit_mode: bool = False) -> str:
+# «Углы» вариации для пакета (-xN): каждому варианту — свой, чтобы промпты были разными даже параллельно.
+_GEN_VARIATION_ANGLES = [
+    "другой ракурс и угол камеры",
+    "другое настроение и схема освещения",
+    "другая цветовая палитра",
+    "другая композиция и кадрирование",
+    "более крупный план, акцент на деталях",
+    "более общий, широкий план со средой",
+    "другое время суток / погода",
+    "другой стиль или техника исполнения",
+    "другой фон и окружение",
+    "другая поза, динамика, действие",
+    "другой эмоциональный тон сцены",
+    "неожиданный творческий приём, нестандартный взгляд",
+]
+
+
+def _sync_image_prompt(user_prompt: str, context_text: str = None, image_desc: str = None,
+                       edit_mode: bool = False, variation_hint: str = None) -> str:
     """Финальный промпт генерации через DeepSeek (официальный). При недоступности — исходный промпт.
     edit_mode (есть референсы) — только уточнение формулировок, без отсебятины;
-    иначе — творческий детальный промпт. image_desc — vision-описания референсов (DeepSeek сам не видит)."""
+    иначе — творческий детальный промпт. image_desc — vision-описания референсов (DeepSeek сам не видит).
+    variation_hint — для пакета: «угол» вариации, чтобы каждый промпт был ЗАМЕТНО другим."""
     if deepseek_client is None:
         return user_prompt
     parts = []
@@ -1258,13 +1277,17 @@ def _sync_image_prompt(user_prompt: str, context_text: str = None, image_desc: s
     if image_desc:
         parts.append(f"Описание референсных изображений (поданы модели на вход):\n{image_desc}")
     parts.append(f"Запрос пользователя: {user_prompt}")
+    if variation_hint:
+        parts.append(f"ЭТО ОДИН ИЗ НЕСКОЛЬКИХ ВАРИАНТОВ. Сделай его ЗАМЕТНО ОТЛИЧНЫМ от других вариантов "
+                     f"того же запроса: {variation_hint}. Суть запроса сохрани, но подачу/детали поменяй существенно.")
     try:
         resp = deepseek_client.chat.completions.create(
             model=DEEPSEEK_MODEL,
             messages=[{"role": "system", "content": _IMAGE_EDIT_SYSTEM if edit_mode else _IMAGE_PROMPT_SYSTEM},
                       {"role": "user", "content": "\n\n".join(parts)}],
             max_tokens=ASK_MAX_TOKENS,  # deepseek-v4-pro — reasoning-модель: 600 токенов съедались размышлениями
-            temperature=0.4 if edit_mode else 0.7,  # редактирование — точность, создание — креатив
+            # вариация → выше температура для разнообразия; редактирование — точность, создание — креатив
+            temperature=(1.0 if variation_hint else (0.4 if edit_mode else 0.7)),
         )
         choice = resp.choices[0]
         out = _strip_think((choice.message.content or "").strip())  # вырезаем inline <think>, если есть
@@ -3361,8 +3384,11 @@ async def gen_command(event):
             async def _variant(idx):
                 async with sem:
                     fp, by_ai = user_prompt, False
-                    if deepseek_requested and deepseek_client is not None:  # СВЕЖИЙ промпт на каждый вариант → разнообразие
-                        fp = await asyncio.to_thread(_sync_image_prompt, user_prompt, context_text, image_desc, edit_mode)
+                    # В ПАКЕТЕ DeepSeek пишет КАЖДОМУ варианту свой промпт со своим «углом» вариации → все уникальны
+                    # (даже без -c/-i/N). Если DeepSeek недоступен/отказал — фолбэк на исходный промпт.
+                    if deepseek_client is not None:
+                        hint = _GEN_VARIATION_ANGLES[idx % len(_GEN_VARIATION_ANGLES)]
+                        fp = await asyncio.to_thread(_sync_image_prompt, user_prompt, context_text, image_desc, edit_mode, hint)
                         by_ai = fp != user_prompt
                     raw_i, mime_i, used_fp, _fb = await _gen_one_image(
                         fp, input_b64s, image_size, aspect_ratio, (by_ai or deepseek_requested), user_prompt)
@@ -4645,8 +4671,8 @@ _HELP_SECTIONS = {
         "   но 2K/4K заметно чётче дефолтного 1K. (Запасная Fast не умеет 4K → авто-понижение до 2K.)\n"
         "\n"
         "**Пакет `-xK` — много вариантов в Избранное:** `-x8` → 8 вариантов уйдут тебе в **Saved Messages**\n"
-        "   (не в текущий чат — там только прогресс), макс. 20. С `-c`/`-i`/числом DeepSeek пишет КАЖДОМУ\n"
-        "   варианту свой промпт (разные трактовки); без них — один промпт, разнообразие от модели.\n"
+        "   (не в текущий чат — там только прогресс), макс. 20. В пакете DeepSeek пишет КАЖДОМУ варианту\n"
+        "   свой УНИКАЛЬНЫЙ промпт со своим «углом» (ракурс/свет/палитра/композиция…) — все разные.\n"
         "   `/gen -x10 -4k аниме кот` · `/gen 200 -c -x8 что нарисовать?` (только для владельца).\n"
         "\n"
         "**Референс-изображения (image-to-image):**\n"
