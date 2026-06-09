@@ -1146,18 +1146,27 @@ class GenRejected(Exception):
 
 
 class GenTransient(Exception):
-    """Временный сбой генерации (провайдер перегружен/лимит/«Provider returned error», нет инстансов) —
+    """Временный сбой генерации (провайдер перегружен/лимит RPM/«Provider returned error», нет инстансов) —
     НЕ цензура: правка промпта не поможет, нужен ретрай ТЕМ ЖЕ промптом позже."""
 
 
-# Маркеры временного сбоя аптайм-провайдера в теле ответа OpenRouter (HTTP 200 без картинки).
-# Бесплатная riverflow при перегрузке отдаёт «Provider returned error» — это НЕ модерация.
+class GenExhausted(GenTransient):
+    """ДНЕВНОЙ лимит провайдера/аккаунта исчерпан (RPD, daily limit) — ретраить сегодня бессмысленно,
+    каждая попытка ещё и списывается из квоты. Подкласс GenTransient, но обрабатывается отдельно (стоп)."""
+
+
+# Маркеры ВРЕМЕННОГО сбоя (ретрай поможет): перегрузка, RPM-лимит, 5xx, нет инстансов.
 _GEN_TRANSIENT_MARKERS = (
     "provider returned error", "provider error", "no instances", "no endpoints",
     "rate limit", "rate-limit", "ratelimited", "too many requests", "429",
     "overloaded", "capacity", "unavailable", "temporarily", "timeout", "timed out",
     "try again", "upstream", "bad gateway", "502", "503", "504", "server error",
-    "busy", "quota", "exhausted", "no available",
+    "busy", "high demand", "per minute", "per m", "limit_rpm", "requests per",
+)
+# Маркеры ДНЕВНОГО исчерпания (ретрай сегодня НЕ поможет, жжёт квоту) — приоритетнее transient.
+_GEN_DAILY_MARKERS = (
+    "daily limit", "limit reached", "per day", "limit_rpd", "rpd/", "exhausted",
+    "out of credits", "insufficient", "quota",
 )
 
 
@@ -1189,20 +1198,28 @@ def _sync_generate_image(prompt: str, input_images_b64: list = None, model: str 
     )
     if resp.status_code >= 500:
         resp.raise_for_status()  # 5xx — временная ошибка провайдера → ретрай тем же промптом
-    if not resp.ok:  # 4xx (вкл. 422) — запрос отклонён (модерация/невалидный вход)
+    if not resp.ok:  # 4xx: РАЗДЕЛЯЕМ дневной лимит / RPM-лимит-перегрузку / реальную модерацию
         try:
             detail = resp.json().get("error", {}).get("message") or resp.text
         except Exception:
             detail = resp.text
-        raise GenRejected(f"HTTP {resp.status_code}: {str(detail)[:200]}")
+        s = str(detail)
+        low = s.lower()
+        if any(mk in low for mk in _GEN_DAILY_MARKERS):
+            raise GenExhausted(f"HTTP {resp.status_code}: {s[:200]}")
+        if resp.status_code == 429 or any(mk in low for mk in _GEN_TRANSIENT_MARKERS):
+            raise GenTransient(f"HTTP {resp.status_code}: {s[:200]}")
+        raise GenRejected(f"HTTP {resp.status_code}: {s[:200]}")
     data = resp.json()
     images = (data.get("choices") or [{}])[0].get("message", {}).get("images") or []
     if not images:
         err = (data.get("choices") or [{}])[0].get("message", {}).get("content") or data.get("error", {}).get("message") or "пустой ответ"
         err_s = str(err)
-        # HTTP 200 без картинки бывает двух видов: перегрузка провайдера («Provider returned error»,
-        # лимиты, нет инстансов) — это ВРЕМЕННО (ретрай тем же промптом), либо реальная модерация.
-        if any(mk in err_s.lower() for mk in _GEN_TRANSIENT_MARKERS):
+        low = err_s.lower()
+        # HTTP 200 без картинки: дневной лимит / перегрузка-RPM (временно) / реальная модерация.
+        if any(mk in low for mk in _GEN_DAILY_MARKERS):
+            raise GenExhausted(f"дневной лимит: {err_s[:200]}")
+        if any(mk in low for mk in _GEN_TRANSIENT_MARKERS):
             raise GenTransient(f"провайдер не отдал картинку (временно): {err_s[:200]}")
         raise GenRejected(f"модель не вернула изображение: {err_s[:200]}")
     url = images[0]["image_url"]["url"]
@@ -3177,24 +3194,53 @@ async def _gen_collect_input_images(event, reply_msg, extra_msgs=None):
     return out, skipped
 
 
+# Глобальный rate-gate для image-API: free Pro у Sourceful = 5 запросов/мин. Разносим вызовы во
+# времени, чтобы не ловить RPM-429 и не жечь дневную квоту на провальных ретраях (failed тоже списываются).
+_GEN_RATE_LOCK = asyncio.Lock()
+_GEN_RATE_MIN_INTERVAL = 13.0  # сек между запросами к генератору (~4–5/мин)
+_GEN_LAST_CALL = [0.0]
+
+
+async def _gen_rate_gate():
+    async with _GEN_RATE_LOCK:
+        gap = _GEN_RATE_MIN_INTERVAL - (time.monotonic() - _GEN_LAST_CALL[0])
+        if gap > 0:
+            await asyncio.sleep(gap)
+        _GEN_LAST_CALL[0] = time.monotonic()
+
+
 async def _gen_one_image(final_prompt, input_b64s, image_size, aspect_ratio, allow_repair, user_prompt, status_cb=None):
     """Один цикл генерации с ретраями (transient тем же промптом / фолбэк на Fast / repair при модерации).
     Возвращает (raw, mime, used_prompt, used_fallback) при успехе или (None, reason, None, used_fallback)
-    при терминальном отказе (reason: 'moderation' | 'overload'). status_cb — необязательный апдейтер статуса."""
+    при отказе (reason: 'moderation' | 'overload' | 'exhausted'). status_cb — необязательный апдейтер статуса.
+    Все вызовы проходят через _gen_rate_gate (≤5/мин)."""
     async def _s(text):
         if status_cb:
             await status_cb(text)
     gen_model = OPENROUTER_IMAGE_MODEL
     used_fallback = False
-    transient_left = 4
+    transient_left = 2  # ретраи дорогие: провальная попытка тоже списывается из дневной квоты
     repair_left = 2 if allow_repair else 0
     attempt = 0
     size = image_size
     fp = final_prompt
     while True:
         try:
+            await _gen_rate_gate()
             raw, mime = await asyncio.to_thread(_sync_generate_image, fp, input_b64s or None, gen_model, size, aspect_ratio)
             return raw, mime, fp, used_fallback
+        except GenExhausted as e:
+            # ДНЕВНОЙ лимит модели исчерпан — ретраить сегодня бессмысленно (и жжёт квоту). Пробуем запасную (своя квота).
+            log("GEN", f"Дневной лимит исчерпан ({gen_model}): {e}")
+            if not used_fallback and OPENROUTER_IMAGE_FALLBACK and OPENROUTER_IMAGE_FALLBACK != gen_model:
+                used_fallback = True
+                gen_model = OPENROUTER_IMAGE_FALLBACK
+                if size == "4K":
+                    size = "2K"
+                log("GEN", f"Пробую запасную {gen_model} (у неё своя квота)…")
+                await _s("🔁 Дневной лимит основной модели — пробую запасную (fast)…")
+                continue
+            return None, "exhausted", None, used_fallback
         except GenRejected as e:
             log("GEN", f"Отклонено модерацией: {e} (repair_left={repair_left})")
             if repair_left > 0:
@@ -3210,7 +3256,7 @@ async def _gen_one_image(final_prompt, input_b64s, image_size, aspect_ratio, all
             if transient_left > 0:
                 transient_left -= 1
                 attempt += 1
-                wait = min(20, 5 + 4 * attempt)  # эскалация: 9, 13, 17, 20с
+                wait = min(30, 15 + 8 * attempt)  # RPM-лимит: ждём дольше (23, 30с)
                 log("GEN", f"Временный сбой провайдера ({gen_model}): {e} — ретрай через {wait}с (осталось {transient_left})")
                 await _s("⏳ Провайдер генерации перегружен — повторяю…")
                 await asyncio.sleep(wait)
@@ -3390,11 +3436,14 @@ async def gen_command(event):
         # ── ПАКЕТНАЯ генерация (-xN): N вариантов → в Избранное (Saved Messages), прогресс в текущем чате ──
         if batch_count > 1:
             await set_status(f"🎨 Пакет {batch_count} → в Избранное: придумываю уникальные промпты…")
-            counter = {"done": 0, "ok": 0}
+            counter = {"done": 0, "ok": 0, "exhausted": False}
             sem = asyncio.Semaphore(GEN_BATCH_CONCURRENCY)
 
             async def _gen_and_send(idx, fp, by_ai):
                 async with sem:
+                    if counter["exhausted"]:  # дневной лимит уже исчерпан — не тратим квоту на обречённый запрос
+                        counter["done"] += 1
+                        return
                     raw_i, mime_i, used_fp, _fb = await _gen_one_image(
                         fp, input_b64s, image_size, aspect_ratio, (by_ai or deepseek_requested), user_prompt)
                     counter["done"] += 1
@@ -3405,6 +3454,8 @@ async def gen_command(event):
                         except Exception as e:
                             log("GEN", f"Вариант {idx + 1}: отправка в Избранное не удалась: {e}")
                     else:
+                        if mime_i == "exhausted":
+                            counter["exhausted"] = True  # дневной лимит — стоп остальным вариантам
                         log("GEN", f"Вариант {idx + 1} не сгенерирован ({mime_i})")
                     await set_status(f"🎨 {counter['done']}/{batch_count} готово · {counter['ok']} в Избранном…")
 
@@ -3412,6 +3463,9 @@ async def gen_command(event):
             # непохожий (без навязанных «углов»). Генерацию (медленную) сразу запускаем в фоне → перекрытие.
             prompts, tasks = [], []
             for i in range(batch_count):
+                if counter["exhausted"]:  # дневной лимит исчерпан — не строим и не шлём остаток
+                    log("GEN", f"Дневной лимит исчерпан — останавливаю пакет на варианте {i + 1}/{batch_count}")
+                    break
                 fp, by_ai = user_prompt, False
                 if deepseek_client is not None:
                     fp = await asyncio.to_thread(_sync_image_prompt, user_prompt, context_text, image_desc, edit_mode, prompts)
@@ -3422,8 +3476,12 @@ async def gen_command(event):
                 if deepseek_client is not None and i + 1 < batch_count:
                     await set_status(f"🧠 Промпты {i + 1}/{batch_count} · 🎨 {counter['done']}/{batch_count} готово…")
             await asyncio.gather(*tasks)
-            await set_status(f"✅ {counter['ok']}/{batch_count} вариантов отправлено тебе в Избранное (Saved Messages) 📌")
-            await asyncio.sleep(6)
+            if counter["exhausted"]:
+                await set_status(f"⚠️ {counter['ok']} готово, но дневной лимит бесплатной модели исчерпан "
+                                 f"(50 запросов/день; провальные тоже считаются). Остальное — завтра или подними лимит. 📌")
+            else:
+                await set_status(f"✅ {counter['ok']}/{batch_count} вариантов отправлено тебе в Избранное (Saved Messages) 📌")
+            await asyncio.sleep(8)
             try:
                 await status.delete()
             except Exception:
@@ -3447,8 +3505,11 @@ async def gen_command(event):
             if mime == "moderation":
                 await set_status("❌ Запрос отклонён модерацией провайдера.\n"
                                  f"Переформулируй промпт и попробуй снова: `/gen {user_prompt[:200]}`")
+            elif mime == "exhausted":
+                await set_status("❌ Дневной лимит бесплатной модели исчерпан (50 запросов/день; провальные тоже считаются).\n"
+                                 "Попробуй завтра, или подними лимит до 1000/день, пополнив баланс OpenRouter на $10.")
             else:
-                await set_status("❌ Провайдер генерации сейчас перегружен или исчерпан дневной лимит бесплатных моделей.\n"
+                await set_status("❌ Провайдер генерации сейчас перегружен (лимит ~5 запросов/мин).\n"
                                  f"Попробуй ещё раз через минуту: `/gen {user_prompt[:200]}`")
             return
         log("GEN", f"Готово за {time.time() - t0:.1f}с · {len(raw) / 1024:.0f} КБ · {mime} · prompt_by_ai={prompt_by_ai} · модель={'fast(запасная)' if used_fb else 'pro'}")
