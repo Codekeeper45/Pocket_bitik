@@ -1159,7 +1159,8 @@ _GEN_TRANSIENT_MARKERS = (
 )
 
 
-def _sync_generate_image(prompt: str, input_images_b64: list = None, model: str = None) -> tuple:
+def _sync_generate_image(prompt: str, input_images_b64: list = None, model: str = None,
+                         image_size: str = "2K", aspect_ratio: str = None) -> tuple:
     """Генерация/редактирование изображения через OpenRouter (Riverflow). Возвращает (байты, mime).
     Проверено живьём: modalities строго ["image"] (с "text" — 404), ответ приходит как webp data-URL.
     modalities/message.images — нестандарт OpenAI, поэтому requests, а не SDK-клиент.
@@ -1168,6 +1169,11 @@ def _sync_generate_image(prompt: str, input_images_b64: list = None, model: str 
     content = [{"type": "text", "text": prompt}]
     for b64 in (input_images_b64 or []):
         content.append({"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{b64}"}})
+    # image_config (живьём проверено): image_size 1K/2K/4K — реальное разрешение выхода
+    # (1K=1024², 2K=2048², 4K только Pro), aspect_ratio — точная ориентация. Без него ~1K (мыло).
+    image_config = {"image_size": image_size}
+    if aspect_ratio:
+        image_config["aspect_ratio"] = aspect_ratio
     resp = requests.post(
         f"{OPENROUTER_BASE_URL}/chat/completions",
         headers={"Authorization": f"Bearer {openrouter_api_key}", "Content-Type": "application/json"},
@@ -1175,6 +1181,7 @@ def _sync_generate_image(prompt: str, input_images_b64: list = None, model: str 
             "model": model or OPENROUTER_IMAGE_MODEL,
             "messages": [{"role": "user", "content": content}],
             "modalities": ["image"],
+            "image_config": image_config,
         },
         timeout=300,  # генерация медленная (reasoning-модель, в тесте ~2.5 мин)
     )
@@ -3160,7 +3167,7 @@ async def _gen_collect_input_images(event, reply_msg, extra_msgs=None):
     return out, skipped
 
 
-@client.on(events.NewMessage(pattern=r"^[./]gen(?:\s+(\d+))?((?:\s+-(?:improve|creative|vertical|horizontal|square|sq|i|c|v|h))+)?\s+(.+)$"))
+@client.on(events.NewMessage(pattern=r"^[./]gen(?:\s+(\d+))?((?:\s+-(?:improve|creative|vertical|horizontal|square|sq|4k|2k|1k|i|c|v|h))+)?\s+(.+)$"))
 async def gen_command(event):
     """Генерация изображений (Riverflow via OpenRouter). Промпт как есть, либо его строит/улучшает DeepSeek
     из контекста (N последних сообщений / текст reply / флаг -i). Фото в сообщении/reply → image-to-image."""
@@ -3176,11 +3183,16 @@ async def gen_command(event):
     toks = (event.pattern_match.group(2) or "").split()
     improve = any(t in ("-i", "-improve") for t in toks)        # уточнить/улучшить промпт (edit при референсе)
     creative = any(t in ("-c", "-creative") for t in toks)      # креатив: DeepSeek сочиняет промпт-ОТВЕТ (не редактирует)
-    orient = None                                               # ориентация → суффикс соотношения сторон в промпт
+    aspect_ratio = None                                         # ориентация → image_config.aspect_ratio (точно)
     for t in toks:
-        if t in ("-v", "-vertical"): orient = "vertical"
-        elif t in ("-h", "-horizontal"): orient = "horizontal"
-        elif t in ("-sq", "-square"): orient = "square"
+        if t in ("-v", "-vertical"): aspect_ratio = "9:16"
+        elif t in ("-h", "-horizontal"): aspect_ratio = "16:9"
+        elif t in ("-sq", "-square"): aspect_ratio = "1:1"
+    image_size = "2K"                                           # дефолт 2K (1024²→2048², вчетверо чётче); -4k/-1k меняют
+    for t in toks:
+        if t.lower() == "-4k": image_size = "4K"
+        elif t.lower() == "-1k": image_size = "1K"
+        elif t.lower() == "-2k": image_size = "2K"
     user_prompt = event.pattern_match.group(3).strip()
     reply_msg = await event.get_reply_message() if getattr(event, "reply_to", None) else None
     reply_target_id = getattr(event, "reply_to_msg_id", None)
@@ -3189,7 +3201,7 @@ async def gen_command(event):
     user_prompt, link_ref_msgs, link_not_found = await _gen_fetch_link_refs(event, user_prompt)
     if not user_prompt:  # остались одни ссылки без инструкции — даём осмысленный дефолт
         user_prompt = "combine the reference images into one cohesive scene"
-    log("GEN", f"Старт от {caller}: N={n or '—'} · improve={improve} · creative={creative} · ориент={orient or '—'} · reply={'да' if reply_msg else 'нет'} · ссылок-реф={len(link_ref_msgs)} · «{user_prompt[:80]}»")
+    log("GEN", f"Старт от {caller}: N={n or '—'} · improve={improve} · creative={creative} · {image_size}/{aspect_ratio or 'авто'} · reply={'да' if reply_msg else 'нет'} · ссылок-реф={len(link_ref_msgs)} · «{user_prompt[:80]}»")
 
     # — референс-фото (моё сообщение + альбом, reply + альбом, ссылки) собираем ДО удаления команды —
     input_b64s, skipped_imgs = await _gen_collect_input_images(event, reply_msg, extra_msgs=link_ref_msgs)
@@ -3269,13 +3281,6 @@ async def gen_command(event):
         # Repair доступен, если DeepSeek был ЗАПРОШЕН (число/-i/текст-контекст) — даже когда его первая
         # попытка не удалась (вернул пустое/упал) и промпт ушёл исходным. Без участия DeepSeek — без repair.
         deepseek_requested = bool(context_text or improve or creative)
-        # Ориентация — суффикс соотношения сторон, дописывается к промпту НА ВЫЗОВЕ генерации
-        # (переживает repair-переписывание final_prompt). У Riverflow нет параметра размера — это сильный хинт.
-        orient_suffix = {
-            "vertical": " Aspect ratio 9:16, vertical portrait orientation.",
-            "horizontal": " Aspect ratio 16:9, horizontal landscape orientation.",
-            "square": " Aspect ratio 1:1, square format.",
-        }.get(orient, "")
         await set_status("🎨 Генерирую изображение… (может занять до пары минут)")
         t0 = time.time()
         # transient_left — перегрузка/лимит провайдера и сеть/5xx (ретрай ТЕМ ЖЕ промптом);
@@ -3288,7 +3293,7 @@ async def gen_command(event):
         attempt = 0
         while True:
             try:
-                raw, mime = await asyncio.to_thread(_sync_generate_image, final_prompt + orient_suffix, input_b64s or None, gen_model)
+                raw, mime = await asyncio.to_thread(_sync_generate_image, final_prompt, input_b64s or None, gen_model, image_size, aspect_ratio)
                 break
             except GenRejected as e:
                 log("GEN", f"Отклонено модерацией: {e} (repair_left={repair_left})")
@@ -3318,6 +3323,9 @@ async def gen_command(event):
                     gen_model = OPENROUTER_IMAGE_FALLBACK
                     transient_left = 2
                     attempt = 0
+                    if image_size == "4K":  # Fast не умеет 4K → понижаем до 2K
+                        image_size = "2K"
+                        log("GEN", "Запасная Fast не поддерживает 4K — понижаю до 2K")
                     log("GEN", f"Основная модель не отвечает — переключаюсь на запасную {gen_model}")
                     await set_status("🔁 Основная модель перегружена — пробую запасную (fast)…")
                     continue
@@ -4563,7 +4571,7 @@ _HELP_SECTIONS = {
         "\n"
         "Модель: Riverflow V2.5 Pro (OpenRouter, бесплатная), при перегрузке — запасная Fast. Нужен `OPENROUTER_API_KEY`.\n"
         "\n"
-        "**Синтаксис:** `/gen [N] [-i|-c] [-v|-h|-sq] <промпт>`\n"
+        "**Синтаксис:** `/gen [N] [-i|-c] [-v|-h|-sq] [-2k|-4k|-1k] <промпт>`\n"
         "   `/gen аниме кот в очках` — генерация ровно по твоему промпту\n"
         "   `/gen -i закат над морем` — DeepSeek улучшит/уточнит промпт (`-i` или `-improve`)\n"
         "   `/gen 100 нарисуй о чём мы спорим` — DeepSeek составит промпт по последним 100 сообщениям чата\n"
@@ -4574,9 +4582,13 @@ _HELP_SECTIONS = {
         "   `/gen 200 -c что хочет нарисовать чат?` · `/gen -c <ссылка> сделай что-то в этом духе`\n"
         "   (без `-c` и с референсом DeepSeek в режиме РЕДАКТИРОВАНИЯ — только уточняет, без отсебятины).\n"
         "\n"
-        "**Ориентация (соотношение сторон):** `-v` вертикаль 9:16 · `-h` горизонталь 16:9 · `-sq` квадрат 1:1\n"
+        "**Ориентация (точное соотношение сторон):** `-v` вертикаль 9:16 · `-h` горизонталь 16:9 · `-sq` квадрат 1:1\n"
         "   `/gen -v аниме девушка у окна` · `/gen -h пейзаж гор` · комбинируется: `/gen -c -v <ссылка> …`\n"
-        "   (у модели нет жёсткого размера — это сильный хинт в промпте, не гарантия точных пикселей).\n"
+        "\n"
+        "**Качество (разрешение):** по умолчанию **2K** (2048²). `-4k` максимум (только Pro, медленнее), `-1k` быстрее/мельче.\n"
+        "   `/gen -4k постер с текстом` — чёткий мелкий текст · `/gen -1k черновик` — быстро.\n"
+        "   ⚠️ Telegram пережимает фото при отправке — для пиксель-в-пиксель оригинала это не панацея,\n"
+        "   но 2K/4K заметно чётче дефолтного 1K. (Запасная Fast не умеет 4K → авто-понижение до 2K.)\n"
         "\n"
         "**Референс-изображения (image-to-image):**\n"
         "   • прикрепи **фото прямо к сообщению** с `/gen` (можно альбомом) — они уйдут модели на вход;\n"
