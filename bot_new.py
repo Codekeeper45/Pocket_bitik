@@ -122,7 +122,10 @@ OPENCODE_BASE_URL = "https://opencode.ai/zen/go/v1"
 # Проверено вживую: /v1/chat/completions в OpenAI-формате, tools работают (как у thinking-моделей —
 # принудительный tool_choice не поддержан, auto — да). ВНИМАНИЕ: шлюз НЕ передаёт картинки до Claude
 # (и base64, и URL — модель отвечает «изображения нет»), поэтому модели только ТЕКСТ+поиск, без -g.
+# WAF шлюза блокирует User-Agent "OpenAI/Python" (403 "Your request was blocked") — нужен браузерный UA
+# (тот же трюк, что с Cloudflare у opencode).
 MODELGATE_BASE_URL = "https://modelgate.app/v1"
+BROWSER_UA = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0 Safari/537.36"
 
 # --- Google Gemini Flash TTS (голосовые ответы в /ask) ---
 GEMINI_TTS_MODEL = os.getenv("GEMINI_TTS_MODEL", "gemini-3.1-flash-tts-preview")
@@ -438,7 +441,8 @@ client = TelegramClient("session_name", api_id, api_hash)
 openrouter_client = OpenAI(api_key=openrouter_api_key, base_url=OPENROUTER_BASE_URL) if openrouter_api_key else None
 deepseek_client = OpenAI(api_key=deepseek_api_key, base_url=DEEPSEEK_BASE_URL) if deepseek_api_key else None
 opencode_client = OpenAI(api_key=opencode_api_key, base_url=OPENCODE_BASE_URL) if opencode_api_key else None
-modelgate_client = OpenAI(api_key=modelgate_api_key, base_url=MODELGATE_BASE_URL) if modelgate_api_key else None
+modelgate_client = OpenAI(api_key=modelgate_api_key, base_url=MODELGATE_BASE_URL,
+                          default_headers={"User-Agent": BROWSER_UA}) if modelgate_api_key else None
 
 
 # ── opencode-go в формате Anthropic Messages (для qwen3.7-max и подобных) ──
