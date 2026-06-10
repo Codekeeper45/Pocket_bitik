@@ -56,6 +56,7 @@ api_hash = os.getenv("api_hash") or ""
 openrouter_api_key = os.getenv("OPENROUTER_API_KEY")
 deepseek_api_key = os.getenv("DEEPSEEK_API_KEY")
 opencode_api_key = os.getenv("OPENCODE_API_KEY")
+modelgate_api_key = os.getenv("MODELGATE_API_KEY")  # шлюз Claude-моделей (OpenAI-совместимый, modelgate.app)
 llama_cloud_api_key = os.getenv("LLAMA_CLOUD_API_KEY")  # OCR фото (LlamaParse); без него фото идут через vision
 
 
@@ -117,6 +118,11 @@ DEEPSEEK_MODEL = os.getenv("DEEPSEEK_MODEL", "deepseek-v4-pro")
 # (на OpenAI-формат → 401 "not supported for format oa-compat"). Свой эндпоинт + ключ в x-api-key.
 OPENCODE_ANTHROPIC_URL = "https://opencode.ai/zen/go/v1/messages"
 OPENCODE_BASE_URL = "https://opencode.ai/zen/go/v1"
+# ModelGate — OpenAI-совместимый шлюз к моделям Claude (claude-opus-4-x / sonnet / haiku).
+# Проверено вживую: /v1/chat/completions в OpenAI-формате, tools работают (как у thinking-моделей —
+# принудительный tool_choice не поддержан, auto — да). ВНИМАНИЕ: шлюз НЕ передаёт картинки до Claude
+# (и base64, и URL — модель отвечает «изображения нет»), поэтому модели только ТЕКСТ+поиск, без -g.
+MODELGATE_BASE_URL = "https://modelgate.app/v1"
 
 # --- Google Gemini Flash TTS (голосовые ответы в /ask) ---
 GEMINI_TTS_MODEL = os.getenv("GEMINI_TTS_MODEL", "gemini-3.1-flash-tts-preview")
@@ -249,6 +255,18 @@ for _mid, _label, _ctx, _safety in [
 # qwen3.7-max — opencode отдаёт её только в формате Anthropic Messages → провайдер "oc_anthropic"
 # (свой адаптер-обёртка под OpenAI-интерфейс; полноценный tool-loop/голос, как у прочих).
 MODEL_REGISTRY["qwen3.7-max"] = ("oc_anthropic", "qwen3.7-max", "Qwen3.7 Max", 262000, 1.15)
+# Claude через ModelGate (OpenAI-совместимый шлюз). Окно 200k, vision и tools — нативные.
+# safety 1.2: токенизатор Claude ≈ o200k, небольшой запас.
+for _cid, _clabel in [
+    ("claude-opus-4-8",   "Claude Opus 4.8"),
+    ("claude-opus-4-7",   "Claude Opus 4.7"),
+    ("claude-opus-4-6",   "Claude Opus 4.6"),
+    ("claude-opus-4-5",   "Claude Opus 4.5"),
+    ("claude-sonnet-4-6", "Claude Sonnet 4.6"),
+    ("claude-sonnet-4-5", "Claude Sonnet 4.5"),
+    ("claude-haiku-4-5",  "Claude Haiku 4.5"),
+]:
+    MODEL_REGISTRY[_cid] = ("modelgate", _cid, _clabel, 200000, 1.2)
 # Автообрезка контекста под окно модели
 CTX_RESERVE_TOKENS = 8000   # запас на ответ (4096) + системку + вопрос
 CTX_CHARS_PER_TOKEN = 2.0   # фоллбэк-оценка, если tiktoken недоступен
@@ -420,6 +438,7 @@ client = TelegramClient("session_name", api_id, api_hash)
 openrouter_client = OpenAI(api_key=openrouter_api_key, base_url=OPENROUTER_BASE_URL) if openrouter_api_key else None
 deepseek_client = OpenAI(api_key=deepseek_api_key, base_url=DEEPSEEK_BASE_URL) if deepseek_api_key else None
 opencode_client = OpenAI(api_key=opencode_api_key, base_url=OPENCODE_BASE_URL) if opencode_api_key else None
+modelgate_client = OpenAI(api_key=modelgate_api_key, base_url=MODELGATE_BASE_URL) if modelgate_api_key else None
 
 
 # ── opencode-go в формате Anthropic Messages (для qwen3.7-max и подобных) ──
@@ -629,6 +648,8 @@ def _client_for_provider(provider):
         return openrouter_client
     if provider == "oc_anthropic":
         return opencode_anthropic_client
+    if provider == "modelgate":
+        return modelgate_client
     return opencode_client
 
 
@@ -667,6 +688,9 @@ def active_model_supports_vision():
     provider = spec[0] if spec else None
     if provider == "openrouter":
         return CUSTOM_MODELS.get(ACTIVE_MODEL, {}).get("vision")  # bool или None если не сохранено
+    if provider == "modelgate":
+        return False  # шлюз ModelGate НЕ доставляет картинки до Claude (проверено: base64 и URL —
+                      # модель отвечает «изображения нет»). Для -g не годится; фото в /ask и так через OCR/медиа-модель.
     return False  # DeepSeek и прочие текстовые
 
 
@@ -3996,6 +4020,7 @@ async def model_command(event):
                 cur_provider = provider
                 title = {"deepseek": "━━ Прямой API ━━", "opencode": "━━ OpenCode Go ━━",
                          "oc_anthropic": "━━ OpenCode Go (нативный) ━━",
+                         "modelgate": "━━ Claude (ModelGate) ━━",
                          "openrouter": "━━ OpenRouter (кастом) ━━"}.get(provider, f"━━ {provider} ━━")
                 lines.append(f"\n{title}")
             mark = f"▶{i}." if slug == ACTIVE_MODEL else f"{i}."
@@ -4793,6 +4818,9 @@ _HELP_SECTIONS = {
         "      • распознавание картинок/кружков в `/ask` (vision-модели `[OR]`);\n"
         "      • возможность ставить любую модель OpenRouter для ответов (`/model vendor/model`).\n"
         "   `OPENCODE_API_KEY` — даёт vision-модели `[OC]` (Kimi / GLM / Qwen / MiMo) в `/model media`.\n"
+        "   `MODELGATE_API_KEY` — даёт модели **Claude** (Opus / Sonnet / Haiku) для ответов\n"
+        "      (`/model` → раздел «Claude (ModelGate)»). Текст и поиск по каналам работают;\n"
+        "      картинки напрямую (`-g`) НЕ принимает — фото идут через OCR/медиа-модель как обычно.\n"
         "   `GOOGLE_GENAI_API_KEY` — даёт **голосовые ответы** (`/voice`, флаг `-v`). Можно\n"
         "      указать несколько ключей через запятую или в `GOOGLE_GENAI_API_KEYS` (ротация).\n"
         "   `FISH_AUDIO_API_KEY` — альтернативный TTS-движок Fish Audio (`/voice engine fish`,\n"
@@ -4945,7 +4973,7 @@ async def status_command(event):
     L.append(f"⭐ **Избранное:** {len(FISH_FAVORITES)} Fish-голос(ов) · {len(CUSTOM_MODELS)} кастомных моделей")
     # — ключи —
     keys = []
-    for p, nm in [("deepseek", "DeepSeek"), ("openrouter", "OpenRouter"), ("opencode", "OpenCode")]:
+    for p, nm in [("deepseek", "DeepSeek"), ("openrouter", "OpenRouter"), ("opencode", "OpenCode"), ("modelgate", "Claude/ModelGate")]:
         keys.append(f"{nm} {'✅' if _client_for_provider(p) is not None else '❌'}")
     keys.append(f"Google TTS {'✅' if tts_available else '❌'}")
     keys.append(f"Fish {'✅' if fish_available else '❌'}")
