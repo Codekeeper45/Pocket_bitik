@@ -57,6 +57,7 @@ openrouter_api_key = os.getenv("OPENROUTER_API_KEY")
 deepseek_api_key = os.getenv("DEEPSEEK_API_KEY")
 opencode_api_key = os.getenv("OPENCODE_API_KEY")
 modelgate_api_key = os.getenv("MODELGATE_API_KEY")  # шлюз Claude-моделей (OpenAI-совместимый, modelgate.app)
+openai_api_key = os.getenv("OPENAI_API_KEY")  # официальный OpenAI API (gpt-5.x / o3); reasoning-модели
 tavily_api_key = os.getenv("TAVILY_API_KEY")  # веб-поиск/извлечение страниц для /ask (tavily.com); без ключа веб-инструменты выключены
 llama_cloud_api_key = os.getenv("LLAMA_CLOUD_API_KEY")  # OCR фото (LlamaParse); без него фото идут через vision
 
@@ -127,6 +128,11 @@ OPENCODE_BASE_URL = "https://opencode.ai/zen/go/v1"
 # (тот же трюк, что с Cloudflare у opencode).
 MODELGATE_BASE_URL = "https://modelgate.app/v1"
 BROWSER_UA = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0 Safari/537.36"
+# OpenAI — официальный API. Модели gpt-5.x/o3 — reasoning: на /chat/completions
+# принимают ТОЛЬКО max_completion_tokens (не max_tokens) и лишь дефолтную temperature
+# (1.0); поэтому клиент обёрнут адаптером _OpenAIReasoningClient (переименовывает
+# max_tokens и убирает temperature). Vision и tools — нативные.
+OPENAI_BASE_URL = "https://api.openai.com/v1"
 
 # --- Google Gemini Flash TTS (голосовые ответы в /ask) ---
 GEMINI_TTS_MODEL = os.getenv("GEMINI_TTS_MODEL", "gemini-3.1-flash-tts-preview")
@@ -271,6 +277,14 @@ for _cid, _clabel in [
     ("claude-haiku-4-5",  "Claude Haiku 4.5"),
 ]:
     MODEL_REGISTRY[_cid] = ("modelgate", _cid, _clabel, 200000, 1.2)
+# OpenAI (официальный API). Окно: gpt-5.x — 400k, o3 — 200k. safety 1.1 —
+# токенизатор o200k почти совпадает с tiktoken (которым считает бот).
+for _oid, _olabel, _octx in [
+    ("gpt-5.5", "GPT-5.5", 400000),
+    ("gpt-5.4", "GPT-5.4", 400000),
+    ("o3",      "OpenAI o3", 200000),
+]:
+    MODEL_REGISTRY[_oid] = ("openai", _oid, _olabel, _octx, 1.1)
 # Автообрезка контекста под окно модели
 CTX_RESERVE_TOKENS = 8000   # запас на ответ (4096) + системку + вопрос
 CTX_CHARS_PER_TOKEN = 2.0   # фоллбэк-оценка, если tiktoken недоступен
@@ -518,6 +532,27 @@ modelgate_client = OpenAI(api_key=modelgate_api_key, base_url=MODELGATE_BASE_URL
                           default_headers={"User-Agent": BROWSER_UA}) if modelgate_api_key else None
 
 
+class _OpenAIReasoningClient:
+    """Адаптер под интерфейс OpenAI-клиента (`.chat.completions.create`) для официального
+    OpenAI API. Модели gpt-5.x/o3 — reasoning: на /chat/completions требуют
+    max_completion_tokens вместо max_tokens и поддерживают только дефолтную temperature.
+    Обёртка переименовывает max_tokens→max_completion_tokens и убирает temperature,
+    остальное (tools, tool_choice, messages, vision) проксирует как есть."""
+
+    def __init__(self, api_key):
+        self._c = OpenAI(api_key=api_key, base_url=OPENAI_BASE_URL)
+        self.chat = SimpleNamespace(completions=SimpleNamespace(create=self._create))
+
+    def _create(self, **kwargs):
+        if "max_tokens" in kwargs:
+            kwargs["max_completion_tokens"] = kwargs.pop("max_tokens")
+        kwargs.pop("temperature", None)  # reasoning-модели принимают только default(1.0)
+        return self._c.chat.completions.create(**kwargs)
+
+
+openai_client = _OpenAIReasoningClient(openai_api_key) if openai_api_key else None
+
+
 # ── opencode-go в формате Anthropic Messages (для qwen3.7-max и подобных) ──
 # Утиная обёртка под интерфейс OpenAI-клиента: `.chat.completions.create(...)`.
 # Переводит OpenAI-формат (messages/tools/tool_calls) ↔ Anthropic Messages, чтобы
@@ -727,6 +762,8 @@ def _client_for_provider(provider):
         return opencode_anthropic_client
     if provider == "modelgate":
         return modelgate_client
+    if provider == "openai":
+        return openai_client
     return opencode_client
 
 
@@ -768,6 +805,8 @@ def active_model_supports_vision():
     if provider == "modelgate":
         return False  # шлюз ModelGate НЕ доставляет картинки до Claude (проверено: base64 и URL —
                       # модель отвечает «изображения нет»). Для -g не годится; фото в /ask и так через OCR/медиа-модель.
+    if provider == "openai":
+        return True   # gpt-5.x / o3 принимают картинки напрямую (официальный API)
     return False  # DeepSeek и прочие текстовые
 
 
@@ -4221,6 +4260,7 @@ async def model_command(event):
                 title = {"deepseek": "━━ Прямой API ━━", "opencode": "━━ OpenCode Go ━━",
                          "oc_anthropic": "━━ OpenCode Go (нативный) ━━",
                          "modelgate": "━━ Claude (ModelGate) ━━",
+                         "openai": "━━ OpenAI (GPT-5/o3) ━━",
                          "openrouter": "━━ OpenRouter (кастом) ━━"}.get(provider, f"━━ {provider} ━━")
                 lines.append(f"\n{title}")
             mark = f"▶{i}." if slug == ACTIVE_MODEL else f"{i}."
@@ -4244,8 +4284,8 @@ async def model_command(event):
         tested = 0
         for slug in slugs:
             provider, mid, _label, _ctx, _safety = MODEL_REGISTRY[slug]
-            if provider == "oc_anthropic":
-                continue  # qwen3.7-max: tools работают (Anthropic-формат), но короткий пробник режет thinking — флаг учится на лету
+            if provider in ("oc_anthropic", "openai"):
+                continue  # qwen3.7-max / gpt-5.x / o3: tools работают, но короткий пробник (20 ток) reasoning-модели режет — флаг учится на лету в реальном /ask
             cl = _client_for_provider(provider)
             if cl is None:
                 continue
@@ -5024,6 +5064,8 @@ _HELP_SECTIONS = {
         "   `MODELGATE_API_KEY` — даёт модели **Claude** (Opus / Sonnet / Haiku) для ответов\n"
         "      (`/model` → раздел «Claude (ModelGate)»). Текст и поиск по каналам работают;\n"
         "      картинки напрямую (`-g`) НЕ принимает — фото идут через OCR/медиа-модель как обычно.\n"
+        "   `OPENAI_API_KEY` — даёт модели **OpenAI** (GPT-5.5 / GPT-5.4 / o3) для ответов\n"
+        "      (`/model` → раздел «OpenAI»). Официальный API — нужен баланс на platform.openai.com.\n"
         "   `GOOGLE_GENAI_API_KEY` — даёт **голосовые ответы** (`/voice`, флаг `-v`). Можно\n"
         "      указать несколько ключей через запятую или в `GOOGLE_GENAI_API_KEYS` (ротация).\n"
         "   `FISH_AUDIO_API_KEY` — альтернативный TTS-движок Fish Audio (`/voice engine fish`,\n"
@@ -5180,7 +5222,7 @@ async def status_command(event):
     L.append(f"⭐ **Избранное:** {len(FISH_FAVORITES)} Fish-голос(ов) · {len(CUSTOM_MODELS)} кастомных моделей")
     # — ключи —
     keys = []
-    for p, nm in [("deepseek", "DeepSeek"), ("openrouter", "OpenRouter"), ("opencode", "OpenCode"), ("modelgate", "Claude/ModelGate")]:
+    for p, nm in [("deepseek", "DeepSeek"), ("openrouter", "OpenRouter"), ("opencode", "OpenCode"), ("modelgate", "Claude/ModelGate"), ("openai", "OpenAI")]:
         keys.append(f"{nm} {'✅' if _client_for_provider(p) is not None else '❌'}")
     keys.append(f"Tavily {'✅' if tavily_api_key else '❌'}")
     keys.append(f"Google TTS {'✅' if tts_available else '❌'}")
