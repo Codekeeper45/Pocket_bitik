@@ -57,6 +57,7 @@ openrouter_api_key = os.getenv("OPENROUTER_API_KEY")
 deepseek_api_key = os.getenv("DEEPSEEK_API_KEY")
 opencode_api_key = os.getenv("OPENCODE_API_KEY")
 modelgate_api_key = os.getenv("MODELGATE_API_KEY")  # шлюз Claude-моделей (OpenAI-совместимый, modelgate.app)
+tavily_api_key = os.getenv("TAVILY_API_KEY")  # веб-поиск/извлечение страниц для /ask (tavily.com); без ключа веб-инструменты выключены
 llama_cloud_api_key = os.getenv("LLAMA_CLOUD_API_KEY")  # OCR фото (LlamaParse); без него фото идут через vision
 
 
@@ -308,6 +309,78 @@ TELEGRAM_SEARCH_TOOL = {
         }
     }
 }
+
+# --- Веб-инструменты Tavily (tavily.com) для /ask: модель САМА решает, когда искать ---
+TAVILY_BASE_URL = "https://api.tavily.com"
+WEB_SEARCH_MAX_RESULTS = 8        # потолок результатов на один web_search
+WEB_EXTRACT_MAX_URLS = 5          # потолок URL на один web_extract
+WEB_EXTRACT_MAX_CHARS = 8000      # обрезка текста одной страницы (extract)
+WEB_CRAWL_MAX_PAGES = 8           # потолок страниц на один web_crawl
+WEB_CRAWL_PAGE_CHARS = 2000       # обрезка текста одной страницы (crawl)
+WEB_MAP_MAX_URLS = 40             # потолок ссылок на один web_map
+
+WEB_SEARCH_TOOL = {
+    "type": "function",
+    "function": {
+        "name": "web_search",
+        "description": "Ищет информацию в интернете (поисковик Tavily). Возвращает до 8 результатов: заголовок, URL, дату и выдержку текста, плюс краткий готовый ответ. Используй, когда вопрос требует актуальных или внешних знаний: новости, события, цены, версии, факты о людях/компаниях, всё чего нет в контексте переписки. Для свежих новостей ставь topic=news и time_range.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "query": {"type": "string", "description": "Поисковый запрос. Формулируй конкретно, как для Google."},
+                "topic": {"type": "string", "enum": ["general", "news"], "description": "news — поиск по новостным сайтам с датами публикаций; general — обычный веб-поиск (по умолчанию)."},
+                "time_range": {"type": "string", "enum": ["day", "week", "month", "year"], "description": "Опционально: ограничить результаты по свежести (day — за сутки, week — за неделю и т.д.)."},
+                "max_results": {"type": "integer", "description": "Сколько результатов вернуть, 1-8 (по умолчанию 5)."},
+                "search_depth": {"type": "string", "enum": ["basic", "advanced"], "description": "advanced — глубже и точнее, но медленнее; для сложных вопросов. По умолчанию basic."}
+            },
+            "required": ["query"]
+        }
+    }
+}
+WEB_EXTRACT_TOOL = {
+    "type": "function",
+    "function": {
+        "name": "web_extract",
+        "description": "Скачивает и извлекает полный текст веб-страниц по URL (до 5 за раз). Используй, чтобы прочитать конкретную страницу целиком: статью из результатов web_search, ссылку из переписки, документацию. Возвращает текст в markdown.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "urls": {"type": "array", "items": {"type": "string"}, "description": "Список URL для извлечения (1-5)."}
+            },
+            "required": ["urls"]
+        }
+    }
+}
+WEB_CRAWL_TOOL = {
+    "type": "function",
+    "function": {
+        "name": "web_crawl",
+        "description": "Обходит сайт по ссылкам начиная с указанного URL и возвращает тексты найденных страниц (до 8 страниц). Используй, когда нужно изучить РАЗДЕЛ сайта целиком (документацию, блог, каталог), а не одну страницу. Дорогая операция — не вызывай без необходимости.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "url": {"type": "string", "description": "Стартовый URL обхода."},
+                "instructions": {"type": "string", "description": "Опционально: что именно искать при обходе, на естественном языке (например «страницы с ценами»)."}
+            },
+            "required": ["url"]
+        }
+    }
+}
+WEB_MAP_TOOL = {
+    "type": "function",
+    "function": {
+        "name": "web_map",
+        "description": "Возвращает карту сайта — список URL страниц, найденных по ссылкам с указанного адреса (до 40). Используй, чтобы понять структуру сайта и выбрать нужные страницы для web_extract. Быстрее и дешевле, чем web_crawl.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "url": {"type": "string", "description": "URL сайта для построения карты."}
+            },
+            "required": ["url"]
+        }
+    }
+}
+WEB_TOOLS = [WEB_SEARCH_TOOL, WEB_EXTRACT_TOOL, WEB_CRAWL_TOOL, WEB_MAP_TOOL]
 
 ASK_SYSTEM_PROMPT = """Ты — {model}, ИИ с характером и собственной точкой зрения. Не нейтральный ассистент, а собеседник с позицией.
 
@@ -1891,6 +1964,99 @@ async def generate_auto_reply(combined_text: str, history: list = None) -> str:
     return result if result else "Понял"
 
 
+# ── Веб-инструменты Tavily: выполнение tool-call'ов из agentic loop ──
+
+def _sync_tavily(endpoint: str, payload: dict, timeout: int = 60) -> dict:
+    """POST на api.tavily.com/{endpoint}. Возвращает dict ответа, кидает RuntimeError при ошибке."""
+    r = requests.post(
+        f"{TAVILY_BASE_URL}/{endpoint}",
+        headers={"Authorization": f"Bearer {tavily_api_key}", "Content-Type": "application/json"},
+        json=payload, timeout=timeout,
+    )
+    if r.status_code != 200:
+        detail = r.text[:200]
+        try:
+            detail = (r.json().get("detail") or {}).get("error") or detail
+        except Exception:
+            pass
+        raise RuntimeError(f"Tavily {endpoint} HTTP {r.status_code}: {detail}")
+    return r.json()
+
+
+async def _run_web_tool(name: str, args: dict) -> str:
+    """Выполняет веб-инструмент (web_search/web_extract/web_crawl/web_map) и форматирует
+    результат строкой для tool-сообщения. Ошибки возвращает текстом — loop не падает."""
+    try:
+        if name == "web_search":
+            query = (args.get("query") or "").strip()
+            if not query:
+                return "Ошибка: пустой поисковый запрос"
+            n = max(1, min(int(args.get("max_results") or 5), WEB_SEARCH_MAX_RESULTS))
+            payload = {"query": query, "max_results": n, "include_answer": True,
+                       "search_depth": args.get("search_depth") if args.get("search_depth") in ("basic", "advanced") else "basic"}
+            if args.get("topic") in ("general", "news"):
+                payload["topic"] = args["topic"]
+            if args.get("time_range") in ("day", "week", "month", "year"):
+                payload["time_range"] = args["time_range"]
+            d = await asyncio.to_thread(_sync_tavily, "search", payload, 40)
+            results = d.get("results") or []
+            if not results:
+                return f"Веб-поиск по «{query}»: ничего не найдено."
+            lines = []
+            if d.get("answer"):
+                lines.append(f"💡 Краткий ответ поисковика: {d['answer']}")
+            for r_ in results:
+                date = f" | 📅 {r_['published_date']}" if r_.get("published_date") else ""
+                lines.append(f"• {r_.get('title', '')}{date}\n  {r_.get('url', '')}\n  {_preview(r_.get('content') or '', 800)}")
+            return f"Веб-поиск «{query}»: {len(results)} результатов.\n\n" + "\n\n".join(lines)
+
+        if name == "web_extract":
+            urls = [u for u in (args.get("urls") or []) if isinstance(u, str) and u.strip()][:WEB_EXTRACT_MAX_URLS]
+            if not urls:
+                return "Ошибка: не передано ни одного URL"
+            d = await asyncio.to_thread(_sync_tavily, "extract", {"urls": urls, "format": "markdown"}, 90)
+            parts = []
+            for r_ in d.get("results") or []:
+                txt = (r_.get("raw_content") or "").strip()
+                cut = " …(обрезано)" if len(txt) > WEB_EXTRACT_MAX_CHARS else ""
+                parts.append(f"═══ {r_.get('url')} ═══\n{txt[:WEB_EXTRACT_MAX_CHARS]}{cut}")
+            for f_ in d.get("failed_results") or []:
+                parts.append(f"⚠️ Не удалось извлечь: {f_.get('url')} ({f_.get('error', '')})")
+            return "\n\n".join(parts) if parts else "Не удалось извлечь ни одной страницы."
+
+        if name == "web_crawl":
+            url = (args.get("url") or "").strip()
+            if not url:
+                return "Ошибка: не передан URL"
+            payload = {"url": url, "limit": WEB_CRAWL_MAX_PAGES, "max_depth": 2}
+            if args.get("instructions"):
+                payload["instructions"] = str(args["instructions"])[:500]
+            d = await asyncio.to_thread(_sync_tavily, "crawl", payload, 150)
+            results = d.get("results") or []
+            if not results:
+                return f"Обход {url}: страниц не найдено."
+            parts = [f"Обход {url}: {len(results)} страниц."]
+            for r_ in results[:WEB_CRAWL_MAX_PAGES]:
+                txt = (r_.get("raw_content") or "").strip()
+                parts.append(f"═══ {r_.get('url')} ═══\n{txt[:WEB_CRAWL_PAGE_CHARS]}{' …(обрезано)' if len(txt) > WEB_CRAWL_PAGE_CHARS else ''}")
+            return "\n\n".join(parts)
+
+        if name == "web_map":
+            url = (args.get("url") or "").strip()
+            if not url:
+                return "Ошибка: не передан URL"
+            d = await asyncio.to_thread(_sync_tavily, "map", {"url": url, "limit": WEB_MAP_MAX_URLS, "max_depth": 2}, 90)
+            urls = d.get("results") or []
+            if not urls:
+                return f"Карта {url}: ссылок не найдено."
+            return f"Карта сайта {url} ({len(urls)} ссылок):\n" + "\n".join(f"• {u}" for u in urls[:WEB_MAP_MAX_URLS])
+
+        return f"Неизвестный веб-инструмент: {name}"
+    except (RuntimeError, requests.exceptions.RequestException) as e:
+        log("ASK", f"Веб-инструмент {name} упал: {e}")
+        return f"Ошибка веб-инструмента {name}: {e}. Попробуй другой запрос или ответь без этих данных."
+
+
 async def ask_agentic(context: str, question: str, must_search: bool = False, caller: str = None, ctx_tokens_est: int = None, voice_mode: str = "off", images: list = None) -> str:
     """Agentic ask: модель сама решает, искать ли информацию в каналах.
     ctx_tokens_est — tiktoken-оценка контекста (для логирования Δ с реальным API).
@@ -1902,14 +2068,23 @@ async def ask_agentic(context: str, question: str, must_search: bool = False, ca
 
     channels = get_tracked()
     has_channels = len(channels) > 0
+    has_web = bool(tavily_api_key)        # веб-инструменты Tavily (web_search/web_extract/web_crawl/web_map)
+    has_tools = has_channels or has_web
 
     now_str = datetime.now(MSK).strftime("%d.%m.%Y %H:%M")
 
     system_prompt = ASK_SYSTEM_PROMPT.replace("{model}", label) + f"\n\nТекущая дата и время: {now_str} МСК. Учитывай актуальность: оценивай свежесть постов по их дате, для вопросов о новостях опирайся на самые недавние."
     if has_channels:
         system_prompt += "\n\nУ тебя есть доступ к инструменту telegram_search для поиска в Telegram-каналах. Используй его если вопрос требует актуальной информации, которой нет в контексте переписки. Формулируй точные поисковые запросы. Для свежих новостей указывай параметр days."
-    if must_search and has_channels:
-        system_prompt += "\n\nОБЯЗАТЕЛЬНО используй telegram_search хотя бы один раз перед тем как ответить."
+    if has_web:
+        system_prompt += ("\n\nУ тебя есть доступ в интернет: web_search (поиск), web_extract (прочитать страницы по URL), "
+                          "web_crawl (обойти раздел сайта), web_map (карта сайта). САМ решай, когда они нужны: "
+                          "актуальные события, факты вне переписки, проверка утверждений, ссылки из чата. "
+                          "Обычно достаточно web_search; web_extract — когда нужен полный текст конкретной страницы. "
+                          "Не ищи то, что и так знаешь или что есть в контексте чата.")
+    if must_search and has_tools:
+        force_name = "telegram_search" if has_channels else "web_search"
+        system_prompt += f"\n\nОБЯЗАТЕЛЬНО используй {force_name} хотя бы один раз перед тем как ответить."
     if voice_mode == "force":
         system_prompt += _voice_style_text(TTS_ENGINE, FISH_TTS_MODEL)
     elif voice_mode == "auto":
@@ -1930,12 +2105,14 @@ async def ask_agentic(context: str, question: str, must_search: bool = False, ca
     ]
 
     max_iterations = 10
-    force_tool = must_search and has_channels
-    sstats = {"iters": 0, "calls": 0, "posts": 0}  # сводка поиска (-c)
+    force_tool = must_search and has_tools
+    force_tool_name = "telegram_search" if has_channels else "web_search"
+    tools_list = ([TELEGRAM_SEARCH_TOOL] if has_channels else []) + (WEB_TOOLS if has_web else [])
+    sstats = {"iters": 0, "calls": 0, "posts": 0, "web": 0}  # сводка поиска (-c)
 
     def _log_search_summary():
         if sstats["iters"]:
-            log("ASK", f"Поиск: {sstats['iters']} итер., {sstats['calls']} запросов к каналам, найдено {sstats['posts']} постов суммарно")
+            log("ASK", f"Поиск: {sstats['iters']} итер., {sstats['calls']} запросов к каналам, найдено {sstats['posts']} постов, веб-вызовов {sstats['web']}")
 
     for iteration in range(max_iterations):
         log("ASK", f"Agentic итерация {iteration + 1}/{max_iterations}")
@@ -1947,16 +2124,16 @@ async def ask_agentic(context: str, question: str, must_search: bool = False, ca
                 max_tokens=ASK_MAX_TOKENS,
                 temperature=1.0,
             )
-            if has_channels:
-                kwargs["tools"] = [TELEGRAM_SEARCH_TOOL]
-                kwargs["tool_choice"] = {"type": "function", "function": {"name": "telegram_search"}} if force_tool else "auto"
+            if tools_list:
+                kwargs["tools"] = tools_list
+                kwargs["tool_choice"] = {"type": "function", "function": {"name": force_tool_name}} if force_tool else "auto"
 
             try:
                 response = await asyncio.to_thread(llm.chat.completions.create, **kwargs)
             except Exception as e:
                 # Thinking-модели (DeepSeek) не умеют ПРИНУДИТЕЛЬНЫЙ tool_choice, но auto — умеют.
                 # Не считаем «без tools»: повторяем с auto, поиск остаётся доступен.
-                if force_tool and has_channels and _is_thinking_mode_quirk(e):
+                if force_tool and has_tools and _is_thinking_mode_quirk(e):
                     log("ASK", "Принудительный tool_choice не поддержан (thinking-режим) — повтор с auto")
                     kwargs["tool_choice"] = "auto"
                     response = await asyncio.to_thread(llm.chat.completions.create, **kwargs)
@@ -1965,7 +2142,7 @@ async def ask_agentic(context: str, question: str, must_search: bool = False, ca
         except TypeError:
             # Модель не поддерживает tools — fallback на обычный ask
             log("ASK", "Модель не поддерживает tool calling, fallback на обычный ask")
-            if has_channels:
+            if has_tools:
                 _set_tools_support(ACTIVE_MODEL, False)
             _log_search_summary()
             return await generate_ask_reply(context, question, caller=caller)
@@ -1977,7 +2154,7 @@ async def ask_agentic(context: str, question: str, must_search: bool = False, ca
                 raise ContextOverflowError(str(e)) from e
             quirk = _is_thinking_mode_quirk(e)
             # thinking-quirk НЕ трактуем как «без tools» (модель умеет auto/tools, просто особенности API)
-            if has_channels and not quirk and any(k in str(e).lower() for k in ("tool", "function")):
+            if has_tools and not quirk and any(k in str(e).lower() for k in ("tool", "function")):
                 _set_tools_support(ACTIVE_MODEL, False)
             # Сброс СТАЛОЙ записи tools_support=False, если на самом деле это thinking-quirk
             if quirk and MODEL_TOOLS_SUPPORT.get(ACTIVE_MODEL) is False:
@@ -2010,10 +2187,9 @@ async def ask_agentic(context: str, question: str, must_search: bool = False, ca
                 log("ASK", f"Δ токенизаторов: tiktoken={ctx_tokens_est} vs API={usage.prompt_tokens} → tiktoken {verdict} на {abs(pct)}% (запас {int(margin)}% {covered})")
 
         # Получили валидный ответ с инструментами — модель умеет tools
-        if has_channels and msg.tool_calls:
+        if has_tools and msg.tool_calls:
             _set_tools_support(ACTIVE_MODEL, True)
             sstats["iters"] += 1
-            sstats["calls"] += len(msg.tool_calls)
 
         # Если нет tool_calls — это финальный ответ
         if not msg.tool_calls:
@@ -2048,23 +2224,43 @@ async def ask_agentic(context: str, question: str, must_search: bool = False, ca
         messages.append(assistant_dict)
 
         for tool_call in msg.tool_calls:
-            if tool_call.function.name != "telegram_search":
+            tname = tool_call.function.name
+            try:
+                args = json.loads(tool_call.function.arguments or "{}")
+                if not isinstance(args, dict):
+                    args = {}
+            except (json.JSONDecodeError, TypeError):
+                args = {}
+
+            # — веб-инструменты Tavily —
+            if tname in ("web_search", "web_extract", "web_crawl", "web_map"):
+                sstats["web"] += 1
+                brief = args.get("query") or args.get("url") or ",".join((args.get("urls") or [])[:2])
+                log("ASK", f"Веб-инструмент {tname}: {str(brief)[:120]}")
+                web_result = await _run_web_tool(tname, args)
+                log("ASK", f"{tname} вернул {len(web_result)} симв")
                 messages.append({
                     "role": "tool",
                     "tool_call_id": tool_call.id,
-                    "content": f"Неизвестный инструмент: {tool_call.function.name}"
+                    "content": web_result,
                 })
                 continue
 
-            query = ""
+            if tname != "telegram_search":
+                messages.append({
+                    "role": "tool",
+                    "tool_call_id": tool_call.id,
+                    "content": f"Неизвестный инструмент: {tname}"
+                })
+                continue
+
+            sstats["calls"] += 1
+            query = (args.get("query") or "").strip()
             days = None
             try:
-                args = json.loads(tool_call.function.arguments)
-                query = (args.get("query") or "").strip()
-                days = args.get("days")
-                if days is not None:
-                    days = int(days)
-            except (json.JSONDecodeError, KeyError, ValueError, TypeError):
+                if args.get("days") is not None:
+                    days = int(args["days"])
+            except (ValueError, TypeError):
                 pass
 
             if not query:
@@ -4633,7 +4829,7 @@ _HELP_SECTIONS = {
         "\n"
         "**Флаги** (шаг 3; можно несколько, слитно `-tc` или раздельно `-t -c`):\n"
         "   `-t` — текст без медиа: не распознаёт фото/голос/кружки → **быстрее и дешевле**.\n"
-        "   `-c` — обязательно искать по подключённым каналам перед ответом.\n"
+        "   `-c` — обязательно искать (по каналам; без каналов — в интернете) перед ответом.\n"
         "   `-d` — дамп: выгрузить собранный контекст отдельным файлом (для отладки).\n"
         "   `-v` — ответить **голосом** (озвучка через Gemini TTS). См. `/help voice`.\n"
         "   `-g` — отдать **картинки напрямую** отвечающей модели (её vision), а не описания.\n"
@@ -4654,6 +4850,9 @@ _HELP_SECTIONS = {
         "   Ответь `/ask вопрос` на чьё-то сообщение — бот возьмёт именно его + контекст вокруг.\n"
         "\n"
         "⏱ На больших N (10–15 тыс.) сбор истории идёт **в несколько потоков** — это норм, подожди.\n"
+        "🌐 С ключом **Tavily** модель сама ходит в интернет: ищет (web_search), читает страницы\n"
+        "   по ссылкам (web_extract), обходит сайты (web_crawl/web_map). Когда искать — решает сама;\n"
+        "   `-c` заставляет искать обязательно.\n"
         "🔑 Работает на ключе **DeepSeek** (обязательный). Медиа в вопросе требует ключ OpenRouter/OpenCode — см. `/help keys`."
     ),
     "model": (
@@ -4831,6 +5030,9 @@ _HELP_SECTIONS = {
         "      `/voice fish` — поиск/избранное голосов).\n"
         "   `LLAMA_CLOUD_API_KEY` — дешёвый **OCR фото** в `/ask` по умолчанию (LlamaParse).\n"
         "      Без него фото автоматически описывает vision-модель (как раньше).\n"
+        "   `TAVILY_API_KEY` — **веб-поиск** в `/ask`: модель сама ищет в интернете, читает\n"
+        "      страницы по ссылкам и обходит сайты (Tavily, бесплатно 1000 запросов/мес).\n"
+        "      Ключ: https://app.tavily.com\n"
         "\n"
         "**Что будет без необязательных ключей:**\n"
         "   • Нет OpenRouter и OpenCode → текст разбирается нормально, но фото/кружки в `/ask`\n"
@@ -4945,6 +5147,7 @@ async def status_command(event):
     else:
         media_label = f"{ACTIVE_MEDIA_MODEL} (кастомная)"
     L.append(f"🖼 **Фото в /ask:** OCR LlamaParse (cost-effective) {'✅' if llama_cloud_api_key else '❌ нет ключа → vision'} · vision (`-m`): {media_label}")
+    L.append(f"🌐 **Веб-поиск (Tavily):** {'✅ модель сама ищет в интернете (search/extract/crawl/map)' if tavily_api_key else '❌ нет TAVILY_API_KEY'}")
     # — голос —
     if not tts_available and not fish_available:
         L.append("🎙 **Голос:** недоступен (нет ключей Google TTS / Fish)")
@@ -4979,6 +5182,7 @@ async def status_command(event):
     keys = []
     for p, nm in [("deepseek", "DeepSeek"), ("openrouter", "OpenRouter"), ("opencode", "OpenCode"), ("modelgate", "Claude/ModelGate")]:
         keys.append(f"{nm} {'✅' if _client_for_provider(p) is not None else '❌'}")
+    keys.append(f"Tavily {'✅' if tavily_api_key else '❌'}")
     keys.append(f"Google TTS {'✅' if tts_available else '❌'}")
     keys.append(f"Fish {'✅' if fish_available else '❌'}")
     L.append("🔑 **Ключи:** " + " · ".join(keys))
