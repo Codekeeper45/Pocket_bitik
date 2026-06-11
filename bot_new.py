@@ -2104,7 +2104,7 @@ async def ask_agentic(context: str, question: str, must_search: bool = False, ca
         {"role": "user", "content": user_content},
     ]
 
-    max_iterations = 10
+    max_iterations = 20
     force_tool = must_search and has_tools
     force_tool_name = "telegram_search" if has_channels else "web_search"
     tools_list = ([TELEGRAM_SEARCH_TOOL] if has_channels else []) + (WEB_TOOLS if has_web else [])
