@@ -2,7 +2,8 @@ from telethon import TelegramClient, events, utils
 from telethon.errors.rpcerrorlist import MessageNotModifiedError, FloodWaitError
 from telethon.extensions import html as tl_html
 from telethon.helpers import add_surrogate
-from telethon.tl.types import MessageEntityBlockquote, MessageEntityPre, MessageMediaWebPage
+from telethon.tl.types import MessageEntityBlockquote, MessageEntityPre, MessageMediaWebPage, InputReplyToMessage
+from telethon.tl.functions.messages import SendMessageRequest
 from dotenv import load_dotenv
 from openai import OpenAI
 import os
@@ -420,7 +421,8 @@ REPLY_TOOL = {
                         "type": "object",
                         "properties": {
                             "message_id": {"type": "integer", "description": "id сообщения из метки #id в истории"},
-                            "text": {"type": "string", "description": "текст ответа именно на это сообщение"}
+                            "text": {"type": "string", "description": "текст ответа именно на это сообщение"},
+                            "quote": {"type": "string", "description": "НЕОБЯЗАТЕЛЬНО: точная подстрока ИЗ этого сообщения (дословно, как в тексте), чтобы подсветить в цитате именно тот фрагмент, на который отвечаешь. Если не нужен фрагмент — не указывай, ответ прикрепится ко всему сообщению."}
                         },
                         "required": ["message_id", "text"]
                     }
@@ -2131,19 +2133,53 @@ async def _run_web_tool(name: str, args: dict) -> str:
         return f"Ошибка веб-инструмента {name}: {e}. Попробуй другой запрос или ответь без этих данных."
 
 
+async def _send_quote_reply(chat_id, mid: int, html_text: str, quote: str, src_text: str) -> bool:
+    """Реплай с подсветкой КОНКРЕТНОГО фрагмента (partial quote). Находит `quote` как точную
+    подстроку исходного текста, считает UTF-16 offset (требование Telegram) и шлёт через сырой
+    SendMessageRequest с InputReplyToMessage(quote_text, quote_offset). True — отправлено;
+    False — фрагмент не найден / текст слишком длинный / ошибка (вызывающий откатится на обычный реплай)."""
+    if not quote or not src_text or len(html_text) > 4000:
+        return False
+    pos = src_text.find(quote)
+    if pos < 0:
+        return False
+    off16 = len(src_text[:pos].encode("utf-16-le")) // 2  # Telegram считает offset в UTF-16
+    try:
+        msg_text, entities = client._parse_message_text(html_text, "html")
+        reply_obj = InputReplyToMessage(reply_to_msg_id=mid, quote_text=quote, quote_offset=off16)
+        await client(SendMessageRequest(peer=chat_id, message=msg_text, reply_to=reply_obj,
+                                        entities=entities, no_webpage=True))
+        return True
+    except FloodWaitError as e:
+        await asyncio.sleep(e.seconds + 1)
+        try:
+            await client(SendMessageRequest(peer=chat_id, message=msg_text, reply_to=reply_obj,
+                                            entities=entities, no_webpage=True))
+            return True
+        except Exception as e2:
+            log("ASK", f"Quote-реплай на #{mid} не ушёл после FloodWait ({e2})")
+            return False
+    except Exception as e:
+        log("ASK", f"Quote-реплай на #{mid} не удался ({e}) — откат на обычный реплай")
+        return False
+
+
 async def _run_reply_tool(args: dict, chat_id, msg_by_id: dict, reply_sent: list) -> str:
-    """Исполняет reply_to_messages: для каждого валидного {message_id, text} шлёт ОТДЕЛЬНЫЙ реплай
-    тредом на исходное сообщение (через send_long, html). Соблюдает лимит REPLY_MAX. Возвращает
-    текстовую сводку для модели (отправлено / не найдено / лимит). Ошибки не роняют agentic-цикл."""
+    """Исполняет reply_to_messages: для каждого валидного {message_id, text, quote?} шлёт ОТДЕЛЬНЫЙ
+    реплай тредом на исходное сообщение. Если задан `quote` (точная подстрока сообщения) — подсвечивает
+    именно этот фрагмент (partial quote); иначе/если не найден — реплай на всё сообщение (send_long).
+    Соблюдает лимит REPLY_MAX. Возвращает сводку для модели. Ошибки не роняют agentic-цикл."""
     replies = args.get("replies")
     if not isinstance(replies, list) or not replies:
         return "Ошибка: пустой список replies. Передай массив объектов {message_id, text}."
     sent, not_found, capped, bad = [], [], 0, 0
+    quoted = 0
     for item in replies:
         if not isinstance(item, dict):
             bad += 1
             continue
         text = (item.get("text") or "").strip()
+        quote = (item.get("quote") or "").strip()
         try:
             mid = int(item.get("message_id"))
         except (TypeError, ValueError):
@@ -2160,16 +2196,24 @@ async def _run_reply_tool(args: dict, chat_id, msg_by_id: dict, reply_sent: list
             continue
         try:
             cleaned = _html_clean_markdown(text)
-            await send_long(chat_id, cleaned, parse_mode="html", reply_to=mid, collapse_threshold=700)
+            did_quote = False
+            if quote:
+                src = msg_by_id[mid]
+                src_text = getattr(src, "raw_text", None) or getattr(src, "message", None) or ""
+                did_quote = await _send_quote_reply(chat_id, mid, cleaned, quote, src_text)
+            if not did_quote:  # без фрагмента или фрагмент не найден → реплай на всё сообщение
+                await send_long(chat_id, cleaned, parse_mode="html", reply_to=mid, collapse_threshold=700)
             reply_sent[0] += 1
             sent.append(mid)
-            log("ASK", f"Реплай отправлен на #{mid} ({len(text)} симв)")
+            quoted += 1 if did_quote else 0
+            log("ASK", f"Реплай отправлен на #{mid} ({len(text)} симв{', с фрагментом' if did_quote else ''})")
         except Exception as e:
             log("ASK", f"Реплай на #{mid} не отправлен: {e}")
             not_found.append(mid)  # модель пусть считает его неудачным
     parts = []
     if sent:
-        parts.append(f"Отправлено {len(sent)} реплаев на #" + ", #".join(str(x) for x in sent) + ".")
+        qn = f" ({quoted} с подсветкой фрагмента)" if quoted else ""
+        parts.append(f"Отправлено {len(sent)} реплаев на #" + ", #".join(str(x) for x in sent) + qn + ".")
     if not_found:
         parts.append("Не найдены/не отправлены id: " + ", ".join(f"#{x}" for x in not_found) + " — проверь метки #id.")
     if capped:
@@ -2215,8 +2259,10 @@ async def ask_agentic(context: str, question: str, must_search: bool = False, ca
                           "ОТВЕТИТЬ РЕПЛАЕМ на конкретные сообщения через инструмент reply_to_messages — "
                           f"на одно или сразу на несколько (до {REPLY_MAX}), каждый ответ уйдёт отдельным "
                           "сообщением, прикреплённым к своему. Делай это, когда уместно ответить адресно "
-                          "(на спор, на чей-то вопрос, на реплики разных людей). Сам решай, нужно ли — не "
-                          "обязательно. После реплаев всё равно дай общий итоговый ответ обычным текстом.")
+                          "(на спор, на чей-то вопрос, на реплики разных людей). Можно подсветить КОНКРЕТНЫЙ "
+                          "фрагмент сообщения: передай в поле quote дословную подстроку из этого сообщения — "
+                          "в цитате выделится именно она (удобно для длинных сообщений). Сам решай, нужно ли — "
+                          "не обязательно. После реплаев всё равно дай общий итоговый ответ обычным текстом.")
     if must_search and (has_channels or has_web):
         force_name = "telegram_search" if has_channels else "web_search"
         system_prompt += f"\n\nОБЯЗАТЕЛЬНО используй {force_name} хотя бы один раз перед тем как ответить."
