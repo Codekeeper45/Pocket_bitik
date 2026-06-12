@@ -279,11 +279,12 @@ for _cid, _clabel in [
     ("claude-haiku-4-5",  "Claude Haiku 4.5"),
 ]:
     MODEL_REGISTRY[_cid] = ("modelgate", _cid, _clabel, 200000, 1.2)
-# OpenAI (официальный API). Окно: gpt-5.x — 400k, o3 — 200k. safety 1.1 —
-# токенизатор o200k почти совпадает с tiktoken (которым считает бот).
+# OpenAI (официальный API). Окна сверены с официальными страницами моделей (2026-06-12):
+# gpt-5.4/5.5 — 1,050,000 (флагманы 5.4+ получили ~1M окно), gpt-5.4-mini — 400k,
+# o3/o4-mini — 200k. safety 1.1 — токенизатор o200k почти совпадает с tiktoken бота.
 for _oid, _olabel, _octx in [
-    ("gpt-5.5", "GPT-5.5", 400000),
-    ("gpt-5.4", "GPT-5.4", 400000),
+    ("gpt-5.5", "GPT-5.5", 1050000),
+    ("gpt-5.4", "GPT-5.4", 1050000),
     ("o3",      "OpenAI o3", 200000),
     ("gpt-5.4-mini", "GPT-5.4 Mini", 400000),
     ("o4-mini", "OpenAI o4-mini", 200000),
