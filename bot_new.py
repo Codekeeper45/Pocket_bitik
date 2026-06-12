@@ -396,6 +396,41 @@ WEB_MAP_TOOL = {
 }
 WEB_TOOLS = [WEB_SEARCH_TOOL, WEB_EXTRACT_TOOL, WEB_CRAWL_TOOL, WEB_MAP_TOOL]
 
+# --- Инструмент адресного реплая: ИИ САМ отвечает реплаем на конкретные сообщения истории ---
+REPLY_MAX = 5  # анти-спам: не больше N реплаев за один /ask
+REPLY_TOOL = {
+    "type": "function",
+    "function": {
+        "name": "reply_to_messages",
+        "description": (
+            "Ответить РЕПЛАЕМ (с цитированием) на конкретные сообщения из истории по их #id "
+            "(числа в метках #id перед каждым сообщением). Можно сразу на несколько — каждый ответ "
+            "уйдёт ОТДЕЛЬНЫМ сообщением, прикреплённым к своему исходному. Используй для адресных "
+            "ответов: на спор, на вопрос конкретного человека, на реплики разных людей. Максимум "
+            f"{REPLY_MAX} реплаев за раз. После вызова дай ещё и общий итоговый ответ обычным текстом "
+            "(он отправится отдельно) — не дублируй в нём дословно то, что уже написал в реплаях."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "replies": {
+                    "type": "array",
+                    "description": "Список адресных ответов (1+). Каждый — реплай на своё сообщение.",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "message_id": {"type": "integer", "description": "id сообщения из метки #id в истории"},
+                            "text": {"type": "string", "description": "текст ответа именно на это сообщение"}
+                        },
+                        "required": ["message_id", "text"]
+                    }
+                }
+            },
+            "required": ["replies"]
+        }
+    }
+}
+
 ASK_SYSTEM_PROMPT = """Ты — {model}, ИИ с характером и собственной точкой зрения. Не нейтральный ассистент, а собеседник с позицией.
 
 Правила:
@@ -2096,11 +2131,64 @@ async def _run_web_tool(name: str, args: dict) -> str:
         return f"Ошибка веб-инструмента {name}: {e}. Попробуй другой запрос или ответь без этих данных."
 
 
-async def ask_agentic(context: str, question: str, must_search: bool = False, caller: str = None, ctx_tokens_est: int = None, voice_mode: str = "off", images: list = None) -> str:
+async def _run_reply_tool(args: dict, chat_id, msg_by_id: dict, reply_sent: list) -> str:
+    """Исполняет reply_to_messages: для каждого валидного {message_id, text} шлёт ОТДЕЛЬНЫЙ реплай
+    тредом на исходное сообщение (через send_long, html). Соблюдает лимит REPLY_MAX. Возвращает
+    текстовую сводку для модели (отправлено / не найдено / лимит). Ошибки не роняют agentic-цикл."""
+    replies = args.get("replies")
+    if not isinstance(replies, list) or not replies:
+        return "Ошибка: пустой список replies. Передай массив объектов {message_id, text}."
+    sent, not_found, capped, bad = [], [], 0, 0
+    for item in replies:
+        if not isinstance(item, dict):
+            bad += 1
+            continue
+        text = (item.get("text") or "").strip()
+        try:
+            mid = int(item.get("message_id"))
+        except (TypeError, ValueError):
+            bad += 1
+            continue
+        if not text:
+            bad += 1
+            continue
+        if reply_sent[0] >= REPLY_MAX:
+            capped += 1
+            continue
+        if mid not in msg_by_id:
+            not_found.append(mid)
+            continue
+        try:
+            cleaned = _html_clean_markdown(text)
+            await send_long(chat_id, cleaned, parse_mode="html", reply_to=mid, collapse_threshold=700)
+            reply_sent[0] += 1
+            sent.append(mid)
+            log("ASK", f"Реплай отправлен на #{mid} ({len(text)} симв)")
+        except Exception as e:
+            log("ASK", f"Реплай на #{mid} не отправлен: {e}")
+            not_found.append(mid)  # модель пусть считает его неудачным
+    parts = []
+    if sent:
+        parts.append(f"Отправлено {len(sent)} реплаев на #" + ", #".join(str(x) for x in sent) + ".")
+    if not_found:
+        parts.append("Не найдены/не отправлены id: " + ", ".join(f"#{x}" for x in not_found) + " — проверь метки #id.")
+    if capped:
+        parts.append(f"Лимит {REPLY_MAX} реплаев исчерпан, лишние {capped} пропущены.")
+    if bad:
+        parts.append(f"{bad} элементов пропущено (пустой текст или некорректный message_id).")
+    if not parts:
+        parts.append("Ничего не отправлено.")
+    parts.append("Теперь дай общий итоговый ответ обычным текстом (он уйдёт отдельным сообщением).")
+    return " ".join(parts)
+
+
+async def ask_agentic(context: str, question: str, must_search: bool = False, caller: str = None, ctx_tokens_est: int = None, voice_mode: str = "off", images: list = None, chat_id=None, msg_by_id: dict = None) -> str:
     """Agentic ask: модель сама решает, искать ли информацию в каналах.
     ctx_tokens_est — tiktoken-оценка контекста (для логирования Δ с реальным API).
     voice_mode: "off" — обычный текст; "force" — ответ под озвучку (флаг -v); "auto" — модель сама может выбрать голос (маркер [[VOICE]]).
-    images — список {"bytes":...} для прямого vision (/ask -g): кладутся в user-сообщение как image_url."""
+    images — список {"bytes":...} для прямого vision (/ask -g): кладутся в user-сообщение как image_url.
+    chat_id/msg_by_id — для инструмента reply_to_messages: модель шлёт реплаи тредами на сообщения
+    из истории по их #id (msg_by_id: {id: Message}); реплаи отправляются сразу в ходе цикла."""
     llm, model_id, label = get_active_model()
     if llm is None:
         return "Модель не настроена (проверь ключ провайдера)"
@@ -2108,7 +2196,8 @@ async def ask_agentic(context: str, question: str, must_search: bool = False, ca
     channels = get_tracked()
     has_channels = len(channels) > 0
     has_web = bool(tavily_api_key)        # веб-инструменты Tavily (web_search/web_extract/web_crawl/web_map)
-    has_tools = has_channels or has_web
+    has_reply = chat_id is not None and bool(msg_by_id)  # адресный реплай по #id истории
+    has_tools = has_channels or has_web or has_reply
 
     now_str = datetime.now(MSK).strftime("%d.%m.%Y %H:%M")
 
@@ -2121,7 +2210,14 @@ async def ask_agentic(context: str, question: str, must_search: bool = False, ca
                           "актуальные события, факты вне переписки, проверка утверждений, ссылки из чата. "
                           "Обычно достаточно web_search; web_extract — когда нужен полный текст конкретной страницы. "
                           "Не ищи то, что и так знаешь или что есть в контексте чата.")
-    if must_search and has_tools:
+    if has_reply:
+        system_prompt += ("\n\nКаждое сообщение в истории помечено его #id (число перед текстом). Ты можешь "
+                          "ОТВЕТИТЬ РЕПЛАЕМ на конкретные сообщения через инструмент reply_to_messages — "
+                          f"на одно или сразу на несколько (до {REPLY_MAX}), каждый ответ уйдёт отдельным "
+                          "сообщением, прикреплённым к своему. Делай это, когда уместно ответить адресно "
+                          "(на спор, на чей-то вопрос, на реплики разных людей). Сам решай, нужно ли — не "
+                          "обязательно. После реплаев всё равно дай общий итоговый ответ обычным текстом.")
+    if must_search and (has_channels or has_web):
         force_name = "telegram_search" if has_channels else "web_search"
         system_prompt += f"\n\nОБЯЗАТЕЛЬНО используй {force_name} хотя бы один раз перед тем как ответить."
     if voice_mode == "force":
@@ -2144,10 +2240,12 @@ async def ask_agentic(context: str, question: str, must_search: bool = False, ca
     ]
 
     max_iterations = 20
-    force_tool = must_search and has_tools
+    force_tool = must_search and (has_channels or has_web)  # принудительный поиск только для search-инструментов
     force_tool_name = "telegram_search" if has_channels else "web_search"
-    tools_list = ([TELEGRAM_SEARCH_TOOL] if has_channels else []) + (WEB_TOOLS if has_web else [])
-    sstats = {"iters": 0, "calls": 0, "posts": 0, "web": 0}  # сводка поиска (-c)
+    tools_list = (([TELEGRAM_SEARCH_TOOL] if has_channels else []) + (WEB_TOOLS if has_web else [])
+                  + ([REPLY_TOOL] if has_reply else []))
+    reply_sent = [0]  # счётчик отправленных реплаев (анти-спам, лимит REPLY_MAX)
+    sstats = {"iters": 0, "calls": 0, "posts": 0, "web": 0, "replies": 0}  # сводка (-c)
 
     def _log_search_summary():
         if sstats["iters"]:
@@ -2283,6 +2381,13 @@ async def ask_agentic(context: str, question: str, must_search: bool = False, ca
                     "tool_call_id": tool_call.id,
                     "content": web_result,
                 })
+                continue
+
+            # — адресный реплай на сообщения истории (отправляем сразу, тредами) —
+            if tname == "reply_to_messages":
+                res = await _run_reply_tool(args, chat_id, msg_by_id, reply_sent)
+                sstats["replies"] = reply_sent[0]
+                messages.append({"role": "tool", "tool_call_id": tool_call.id, "content": res})
                 continue
 
             if tname != "telegram_search":
@@ -2641,6 +2746,7 @@ async def _render_unit(msg, text_only: bool, anchor_id=None, vision_model: str =
         "ts": _fmt_ts(getattr(msg, "date", None)),
         "body": body,
         "gid": getattr(msg, "grouped_id", None),
+        "mid": getattr(msg, "id", None),  # для пометки #id в контексте (reply_to_messages)
         "marked": marked,
         "failed": sum(body.count(mk) for mk in MEDIA_FAILURE_MARKERS),
     }
@@ -2763,6 +2869,7 @@ async def _render_album_segment(group, text_only: bool, anchor_id=None, vision_m
         "label": label,
         "ts": _fmt_ts(getattr(first, "date", None)),
         "body": body,
+        "mid": getattr(first, "id", None),  # альбом → id первого сообщения (reply_to_messages)
         "marked": marked,
         "failed": sum(body.count(mk) for mk in MEDIA_FAILURE_MARKERS),
     }
@@ -2781,10 +2888,12 @@ def _needs_media(m) -> bool:
                 or getattr(m, "audio", None) or getattr(m, "video_note", None))
 
 
-async def assemble_context(messages, text_only: bool, anchor_id=None, progress_cb=None, vision_model: str = None, detail: str = "high", safety_override: float = None, inline_ids: set = None, inline_images: list = None, photo_mode: str = "ocr"):
+async def assemble_context(messages, text_only: bool, anchor_id=None, progress_cb=None, vision_model: str = None, detail: str = "high", safety_override: float = None, inline_ids: set = None, inline_images: list = None, photo_mode: str = "ocr", include_ids: bool = False):
     """Строит контекст: параллельный рендер + склейка альбомов и подряд идущих реплик автора.
     Возвращает (context_str, dropped_blocks, failed_media, ctx_tokens). progress_cb(done, total, failed).
-    safety_override — если задан, перебивает per-model safety (используется при ретрае overflow)."""
+    safety_override — если задан, перебивает per-model safety (используется при ретрае overflow).
+    include_ids — каждую строку-сообщение префиксовать её #id (чтобы модель могла адресно ответить
+    реплаем через reply_to_messages); см. ask_agentic."""
     if not messages:
         return "", 0, 0, 0
     t_render_start = time.time()
@@ -2857,16 +2966,21 @@ async def assemble_context(messages, text_only: bool, anchor_id=None, progress_c
         log("ASK", f"Медиа: {mtot} (фото {mstats['photos']} · голос {mstats['voice']} · аудио {mstats['audio']} · кружок {mstats['video_note']}) · кэш-хит {mstats['hit']}/{mtot} ({hr}%) · новых {mstats['miss']} · сбоев {failed_total}")
 
     # Склейка: подряд идущие сообщения одного автора без меток → один блок (альбомы уже самоформатированы).
+    # При include_ids каждая строка-сообщение получает префикс #id, чтобы модель адресовала reply_to_messages.
+    def _line(u):
+        if include_ids and u.get("mid"):
+            return f"#{u['mid']} {u['body']}"
+        return u["body"]
     blocks = []
     for u in units:
         if not u["body"]:
             continue
         if blocks and not u["marked"] and not blocks[-1]["marked"] and blocks[-1]["akey"] == u["akey"]:
-            blocks[-1]["lines"].append(u["body"])
+            blocks[-1]["lines"].append(_line(u))
         else:
             blocks.append({
                 "akey": u["akey"], "label": u["label"], "ts": u["ts"],
-                "lines": [u["body"]], "marked": u["marked"],
+                "lines": [_line(u)], "marked": u["marked"],
             })
 
     out = [f"[{(b['ts'] + ' ' + b['label']).strip()}]: " + "\n".join(b["lines"]) for b in blocks]
@@ -3217,6 +3331,9 @@ async def ask_command(event):
         short = " (чат короче запроса)" if len(ordered) < n else ""
         log("ASK", f"Сбор: запрошено N={n}, фактически {len(ordered)} сообщ.{short}")
 
+        # Карта id→Message для инструмента reply_to_messages (модель шлёт реплаи тредами по #id).
+        msg_by_id = {m.id: m for m in ordered if getattr(m, "id", None) is not None}
+
         # /ask -g: отбираем самые свежие фото (до лимита) для прямой отдачи модели.
         # inline_ids — dict {msg_id: idx}, где idx = детерминированная позиция в хронологии (0..K-1).
         inline_ids = None
@@ -3241,6 +3358,7 @@ async def ask_command(event):
                 ordered, text_only, anchor_id=anchor_id, progress_cb=progress_cb,
                 vision_model=vision_model, detail=detail, safety_override=safety_override,
                 inline_ids=inline_ids, inline_images=inline_images, photo_mode=photo_mode,
+                include_ids=True,  # пометка #id у каждого сообщения → reply_to_messages
             )
             t_ctx = time.time()
             context = context or "(нет сообщений)"
@@ -3251,7 +3369,7 @@ async def ask_command(event):
                 log("ASK", f"-g: картинок напрямую модели: {len(images_sorted)}")
             await set_status(f"🤖 Думаю над ответом…{retry_suffix}")
             try:
-                reply = await ask_agentic(context, question, must_search=must_search, caller=caller, ctx_tokens_est=ctx_tokens, voice_mode=voice_mode, images=images_sorted)
+                reply = await ask_agentic(context, question, must_search=must_search, caller=caller, ctx_tokens_est=ctx_tokens, voice_mode=voice_mode, images=images_sorted, chat_id=event.chat_id, msg_by_id=msg_by_id)
                 t_llm = time.time()
                 break  # успех
             except ContextOverflowError as e:
@@ -4890,6 +5008,9 @@ _HELP_SECTIONS = {
         "   Ответь `/ask вопрос` на чьё-то сообщение — бот возьмёт именно его + контекст вокруг.\n"
         "\n"
         "⏱ На больших N (10–15 тыс.) сбор истории идёт **в несколько потоков** — это норм, подожди.\n"
+        "↩️ ИИ может САМ ответить **реплаем** на конкретные сообщения из истории (на одно или сразу\n"
+        "   на несколько, до 5) — например адресно на спор или на вопросы разных людей. Решает сам;\n"
+        "   после реплаев идёт общий ответ. Работает на моделях с поддержкой инструментов.\n"
         "🌐 С ключом **Tavily** модель сама ходит в интернет: ищет (web_search), читает страницы\n"
         "   по ссылкам (web_extract), обходит сайты (web_crawl/web_map). Когда искать — решает сама;\n"
         "   `-c` заставляет искать обязательно.\n"
