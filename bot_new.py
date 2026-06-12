@@ -651,6 +651,12 @@ class _OpenAIReasoningClient:
         model = kwargs.get("model", "")
         if REASONING_EFFORT:
             kwargs.setdefault("reasoning_effort", _clamp_reasoning(model, REASONING_EFFORT))
+        # Ризонинг-токены СЧИТАЮТСЯ в max_completion_tokens, но невидимы. На medium+ цепочка
+        # может съесть весь потолок → finish=length и ПУСТОЙ видимый ответ. Поднимаем потолок
+        # так, чтобы после размышлений гарантированно оставалось место на текст.
+        _floor = {"medium": 24000, "high": 40000, "xhigh": 64000}.get(kwargs.get("reasoning_effort"))
+        if _floor and int(kwargs.get("max_completion_tokens") or 0) < _floor:
+            kwargs["max_completion_tokens"] = _floor
         if kwargs.get("reasoning_effort") and kwargs.get("tools") and model not in OPENAI_TOOLS_EFFORT_CHAT_OK:
             # gpt-5.x: tools+reasoning_effort на chat = 400 → идём через Responses API
             try:
