@@ -302,6 +302,10 @@ OPENAI_REASONING_LEVELS = {
 }
 OPENAI_REASONING_DEFAULTS = {"gpt-5.5": "medium", "gpt-5.4": "none", "o3": "medium",
                              "gpt-5.4-mini": "none", "o4-mini": "medium"}  # что применяет API без параметра
+# o-серия принимает tools+reasoning_effort на /chat/completions; gpt-5.x — НЕТ (400
+# «Function tools with reasoning_effort are not supported... use /v1/responses», зонд 2026-06-12)
+# → для gpt-5.x эта комбинация уходит через Responses API (см. _OpenAIReasoningClient._via_responses).
+OPENAI_TOOLS_EFFORT_CHAT_OK = {"o3", "o4-mini"}
 _REASONING_RANK = ["xhigh", "high", "medium", "low", "none"]  # шкала силы для клампа
 # Бесплатные дневные квоты OpenAI по программе data sharing (Tier 1-2, сброс в 00:00 UTC):
 # 250k/день на основные модели (gpt-5.x/o3) и ОТДЕЛЬНЫЕ 2.5M/день на mini-группу.
@@ -644,11 +648,95 @@ class _OpenAIReasoningClient:
         if "max_tokens" in kwargs:
             kwargs["max_completion_tokens"] = kwargs.pop("max_tokens")
         kwargs.pop("temperature", None)  # reasoning-модели принимают только default(1.0)
+        model = kwargs.get("model", "")
         if REASONING_EFFORT:
-            kwargs.setdefault("reasoning_effort", _clamp_reasoning(kwargs.get("model", ""), REASONING_EFFORT))
-        resp = self._c.chat.completions.create(**kwargs)
-        _openai_usage_add(getattr(resp, "usage", None), kwargs.get("model", ""))  # дневной счётчик квоты (по корзине)
+            kwargs.setdefault("reasoning_effort", _clamp_reasoning(model, REASONING_EFFORT))
+        if kwargs.get("reasoning_effort") and kwargs.get("tools") and model not in OPENAI_TOOLS_EFFORT_CHAT_OK:
+            # gpt-5.x: tools+reasoning_effort на chat = 400 → идём через Responses API
+            try:
+                resp = self._via_responses(kwargs)
+            except Exception as e:
+                # запасной путь: инструменты важнее управления ризонингом
+                log("MODEL", f"Responses API не сработал ({str(e)[:150]}) — chat без reasoning_effort")
+                kwargs.pop("reasoning_effort", None)
+                resp = self._c.chat.completions.create(**kwargs)
+        else:
+            resp = self._c.chat.completions.create(**kwargs)
+        _openai_usage_add(getattr(resp, "usage", None), model)  # дневной счётчик квоты (по корзине)
         return resp
+
+    @staticmethod
+    def _to_responses_input(messages):
+        """OpenAI chat-messages → input-items Responses API. tool-результаты → function_call_output,
+        assistant tool_calls → function_call, мультимодальный user → input_text/input_image."""
+        items = []
+        for m in messages or []:
+            role = m.get("role") if isinstance(m, dict) else getattr(m, "role", None)
+            content = m.get("content") if isinstance(m, dict) else getattr(m, "content", None)
+            if role == "tool":
+                cid = m.get("tool_call_id") if isinstance(m, dict) else getattr(m, "tool_call_id", None)
+                out = content if isinstance(content, str) else json.dumps(content, ensure_ascii=False)
+                items.append({"type": "function_call_output", "call_id": cid, "output": out})
+                continue
+            if role == "assistant":
+                tcs = m.get("tool_calls") if isinstance(m, dict) else getattr(m, "tool_calls", None)
+                if content:
+                    items.append({"role": "assistant", "content": content})
+                for tc in (tcs or []):
+                    f = tc.get("function") if isinstance(tc, dict) else getattr(tc, "function", None)
+                    name = (f.get("name") if isinstance(f, dict) else getattr(f, "name", "")) or ""
+                    args = (f.get("arguments") if isinstance(f, dict) else getattr(f, "arguments", None)) or "{}"
+                    cid = tc.get("id") if isinstance(tc, dict) else getattr(tc, "id", None)
+                    items.append({"type": "function_call", "call_id": cid, "name": name, "arguments": args})
+                continue
+            if isinstance(content, list):  # мультимодальный user (текст + картинки -g)
+                parts = []
+                for p in content:
+                    pt = p.get("type")
+                    if pt == "text":
+                        parts.append({"type": "input_text", "text": p.get("text", "")})
+                    elif pt == "image_url":
+                        parts.append({"type": "input_image", "image_url": (p.get("image_url") or {}).get("url", "")})
+                items.append({"role": role or "user", "content": parts})
+            else:
+                items.append({"role": role or "user", "content": content or ""})
+        return items
+
+    def _via_responses(self, kwargs):
+        """chat.completions-стиль kwargs → /v1/responses; ответ маппится обратно в форму
+        chat.completions (duck-typing — agentic-цикл и логи работают без изменений)."""
+        body = {"model": kwargs["model"], "input": self._to_responses_input(kwargs.get("messages")),
+                "reasoning": {"effort": kwargs["reasoning_effort"]}}
+        if kwargs.get("max_completion_tokens"):
+            body["max_output_tokens"] = kwargs["max_completion_tokens"]
+        tools = [{"type": "function", "name": (t.get("function") or {}).get("name"),
+                  "description": (t.get("function") or {}).get("description", ""),
+                  "parameters": (t.get("function") or {}).get("parameters") or {"type": "object", "properties": {}}}
+                 for t in (kwargs.get("tools") or [])]
+        if tools:
+            body["tools"] = tools
+            tc = kwargs.get("tool_choice", "auto")
+            if isinstance(tc, dict):  # форсированный выбор: формат у responses плоский
+                body["tool_choice"] = {"type": "function", "name": (tc.get("function") or {}).get("name")}
+            else:
+                body["tool_choice"] = tc
+        r = self._c.responses.create(**body)
+        text = getattr(r, "output_text", "") or ""
+        tcs = []
+        for item in (getattr(r, "output", None) or []):
+            if getattr(item, "type", None) == "function_call":
+                tcs.append(SimpleNamespace(id=getattr(item, "call_id", None) or getattr(item, "id", None),
+                                           type="function",
+                                           function=SimpleNamespace(name=getattr(item, "name", "") or "",
+                                                                    arguments=getattr(item, "arguments", None) or "{}")))
+        finish = "tool_calls" if tcs else "stop"
+        if getattr(r, "status", "") == "incomplete":
+            finish = "length"
+        u = getattr(r, "usage", None)
+        usage = SimpleNamespace(prompt_tokens=int(getattr(u, "input_tokens", 0) or 0),
+                                completion_tokens=int(getattr(u, "output_tokens", 0) or 0))
+        msg = SimpleNamespace(role="assistant", content=text, tool_calls=tcs or None, reasoning_content=None)
+        return SimpleNamespace(choices=[SimpleNamespace(message=msg, finish_reason=finish)], usage=usage)
 
 
 openai_client = _OpenAIReasoningClient(openai_api_key) if openai_api_key else None
@@ -834,6 +922,10 @@ ACTIVE_MODEL = _model_state.get("active", "deepseek")
 if ACTIVE_MODEL not in MODEL_REGISTRY:
     ACTIVE_MODEL = "deepseek"
 MODEL_TOOLS_SUPPORT = _model_state.get("tools_support", {})  # {slug: True|False} — обучается на лету
+# Чистка ошибочно выученных tools=False у OpenAI-моделей: до фикса 2026-06-12 комбинация
+# tools+reasoning_effort на gpt-5.x давала 400 и писала «нет tools» (function calling есть у всех).
+for _oslug in [s for s, sp in MODEL_REGISTRY.items() if sp[0] == "openai" and MODEL_TOOLS_SUPPORT.get(s) is False]:
+    MODEL_TOOLS_SUPPORT.pop(_oslug, None)
 # Глубина размышлений OpenAI-моделей (/model reason): None = авто (дефолт модели)
 REASONING_EFFORT = _model_state.get("reasoning_effort")
 if REASONING_EFFORT not in _REASONING_RANK:
@@ -2449,8 +2541,9 @@ async def ask_agentic(context: str, question: str, must_search: bool = False, ca
                 _log_search_summary()
                 raise ContextOverflowError(str(e)) from e
             quirk = _is_thinking_mode_quirk(e)
-            # thinking-quirk НЕ трактуем как «без tools» (модель умеет auto/tools, просто особенности API)
-            if has_tools and not quirk and any(k in str(e).lower() for k in ("tool", "function")):
+            # thinking-quirk НЕ трактуем как «без tools» (модель умеет auto/tools, просто особенности API);
+            # ошибки про reasoning_effort — тоже (это конфликт параметров, а не отсутствие tools)
+            if has_tools and not quirk and "reasoning_effort" not in str(e) and any(k in str(e).lower() for k in ("tool", "function")):
                 _set_tools_support(ACTIVE_MODEL, False)
             # Сброс СТАЛОЙ записи tools_support=False, если на самом деле это thinking-quirk
             if quirk and MODEL_TOOLS_SUPPORT.get(ACTIVE_MODEL) is False:
