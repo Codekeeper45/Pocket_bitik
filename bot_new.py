@@ -286,6 +286,32 @@ for _oid, _olabel, _octx in [
     ("o3",      "OpenAI o3", 200000),
 ]:
     MODEL_REGISTRY[_oid] = ("openai", _oid, _olabel, _octx, 1.1)
+# Уровни глубины размышлений (reasoning_effort) OpenAI-моделей, от мощного к слабому.
+# API жёстко валидирует значение ПО МОДЕЛИ (неподдерживаемое → 400): gpt-5.4/5.5 принимают
+# none/low/medium/high/xhigh, o3 — только low/medium/high. Дефолты: 5.5 → medium, 5.4 → none, o3 → medium.
+OPENAI_REASONING_LEVELS = {
+    "gpt-5.5": ["xhigh", "high", "medium", "low", "none"],
+    "gpt-5.4": ["xhigh", "high", "medium", "low", "none"],
+    "o3":      ["high", "medium", "low"],
+}
+_REASONING_RANK = ["xhigh", "high", "medium", "low", "none"]  # шкала силы для клампа
+
+
+def _clamp_reasoning(model_id: str, effort: str) -> str:
+    """Приводит глобальный уровень ризонинга к допустимому для конкретной модели:
+    o3 не принимает none/xhigh → ближайший по силе (low/high). Неизвестная модель → medium."""
+    levels = OPENAI_REASONING_LEVELS.get(model_id)
+    if not levels:
+        return effort if effort in ("low", "medium", "high") else "medium"
+    if effort in levels:
+        return effort
+    try:
+        r = _REASONING_RANK.index(effort)
+    except ValueError:
+        return "medium"
+    return min(levels, key=lambda lv: abs(_REASONING_RANK.index(lv) - r))
+
+
 # Автообрезка контекста под окно модели
 CTX_RESERVE_TOKENS = 8000   # запас на ответ (4096) + системку + вопрос
 CTX_CHARS_PER_TOKEN = 2.0   # фоллбэк-оценка, если tiktoken недоступен
@@ -399,6 +425,7 @@ WEB_TOOLS = [WEB_SEARCH_TOOL, WEB_EXTRACT_TOOL, WEB_CRAWL_TOOL, WEB_MAP_TOOL]
 
 # --- Инструмент адресного реплая: ИИ САМ отвечает реплаем на конкретные сообщения истории ---
 REPLY_MAX = 5  # анти-спам: не больше N реплаев за один /ask
+REPLY_COLLAPSE = 300  # реплаи длиннее — сворачиваются в раскрывающийся цитат-блок (общий ответ /ask — 700)
 REPLY_TOOL = {
     "type": "function",
     "function": {
@@ -436,7 +463,8 @@ REPLY_TOOL = {
 ASK_SYSTEM_PROMPT = """Ты — {model}, ИИ с характером и собственной точкой зрения. Не нейтральный ассистент, а собеседник с позицией.
 
 Правила:
-- Отвечай на русском. Не ограничивай себя по длине — давай полный, развёрнутый ответ, столько сколько требует вопрос. Не комкай и не сокращай.
+- Отвечай на русском. Пиши лаконично и плотно: без воды, повторов, пустых вводных и дежурных выводов. Мастерски сжимай: вся суть и все факты сохраняются, лишние слова уходят. Ёмкий абзац лучше простыни; длина — ровно сколько требует вопрос, не больше.
+- Когда материала много — структурируй: короткие абзацы по одной мысли, списки «• » по делу. Лаконичность ≠ сухость: живой характер, позиция и интонация остаются.
 - Говори о людях в третьем лице, без местоимений: не «ты сказал», не «он написал», а по имени или роли — «Маша написала», «собеседник предложил», «автор сообщения считает».
 - Имей позицию. Если с чем-то не согласен — скажи прямо. Не подстраивайся под всех.
 - Не извиняйся, не используй эмоджи-заглушки.
@@ -574,7 +602,9 @@ class _OpenAIReasoningClient:
     OpenAI API. Модели gpt-5.x/o3 — reasoning: на /chat/completions требуют
     max_completion_tokens вместо max_tokens и поддерживают только дефолтную temperature.
     Обёртка переименовывает max_tokens→max_completion_tokens и убирает temperature,
-    остальное (tools, tool_choice, messages, vision) проксирует как есть."""
+    остальное (tools, tool_choice, messages, vision) проксирует как есть.
+    Глубина размышлений: если задан REASONING_EFFORT (/model reason) — инжектится
+    reasoning_effort, приведённый к допустимому для модели значению (_clamp_reasoning)."""
 
     def __init__(self, api_key):
         self._c = OpenAI(api_key=api_key, base_url=OPENAI_BASE_URL)
@@ -584,6 +614,8 @@ class _OpenAIReasoningClient:
         if "max_tokens" in kwargs:
             kwargs["max_completion_tokens"] = kwargs.pop("max_tokens")
         kwargs.pop("temperature", None)  # reasoning-модели принимают только default(1.0)
+        if REASONING_EFFORT:
+            kwargs.setdefault("reasoning_effort", _clamp_reasoning(kwargs.get("model", ""), REASONING_EFFORT))
         return self._c.chat.completions.create(**kwargs)
 
 
@@ -770,6 +802,10 @@ ACTIVE_MODEL = _model_state.get("active", "deepseek")
 if ACTIVE_MODEL not in MODEL_REGISTRY:
     ACTIVE_MODEL = "deepseek"
 MODEL_TOOLS_SUPPORT = _model_state.get("tools_support", {})  # {slug: True|False} — обучается на лету
+# Глубина размышлений OpenAI-моделей (/model reason): None = авто (дефолт модели)
+REASONING_EFFORT = _model_state.get("reasoning_effort")
+if REASONING_EFFORT not in _REASONING_RANK:
+    REASONING_EFFORT = None
 # slug из реестра ИЛИ произвольный model_id OpenRouter (кастомная медиа-модель)
 ACTIVE_MEDIA_MODEL = _model_state.get("active_media") or "lite"
 # Голос для озвучки ответов (/ask) и режим авто-голоса (модель сама решает озвучивать)
@@ -889,7 +925,7 @@ def count_tokens(text: str) -> int:
 
 
 def _save_model_state():
-    save_json(MODEL_STATE_PATH, {"active": ACTIVE_MODEL, "tools_support": MODEL_TOOLS_SUPPORT, "active_media": ACTIVE_MEDIA_MODEL, "custom_models": CUSTOM_MODELS, "active_voice": ACTIVE_VOICE, "voice_auto": VOICE_AUTO, "tts_engine": TTS_ENGINE, "fish_voice": FISH_VOICE, "fish_favorites": FISH_FAVORITES})
+    save_json(MODEL_STATE_PATH, {"active": ACTIVE_MODEL, "tools_support": MODEL_TOOLS_SUPPORT, "active_media": ACTIVE_MEDIA_MODEL, "custom_models": CUSTOM_MODELS, "active_voice": ACTIVE_VOICE, "voice_auto": VOICE_AUTO, "tts_engine": TTS_ENGINE, "fish_voice": FISH_VOICE, "fish_favorites": FISH_FAVORITES, "reasoning_effort": REASONING_EFFORT})
 
 
 def _set_tools_support(slug, ok):
@@ -2145,7 +2181,10 @@ async def _send_quote_reply(chat_id, mid: int, html_text: str, quote: str, src_t
         return False
     off16 = len(src_text[:pos].encode("utf-16-le")) // 2  # Telegram считает offset в UTF-16
     try:
-        msg_text, entities = client._parse_message_text(html_text, "html")
+        if len(html_text) > REPLY_COLLAPSE:  # длинный реплай — свернуть в раскрывающийся цитат-блок
+            msg_text, entities = _collapsed_entities(html_text, parse_html=True)
+        else:
+            msg_text, entities = client._parse_message_text(html_text, "html")
         reply_obj = InputReplyToMessage(reply_to_msg_id=mid, quote_text=quote, quote_offset=off16)
         await client(SendMessageRequest(peer=chat_id, message=msg_text, reply_to=reply_obj,
                                         entities=entities, no_webpage=True))
@@ -2202,7 +2241,7 @@ async def _run_reply_tool(args: dict, chat_id, msg_by_id: dict, reply_sent: list
                 src_text = getattr(src, "raw_text", None) or getattr(src, "message", None) or ""
                 did_quote = await _send_quote_reply(chat_id, mid, cleaned, quote, src_text)
             if not did_quote:  # без фрагмента или фрагмент не найден → реплай на всё сообщение
-                await send_long(chat_id, cleaned, parse_mode="html", reply_to=mid, collapse_threshold=700)
+                await send_long(chat_id, cleaned, parse_mode="html", reply_to=mid, collapse_threshold=REPLY_COLLAPSE)
             reply_sent[0] += 1
             sent.append(mid)
             quoted += 1 if did_quote else 0
@@ -4305,7 +4344,7 @@ async def scheduler_loop():
 async def model_command(event):
     if await _slash_for_other_bot(event):
         return
-    global ACTIVE_MODEL, ACTIVE_MEDIA_MODEL
+    global ACTIVE_MODEL, ACTIVE_MEDIA_MODEL, REASONING_EFFORT
     arg = (event.pattern_match.group(1) or "").strip()
     slugs = list(MODEL_REGISTRY.keys())
 
@@ -4409,6 +4448,47 @@ async def model_command(event):
         await event.edit(f"🗑 Удалена из избранного: `{target}`." + (" Активная модель сброшена на DeepSeek." if was_active else ""))
         return
 
+    # --- глубина размышлений OpenAI-моделей: /model reason [уровень|auto] ---
+    if arg.lower().startswith("reason"):
+        rarg = arg[len("reason"):].strip().lower()
+        active_provider = MODEL_REGISTRY.get(ACTIVE_MODEL, MODEL_REGISTRY["deepseek"])[0]
+        if not rarg:
+            lines = ["🤔 **Глубина размышлений** — только OpenAI-модели (GPT-5.x / o3):", ""]
+            for i, lv in enumerate(_REASONING_RANK, 1):
+                mk = "▶" if lv == REASONING_EFFORT else "  "
+                lines.append(f"{mk}{i}. `/model reason {lv}`")
+            mk = "▶" if REASONING_EFFORT is None else "  "
+            lines.append(f"{mk}{len(_REASONING_RANK) + 1}. `/model reason auto` — дефолт модели (5.5→medium, 5.4→none, o3→medium)")
+            lines.append("\nДля o3 уровни none/xhigh автоматически приводятся к low/high (модель принимает только low/medium/high).")
+            lines.append("Быстрый выбор из списка `/model`: номер `N.M` (N — модель, M — сила ризонинга, M=1 — мощнейший).")
+            if active_provider != "openai":
+                lines.append("⚠️ Активная модель сейчас не OpenAI — настройка сработает после выбора GPT/o3.")
+            await event.edit("\n".join(lines)[:4000])
+            return
+        if rarg.isdigit() and 1 <= int(rarg) <= len(_REASONING_RANK) + 1:
+            rarg = (_REASONING_RANK + ["auto"])[int(rarg) - 1]
+        if rarg in ("auto", "сброс", "reset", "off", "default"):
+            REASONING_EFFORT = None
+            _save_model_state()
+            log("MODEL", "Ризонинг OpenAI: auto (дефолт модели)")
+            await event.edit("✅ Глубина размышлений: авто (дефолт модели — 5.5→medium, 5.4→none, o3→medium).")
+            return
+        if rarg in _REASONING_RANK:
+            REASONING_EFFORT = rarg
+            _save_model_state()
+            note = ""
+            if active_provider == "openai":
+                applied = _clamp_reasoning(MODEL_REGISTRY[ACTIVE_MODEL][1], rarg)
+                if applied != rarg:
+                    note = f" (для активной {MODEL_REGISTRY[ACTIVE_MODEL][2]} применится `{applied}`)"
+            else:
+                note = " — сработает на моделях OpenAI (GPT-5.x / o3)"
+            log("MODEL", f"Ризонинг OpenAI: {rarg}")
+            await event.edit(f"✅ Глубина размышлений: `{rarg}`{note}")
+            return
+        await event.edit("Не понял уровень. `/model reason` — список: " + " · ".join(f"`{lv}`" for lv in _REASONING_RANK) + " · `auto`.")
+        return
+
     if not arg:
         lines = [
             "╭───────────────────────╮",
@@ -4430,6 +4510,13 @@ async def model_command(event):
             mark = f"▶{i}." if slug == ACTIVE_MODEL else f"{i}."
             warn = " ⚠️нет ключа" if not is_available(provider) else ""
             lines.append(f"{mark} `{slug}` — {label} · 🪟{_fmt_ctx(ctx)}{tool_mark(slug)}{warn}")
+            if provider == "openai" and slug in OPENAI_REASONING_LEVELS:
+                # вариации силы ризонинга: выбор номером N.M (M=1 — мощнейший)
+                parts = []
+                for j, lv in enumerate(OPENAI_REASONING_LEVELS[slug], 1):
+                    cur = "▶" if (slug == ACTIVE_MODEL and REASONING_EFFORT and _clamp_reasoning(slug, REASONING_EFFORT) == lv) else ""
+                    parts.append(f"{cur}`{i}.{j}`{lv}")
+                lines.append("    🤔 " + " · ".join(parts))
         if ACTIVE_MEDIA_MODEL in MEDIA_MODEL_REGISTRY:
             media_label = MEDIA_MODEL_REGISTRY[ACTIVE_MEDIA_MODEL][1]
         elif ACTIVE_MEDIA_MODEL in MEDIA_OPENCODE_SLUGS and ACTIVE_MEDIA_MODEL in MODEL_REGISTRY:
@@ -4438,6 +4525,8 @@ async def model_command(event):
             media_label = f"{ACTIVE_MEDIA_MODEL} (кастомная)"
         lines.append(f"\n🖼 медиа-модель: {media_label} · `/model media` — сменить")
         lines.append("`/model N` / `/model <slug>` — выбрать · `/model probe` — проверить поиск (❔→🔧/🚫)")
+        reff = f"`{REASONING_EFFORT}`" if REASONING_EFFORT else "авто"
+        lines.append(f"`/model N.M` — GPT с силой ризонинга (M=1 мощнейший) · `/model reason` — глубина размышлений (сейчас: {reff})")
         lines.append("`/model vendor/model` — добавить ЛЮБУЮ модель OpenRouter по id (напр. `/model openai/gpt-4o`)")
         lines.append("`/model fav` — избранные OR-модели · `/model remove <N|id>` — удалить кастомную")
         await event.edit("\n".join(lines)[:4000])
@@ -4471,6 +4560,33 @@ async def model_command(event):
             tested += 1
             await asyncio.sleep(0.2)
         await event.edit(f"🔧 Проверено моделей: {tested}. Смотри `/model`.")
+        return
+
+    # --- выбор N.M: модель N с силой ризонинга M (только OpenAI; M=1 — мощнейший) ---
+    m_nm = re.match(r"^(\d+)\.(\d+)$", arg)
+    if m_nm:
+        n, mlev = int(m_nm.group(1)), int(m_nm.group(2))
+        if not (1 <= n <= len(slugs)):
+            await event.edit(f"Нет модели с номером {n}. `/model` — список.")
+            return
+        slug_nm = slugs[n - 1]
+        provider_nm, _midn, label_nm, ctx_nm, _sn = MODEL_REGISTRY[slug_nm]
+        levels = OPENAI_REASONING_LEVELS.get(slug_nm)
+        if provider_nm != "openai" or not levels:
+            await event.edit(f"Вариации `{n}.M` (сила ризонинга) доступны только для OpenAI-моделей (GPT-5.x / o3). Для {label_nm} — просто `/model {n}`.")
+            return
+        if not (1 <= mlev <= len(levels)):
+            opts = " · ".join(f"`{n}.{j}` {lv}" for j, lv in enumerate(levels, 1))
+            await event.edit(f"У {label_nm} уровни 1–{len(levels)}: {opts}")
+            return
+        if not is_available(provider_nm):
+            await event.edit(f"Модель «{label_nm}» недоступна — нет ключа провайдера (openai).")
+            return
+        ACTIVE_MODEL = slug_nm
+        REASONING_EFFORT = levels[mlev - 1]
+        _save_model_state()
+        log("MODEL", f"Активная модель: {slug_nm} ({label_nm}), ризонинг {REASONING_EFFORT}")
+        await event.edit(f"✅ Модель ответов: {label_nm} (окно 🪟{_fmt_ctx(ctx_nm)}) · 🤔 ризонинг: `{REASONING_EFFORT}`")
         return
 
     chosen = None
@@ -4514,7 +4630,10 @@ async def model_command(event):
     ACTIVE_MODEL = chosen
     _save_model_state()
     log("MODEL", f"Активная модель: {chosen} ({label})")
-    await event.edit(f"✅ Модель ответов: {label} (окно 🪟{_fmt_ctx(ctx)})")
+    rtag = ""
+    if provider == "openai":
+        rtag = f" · 🤔 ризонинг: `{_clamp_reasoning(_mid, REASONING_EFFORT)}`" if REASONING_EFFORT else " · 🤔 ризонинг: авто (`/model reason`)"
+    await event.edit(f"✅ Модель ответов: {label} (окно 🪟{_fmt_ctx(ctx)}){rtag}")
 
 
 def _sync_fish_search(query: str):
@@ -5076,6 +5195,12 @@ _HELP_SECTIONS = {
         "\n"
         "   `/model probe` — прогнать модели и проверить, у каких работает веб-поиск.\n"
         "\n"
+        "**Глубина размышлений (только OpenAI: GPT-5.x / o3):**\n"
+        "   `/model reason` — текущий уровень и список (xhigh/high/medium/low/none/auto).\n"
+        "   `/model reason high` — установить уровень (глобально, переживает рестарт).\n"
+        "   `/model N.M` — выбрать модель N сразу с силой ризонинга M (M=1 — мощнейший).\n"
+        "        _Пример:_ `/model 21.1` — GPT-5.5 на максимуме. Для o3 none/xhigh → low/high.\n"
+        "\n"
         "**Избранное OpenRouter-моделей:**\n"
         "   `/model fav` — список добавленных кастомных моделей (быстрый выбор по номеру).\n"
         "   `/model remove <N|id>` — удалить кастомную модель из избранного.\n"
@@ -5340,7 +5465,8 @@ async def status_command(event):
     # — модель ответов —
     provider, _mid, label, ctx, _ = MODEL_REGISTRY.get(ACTIVE_MODEL, MODEL_REGISTRY["deepseek"])
     prov_name = {"deepseek": "DeepSeek", "openrouter": "OpenRouter", "opencode": "OpenCode Go",
-                 "oc_anthropic": "OpenCode (нативный)"}.get(provider, provider)
+                 "oc_anthropic": "OpenCode (нативный)", "modelgate": "ModelGate (Claude)",
+                 "openai": "OpenAI"}.get(provider, provider)
     ts = MODEL_TOOLS_SUPPORT.get(ACTIVE_MODEL)
     search_mark = "🔧 есть" if ts is True else ("🚫 нет" if ts is False else "❔ не проверен")
     sv = active_model_supports_vision()
@@ -5348,6 +5474,9 @@ async def status_command(event):
     L.append("📊 **СТАТУС БОТА**")
     L.append(f"\n🧠 **Модель ответов:** {label} (`{ACTIVE_MODEL}`)")
     L.append(f"   провайдер: {prov_name} · окно: 🪟{_fmt_ctx(ctx)} · поиск по каналам: {search_mark} · vision (`-g`): {vis_mark}")
+    if provider == "openai":
+        reff = f"`{_clamp_reasoning(_mid, REASONING_EFFORT)}`" if REASONING_EFFORT else "авто (дефолт модели)"
+        L.append(f"   🤔 глубина размышлений: {reff} · `/model reason` — сменить")
     # — медиа-модель —
     if ACTIVE_MEDIA_MODEL in MEDIA_MODEL_REGISTRY:
         media_label = MEDIA_MODEL_REGISTRY[ACTIVE_MEDIA_MODEL][1]
