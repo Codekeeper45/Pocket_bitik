@@ -285,6 +285,8 @@ for _oid, _olabel, _octx in [
     ("gpt-5.5", "GPT-5.5", 400000),
     ("gpt-5.4", "GPT-5.4", 400000),
     ("o3",      "OpenAI o3", 200000),
+    ("gpt-5.4-mini", "GPT-5.4 Mini", 400000),
+    ("o4-mini", "OpenAI o4-mini", 200000),
 ]:
     MODEL_REGISTRY[_oid] = ("openai", _oid, _olabel, _octx, 1.1)
 # Уровни глубины размышлений (reasoning_effort) OpenAI-моделей, от мощного к слабому.
@@ -294,13 +296,23 @@ OPENAI_REASONING_LEVELS = {
     "gpt-5.5": ["xhigh", "high", "medium", "low", "none"],
     "gpt-5.4": ["xhigh", "high", "medium", "low", "none"],
     "o3":      ["high", "medium", "low"],
+    "gpt-5.4-mini": ["xhigh", "high", "medium", "low", "none"],  # проверено зондом 2026-06-12
+    "o4-mini": ["xhigh", "high", "medium", "low"],               # none не принимает (зонд)
 }
-OPENAI_REASONING_DEFAULTS = {"gpt-5.5": "medium", "gpt-5.4": "none", "o3": "medium"}  # что применяет API без параметра
+OPENAI_REASONING_DEFAULTS = {"gpt-5.5": "medium", "gpt-5.4": "none", "o3": "medium",
+                             "gpt-5.4-mini": "none", "o4-mini": "medium"}  # что применяет API без параметра
 _REASONING_RANK = ["xhigh", "high", "medium", "low", "none"]  # шкала силы для клампа
-# Бесплатная дневная квота OpenAI по программе data sharing (Tier 1-2 = 250k/день,
-# сброс в 00:00 UTC). Счётчик бота — ориентир: внешние запросы организации он не видит,
-# а граничный запрос OpenAI биллит целиком.
-OPENAI_FREE_DAILY = 250_000
+# Бесплатные дневные квоты OpenAI по программе data sharing (Tier 1-2, сброс в 00:00 UTC):
+# 250k/день на основные модели (gpt-5.x/o3) и ОТДЕЛЬНЫЕ 2.5M/день на mini-группу.
+# Счётчик бота — ориентир: внешние запросы организации он не видит, а граничный
+# запрос OpenAI биллит целиком.
+OPENAI_FREE_DAILY_LARGE = 250_000
+OPENAI_FREE_DAILY_MINI = 2_500_000
+OPENAI_MINI_MODELS = {"gpt-5.4-mini", "o4-mini"}  # модели mini-группы квоты
+
+
+def _openai_bucket(model_id: str) -> str:
+    return "mini" if model_id in OPENAI_MINI_MODELS else "large"
 
 
 def _clamp_reasoning(model_id: str, effort: str) -> str:
@@ -634,7 +646,7 @@ class _OpenAIReasoningClient:
         if REASONING_EFFORT:
             kwargs.setdefault("reasoning_effort", _clamp_reasoning(kwargs.get("model", ""), REASONING_EFFORT))
         resp = self._c.chat.completions.create(**kwargs)
-        _openai_usage_add(getattr(resp, "usage", None))  # дневной счётчик бесплатной квоты
+        _openai_usage_add(getattr(resp, "usage", None), kwargs.get("model", ""))  # дневной счётчик квоты (по корзине)
         return resp
 
 
@@ -955,21 +967,27 @@ def _set_tools_support(slug, ok):
 
 
 # --- Дневной счётчик токенов OpenAI (бесплатная квота data sharing, сброс 00:00 UTC) ---
+# Две корзины квоты: "large" (gpt-5.x/o3, 250k/день) и "mini" (gpt-5.4-mini/o4-mini, 2.5M/день).
 
-_openai_usage = load_json(OPENAI_USAGE_PATH, {})  # {"date": "YYYY-MM-DD" (UTC), "input": int, "output": int}
+_openai_usage = load_json(OPENAI_USAGE_PATH, {})  # {"date": "YYYY-MM-DD" (UTC), "large": {"input","output"}, "mini": {...}}
+if "input" in _openai_usage:  # миграция старого плоского формата (была одна корзина)
+    _openai_usage = {"date": _openai_usage.get("date"),
+                     "large": {"input": int(_openai_usage.get("input", 0) or 0), "output": int(_openai_usage.get("output", 0) or 0)},
+                     "mini": {"input": 0, "output": 0}}
 
 
-def _openai_usage_today():
-    """(input, output, total) токенов OpenAI за текущие UTC-сутки (как считает квоту OpenAI)."""
+def _openai_usage_today(bucket: str = "large"):
+    """(input, output, total) токенов OpenAI за текущие UTC-сутки по корзине квоты."""
     today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
     if _openai_usage.get("date") != today:
         return 0, 0, 0
-    i, o = int(_openai_usage.get("input", 0) or 0), int(_openai_usage.get("output", 0) or 0)
+    b = _openai_usage.get(bucket) or {}
+    i, o = int(b.get("input", 0) or 0), int(b.get("output", 0) or 0)
     return i, o, i + o
 
 
-def _openai_usage_add(usage):
-    """Прибавляет usage ответа OpenAI к дневному счётчику (вызывается из адаптера на каждый ответ)."""
+def _openai_usage_add(usage, model_id: str = ""):
+    """Прибавляет usage ответа OpenAI к дневному счётчику его корзины (вызывается из адаптера)."""
     try:
         pt = int(getattr(usage, "prompt_tokens", 0) or 0)
         ct = int(getattr(usage, "completion_tokens", 0) or 0)
@@ -980,9 +998,10 @@ def _openai_usage_add(usage):
     today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
     if _openai_usage.get("date") != today:  # новые UTC-сутки — квота сброшена
         _openai_usage.clear()
-        _openai_usage.update({"date": today, "input": 0, "output": 0})
-    _openai_usage["input"] = int(_openai_usage.get("input", 0) or 0) + pt
-    _openai_usage["output"] = int(_openai_usage.get("output", 0) or 0) + ct
+        _openai_usage.update({"date": today, "large": {"input": 0, "output": 0}, "mini": {"input": 0, "output": 0}})
+    b = _openai_usage.setdefault(_openai_bucket(model_id), {"input": 0, "output": 0})
+    b["input"] = int(b.get("input", 0) or 0) + pt
+    b["output"] = int(b.get("output", 0) or 0) + ct
     try:
         save_json(OPENAI_USAGE_PATH, _openai_usage)
     except Exception as e:
@@ -3572,11 +3591,14 @@ async def ask_command(event):
         if failed:
             notes.append(f"⚠️ {failed} медиа не распознано")
         if MODEL_REGISTRY.get(ACTIVE_MODEL, ("",))[0] == "openai":
-            _qi, _qo, qtot = _openai_usage_today()
-            if qtot >= OPENAI_FREE_DAILY:
-                notes.append(f"🎁 бесплатная квота дня исчерпана (~{_fmt_ctx(qtot)}/{_fmt_ctx(OPENAI_FREE_DAILY)}) — дальше с баланса")
-            elif qtot >= int(OPENAI_FREE_DAILY * 0.8):
-                notes.append(f"🎁 квота дня: ~{_fmt_ctx(qtot)}/{_fmt_ctx(OPENAI_FREE_DAILY)}")
+            _qbucket = _openai_bucket(MODEL_REGISTRY[ACTIVE_MODEL][1])
+            _qlimit, _qlim_s = ((OPENAI_FREE_DAILY_MINI, "2.5M") if _qbucket == "mini"
+                                else (OPENAI_FREE_DAILY_LARGE, "250k"))
+            _qi, _qo, qtot = _openai_usage_today(_qbucket)
+            if qtot >= _qlimit:
+                notes.append(f"🎁 бесплатная квота дня исчерпана (~{_fmt_ctx(qtot)}/{_qlim_s}) — дальше с баланса")
+            elif qtot >= int(_qlimit * 0.8):
+                notes.append(f"🎁 квота дня: ~{_fmt_ctx(qtot)}/{_qlim_s}")
 
         # Решаем, идёт ли ответ голосом: force (флаг -v) или auto (модель начала с маркера [[VOICE]]).
         go_voice, spoken = False, reply
@@ -4518,8 +4540,8 @@ async def model_command(event):
                 mk = "▶" if lv == REASONING_EFFORT else "  "
                 lines.append(f"{mk}{i}. `/model reason {lv}`")
             mk = "▶" if REASONING_EFFORT is None else "  "
-            lines.append(f"{mk}{len(_REASONING_RANK) + 1}. `/model reason auto` — дефолт модели (5.5→medium, 5.4→none, o3→medium)")
-            lines.append("\nДля o3 уровни none/xhigh автоматически приводятся к low/high (модель принимает только low/medium/high).")
+            lines.append(f"{mk}{len(_REASONING_RANK) + 1}. `/model reason auto` — дефолт модели (5.5→medium, 5.4/5.4-mini→none, o3/o4-mini→medium)")
+            lines.append("\nНеподдерживаемый моделью уровень приводится к ближайшему: o3 — только low/medium/high (none→low, xhigh→high); o4-mini без none (none→low).")
             lines.append("Быстрый выбор из списка `/model`: номер `N.M` (N — модель, M — сила ризонинга, M=1 — мощнейший).")
             if active_provider != "openai":
                 lines.append("⚠️ Активная модель сейчас не OpenAI — настройка сработает после выбора GPT/o3.")
@@ -4531,7 +4553,7 @@ async def model_command(event):
             REASONING_EFFORT = None
             _save_model_state()
             log("MODEL", "Ризонинг OpenAI: auto (дефолт модели)")
-            await event.edit("✅ Глубина размышлений: авто (дефолт модели — 5.5→medium, 5.4→none, o3→medium).")
+            await event.edit("✅ Глубина размышлений: авто (дефолт модели — 5.5→medium, 5.4/5.4-mini→none, o3/o4-mini→medium).")
             return
         if rarg in _REASONING_RANK:
             REASONING_EFFORT = rarg
@@ -5259,7 +5281,7 @@ _HELP_SECTIONS = {
         "   `/model reason` — текущий уровень и список (xhigh/high/medium/low/none/auto).\n"
         "   `/model reason high` — установить уровень (глобально, переживает рестарт).\n"
         "   `/model N.M` — выбрать модель N сразу с силой ризонинга M (M=1 — мощнейший).\n"
-        "        _Пример:_ `/model 21.1` — GPT-5.5 на максимуме. Для o3 none/xhigh → low/high.\n"
+        "        _Пример:_ `/model 21.1` — GPT-5.5 на максимуме. Для o3 none/xhigh → low/high, для o4-mini none → low.\n"
         "\n"
         "**Избранное OpenRouter-моделей:**\n"
         "   `/model fav` — список добавленных кастомных моделей (быстрый выбор по номеру).\n"
@@ -5538,9 +5560,11 @@ async def status_command(event):
         reff = f"`{_clamp_reasoning(_mid, REASONING_EFFORT)}`" if REASONING_EFFORT else "авто (дефолт модели)"
         L.append(f"   🤔 глубина размышлений: {reff} · `/model reason` — сменить")
     if openai_api_key:
-        _qi, _qo, qtot = _openai_usage_today()
-        qpct = min(100, int(qtot * 100 / OPENAI_FREE_DAILY))
-        L.append(f"🎁 **OpenAI бесплатная квота (data sharing):** ~{_fmt_ctx(qtot)} / {_fmt_ctx(OPENAI_FREE_DAILY)} за сутки ({qpct}%) · сброс 00:00 UTC (03:00 МСК)")
+        _li, _lo, ltot = _openai_usage_today("large")
+        _mi, _mo, mtot = _openai_usage_today("mini")
+        lp = min(100, int(ltot * 100 / OPENAI_FREE_DAILY_LARGE))
+        mp = min(100, int(mtot * 100 / OPENAI_FREE_DAILY_MINI))
+        L.append(f"🎁 **OpenAI бесплатная квота (data sharing):** основные ~{_fmt_ctx(ltot)}/250k ({lp}%) · mini ~{_fmt_ctx(mtot)}/2.5M ({mp}%) · сброс 00:00 UTC (03:00 МСК)")
     # — медиа-модель —
     if ACTIVE_MEDIA_MODEL in MEDIA_MODEL_REGISTRY:
         media_label = MEDIA_MODEL_REGISTRY[ACTIVE_MEDIA_MODEL][1]
