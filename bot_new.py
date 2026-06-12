@@ -294,6 +294,7 @@ OPENAI_REASONING_LEVELS = {
     "gpt-5.4": ["xhigh", "high", "medium", "low", "none"],
     "o3":      ["high", "medium", "low"],
 }
+OPENAI_REASONING_DEFAULTS = {"gpt-5.5": "medium", "gpt-5.4": "none", "o3": "medium"}  # что применяет API без параметра
 _REASONING_RANK = ["xhigh", "high", "medium", "low", "none"]  # шкала силы для клампа
 
 
@@ -310,6 +311,17 @@ def _clamp_reasoning(model_id: str, effort: str) -> str:
     except ValueError:
         return "medium"
     return min(levels, key=lambda lv: abs(_REASONING_RANK.index(lv) - r))
+
+
+def _reasoning_tag() -> str:
+    """' · 🤔 high' — применяемый уровень ризонинга активной OpenAI-модели (для префикса ответа
+    и подписей). Без /model reason показывает дефолт API. Не-OpenAI модели → пустая строка."""
+    spec = MODEL_REGISTRY.get(ACTIVE_MODEL)
+    if not spec or spec[0] != "openai":
+        return ""
+    if REASONING_EFFORT:
+        return f" · 🤔 {_clamp_reasoning(spec[1], REASONING_EFFORT)}"
+    return f" · 🤔 {OPENAI_REASONING_DEFAULTS.get(spec[1], 'auto')}"
 
 
 # Автообрезка контекста под окно модели
@@ -3543,7 +3555,7 @@ async def ask_command(event):
             notes.append("🔇 голос не сгенерировался")  # фолбэк на текст
 
         note = (" — " + "; ".join(notes)) if notes else ""
-        prefix = f"{label}{note}:\n\n"
+        prefix = f"{label}{_reasoning_tag()}{note}:\n\n"
         # На текстовом пути срезаем возможный ведущий маркер [[VOICE]] (если авто-режим выбрал голос, но он упал).
         if reply.lstrip().startswith("[[VOICE]]"):
             reply = reply.lstrip()[len("[[VOICE]]"):].lstrip()
