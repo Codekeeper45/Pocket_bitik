@@ -219,6 +219,7 @@ MODEL_STATE_PATH = "model_state.json"
 MEDIA_CACHE_PATH = "media_cache.json"
 MEDIA_CACHE_TS_PATH = "media_cache_ts.json"
 AUTO_REPLY_PATH = "auto_reply.json"
+OPENAI_USAGE_PATH = "openai_usage.json"  # дневной счётчик токенов OpenAI (бесплатная квота data sharing)
 ALLOWED_PATH = "allowed_users.json"
 ALLOWED_ASK_TEXT_LIMIT = 500  # для гостей: запрос > этого числа → vision переключается на free
 MEDIA_HIDETAIL_MAX_N = 200    # /ask с N больше этого → описываем фото в detail="low" (дешевле)
@@ -296,6 +297,10 @@ OPENAI_REASONING_LEVELS = {
 }
 OPENAI_REASONING_DEFAULTS = {"gpt-5.5": "medium", "gpt-5.4": "none", "o3": "medium"}  # что применяет API без параметра
 _REASONING_RANK = ["xhigh", "high", "medium", "low", "none"]  # шкала силы для клампа
+# Бесплатная дневная квота OpenAI по программе data sharing (Tier 1-2 = 250k/день,
+# сброс в 00:00 UTC). Счётчик бота — ориентир: внешние запросы организации он не видит,
+# а граничный запрос OpenAI биллит целиком.
+OPENAI_FREE_DAILY = 250_000
 
 
 def _clamp_reasoning(model_id: str, effort: str) -> str:
@@ -628,7 +633,9 @@ class _OpenAIReasoningClient:
         kwargs.pop("temperature", None)  # reasoning-модели принимают только default(1.0)
         if REASONING_EFFORT:
             kwargs.setdefault("reasoning_effort", _clamp_reasoning(kwargs.get("model", ""), REASONING_EFFORT))
-        return self._c.chat.completions.create(**kwargs)
+        resp = self._c.chat.completions.create(**kwargs)
+        _openai_usage_add(getattr(resp, "usage", None))  # дневной счётчик бесплатной квоты
+        return resp
 
 
 openai_client = _OpenAIReasoningClient(openai_api_key) if openai_api_key else None
@@ -945,6 +952,41 @@ def _set_tools_support(slug, ok):
         MODEL_TOOLS_SUPPORT[slug] = ok
         _save_model_state()
         log("MODEL", f"{slug}: поддержка tools = {ok}")
+
+
+# --- Дневной счётчик токенов OpenAI (бесплатная квота data sharing, сброс 00:00 UTC) ---
+
+_openai_usage = load_json(OPENAI_USAGE_PATH, {})  # {"date": "YYYY-MM-DD" (UTC), "input": int, "output": int}
+
+
+def _openai_usage_today():
+    """(input, output, total) токенов OpenAI за текущие UTC-сутки (как считает квоту OpenAI)."""
+    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    if _openai_usage.get("date") != today:
+        return 0, 0, 0
+    i, o = int(_openai_usage.get("input", 0) or 0), int(_openai_usage.get("output", 0) or 0)
+    return i, o, i + o
+
+
+def _openai_usage_add(usage):
+    """Прибавляет usage ответа OpenAI к дневному счётчику (вызывается из адаптера на каждый ответ)."""
+    try:
+        pt = int(getattr(usage, "prompt_tokens", 0) or 0)
+        ct = int(getattr(usage, "completion_tokens", 0) or 0)
+    except Exception:
+        return
+    if not (pt or ct):
+        return
+    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    if _openai_usage.get("date") != today:  # новые UTC-сутки — квота сброшена
+        _openai_usage.clear()
+        _openai_usage.update({"date": today, "input": 0, "output": 0})
+    _openai_usage["input"] = int(_openai_usage.get("input", 0) or 0) + pt
+    _openai_usage["output"] = int(_openai_usage.get("output", 0) or 0) + ct
+    try:
+        save_json(OPENAI_USAGE_PATH, _openai_usage)
+    except Exception as e:
+        log("MODEL", f"Не сохранился счётчик OpenAI-квоты: {e}")
 
 
 # --- Персист активных auto_reply-чатов ---
@@ -3529,6 +3571,12 @@ async def ask_command(event):
             notes.append(f"✂️ обрезано {dropped} стар. сообщ.")
         if failed:
             notes.append(f"⚠️ {failed} медиа не распознано")
+        if MODEL_REGISTRY.get(ACTIVE_MODEL, ("",))[0] == "openai":
+            _qi, _qo, qtot = _openai_usage_today()
+            if qtot >= OPENAI_FREE_DAILY:
+                notes.append(f"🎁 бесплатная квота дня исчерпана (~{_fmt_ctx(qtot)}/{_fmt_ctx(OPENAI_FREE_DAILY)}) — дальше с баланса")
+            elif qtot >= int(OPENAI_FREE_DAILY * 0.8):
+                notes.append(f"🎁 квота дня: ~{_fmt_ctx(qtot)}/{_fmt_ctx(OPENAI_FREE_DAILY)}")
 
         # Решаем, идёт ли ответ голосом: force (флаг -v) или auto (модель начала с маркера [[VOICE]]).
         go_voice, spoken = False, reply
@@ -5489,6 +5537,10 @@ async def status_command(event):
     if provider == "openai":
         reff = f"`{_clamp_reasoning(_mid, REASONING_EFFORT)}`" if REASONING_EFFORT else "авто (дефолт модели)"
         L.append(f"   🤔 глубина размышлений: {reff} · `/model reason` — сменить")
+    if openai_api_key:
+        _qi, _qo, qtot = _openai_usage_today()
+        qpct = min(100, int(qtot * 100 / OPENAI_FREE_DAILY))
+        L.append(f"🎁 **OpenAI бесплатная квота (data sharing):** ~{_fmt_ctx(qtot)} / {_fmt_ctx(OPENAI_FREE_DAILY)} за сутки ({qpct}%) · сброс 00:00 UTC (03:00 МСК)")
     # — медиа-модель —
     if ACTIVE_MEDIA_MODEL in MEDIA_MODEL_REGISTRY:
         media_label = MEDIA_MODEL_REGISTRY[ACTIVE_MEDIA_MODEL][1]
