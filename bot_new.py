@@ -292,6 +292,12 @@ for _oid, _olabel, _octx in [
     ("o4-mini", "OpenAI o4-mini", 200000),
 ]:
     MODEL_REGISTRY[_oid] = ("openai", _oid, _olabel, _octx, 1.1)
+# Google Gemini Flash (официальный generativelanguage REST, как наш TTS). Окно 1M/выход 64k.
+# safety 1.15 — токенизатор близок к o200k. Ключи берём из GOOGLE_TTS_KEYS (общие с голосом).
+GEMINI_GENERATE_URL = "https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
+GEMINI_MODELS = {"gemini-3.5-flash", "gemini-3.1-flash-lite"}
+for _gid, _glabel in [("gemini-3.5-flash", "Gemini 3.5 Flash"), ("gemini-3.1-flash-lite", "Gemini 3.1 Flash Lite")]:
+    MODEL_REGISTRY[_gid] = ("google", _gid, _glabel, 1048576, 1.15)
 # Уровни глубины размышлений (reasoning_effort) OpenAI-моделей, от мощного к слабому.
 # API жёстко валидирует значение ПО МОДЕЛИ (неподдерживаемое → 400): gpt-5.4/5.5 принимают
 # none/low/medium/high/xhigh, o3 — только low/medium/high. Дефолты: 5.5 → medium, 5.4 → none, o3 → medium.
@@ -304,6 +310,10 @@ OPENAI_REASONING_LEVELS = {
 }
 OPENAI_REASONING_DEFAULTS = {"gpt-5.5": "medium", "gpt-5.4": "none", "o3": "medium",
                              "gpt-5.4-mini": "none", "o4-mini": "medium"}  # что применяет API без параметра
+# Gemini 3.x: глубина размышлений — thinkingLevel (minimal|low|medium|high), полного off нет.
+# Единый глобальный REASONING_EFFORT (шкала xhigh..none) мапим на уровни Gemini.
+GEMINI_THINKING_MAP = {"xhigh": "high", "high": "high", "medium": "medium", "low": "low", "none": "minimal"}
+GEMINI_THINKING_DEFAULT = "medium"  # что Google применяет без thinkingConfig (для показа в /status)
 # o-серия принимает tools+reasoning_effort на /chat/completions; gpt-5.x — НЕТ (400
 # «Function tools with reasoning_effort are not supported... use /v1/responses», зонд 2026-06-12)
 # → для gpt-5.x эта комбинация уходит через Responses API (см. _OpenAIReasoningClient._via_responses).
@@ -323,8 +333,11 @@ def _openai_bucket(model_id: str) -> str:
 
 
 def _clamp_reasoning(model_id: str, effort: str) -> str:
-    """Приводит глобальный уровень ризонинга к допустимому для конкретной модели:
-    o3 не принимает none/xhigh → ближайший по силе (low/high). Неизвестная модель → medium."""
+    """Приводит глобальный уровень ризонинга (шкала xhigh..none) к допустимому для модели:
+    Gemini → thinkingLevel (none→minimal, xhigh→high); o3 не принимает none/xhigh → ближайший
+    (low/high). Неизвестная модель → medium."""
+    if model_id in GEMINI_MODELS:
+        return GEMINI_THINKING_MAP.get(effort, "medium")
     levels = OPENAI_REASONING_LEVELS.get(model_id)
     if not levels:
         return effort if effort in ("low", "medium", "high") else "medium"
@@ -337,15 +350,33 @@ def _clamp_reasoning(model_id: str, effort: str) -> str:
     return min(levels, key=lambda lv: abs(_REASONING_RANK.index(lv) - r))
 
 
+def _supports_reasoning(provider: str) -> bool:
+    """Провайдеры с управляемой глубиной размышлений (/model reason): OpenAI и Google Gemini."""
+    return provider in ("openai", "google")
+
+
+def _reasoning_levels(slug: str):
+    """Список уровней ризонинга для выбора `N.M` у модели (от мощного к слабому). None — не поддерживает."""
+    spec = MODEL_REGISTRY.get(slug)
+    if not spec:
+        return None
+    if spec[0] == "openai":
+        return OPENAI_REASONING_LEVELS.get(slug)
+    if spec[0] == "google":
+        return _REASONING_RANK  # общая 5-уровневая шкала; маппится на thinkingLevel в _clamp_reasoning
+    return None
+
+
 def _reasoning_tag() -> str:
-    """' · 🤔 high' — применяемый уровень ризонинга активной OpenAI-модели (для префикса ответа
-    и подписей). Без /model reason показывает дефолт API. Не-OpenAI модели → пустая строка."""
+    """' · 🤔 high' — применяемый уровень ризонинга активной модели (OpenAI/Gemini) для префикса
+    ответа и подписей. Без /model reason показывает дефолт. Прочие провайдеры → пустая строка."""
     spec = MODEL_REGISTRY.get(ACTIVE_MODEL)
-    if not spec or spec[0] != "openai":
+    if not spec or not _supports_reasoning(spec[0]):
         return ""
     if REASONING_EFFORT:
         return f" · 🤔 {_clamp_reasoning(spec[1], REASONING_EFFORT)}"
-    return f" · 🤔 {OPENAI_REASONING_DEFAULTS.get(spec[1], 'auto')}"
+    default = GEMINI_THINKING_DEFAULT if spec[0] == "google" else OPENAI_REASONING_DEFAULTS.get(spec[1], "auto")
+    return f" · 🤔 {default}"
 
 
 # Автообрезка контекста под окно модели
@@ -850,6 +881,156 @@ class _OCAnthropicClient:
 
 opencode_anthropic_client = _OCAnthropicClient(opencode_api_key) if opencode_api_key else None
 
+
+class _GoogleGeminiClient:
+    """Адаптер под интерфейс OpenAI-клиента (`.chat.completions.create`) для Google Gemini
+    (generativelanguage REST, как наш TTS). Переводит OpenAI-сообщения ↔ Gemini contents,
+    function calling и thinkingLevel; ответ маппится обратно в форму chat.completions.
+
+    Gemini-3 особенность: на tool-call ходах в parts лежат thoughtSignature — их НЕЛЬЗЯ
+    потерять (иначе 400 на следующем запросе). Бот пересобирает messages в OpenAI-форме и
+    подписи теряет, поэтому кэшируем сырые model-ходы (functionCall.id → сырой content) и
+    при сборке contents подставляем их ВЕРБАТИМ вместо реконструкции."""
+
+    def __init__(self, keys):
+        self._keys = list(keys or [])
+        self._ki = 0  # round-robin указатель
+        self._raw = {}  # functionCall.id → сырой Gemini content-dict (с thoughtSignature)
+        self.chat = SimpleNamespace(completions=SimpleNamespace(create=self._create))
+
+    @staticmethod
+    def _img_part(url):
+        """data:<mime>;base64,<...> → {inlineData:{mimeType,data}} либо None."""
+        if not (isinstance(url, str) and url.startswith("data:") and "," in url):
+            return None
+        meta, b64 = url.split(",", 1)
+        mt = meta.split(";")[0].split(":")[-1] or "image/jpeg"
+        return {"inlineData": {"mimeType": mt, "data": b64}}
+
+    def _to_gemini(self, messages):
+        """OpenAI messages → (systemInstruction|None, contents). Карту id→name строим сканом
+        (для functionResponse, где имя функции нужно, а бот в tool-сообщении хранит только id)."""
+        id2name = {}
+        for m in messages:
+            for tc in (m.get("tool_calls") or []):
+                fn = tc.get("function") or {}
+                if tc.get("id"):
+                    id2name[tc["id"]] = fn.get("name")
+        system_parts, contents = [], []
+        for m in messages:
+            role, content = m.get("role"), m.get("content")
+            if role == "system":
+                if isinstance(content, str):
+                    system_parts.append(content)
+            elif role == "tool":
+                cid = m.get("tool_call_id")
+                contents.append({"role": "user", "parts": [{"functionResponse": {
+                    "name": id2name.get(cid) or "tool", "id": cid,
+                    "response": {"result": content if isinstance(content, str) else json.dumps(content, ensure_ascii=False)}}}]})
+            elif role == "assistant":
+                tcs = m.get("tool_calls") or []
+                raw = self._raw.get(tcs[0]["id"]) if tcs and tcs[0].get("id") in self._raw else None
+                if raw is not None:  # сырой model-ход с thoughtSignature — вербатим
+                    contents.append(raw)
+                    continue
+                parts = []
+                if isinstance(content, str) and content.strip():
+                    parts.append({"text": content})
+                for tc in tcs:  # фоллбэк-реконструкция (без подписи; может дать 400)
+                    fn = tc.get("function") or {}
+                    try:
+                        args = json.loads(fn.get("arguments") or "{}")
+                    except Exception:
+                        args = {}
+                    parts.append({"functionCall": {"name": fn.get("name"), "args": args}})
+                contents.append({"role": "model", "parts": parts or [{"text": ""}]})
+            else:  # user
+                if isinstance(content, list):
+                    parts = []
+                    for part in content:
+                        if not isinstance(part, dict):
+                            continue
+                        if part.get("type") == "text":
+                            parts.append({"text": part.get("text", "")})
+                        elif part.get("type") == "image_url":
+                            ip = self._img_part((part.get("image_url") or {}).get("url", ""))
+                            if ip:
+                                parts.append(ip)
+                    contents.append({"role": "user", "parts": parts or [{"text": ""}]})
+                else:
+                    contents.append({"role": "user", "parts": [{"text": content if isinstance(content, str) else str(content)}]})
+        return ("\n\n".join(system_parts) or None), contents
+
+    def _create(self, *, model, messages, max_tokens=4096, temperature=1.0, tools=None, tool_choice=None, **_ignore):
+        system, contents = self._to_gemini(messages)
+        gen = {"maxOutputTokens": int(max_tokens), "temperature": float(temperature)}
+        if REASONING_EFFORT:
+            level = _clamp_reasoning(model, REASONING_EFFORT)
+            gen["thinkingConfig"] = {"thinkingLevel": level}
+            # thinking-токены едят выходной бюджет → поднимаем потолок (как у OpenAI floor)
+            floor = {"medium": 24000, "high": 40000}.get(level)
+            if floor and gen["maxOutputTokens"] < floor:
+                gen["maxOutputTokens"] = min(floor, 65536)
+        body = {"contents": contents, "generationConfig": gen}
+        if system:
+            body["systemInstruction"] = {"parts": [{"text": system}]}
+        if tools:
+            body["tools"] = [{"functionDeclarations": [{
+                "name": (t.get("function") or {}).get("name"),
+                "description": (t.get("function") or {}).get("description", ""),
+                "parameters": (t.get("function") or {}).get("parameters") or {"type": "object", "properties": {}}}
+                for t in tools]}]
+            if isinstance(tool_choice, dict):  # форс конкретной функции
+                fname = (tool_choice.get("function") or {}).get("name")
+                body["toolConfig"] = {"functionCallingConfig": {"mode": "ANY", "allowedFunctionNames": [fname]}}
+            else:
+                body["toolConfig"] = {"functionCallingConfig": {"mode": "AUTO"}}
+        url = GEMINI_GENERATE_URL.format(model=model)
+        # ротация ключей при 429/5xx (как TTS) — пробегаем все ключи начиная с текущего
+        last_err = None
+        n = len(self._keys) or 1
+        for off in range(n):
+            key = self._keys[(self._ki + off) % n]
+            r = requests.post(url, headers={"x-goog-api-key": key, "Content-Type": "application/json"},
+                              json=body, timeout=300)
+            if r.status_code == 200:
+                self._ki = (self._ki + off) % n  # запомним рабочий ключ
+                return self._parse(r.json())
+            last_err = f"Gemini HTTP {r.status_code}: {r.text[:200]}"
+            if r.status_code not in (429, 500, 502, 503, 504):
+                break  # 4xx (кроме 429) — ключ не виноват, не ротируем
+        raise RuntimeError(last_err or "Gemini: нет ключей")
+
+    def _parse(self, data):
+        cand = (data.get("candidates") or [{}])[0]
+        content = cand.get("content") or {}
+        parts = content.get("parts") or []
+        text = "".join(p.get("text", "") for p in parts if isinstance(p, dict) and "text" in p and not p.get("thought"))
+        thoughts = "".join(p.get("text", "") for p in parts if isinstance(p, dict) and p.get("thought"))
+        fcalls = [p["functionCall"] for p in parts if isinstance(p, dict) and p.get("functionCall")]
+        tcs = None
+        if fcalls:
+            tcs = []
+            for fc in fcalls:
+                # Gemini-3 присылает id; если нет — генерим стабильный из имени+индекса
+                cid = fc.get("id") or f"gem_{fc.get('name')}_{len(self._raw)}"
+                tcs.append(SimpleNamespace(id=cid, type="function",
+                                           function=SimpleNamespace(name=fc.get("name"),
+                                                                    arguments=json.dumps(fc.get("args") or {}, ensure_ascii=False))))
+                if len(self._raw) > 500:  # ограничение роста кэша
+                    self._raw.clear()
+                self._raw[cid] = content  # сырой model-ход с thoughtSignature — для следующего хода
+        fr_map = {"STOP": "stop", "MAX_TOKENS": "length", "SAFETY": "stop", "RECITATION": "stop"}
+        fr = "tool_calls" if tcs else fr_map.get(cand.get("finishReason"), "stop")
+        u = data.get("usageMetadata") or {}
+        usage = SimpleNamespace(prompt_tokens=int(u.get("promptTokenCount", 0) or 0),
+                                completion_tokens=int(u.get("candidatesTokenCount", 0) or 0) + int(u.get("thoughtsTokenCount", 0) or 0))
+        msg = SimpleNamespace(role="assistant", content=text, tool_calls=tcs, reasoning_content=(thoughts or None))
+        return SimpleNamespace(choices=[SimpleNamespace(message=msg, finish_reason=fr)], usage=usage)
+
+
+google_client = _GoogleGeminiClient(GOOGLE_TTS_KEYS) if GOOGLE_TTS_KEYS else None
+
 AUTO_REPLY_BUFFERS: dict = {}
 AUTO_REPLY_TASKS: dict = {}
 AUTO_REPLY_BUSY: set = set()     # чаты в фазе LLM/отправки — не отменяем их таску (иначе теряем сообщения)
@@ -970,6 +1151,8 @@ def _client_for_provider(provider):
         return modelgate_client
     if provider == "openai":
         return openai_client
+    if provider == "google":
+        return google_client
     return opencode_client
 
 
@@ -1013,6 +1196,8 @@ def active_model_supports_vision():
                       # модель отвечает «изображения нет»). Для -g не годится; фото в /ask и так через OCR/медиа-модель.
     if provider == "openai":
         return True   # gpt-5.x / o3 принимают картинки напрямую (официальный API)
+    if provider == "google":
+        return True   # Gemini Flash видят картинки напрямую (нативный inlineData)
     return False  # DeepSeek и прочие текстовые
 
 
@@ -4633,21 +4818,21 @@ async def model_command(event):
         await event.edit(f"🗑 Удалена из избранного: `{target}`." + (" Активная модель сброшена на DeepSeek." if was_active else ""))
         return
 
-    # --- глубина размышлений OpenAI-моделей: /model reason [уровень|auto] ---
+    # --- глубина размышлений (OpenAI и Gemini): /model reason [уровень|auto] ---
     if arg.lower().startswith("reason"):
         rarg = arg[len("reason"):].strip().lower()
         active_provider = MODEL_REGISTRY.get(ACTIVE_MODEL, MODEL_REGISTRY["deepseek"])[0]
         if not rarg:
-            lines = ["🤔 **Глубина размышлений** — только OpenAI-модели (GPT-5.x / o3):", ""]
+            lines = ["🤔 **Глубина размышлений** — OpenAI (GPT-5.x / o3) и Google Gemini:", ""]
             for i, lv in enumerate(_REASONING_RANK, 1):
                 mk = "▶" if lv == REASONING_EFFORT else "  "
                 lines.append(f"{mk}{i}. `/model reason {lv}`")
             mk = "▶" if REASONING_EFFORT is None else "  "
-            lines.append(f"{mk}{len(_REASONING_RANK) + 1}. `/model reason auto` — дефолт модели (5.5→medium, 5.4/5.4-mini→none, o3/o4-mini→medium)")
-            lines.append("\nНеподдерживаемый моделью уровень приводится к ближайшему: o3 — только low/medium/high (none→low, xhigh→high); o4-mini без none (none→low).")
+            lines.append(f"{mk}{len(_REASONING_RANK) + 1}. `/model reason auto` — дефолт модели (5.5→medium, 5.4/5.4-mini→none, o3/o4-mini/Gemini→medium)")
+            lines.append("\nНеподдерживаемый моделью уровень приводится к ближайшему: o3 — low/medium/high (none→low, xhigh→high); o4-mini без none; Gemini → thinkingLevel (none→minimal, xhigh→high).")
             lines.append("Быстрый выбор из списка `/model`: номер `N.M` (N — модель, M — сила ризонинга, M=1 — мощнейший).")
-            if active_provider != "openai":
-                lines.append("⚠️ Активная модель сейчас не OpenAI — настройка сработает после выбора GPT/o3.")
+            if not _supports_reasoning(active_provider):
+                lines.append("⚠️ Активная модель не поддерживает управление ризонингом — настройка сработает после выбора GPT/o3/Gemini.")
             await event.edit("\n".join(lines)[:4000])
             return
         if rarg.isdigit() and 1 <= int(rarg) <= len(_REASONING_RANK) + 1:
@@ -4655,20 +4840,20 @@ async def model_command(event):
         if rarg in ("auto", "сброс", "reset", "off", "default"):
             REASONING_EFFORT = None
             _save_model_state()
-            log("MODEL", "Ризонинг OpenAI: auto (дефолт модели)")
-            await event.edit("✅ Глубина размышлений: авто (дефолт модели — 5.5→medium, 5.4/5.4-mini→none, o3/o4-mini→medium).")
+            log("MODEL", "Ризонинг: auto (дефолт модели)")
+            await event.edit("✅ Глубина размышлений: авто (дефолт модели — 5.5→medium, 5.4/5.4-mini→none, o3/o4-mini/Gemini→medium).")
             return
         if rarg in _REASONING_RANK:
             REASONING_EFFORT = rarg
             _save_model_state()
             note = ""
-            if active_provider == "openai":
+            if _supports_reasoning(active_provider):
                 applied = _clamp_reasoning(MODEL_REGISTRY[ACTIVE_MODEL][1], rarg)
                 if applied != rarg:
                     note = f" (для активной {MODEL_REGISTRY[ACTIVE_MODEL][2]} применится `{applied}`)"
             else:
-                note = " — сработает на моделях OpenAI (GPT-5.x / o3)"
-            log("MODEL", f"Ризонинг OpenAI: {rarg}")
+                note = " — сработает на моделях OpenAI (GPT-5.x / o3) и Gemini"
+            log("MODEL", f"Ризонинг: {rarg}")
             await event.edit(f"✅ Глубина размышлений: `{rarg}`{note}")
             return
         await event.edit("Не понял уровень. `/model reason` — список: " + " · ".join(f"`{lv}`" for lv in _REASONING_RANK) + " · `auto`.")
@@ -4690,16 +4875,18 @@ async def model_command(event):
                          "oc_anthropic": "━━ OpenCode Go (нативный) ━━",
                          "modelgate": "━━ Claude (ModelGate) ━━",
                          "openai": "━━ OpenAI (GPT-5/o3) ━━",
+                         "google": "━━ Google Gemini ━━",
                          "openrouter": "━━ OpenRouter (кастом) ━━"}.get(provider, f"━━ {provider} ━━")
                 lines.append(f"\n{title}")
             mark = f"▶{i}." if slug == ACTIVE_MODEL else f"{i}."
             warn = " ⚠️нет ключа" if not is_available(provider) else ""
             lines.append(f"{mark} `{slug}` — {label} · 🪟{_fmt_ctx(ctx)}{tool_mark(slug)}{warn}")
-            if provider == "openai" and slug in OPENAI_REASONING_LEVELS:
+            _levels = _reasoning_levels(slug)
+            if _levels:
                 # вариации силы ризонинга: выбор номером N.M (M=1 — мощнейший)
                 parts = []
-                for j, lv in enumerate(OPENAI_REASONING_LEVELS[slug], 1):
-                    cur = "▶" if (slug == ACTIVE_MODEL and REASONING_EFFORT and _clamp_reasoning(slug, REASONING_EFFORT) == lv) else ""
+                for j, lv in enumerate(_levels, 1):
+                    cur = "▶" if (slug == ACTIVE_MODEL and REASONING_EFFORT and _clamp_reasoning(slug, REASONING_EFFORT) == _clamp_reasoning(slug, lv)) else ""
                     parts.append(f"{cur}`{i}.{j}`{lv}")
                 lines.append("    🤔 " + " · ".join(parts))
         if ACTIVE_MEDIA_MODEL in MEDIA_MODEL_REGISTRY:
@@ -4722,8 +4909,8 @@ async def model_command(event):
         tested = 0
         for slug in slugs:
             provider, mid, _label, _ctx, _safety = MODEL_REGISTRY[slug]
-            if provider in ("oc_anthropic", "openai"):
-                continue  # qwen3.7-max / gpt-5.x / o3: tools работают, но короткий пробник (20 ток) reasoning-модели режет — флаг учится на лету в реальном /ask
+            if provider in ("oc_anthropic", "openai", "google"):
+                continue  # qwen3.7-max / gpt-5.x / o3 / Gemini: tools работают, но короткий пробник (20 ток) reasoning-модели режет — флаг учится на лету в реальном /ask
             cl = _client_for_provider(provider)
             if cl is None:
                 continue
@@ -4747,7 +4934,7 @@ async def model_command(event):
         await event.edit(f"🔧 Проверено моделей: {tested}. Смотри `/model`.")
         return
 
-    # --- выбор N.M: модель N с силой ризонинга M (только OpenAI; M=1 — мощнейший) ---
+    # --- выбор N.M: модель N с силой ризонинга M (OpenAI/Gemini; M=1 — мощнейший) ---
     m_nm = re.match(r"^(\d+)\.(\d+)$", arg)
     if m_nm:
         n, mlev = int(m_nm.group(1)), int(m_nm.group(2))
@@ -4756,22 +4943,24 @@ async def model_command(event):
             return
         slug_nm = slugs[n - 1]
         provider_nm, _midn, label_nm, ctx_nm, _sn = MODEL_REGISTRY[slug_nm]
-        levels = OPENAI_REASONING_LEVELS.get(slug_nm)
-        if provider_nm != "openai" or not levels:
-            await event.edit(f"Вариации `{n}.M` (сила ризонинга) доступны только для OpenAI-моделей (GPT-5.x / o3). Для {label_nm} — просто `/model {n}`.")
+        levels = _reasoning_levels(slug_nm)
+        if not levels:
+            await event.edit(f"Вариации `{n}.M` (сила ризонинга) доступны только для OpenAI (GPT-5.x / o3) и Gemini. Для {label_nm} — просто `/model {n}`.")
             return
         if not (1 <= mlev <= len(levels)):
             opts = " · ".join(f"`{n}.{j}` {lv}" for j, lv in enumerate(levels, 1))
             await event.edit(f"У {label_nm} уровни 1–{len(levels)}: {opts}")
             return
         if not is_available(provider_nm):
-            await event.edit(f"Модель «{label_nm}» недоступна — нет ключа провайдера (openai).")
+            await event.edit(f"Модель «{label_nm}» недоступна — нет ключа провайдера ({provider_nm}).")
             return
         ACTIVE_MODEL = slug_nm
         REASONING_EFFORT = levels[mlev - 1]
         _save_model_state()
-        log("MODEL", f"Активная модель: {slug_nm} ({label_nm}), ризонинг {REASONING_EFFORT}")
-        await event.edit(f"✅ Модель ответов: {label_nm} (окно 🪟{_fmt_ctx(ctx_nm)}) · 🤔 ризонинг: `{REASONING_EFFORT}`")
+        applied = _clamp_reasoning(_midn, REASONING_EFFORT)
+        rnote = f"`{REASONING_EFFORT}`" + (f" (→ `{applied}`)" if applied != REASONING_EFFORT else "")
+        log("MODEL", f"Активная модель: {slug_nm} ({label_nm}), ризонинг {REASONING_EFFORT}→{applied}")
+        await event.edit(f"✅ Модель ответов: {label_nm} (окно 🪟{_fmt_ctx(ctx_nm)}) · 🤔 ризонинг: {rnote}")
         return
 
     chosen = None
@@ -4816,7 +5005,7 @@ async def model_command(event):
     _save_model_state()
     log("MODEL", f"Активная модель: {chosen} ({label})")
     rtag = ""
-    if provider == "openai":
+    if _supports_reasoning(provider):
         rtag = f" · 🤔 ризонинг: `{_clamp_reasoning(_mid, REASONING_EFFORT)}`" if REASONING_EFFORT else " · 🤔 ризонинг: авто (`/model reason`)"
     await event.edit(f"✅ Модель ответов: {label} (окно 🪟{_fmt_ctx(ctx)}){rtag}")
 
@@ -5380,11 +5569,12 @@ _HELP_SECTIONS = {
         "\n"
         "   `/model probe` — прогнать модели и проверить, у каких работает веб-поиск.\n"
         "\n"
-        "**Глубина размышлений (только OpenAI: GPT-5.x / o3):**\n"
+        "**Глубина размышлений (OpenAI GPT-5.x / o3 и Google Gemini):**\n"
         "   `/model reason` — текущий уровень и список (xhigh/high/medium/low/none/auto).\n"
         "   `/model reason high` — установить уровень (глобально, переживает рестарт).\n"
         "   `/model N.M` — выбрать модель N сразу с силой ризонинга M (M=1 — мощнейший).\n"
-        "        _Пример:_ `/model 21.1` — GPT-5.5 на максимуме. Для o3 none/xhigh → low/high, для o4-mini none → low.\n"
+        "        _Пример:_ `/model 21.1` — на максимуме. o3: none/xhigh → low/high; o4-mini none → low;\n"
+        "        Gemini → thinkingLevel (none→minimal, xhigh→high).\n"
         "\n"
         "**Избранное OpenRouter-моделей:**\n"
         "   `/model fav` — список добавленных кастомных моделей (быстрый выбор по номеру).\n"
@@ -5543,8 +5733,10 @@ _HELP_SECTIONS = {
         "      картинки напрямую (`-g`) НЕ принимает — фото идут через OCR/медиа-модель как обычно.\n"
         "   `OPENAI_API_KEY` — даёт модели **OpenAI** (GPT-5.5 / GPT-5.4 / o3) для ответов\n"
         "      (`/model` → раздел «OpenAI»). Официальный API — нужен баланс на platform.openai.com.\n"
-        "   `GOOGLE_GENAI_API_KEY` — даёт **голосовые ответы** (`/voice`, флаг `-v`). Можно\n"
-        "      указать несколько ключей через запятую или в `GOOGLE_GENAI_API_KEYS` (ротация).\n"
+        "   `GOOGLE_GENAI_API_KEY` — даёт модели **Google Gemini** (Gemini 3.5 Flash / 3.1 Flash Lite)\n"
+        "      для ответов (`/model` → раздел «Google Gemini»; видят картинки `-g`) И **голосовые\n"
+        "      ответы** (`/voice`, флаг `-v`) — один ключ на оба. Можно указать несколько ключей\n"
+        "      через запятую или в `GOOGLE_GENAI_API_KEYS` (ротация).\n"
         "   `FISH_AUDIO_API_KEY` — альтернативный TTS-движок Fish Audio (`/voice engine fish`,\n"
         "      `/voice fish` — поиск/избранное голосов).\n"
         "   `LLAMA_CLOUD_API_KEY` — дешёвый **OCR фото** в `/ask` по умолчанию (LlamaParse).\n"
@@ -5651,7 +5843,7 @@ async def status_command(event):
     provider, _mid, label, ctx, _ = MODEL_REGISTRY.get(ACTIVE_MODEL, MODEL_REGISTRY["deepseek"])
     prov_name = {"deepseek": "DeepSeek", "openrouter": "OpenRouter", "opencode": "OpenCode Go",
                  "oc_anthropic": "OpenCode (нативный)", "modelgate": "ModelGate (Claude)",
-                 "openai": "OpenAI"}.get(provider, provider)
+                 "openai": "OpenAI", "google": "Google Gemini"}.get(provider, provider)
     ts = MODEL_TOOLS_SUPPORT.get(ACTIVE_MODEL)
     search_mark = "🔧 есть" if ts is True else ("🚫 нет" if ts is False else "❔ не проверен")
     sv = active_model_supports_vision()
@@ -5659,7 +5851,7 @@ async def status_command(event):
     L.append("📊 **СТАТУС БОТА**")
     L.append(f"\n🧠 **Модель ответов:** {label} (`{ACTIVE_MODEL}`)")
     L.append(f"   провайдер: {prov_name} · окно: 🪟{_fmt_ctx(ctx)} · поиск по каналам: {search_mark} · vision (`-g`): {vis_mark}")
-    if provider == "openai":
+    if _supports_reasoning(provider):
         reff = f"`{_clamp_reasoning(_mid, REASONING_EFFORT)}`" if REASONING_EFFORT else "авто (дефолт модели)"
         L.append(f"   🤔 глубина размышлений: {reff} · `/model reason` — сменить")
     if openai_api_key:
@@ -5709,7 +5901,7 @@ async def status_command(event):
     L.append(f"⭐ **Избранное:** {len(FISH_FAVORITES)} Fish-голос(ов) · {len(CUSTOM_MODELS)} кастомных моделей")
     # — ключи —
     keys = []
-    for p, nm in [("deepseek", "DeepSeek"), ("openrouter", "OpenRouter"), ("opencode", "OpenCode"), ("modelgate", "Claude/ModelGate"), ("openai", "OpenAI")]:
+    for p, nm in [("deepseek", "DeepSeek"), ("openrouter", "OpenRouter"), ("opencode", "OpenCode"), ("modelgate", "Claude/ModelGate"), ("openai", "OpenAI"), ("google", "Google Gemini")]:
         keys.append(f"{nm} {'✅' if _client_for_provider(p) is not None else '❌'}")
     keys.append(f"Tavily {'✅' if tavily_api_key else '❌'}")
     keys.append(f"Google TTS {'✅' if tts_available else '❌'}")
