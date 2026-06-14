@@ -295,8 +295,11 @@ for _oid, _olabel, _octx in [
 # Google Gemini Flash (официальный generativelanguage REST, как наш TTS). Окно 1M/выход 64k.
 # safety 1.15 — токенизатор близок к o200k. Ключи берём из GOOGLE_TTS_KEYS (общие с голосом).
 GEMINI_GENERATE_URL = "https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
-GEMINI_MODELS = {"gemini-3.5-flash", "gemini-3.1-flash-lite"}
-for _gid, _glabel in [("gemini-3.5-flash", "Gemini 3.5 Flash"), ("gemini-3.1-flash-lite", "Gemini 3.1 Flash Lite")]:
+# gemini-3.1-pro-preview НЕ добавлен: на бесплатных ключах даёт 429 (нет free-квоты, нужен биллинг).
+GEMINI_MODELS = {"gemini-3.5-flash", "gemini-3-flash-preview", "gemini-3.1-flash-lite"}
+for _gid, _glabel in [("gemini-3.5-flash", "Gemini 3.5 Flash"),
+                      ("gemini-3-flash-preview", "Gemini 3 Flash"),
+                      ("gemini-3.1-flash-lite", "Gemini 3.1 Flash Lite")]:
     MODEL_REGISTRY[_gid] = ("google", _gid, _glabel, 1048576, 1.15)
 # Уровни глубины размышлений (reasoning_effort) OpenAI-моделей, от мощного к слабому.
 # API жёстко валидирует значение ПО МОДЕЛИ (неподдерживаемое → 400): gpt-5.4/5.5 принимают
