@@ -233,7 +233,7 @@ MEDIA_MAX_ITEMS = 300     # потолок медиа-сегментов на о
 SEARCH_CONCURRENCY = 5    # параллельный поиск по каналам
 # Чтение текстовых файлов-вложений в /ask (по умолчанию): содержимое идёт в контекст.
 DOC_MAX_BYTES = 512_000   # больше — не тянем (плейсхолдер [Файл])
-DOC_MAX_CHARS = 16_000    # потолок встраиваемого текста файла (~5–6k токенов), дальше обрезка
+DOC_MAX_CHARS = 32_000    # потолок встраиваемого текста файла (~10–12k токенов), дальше обрезка
 TEXT_MIME = {"application/json", "application/xml", "application/javascript", "application/x-yaml",
              "application/x-sh", "application/x-python", "application/toml", "application/csv",
              "application/x-tex", "application/sql", "image/svg+xml"}
