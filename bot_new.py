@@ -258,7 +258,7 @@ COLLECT_OVERFETCH = 1.2       # запас позиций на скип серв
 # целевой модели может быть плотнее o200k (которым считает tiktoken). На опыте:
 # Kimi K2.x ≈ 2.25× плотнее o200k → safety 2.5. Остальные близки к o200k → 1.15.
 MODEL_REGISTRY = {
-    "deepseek": ("deepseek", DEEPSEEK_MODEL, "DeepSeek V4 Pro", 1000000, 1.15),
+    "deepseek-pro": ("deepseek", DEEPSEEK_MODEL, "DeepSeek V4 Pro", 1000000, 1.15),
     "deepseek-flash": ("deepseek", "deepseek-v4-flash", "DeepSeek V4 Flash", 1000000, 1.15),  # прямой API
 }
 # Реестр почищен (2026-06-14): оставлены только новейшие версии каждой модели. Убраны устаревшие
@@ -1079,7 +1079,7 @@ AUTO_REPLY_HISTORY: dict = {}   # {chat_id: [{"role","content"}, ...]}
 LAST_SCAN: list = []
 LAST_FISH_SEARCH: list = []     # [{_id,title,languages}] последнего /voice fish search — для add по номеру
 _ENTITY_CACHE: dict = {}        # кэш зарезолвленных каналов
-ACTIVE_MODEL = "deepseek"       # перезаписывается из model_state.json при старте
+ACTIVE_MODEL = "deepseek-pro"   # перезаписывается из model_state.json при старте
 OWNER_ID = None                 # заполняется из get_me() при старте
 OWNER_USERNAME = None
 OWNER_NAME = None
@@ -1148,9 +1148,9 @@ _model_state = load_json(MODEL_STATE_PATH, {})
 CUSTOM_MODELS = _model_state.get("custom_models", {})  # {id: {"label","ctx","safety"}}
 for _cid, _ci in CUSTOM_MODELS.items():
     MODEL_REGISTRY[_cid] = ("openrouter", _cid, (_ci.get("label") or _cid), int(_ci.get("ctx") or 128000), float(_ci.get("safety") or 1.3))
-ACTIVE_MODEL = _model_state.get("active", "deepseek")
+ACTIVE_MODEL = _model_state.get("active", "deepseek-pro")
 if ACTIVE_MODEL not in MODEL_REGISTRY:
-    ACTIVE_MODEL = "deepseek"
+    ACTIVE_MODEL = "deepseek-pro"
 MODEL_TOOLS_SUPPORT = _model_state.get("tools_support", {})  # {slug: True|False} — обучается на лету
 # Чистка ошибочно выученных tools=False у OpenAI-моделей: до фикса 2026-06-12 комбинация
 # tools+reasoning_effort на gpt-5.x давала 400 и писала «нет tools» (function calling есть у всех).
@@ -1174,7 +1174,7 @@ FISH_FAVORITES = _model_state.get("fish_favorites", [])  # [{"id","title"}]
 
 def get_active_model():
     """Возвращает (client, api_model_id, label) для активной модели. client=None если провайдер не настроен."""
-    provider, model_id, label, _ctx, _safety = MODEL_REGISTRY.get(ACTIVE_MODEL, MODEL_REGISTRY["deepseek"])
+    provider, model_id, label, _ctx, _safety = MODEL_REGISTRY.get(ACTIVE_MODEL, MODEL_REGISTRY["deepseek-pro"])
     client_obj = _client_for_provider(provider)
     return client_obj, model_id, label
 
@@ -1199,13 +1199,13 @@ def _client_for_provider(provider):
 
 
 def active_context_window() -> int:
-    return MODEL_REGISTRY.get(ACTIVE_MODEL, MODEL_REGISTRY["deepseek"])[3]
+    return MODEL_REGISTRY.get(ACTIVE_MODEL, MODEL_REGISTRY["deepseek-pro"])[3]
 
 
 def active_ctx_safety() -> float:
     """Множитель safety для активной модели. Tiktoken (o200k) недосчитывает у некоторых моделей —
     safety даёт запас бюджета, чтобы не переполнить окно (см. ctx_safety_mult в реестре)."""
-    spec = MODEL_REGISTRY.get(ACTIVE_MODEL, MODEL_REGISTRY["deepseek"])
+    spec = MODEL_REGISTRY.get(ACTIVE_MODEL, MODEL_REGISTRY["deepseek-pro"])
     return spec[4] if len(spec) >= 5 else CTX_TOKEN_SAFETY
 
 
@@ -4932,7 +4932,7 @@ async def model_command(event):
         CUSTOM_MODELS.pop(target, None)
         MODEL_REGISTRY.pop(target, None)
         if was_active:
-            ACTIVE_MODEL = "deepseek"
+            ACTIVE_MODEL = "deepseek-pro"
         _save_model_state()
         log("MODEL", f"Удалена кастомная модель: {target}")
         await event.edit(f"🗑 Удалена из избранного: `{target}`." + (" Активная модель сброшена на DeepSeek." if was_active else ""))
@@ -4941,7 +4941,7 @@ async def model_command(event):
     # --- глубина размышлений (OpenAI и Gemini): /model reason [уровень|auto] ---
     if arg.lower().startswith("reason"):
         rarg = arg[len("reason"):].strip().lower()
-        active_provider = MODEL_REGISTRY.get(ACTIVE_MODEL, MODEL_REGISTRY["deepseek"])[0]
+        active_provider = MODEL_REGISTRY.get(ACTIVE_MODEL, MODEL_REGISTRY["deepseek-pro"])[0]
         if not rarg:
             lines = ["🤔 **Глубина размышлений** — OpenAI (GPT-5.x / o3) и Google Gemini:", ""]
             for i, lv in enumerate(_REASONING_RANK, 1):
@@ -5963,7 +5963,7 @@ async def status_command(event):
         return
     L = []
     # — модель ответов —
-    provider, _mid, label, ctx, _ = MODEL_REGISTRY.get(ACTIVE_MODEL, MODEL_REGISTRY["deepseek"])
+    provider, _mid, label, ctx, _ = MODEL_REGISTRY.get(ACTIVE_MODEL, MODEL_REGISTRY["deepseek-pro"])
     prov_name = {"deepseek": "DeepSeek", "openrouter": "OpenRouter", "opencode": "OpenCode Go",
                  "oc_anthropic": "OpenCode (нативный)", "modelgate": "ModelGate (Claude)",
                  "openai": "OpenAI", "google": "Google Gemini", "zai": "z.ai (GLM)"}.get(provider, provider)
