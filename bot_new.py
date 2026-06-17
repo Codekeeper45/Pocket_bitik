@@ -261,14 +261,17 @@ MODEL_REGISTRY = {
     "deepseek-pro": ("deepseek", DEEPSEEK_MODEL, "DeepSeek V4 Pro", 1000000, 1.15),
     "deepseek-flash": ("deepseek", "deepseek-v4-flash", "DeepSeek V4 Flash", 1000000, 1.15),  # прямой API
 }
-# Реестр почищен (2026-06-14): оставлены только новейшие версии каждой модели. Убраны устаревшие
-# glm-5/5.1 (есть GLM-5.2 на z.ai), kimi-k2.5, minimax-m2.5/m2.7, qwen3.5/3.6-plus, mimo-v2.5/v2-pro.
+# Реестр почищен (2026-06-14): оставлены только новейшие версии каждой модели на КАЖДОМ провайдере
+# (разный провайдер/транспорт — отдельная модель). Убраны устаревшие: glm-5 (есть glm-5.1 на opencode),
+# kimi-k2.5, minimax-m2.5/m2.7, qwen3.5/3.6-plus, mimo-v2.5/v2-pro. GLM-5.1 на opencode оставлен —
+# это другой транспорт, чем GLM-5.2 на z.ai (там vision-вариант, тут текстовый).
 for _mid, _label, _ctx, _safety in [
     ("deepseek-v4-pro",  "DeepSeek V4 Pro",   1000000, 1.15),
     ("deepseek-v4-flash","DeepSeek V4 Flash", 1000000, 1.15),
     ("kimi-k2.6",        "Kimi K2.6",          262000, 2.50),
     ("kimi-k2.7-code",   "Kimi K2.7 Code",     262000, 2.50),
     ("minimax-m3",       "MiniMax M3",        1000000, 1.30),
+    ("glm-5.1",          "GLM-5.1",            203000, 1.30),
     ("qwen3.7-plus",     "Qwen3.7 Plus",       262000, 1.15),
     ("mimo-v2.5",        "MiMo V2.5",         1000000, 1.50),
     ("mimo-v2.5-pro",    "MiMo V2.5 Pro",     1000000, 1.50),
