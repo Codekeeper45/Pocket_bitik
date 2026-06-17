@@ -259,6 +259,7 @@ COLLECT_OVERFETCH = 1.2       # запас позиций на скип серв
 # Kimi K2.x ≈ 2.25× плотнее o200k → safety 2.5. Остальные близки к o200k → 1.15.
 MODEL_REGISTRY = {
     "deepseek": ("deepseek", DEEPSEEK_MODEL, "DeepSeek V4 Pro", 1000000, 1.15),
+    "deepseek-flash": ("deepseek", "deepseek-v4-flash", "DeepSeek V4 Flash", 1000000, 1.15),  # прямой API
 }
 # Реестр почищен (2026-06-14): оставлены только новейшие версии каждой модели. Убраны устаревшие
 # glm-5/5.1 (есть GLM-5.2 на z.ai), kimi-k2.5, minimax-m2.5/m2.7, qwen3.5/3.6-plus, mimo-v2.5/v2-pro.
@@ -269,6 +270,7 @@ for _mid, _label, _ctx, _safety in [
     ("kimi-k2.7-code",   "Kimi K2.7 Code",     262000, 2.50),
     ("minimax-m3",       "MiniMax M3",        1000000, 1.30),
     ("qwen3.7-plus",     "Qwen3.7 Plus",       262000, 1.15),
+    ("mimo-v2.5",        "MiMo V2.5",         1000000, 1.50),
     ("mimo-v2.5-pro",    "MiMo V2.5 Pro",     1000000, 1.50),
     ("mimo-v2-omni",     "MiMo V2 Omni",      1000000, 1.50),
     ("hy3-preview",      "Hunyuan 3 Preview",  256000, 1.50),
@@ -300,8 +302,9 @@ for _oid, _olabel, _octx in [
 # safety 1.15 — токенизатор близок к o200k. Ключи берём из GOOGLE_TTS_KEYS (общие с голосом).
 GEMINI_GENERATE_URL = "https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
 # gemini-3.1-pro-preview НЕ добавлен: на бесплатных ключах даёт 429 (нет free-квоты, нужен биллинг).
-GEMINI_MODELS = {"gemini-3.5-flash", "gemini-3.1-flash-lite"}
+GEMINI_MODELS = {"gemini-3.5-flash", "gemini-3-flash-preview", "gemini-3.1-flash-lite"}
 for _gid, _glabel in [("gemini-3.5-flash", "Gemini 3.5 Flash"),
+                      ("gemini-3-flash-preview", "Gemini 3 Flash"),
                       ("gemini-3.1-flash-lite", "Gemini 3.1 Flash Lite")]:
     MODEL_REGISTRY[_gid] = ("google", _gid, _glabel, 1048576, 1.15)
 # z.ai (Zhipu) — модели GLM, OpenAI-совместимый API (api.z.ai, прямой Bearer). safety 1.30 (как GLM
