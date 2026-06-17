@@ -418,7 +418,7 @@ def _reasoning_tag() -> str:
 
 
 # Автообрезка контекста под окно модели
-CTX_RESERVE_TOKENS = 8000   # запас на ответ (4096) + системку + вопрос
+CTX_RESERVE_TOKENS = ASK_MAX_TOKENS + 2000  # запас под ВЕСЬ ответ (ASK_MAX_TOKENS, у thinking-моделей reasoning жрёт почти весь потолок) + системку + вопрос
 CTX_CHARS_PER_TOKEN = 2.0   # фоллбэк-оценка, если tiktoken недоступен
 # Подсчёт токенов идёт через o200k (GPT-4o), но отвечают другие модели
 # (DeepSeek/Qwen/GLM/…). Их BPE-словари близки, но не идентичны — даём запас:
@@ -3273,7 +3273,8 @@ async def _render_unit(msg, text_only: bool, anchor_id=None, vision_model: str =
             log("ASK", f"Ошибка обработки медиа в контексте: {e}")
     body = _assemble_body(msg, media_body)
 
-    if anchor_id is not None and getattr(msg, "id", None) == anchor_id:
+    is_anchor = anchor_id is not None and getattr(msg, "id", None) == anchor_id
+    if is_anchor:
         label += " ← ВОПРОС ОБ ЭТОМ"
         marked = True
 
@@ -3285,6 +3286,7 @@ async def _render_unit(msg, text_only: bool, anchor_id=None, vision_model: str =
         "gid": getattr(msg, "grouped_id", None),
         "mid": getattr(msg, "id", None),  # для пометки #id в контексте (reply_to_messages)
         "marked": marked,
+        "is_anchor": is_anchor,  # цель reply-/ask — закрепляется при обрезке (см. assemble_context)
         "failed": sum(body.count(mk) for mk in MEDIA_FAILURE_MARKERS),
     }
 
@@ -3318,7 +3320,8 @@ async def _render_album_segment(group, text_only: bool, anchor_id=None, vision_m
     if fwd:
         label += f" ⤷ из {fwd}"
         marked = True
-    if anchor_id is not None and any(getattr(m, "id", None) == anchor_id for m in group):
+    is_anchor = anchor_id is not None and any(getattr(m, "id", None) == anchor_id for m in group)
+    if is_anchor:
         label += " ← ВОПРОС ОБ ЭТОМ"
         marked = True
 
@@ -3408,6 +3411,7 @@ async def _render_album_segment(group, text_only: bool, anchor_id=None, vision_m
         "body": body,
         "mid": getattr(first, "id", None),  # альбом → id первого сообщения (reply_to_messages)
         "marked": marked,
+        "is_anchor": is_anchor,  # цель reply-/ask — закрепляется при обрезке (см. assemble_context)
         "failed": sum(body.count(mk) for mk in MEDIA_FAILURE_MARKERS),
     }
 
@@ -3446,7 +3450,7 @@ async def assemble_context(messages, text_only: bool, anchor_id=None, progress_c
     media_total = 0 if text_only else len(media_idx) - len(skip_media)
     done = 0
     failed_total = 0
-    mstats = {"photos": 0, "voice": 0, "audio": 0, "video_note": 0, "hit": 0, "miss": 0}
+    mstats = {"photos": 0, "voice": 0, "audio": 0, "video_note": 0, "doc": 0, "hit": 0, "miss": 0}
     # In-batch lookup для reply-target'ов: убирает 80–95% сетевых вызовов на больших N.
     by_id = {getattr(m, "id", None): m for m in messages if getattr(m, "id", None) is not None}
     # Батч-префетч target-сообщений, которых нет в by_id (типичный сценарий под фильтром @user,
@@ -3497,10 +3501,10 @@ async def assemble_context(messages, text_only: bool, anchor_id=None, progress_c
     t_render = time.time() - t_render_start
 
     # Сводка по медиа (если что-то было)
-    mtot = mstats["photos"] + mstats["voice"] + mstats["audio"] + mstats["video_note"]
+    mtot = mstats["photos"] + mstats["voice"] + mstats["audio"] + mstats["video_note"] + mstats["doc"]
     if mtot:
         hr = round(100 * mstats["hit"] / mtot, 1)
-        log("ASK", f"Медиа: {mtot} (фото {mstats['photos']} · голос {mstats['voice']} · аудио {mstats['audio']} · кружок {mstats['video_note']}) · кэш-хит {mstats['hit']}/{mtot} ({hr}%) · новых {mstats['miss']} · сбоев {failed_total}")
+        log("ASK", f"Медиа: {mtot} (фото {mstats['photos']} · голос {mstats['voice']} · аудио {mstats['audio']} · кружок {mstats['video_note']} · файлы {mstats['doc']}) · кэш-хит {mstats['hit']}/{mtot} ({hr}%) · новых {mstats['miss']} · сбоев {failed_total}")
 
     # Склейка: подряд идущие сообщения одного автора без меток → один блок (альбомы уже самоформатированы).
     # При include_ids каждая строка-сообщение получает префикс #id, чтобы модель адресовала reply_to_messages.
@@ -3517,10 +3521,11 @@ async def assemble_context(messages, text_only: bool, anchor_id=None, progress_c
         else:
             blocks.append({
                 "akey": u["akey"], "label": u["label"], "ts": u["ts"],
-                "lines": [_line(u)], "marked": u["marked"],
+                "lines": [_line(u)], "marked": u["marked"], "is_anchor": u.get("is_anchor", False),
             })
 
     out = [f"[{(b['ts'] + ' ' + b['label']).strip()}]: " + "\n".join(b["lines"]) for b in blocks]
+    anchor_idx = next((i for i, b in enumerate(blocks) if b.get("is_anchor")), None)  # цель reply-/ask
 
     # Автообрезка под окно активной модели: держим самые свежие блоки, что влезают.
     # Бюджет в токенах; запас прочности под чужие токенизаторы (см. CTX_TOKEN_SAFETY).
@@ -3529,15 +3534,23 @@ async def assemble_context(messages, text_only: bool, anchor_id=None, progress_c
     t_trunc_start = time.time()
     safety = safety_override if safety_override is not None else active_ctx_safety()
     budget = max(2000, int((active_context_window() - CTX_RESERVE_TOKENS) / safety))
-    kept, total, truncated = [], 0, False
-    for s in reversed(out):  # с конца — новейшие
-        add = count_tokens(s) + 1  # +1 на разделитель блоков
-        if kept and total + add > budget:
+    kept_idx, total, truncated = [], 0, False
+    for i in range(len(out) - 1, -1, -1):  # с конца — новейшие
+        add = count_tokens(out[i]) + 1  # +1 на разделитель блоков
+        if kept_idx and total + add > budget:
             truncated = True
             break
-        kept.append(s)
+        kept_idx.append(i)
         total += add
-    kept.reverse()
+    # Закрепляем якорный блок (цель reply-/ask): даже если он самый старый и не влез — без
+    # него модель отвечает «про это», не видя «этого». Якорь 1:1 = один блок (он marked).
+    anchor_pinned = False
+    if truncated and anchor_idx is not None and anchor_idx not in kept_idx:
+        total += count_tokens(out[anchor_idx]) + 1
+        kept_idx.append(anchor_idx)
+        anchor_pinned = True
+    kept_idx.sort()
+    kept = [out[i] for i in kept_idx]
     t_trunc = time.time() - t_trunc_start
     dropped = 0
     window = active_context_window()
@@ -3545,8 +3558,10 @@ async def assemble_context(messages, text_only: bool, anchor_id=None, progress_c
     enc = "tiktoken" if _ENC is not None else "оценка по символам"
     if truncated:
         dropped = len(out) - len(kept)
-        kept.insert(0, f"[…{dropped} более старых сообщений опущено — не влезли в окно модели…]")
-        log("ASK", f"Контекст обрезан под окно {_fmt_ctx(window)}: оставлено {len(kept) - 1}/{len(out)} блоков, ~{total} ток ({enc}) = {pct}% окна (бюджет {budget} ток, safety×{safety:.2f})")
+        # маркер ставим ПОСЛЕ закреплённого якоря (он самый старый, идёт первым)
+        note = " (цель вопроса сохранена выше)" if anchor_pinned else ""
+        kept.insert(1 if anchor_pinned else 0, f"[…{dropped} более старых сообщений опущено — не влезли в окно модели{note}…]")
+        log("ASK", f"Контекст обрезан под окно {_fmt_ctx(window)}: оставлено {len(kept) - 1}/{len(out)} блоков, ~{total} ток ({enc}) = {pct}% окна (бюджет {budget} ток, safety×{safety:.2f})" + (" · якорь закреплён" if anchor_pinned else ""))
     else:
         log("ASK", f"Контекст готов: ~{total} ток ({enc}) из окна {_fmt_ctx(window)} = {pct}% занято, блоков {len(kept)} (бюджет {budget} ток, safety×{safety:.2f})")
 
@@ -3556,6 +3571,14 @@ async def assemble_context(messages, text_only: bool, anchor_id=None, progress_c
         no_q = f" · без цитат: {rep_stats['no_quote']}" if rep_stats["no_quote"] else ""
         log("ASK", f"Подэтапы контекста: рендер={t_render:.1f}с · обрезка={t_trunc:.1f}с · "
                    f"reply: in-batch {rep_stats['hit']} · сеть {net_budget['used']}/{REPLY_NETWORK_BUDGET}{no_q}")
+    # /ask -g: выкидываем картинки из блоков, что не пережили обрезку — иначе модель
+    # получает байты без текстовой ссылки [Картинка #k]. Граница (\d+) против матча #1 в #12.
+    if inline_images:
+        surv = {int(x) for x in re.findall(r"Картинка #(\d+)", "\n".join(kept))}
+        before = len(inline_images)
+        inline_images[:] = [im for im in inline_images if im["idx"] in surv]
+        if len(inline_images) != before:
+            log("ASK", f"-g: отброшено {before - len(inline_images)} картинок из срезанных блоков")
     return "\n\n".join(kept), dropped, failed_total, total
 
 
