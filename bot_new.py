@@ -3199,6 +3199,7 @@ async def _reply_info(msg, by_id=None, net_budget=None, rep_stats=None) -> str:
     if not rto:
         return None
     rto_id = getattr(rto, "reply_to_msg_id", None)
+    qtext = getattr(rto, "quote_text", None)  # выделенный пользователем фрагмент (partial quote) — лежит прямо в reply_to, сеть не нужна
     rep = by_id.get(rto_id) if (by_id and rto_id) else None
     if rep is not None and rep_stats is not None:
         rep_stats["hit"] = rep_stats.get("hit", 0) + 1
@@ -3225,15 +3226,22 @@ async def _reply_info(msg, by_id=None, net_budget=None, rep_stats=None) -> str:
     if rep is None:
         if rep_stats is not None:
             rep_stats["no_quote"] = rep_stats.get("no_quote", 0) + 1
+        # target вне выборки/бюджета — но фрагмент-цитата есть в reply_to, покажем хотя бы его
+        if qtext:
+            return f"↩ на фрагмент: «{_preview(qtext, 80)}»"
         return "↩"
     if getattr(rep, "out", False):
         rauthor = _owner_label()
     else:
         rauthor = _user_label(getattr(rep, "sender", None))
-    quote = _preview(getattr(rep, "raw_text", None) or (_media_tag(rep) or ""), 50)
     head = ("↩ " + rauthor).strip()
-    if quote:
-        head += f": «{quote}»"
+    if qtext:
+        # отвечают на КОНКРЕТНЫЙ фрагмент — показываем именно его, а не начало всего сообщения
+        head += f" (на фрагмент: «{_preview(qtext, 80)}»)"
+    else:
+        quote = _preview(getattr(rep, "raw_text", None) or (_media_tag(rep) or ""), 50)
+        if quote:
+            head += f": «{quote}»"
     return head
 
 
