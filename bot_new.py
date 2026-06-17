@@ -319,11 +319,12 @@ for _gid, _glabel in [("gemini-3.5-flash", "Gemini 3.5 Flash"),
                       ("gemini-3.1-flash-lite", "Gemini 3.1 Flash Lite")]:
     MODEL_REGISTRY[_gid] = ("google", _gid, _glabel, 1048576, 1.15)
 # z.ai (Zhipu) — модели GLM, OpenAI-совместимый API (api.z.ai, прямой Bearer). safety 1.30 (как GLM
-# у opencode). Окна — оценка по семейству GLM (4.6 = 200K). glm-4.6v-flash и glm-4.7-flash — Free-тариф.
+# у opencode). Окна сверены (2026-06-14): GLM-5.2 — 1M (выход 131k), 4.7-flash — ~200k (202752),
+# 4.6v-flash — 128k. glm-4.6v-flash и glm-4.7-flash — Free-тариф.
 for _zid, _zlabel, _zctx in [
-    ("glm-5.2",        "GLM-5.2",            200000),
-    ("glm-4.7-flash",  "GLM-4.7 Flash",     128000),
-    ("glm-4.6v-flash", "GLM-4.6V Flash",     64000),
+    ("glm-5.2",        "GLM-5.2",           1000000),
+    ("glm-4.7-flash",  "GLM-4.7 Flash",      200000),
+    ("glm-4.6v-flash", "GLM-4.6V Flash",     128000),
 ]:
     MODEL_REGISTRY[_zid] = ("zai", _zid, _zlabel, _zctx, 1.30)
 ZAI_VISION = {"glm-4.6v-flash"}  # из GLM на z.ai картинки принимает только V-модель (проверено)
