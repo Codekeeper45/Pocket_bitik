@@ -356,6 +356,9 @@ GEMINI_THINKING_DEFAULT = "medium"  # что Google применяет без th
 # → для gpt-5.x эта комбинация уходит через Responses API (см. _OpenAIReasoningClient._via_responses).
 OPENAI_TOOLS_EFFORT_CHAT_OK = {"o3", "o4-mini"}
 _REASONING_RANK = ["xhigh", "high", "medium", "low", "none"]  # шкала силы для клампа
+# Fireworks reasoning-модели: reasoning_effort принимает low/medium/high/none (нет xhigh; none = отключить
+# мышление). Доки https://docs.fireworks.ai/guides/reasoning. Шкала от мощного к слабому для выбора N.M.
+FIREWORKS_REASONING_LEVELS = ["high", "medium", "low", "none"]
 # Бесплатные дневные квоты OpenAI по программе data sharing (Tier 1-2, сброс в 00:00 UTC):
 # 250k/день на основные модели (gpt-5.x/o3) и ОТДЕЛЬНЫЕ 2.5M/день на mini-группу.
 # Счётчик бота — ориентир: внешние запросы организации он не видит, а граничный
@@ -394,6 +397,8 @@ def _clamp_reasoning(model_id: str, effort: str) -> str:
     (low/high). Неизвестная модель → medium."""
     if model_id in GEMINI_MODELS:
         return GEMINI_THINKING_MAP.get(effort, "medium")
+    if model_id.startswith("accounts/fireworks/"):
+        return "high" if effort == "xhigh" else effort  # Fireworks: low/medium/high/none (нет xhigh)
     levels = OPENAI_REASONING_LEVELS.get(model_id)
     if not levels:
         return effort if effort in ("low", "medium", "high") else "medium"
@@ -407,8 +412,8 @@ def _clamp_reasoning(model_id: str, effort: str) -> str:
 
 
 def _supports_reasoning(provider: str) -> bool:
-    """Провайдеры с управляемой глубиной размышлений (/model reason): OpenAI и Google Gemini."""
-    return provider in ("openai", "google")
+    """Провайдеры с управляемой глубиной размышлений (/model reason): OpenAI, Google Gemini, Fireworks."""
+    return provider in ("openai", "google", "fireworks")
 
 
 def _reasoning_levels(slug: str):
@@ -420,6 +425,8 @@ def _reasoning_levels(slug: str):
         return OPENAI_REASONING_LEVELS.get(slug)
     if spec[0] == "google":
         return _REASONING_RANK  # общая 5-уровневая шкала; маппится на thinkingLevel в _clamp_reasoning
+    if spec[0] == "fireworks":
+        return FIREWORKS_REASONING_LEVELS  # low/medium/high/none
     return None
 
 
@@ -838,6 +845,27 @@ class _OpenAIReasoningClient:
 openai_client = _OpenAIReasoningClient(openai_api_key) if openai_api_key else None
 
 
+class _FireworksReasoningClient:
+    """Адаптер под интерфейс OpenAI-клиента для Fireworks (api.fireworks.ai, OpenAI-совместимый).
+    Fireworks — стандартный chat (max_tokens/temperature как есть), но reasoning-модели принимают
+    reasoning_effort (low/medium/high/none, доки fireworks.ai/guides/reasoning). Если задан
+    REASONING_EFFORT (/model reason) — инжектим его, приведя к шкале Fireworks (xhigh→high). На medium+
+    поднимаем max_tokens, чтобы цепочка размышлений (считается в выводе) не съела весь бюджет и не
+    оставила пустой видимый ответ. У всех 5 fw-моделей окно ≥262k → поднятый потолок не переполнит окно."""
+
+    def __init__(self, api_key):
+        self._c = OpenAI(api_key=api_key, base_url=FIREWORKS_BASE_URL)
+        self.chat = SimpleNamespace(completions=SimpleNamespace(create=self._create))
+
+    def _create(self, **kwargs):
+        if REASONING_EFFORT:
+            kwargs.setdefault("reasoning_effort", _clamp_reasoning(kwargs.get("model", ""), REASONING_EFFORT))
+            _floor = {"medium": 24000, "high": 40000}.get(kwargs.get("reasoning_effort"))
+            if _floor and int(kwargs.get("max_tokens") or 0) < _floor:
+                kwargs["max_tokens"] = _floor
+        return self._c.chat.completions.create(**kwargs)
+
+
 # ── opencode-go в формате Anthropic Messages (для qwen3.7-max и подобных) ──
 # Утиная обёртка под интерфейс OpenAI-клиента: `.chat.completions.create(...)`.
 # Переводит OpenAI-формат (messages/tools/tool_calls) ↔ Anthropic Messages, чтобы
@@ -1088,7 +1116,7 @@ class _GoogleGeminiClient:
 
 google_client = _GoogleGeminiClient(GOOGLE_TTS_KEYS) if GOOGLE_TTS_KEYS else None
 zai_client = OpenAI(api_key=zai_api_key, base_url=ZAI_BASE_URL) if zai_api_key else None  # z.ai GLM (OpenAI-совместимый)
-fireworks_client = OpenAI(api_key=fireworks_api_key, base_url=FIREWORKS_BASE_URL) if fireworks_api_key else None  # Fireworks (OpenAI-совместимый)
+fireworks_client = _FireworksReasoningClient(fireworks_api_key) if fireworks_api_key else None  # Fireworks (OpenAI-совместимый, с управляемым reasoning_effort)
 
 AUTO_REPLY_BUFFERS: dict = {}
 AUTO_REPLY_TASKS: dict = {}
@@ -5002,16 +5030,16 @@ async def model_command(event):
         rarg = arg[len("reason"):].strip().lower()
         active_provider = MODEL_REGISTRY.get(ACTIVE_MODEL, MODEL_REGISTRY["deepseek-pro"])[0]
         if not rarg:
-            lines = ["🤔 **Глубина размышлений** — OpenAI (GPT-5.x / o3) и Google Gemini:", ""]
+            lines = ["🤔 **Глубина размышлений** — OpenAI (GPT-5.x / o3), Google Gemini и Fireworks:", ""]
             for i, lv in enumerate(_REASONING_RANK, 1):
                 mk = "▶" if lv == REASONING_EFFORT else "  "
                 lines.append(f"{mk}{i}. `/model reason {lv}`")
             mk = "▶" if REASONING_EFFORT is None else "  "
             lines.append(f"{mk}{len(_REASONING_RANK) + 1}. `/model reason auto` — дефолт модели (5.5→medium, 5.4/5.4-mini→none, o3/o4-mini/Gemini→medium)")
-            lines.append("\nНеподдерживаемый моделью уровень приводится к ближайшему: o3 — low/medium/high (none→low, xhigh→high); o4-mini без none; Gemini → thinkingLevel (none→minimal, xhigh→high).")
+            lines.append("\nНеподдерживаемый моделью уровень приводится к ближайшему: o3 — low/medium/high (none→low, xhigh→high); o4-mini без none; Gemini → thinkingLevel (none→minimal, xhigh→high); Fireworks — low/medium/high/none (xhigh→high).")
             lines.append("Быстрый выбор из списка `/model`: номер `N.M` (N — модель, M — сила ризонинга, M=1 — мощнейший).")
             if not _supports_reasoning(active_provider):
-                lines.append("⚠️ Активная модель не поддерживает управление ризонингом — настройка сработает после выбора GPT/o3/Gemini.")
+                lines.append("⚠️ Активная модель не поддерживает управление ризонингом — настройка сработает после выбора GPT/o3/Gemini/Fireworks.")
             await event.edit("\n".join(lines)[:4000])
             return
         if rarg.isdigit() and 1 <= int(rarg) <= len(_REASONING_RANK) + 1:
@@ -5031,7 +5059,7 @@ async def model_command(event):
                 if applied != rarg:
                     note = f" (для активной {MODEL_REGISTRY[ACTIVE_MODEL][2]} применится `{applied}`)"
             else:
-                note = " — сработает на моделях OpenAI (GPT-5.x / o3) и Gemini"
+                note = " — сработает на моделях OpenAI (GPT-5.x / o3), Gemini и Fireworks"
             log("MODEL", f"Ризонинг: {rarg}")
             await event.edit(f"✅ Глубина размышлений: `{rarg}`{note}")
             return
@@ -5127,7 +5155,7 @@ async def model_command(event):
         provider_nm, _midn, label_nm, ctx_nm, _sn = MODEL_REGISTRY[slug_nm]
         levels = _reasoning_levels(slug_nm)
         if not levels:
-            await event.edit(f"Вариации `{n}.M` (сила ризонинга) доступны только для OpenAI (GPT-5.x / o3) и Gemini. Для {label_nm} — просто `/model {n}`.")
+            await event.edit(f"Вариации `{n}.M` (сила ризонинга) доступны для OpenAI (GPT-5.x / o3), Gemini и Fireworks. Для {label_nm} — просто `/model {n}`.")
             return
         if not (1 <= mlev <= len(levels)):
             opts = " · ".join(f"`{n}.{j}` {lv}" for j, lv in enumerate(levels, 1))
