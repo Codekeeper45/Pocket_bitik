@@ -60,6 +60,7 @@ opencode_api_key = os.getenv("OPENCODE_API_KEY")
 modelgate_api_key = os.getenv("MODELGATE_API_KEY")  # шлюз Claude-моделей (OpenAI-совместимый, modelgate.app)
 openai_api_key = os.getenv("OPENAI_API_KEY")  # официальный OpenAI API (gpt-5.x / o3); reasoning-модели
 zai_api_key = os.getenv("ZAI_API_KEY")  # z.ai (Zhipu) — модели GLM (OpenAI-совместимый, прямой Bearer)
+fireworks_api_key = os.getenv("FIREWORKS_API_KEY")  # Fireworks AI — serverless-модели (OpenAI-совместимый, прямой Bearer)
 tavily_api_key = os.getenv("TAVILY_API_KEY")  # веб-поиск/извлечение страниц для /ask (tavily.com); без ключа веб-инструменты выключены
 llama_cloud_api_key = os.getenv("LLAMA_CLOUD_API_KEY")  # OCR фото (LlamaParse); без него фото идут через vision
 
@@ -136,6 +137,7 @@ BROWSER_UA = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Ge
 # max_tokens и убирает temperature). Vision и tools — нативные.
 OPENAI_BASE_URL = "https://api.openai.com/v1"
 ZAI_BASE_URL = "https://api.z.ai/api/paas/v4"  # z.ai (Zhipu) международный, OpenAI-совместимый
+FIREWORKS_BASE_URL = "https://api.fireworks.ai/inference/v1"  # Fireworks AI, OpenAI-совместимый
 
 # --- Google Gemini Flash TTS (голосовые ответы в /ask) ---
 GEMINI_TTS_MODEL = os.getenv("GEMINI_TTS_MODEL", "gemini-3.1-flash-tts-preview")
@@ -320,6 +322,19 @@ for _zid, _zlabel, _zctx in [
 ]:
     MODEL_REGISTRY[_zid] = ("zai", _zid, _zlabel, _zctx, 1.30)
 ZAI_VISION = {"glm-4.6v-flash"}  # из GLM на z.ai картинки принимает только V-модель (проверено)
+# Fireworks AI — serverless-модели, OpenAI-совместимый API (api.fireworks.ai/inference/v1, прямой Bearer).
+# id модели — ПОЛНЫЙ путь accounts/fireworks/models/<slug>. Слаги с префиксом fw- (имена линеек уже заняты
+# opencode/direct). Окна/vision из каталога + сверено вживую (2026-06-17): текст, tools, reasoning_content
+# отделяется; vision у minimax-m3 (512k) и kimi-k2.6. Kimi safety 2.50 (плотный токенизатор, как на opencode).
+for _fwid, _fwapi, _fwlabel, _fwctx, _fwsafe in [
+    ("fw-minimax-m3",       "minimax-m3",             "MiniMax M3 (FW)",       512000, 1.30),
+    ("fw-nemotron-3-ultra", "nemotron-3-ultra-nvfp4", "Nemotron 3 Ultra",      262144, 1.30),
+    ("fw-deepseek-v4-pro",  "deepseek-v4-pro",        "DeepSeek V4 Pro (FW)", 1048576, 1.15),
+    ("fw-glm-5.2",          "glm-5p2",                "GLM-5.2 (FW)",         1048576, 1.30),
+    ("fw-kimi-k2.6",        "kimi-k2p6",              "Kimi K2.6 (FW)",        262144, 2.50),
+]:
+    MODEL_REGISTRY[_fwid] = ("fireworks", "accounts/fireworks/models/" + _fwapi, _fwlabel, _fwctx, _fwsafe)
+FIREWORKS_VISION = {"fw-minimax-m3", "fw-kimi-k2.6"}  # vision-варианты на Fireworks (проверено вживую)
 # Уровни глубины размышлений (reasoning_effort) OpenAI-моделей, от мощного к слабому.
 # API жёстко валидирует значение ПО МОДЕЛИ (неподдерживаемое → 400): gpt-5.4/5.5 принимают
 # none/low/medium/high/xhigh, o3 — только low/medium/high. Дефолты: 5.5 → medium, 5.4 → none, o3 → medium.
@@ -1073,6 +1088,7 @@ class _GoogleGeminiClient:
 
 google_client = _GoogleGeminiClient(GOOGLE_TTS_KEYS) if GOOGLE_TTS_KEYS else None
 zai_client = OpenAI(api_key=zai_api_key, base_url=ZAI_BASE_URL) if zai_api_key else None  # z.ai GLM (OpenAI-совместимый)
+fireworks_client = OpenAI(api_key=fireworks_api_key, base_url=FIREWORKS_BASE_URL) if fireworks_api_key else None  # Fireworks (OpenAI-совместимый)
 
 AUTO_REPLY_BUFFERS: dict = {}
 AUTO_REPLY_TASKS: dict = {}
@@ -1198,6 +1214,8 @@ def _client_for_provider(provider):
         return google_client
     if provider == "zai":
         return zai_client
+    if provider == "fireworks":
+        return fireworks_client
     return opencode_client
 
 
@@ -1245,6 +1263,8 @@ def active_model_supports_vision():
         return True   # Gemini Flash видят картинки напрямую (нативный inlineData)
     if provider == "zai":
         return ACTIVE_MODEL in ZAI_VISION  # из GLM на z.ai только V-модель принимает картинки
+    if provider == "fireworks":
+        return ACTIVE_MODEL in FIREWORKS_VISION  # на Fireworks картинки принимают minimax-m3 и kimi-k2.6
     return False  # DeepSeek и прочие текстовые
 
 
@@ -5031,6 +5051,7 @@ async def model_command(event):
                          "openai": "━━ OpenAI (GPT-5/o3) ━━",
                          "google": "━━ Google Gemini ━━",
                          "zai": "━━ z.ai (GLM) ━━",
+                         "fireworks": "━━ Fireworks ━━",
                          "openrouter": "━━ OpenRouter (кастом) ━━"}.get(provider, f"━━ {provider} ━━")
                 lines.append(f"\n{title}")
             mark = f"▶{i}." if slug == ACTIVE_MODEL else f"{i}."
@@ -5064,8 +5085,8 @@ async def model_command(event):
         tested = 0
         for slug in slugs:
             provider, mid, _label, _ctx, _safety = MODEL_REGISTRY[slug]
-            if provider in ("oc_anthropic", "openai", "google", "zai"):
-                continue  # qwen3.7-max / gpt-5.x / o3 / Gemini: tools работают, но короткий пробник (20 ток) reasoning-модели режет — флаг учится на лету в реальном /ask
+            if provider in ("oc_anthropic", "openai", "google", "zai", "fireworks"):
+                continue  # qwen3.7-max / gpt-5.x / o3 / Gemini / Fireworks: tools работают, но короткий пробник (20 ток) reasoning-модели режет — флаг учится на лету в реальном /ask
             cl = _client_for_provider(provider)
             if cl is None:
                 continue
@@ -5890,6 +5911,8 @@ _HELP_SECTIONS = {
         "      (`/model` → раздел «OpenAI»). Официальный API — нужен баланс на platform.openai.com.\n"
         "   `ZAI_API_KEY` — даёт модели **z.ai / GLM** (GLM-5.2 / 4.7 Flash / 4.6V Flash) для ответов\n"
         "      (`/model` → раздел «z.ai (GLM)»). GLM-4.6V Flash видит картинки (`-g`); Flash-модели бесплатны.\n"
+        "   `FIREWORKS_API_KEY` — даёт модели **Fireworks** (MiniMax M3 / Nemotron 3 Ultra / DeepSeek V4 Pro /\n"
+        "      GLM-5.2 / Kimi K2.6) для ответов (`/model` → раздел «Fireworks»). MiniMax M3 и Kimi K2.6 видят картинки (`-g`).\n"
         "   `GOOGLE_GENAI_API_KEY` — даёт модели **Google Gemini** (Gemini 3.5 Flash / 3.1 Flash Lite)\n"
         "      для ответов (`/model` → раздел «Google Gemini»; видят картинки `-g`) И **голосовые\n"
         "      ответы** (`/voice`, флаг `-v`) — один ключ на оба. Можно указать несколько ключей\n"
@@ -6000,7 +6023,7 @@ async def status_command(event):
     provider, _mid, label, ctx, _ = MODEL_REGISTRY.get(ACTIVE_MODEL, MODEL_REGISTRY["deepseek-pro"])
     prov_name = {"deepseek": "DeepSeek", "openrouter": "OpenRouter", "opencode": "OpenCode Go",
                  "oc_anthropic": "OpenCode (нативный)", "modelgate": "ModelGate (Claude)",
-                 "openai": "OpenAI", "google": "Google Gemini", "zai": "z.ai (GLM)"}.get(provider, provider)
+                 "openai": "OpenAI", "google": "Google Gemini", "zai": "z.ai (GLM)", "fireworks": "Fireworks"}.get(provider, provider)
     ts = MODEL_TOOLS_SUPPORT.get(ACTIVE_MODEL)
     search_mark = "🔧 есть" if ts is True else ("🚫 нет" if ts is False else "❔ не проверен")
     sv = active_model_supports_vision()
@@ -6058,7 +6081,7 @@ async def status_command(event):
     L.append(f"⭐ **Избранное:** {len(FISH_FAVORITES)} Fish-голос(ов) · {len(CUSTOM_MODELS)} кастомных моделей")
     # — ключи —
     keys = []
-    for p, nm in [("deepseek", "DeepSeek"), ("openrouter", "OpenRouter"), ("opencode", "OpenCode"), ("modelgate", "Claude/ModelGate"), ("openai", "OpenAI"), ("google", "Google Gemini"), ("zai", "z.ai (GLM)")]:
+    for p, nm in [("deepseek", "DeepSeek"), ("openrouter", "OpenRouter"), ("opencode", "OpenCode"), ("modelgate", "Claude/ModelGate"), ("openai", "OpenAI"), ("google", "Google Gemini"), ("zai", "z.ai (GLM)"), ("fireworks", "Fireworks")]:
         keys.append(f"{nm} {'✅' if _client_for_provider(p) is not None else '❌'}")
     keys.append(f"Tavily {'✅' if tavily_api_key else '❌'}")
     keys.append(f"Google TTS {'✅' if tts_available else '❌'}")
