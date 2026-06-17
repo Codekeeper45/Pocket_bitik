@@ -1244,16 +1244,16 @@ def _client_for_media_model(model_id: str):
     return opencode_client if model_id in MEDIA_OPENCODE_SLUGS else openrouter_client
 
 
-def active_model_supports_vision():
-    """Умеет ли АКТИВНАЯ отвечающая модель принимать картинки напрямую (для /ask -g).
+def _model_supports_vision(slug):
+    """Умеет ли модель `slug` принимать картинки напрямую (для /ask -g).
     True/False — известно; None — кастомная OpenRouter-модель без сохранённого флага
     (вызывающий проверит вживую через _openrouter_model_info)."""
-    if ACTIVE_MODEL in MEDIA_OPENCODE_SLUGS:
+    if slug in MEDIA_OPENCODE_SLUGS:
         return True  # vision-слуги OpenCode (kimi/glm/qwen/mimo)
-    spec = MODEL_REGISTRY.get(ACTIVE_MODEL)
+    spec = MODEL_REGISTRY.get(slug)
     provider = spec[0] if spec else None
     if provider == "openrouter":
-        return CUSTOM_MODELS.get(ACTIVE_MODEL, {}).get("vision")  # bool или None если не сохранено
+        return CUSTOM_MODELS.get(slug, {}).get("vision")  # bool или None если не сохранено
     if provider == "modelgate":
         return False  # шлюз ModelGate НЕ доставляет картинки до Claude (проверено: base64 и URL —
                       # модель отвечает «изображения нет»). Для -g не годится; фото в /ask и так через OCR/медиа-модель.
@@ -1262,10 +1262,15 @@ def active_model_supports_vision():
     if provider == "google":
         return True   # Gemini Flash видят картинки напрямую (нативный inlineData)
     if provider == "zai":
-        return ACTIVE_MODEL in ZAI_VISION  # из GLM на z.ai только V-модель принимает картинки
+        return slug in ZAI_VISION  # из GLM на z.ai только V-модель принимает картинки
     if provider == "fireworks":
-        return ACTIVE_MODEL in FIREWORKS_VISION  # на Fireworks картинки принимают minimax-m3 и kimi-k2.6
+        return slug in FIREWORKS_VISION  # на Fireworks картинки принимают minimax-m3 и kimi-k2.6
     return False  # DeepSeek и прочие текстовые
+
+
+def active_model_supports_vision():
+    """Vision активной отвечающей модели (для /ask -g). См. _model_supports_vision."""
+    return _model_supports_vision(ACTIVE_MODEL)
 
 
 async def _openrouter_model_info(model_id: str):
@@ -5038,7 +5043,7 @@ async def model_command(event):
             "╭───────────────────────╮",
             "│   🧠  МОДЕЛИ ОТВЕТОВ   │",
             "╰───────────────────────╯",
-            "▶ активная · 🪟 окно · 🔧 поиск · 🚫 нет · ❔ не проверено",
+            "▶ активная · 🪟 окно · 👁 видит картинки (-g) · 🔧 поиск · 🚫 нет · ❔ не проверено",
         ]
         cur_provider = None
         for i, slug in enumerate(slugs, 1):
@@ -5056,7 +5061,8 @@ async def model_command(event):
                 lines.append(f"\n{title}")
             mark = f"▶{i}." if slug == ACTIVE_MODEL else f"{i}."
             warn = " ⚠️нет ключа" if not is_available(provider) else ""
-            lines.append(f"{mark} `{slug}` — {label} · 🪟{_fmt_ctx(ctx)}{tool_mark(slug)}{warn}")
+            vmark = " 👁" if _model_supports_vision(slug) else ""  # видит картинки напрямую (-g)
+            lines.append(f"{mark} `{slug}` — {label}{vmark} · 🪟{_fmt_ctx(ctx)}{tool_mark(slug)}{warn}")
             _levels = _reasoning_levels(slug)
             if _levels:
                 # вариации силы ризонинга: выбор номером N.M (M=1 — мощнейший)
