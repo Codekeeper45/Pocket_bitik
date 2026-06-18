@@ -368,6 +368,11 @@ FIREWORKS_REASONING_LEVELS = ["high", "medium", "low", "none"]
 # даёт 400 → обёртка ретраит без параметра (дефолтная глубина). Не-reasoning модели тоже покрыты ретраем.
 # minimax-m3 кладёт мышление в <think> (его и так режет _strip_think).
 OPENCODE_REASONING_LEVELS = ["high", "medium", "low", "none"]
+# Официальный DeepSeek (V4): мышление вкл/выкл через extra_body thinking, глубина reasoning_effort.
+# Реально различимы high и max (low/medium→high, xhigh→max — доки api-docs.deepseek.com/guides/thinking_mode).
+# Проверено вживую 2026-06-17: thinking:disabled → reasoning=0 (off), high vs max — реальная разница
+# (flash high→1066 / max→5402). Шкала в ГЛОБАЛЬНЫХ значениях (xhigh→max, none→off-switch).
+DEEPSEEK_REASONING_LEVELS = ["xhigh", "high", "none"]
 # Бесплатные дневные квоты OpenAI по программе data sharing (Tier 1-2, сброс в 00:00 UTC):
 # 250k/день на основные модели (gpt-5.x/o3) и ОТДЕЛЬНЫЕ 2.5M/день на mini-группу.
 # Счётчик бота — ориентир: внешние запросы организации он не видит, а граничный
@@ -411,6 +416,11 @@ def _clamp_reasoning(model_id: str, effort: str, provider: str = None) -> str:
         return "high" if effort == "xhigh" else effort  # Fireworks: low/medium/high/none (нет xhigh)
     if provider == "opencode":
         return "high" if effort == "xhigh" else effort  # low/medium/high/none (none → 400-fallback у deepseek)
+    if provider == "deepseek":
+        # официальный DeepSeek V4: none→off, xhigh→max, остальное→high (low/medium схлопываются в high)
+        if effort == "none":
+            return "none"
+        return "max" if effort == "xhigh" else "high"
     levels = OPENAI_REASONING_LEVELS.get(model_id)
     if not levels:
         return effort if effort in ("low", "medium", "high") else "medium"
@@ -424,8 +434,8 @@ def _clamp_reasoning(model_id: str, effort: str, provider: str = None) -> str:
 
 
 def _supports_reasoning(provider: str) -> bool:
-    """Провайдеры с управляемой глубиной размышлений (/model reason): OpenAI, Google Gemini, Fireworks, opencode."""
-    return provider in ("openai", "google", "fireworks", "opencode")
+    """Провайдеры с управляемой глубиной размышлений (/model reason): OpenAI, Google Gemini, Fireworks, opencode, DeepSeek."""
+    return provider in ("openai", "google", "fireworks", "opencode", "deepseek")
 
 
 def _reasoning_levels(slug: str):
@@ -440,7 +450,9 @@ def _reasoning_levels(slug: str):
     if spec[0] == "fireworks":
         return FIREWORKS_REASONING_LEVELS  # low/medium/high/none
     if spec[0] == "opencode":
-        return OPENCODE_REASONING_LEVELS  # high/medium/low (none избегаем — 400 у deepseek)
+        return OPENCODE_REASONING_LEVELS  # high/medium/low/none
+    if spec[0] == "deepseek":
+        return DEEPSEEK_REASONING_LEVELS  # xhigh(→max)/high/none(→off)
     return None
 
 
@@ -913,6 +925,33 @@ class _OpencodeReasoningClient:
 opencode_reasoning_client = _OpencodeReasoningClient(opencode_api_key) if opencode_api_key else None  # путь ответов (медиа — на сыром opencode_client)
 
 
+class _DeepSeekReasoningClient:
+    """Адаптер для официального DeepSeek (api.deepseek.com, OpenAI-совместимый). V4-модели: мышление
+    вкл/выкл через `extra_body.thinking`, глубина — `reasoning_effort` (различимы high и max; low/medium→high,
+    xhigh→max — доки api-docs.deepseek.com/guides/thinking_mode). При REASONING_EFFORT: none → thinking
+    disabled (off-switch), xhigh → effort max, иначе → effort high. Параметры шлём в extra_body (минуя
+    валидацию enum SDK). Оборачивает ТОЛЬКО путь ответов; _sync_image_prompt и пр. — на сыром deepseek_client.
+    temperature в режиме мышления DeepSeek игнорирует без ошибки."""
+
+    def __init__(self, api_key):
+        self._c = OpenAI(api_key=api_key, base_url=DEEPSEEK_BASE_URL)
+        self.chat = SimpleNamespace(completions=SimpleNamespace(create=self._create))
+
+    def _create(self, **kwargs):
+        if REASONING_EFFORT:
+            eff = _clamp_reasoning(kwargs.get("model", ""), REASONING_EFFORT, "deepseek")  # none/high/max
+            xb = dict(kwargs.pop("extra_body", None) or {})
+            if eff == "none":
+                xb["thinking"] = {"type": "disabled"}
+            else:
+                xb["reasoning_effort"] = eff
+            kwargs["extra_body"] = xb
+        return self._c.chat.completions.create(**kwargs)
+
+
+deepseek_reasoning_client = _DeepSeekReasoningClient(deepseek_api_key) if deepseek_api_key else None  # путь ответов (спец-вызовы — на сыром deepseek_client)
+
+
 # ── opencode-go в формате Anthropic Messages (для qwen3.7-max и подобных) ──
 # Утиная обёртка под интерфейс OpenAI-клиента: `.chat.completions.create(...)`.
 # Переводит OpenAI-формат (messages/tools/tool_calls) ↔ Anthropic Messages, чтобы
@@ -1276,7 +1315,7 @@ def get_active_model():
 def _client_for_provider(provider):
     """Клиент/маркер доступности по провайдеру. None — провайдер не настроен."""
     if provider == "deepseek":
-        return deepseek_client
+        return deepseek_reasoning_client  # путь ответов с управлением мышлением (медиа/промпт-ген — на сыром deepseek_client)
     if provider == "openrouter":
         return openrouter_client
     if provider == "oc_anthropic":
@@ -5079,16 +5118,16 @@ async def model_command(event):
         rarg = arg[len("reason"):].strip().lower()
         active_provider = MODEL_REGISTRY.get(ACTIVE_MODEL, MODEL_REGISTRY["deepseek-pro"])[0]
         if not rarg:
-            lines = ["🤔 **Глубина размышлений** — OpenAI (GPT-5.x / o3), Google Gemini, Fireworks и opencode:", ""]
+            lines = ["🤔 **Глубина размышлений** — OpenAI (GPT-5.x / o3), Gemini, Fireworks, opencode и DeepSeek:", ""]
             for i, lv in enumerate(_REASONING_RANK, 1):
                 mk = "▶" if lv == REASONING_EFFORT else "  "
                 lines.append(f"{mk}{i}. `/model reason {lv}`")
             mk = "▶" if REASONING_EFFORT is None else "  "
             lines.append(f"{mk}{len(_REASONING_RANK) + 1}. `/model reason auto` — дефолт модели (5.5→medium, 5.4/5.4-mini→none, o3/o4-mini/Gemini→medium)")
-            lines.append("\nНеподдерживаемый моделью уровень приводится к ближайшему: o3 — low/medium/high (none→low, xhigh→high); o4-mini без none; Gemini → thinkingLevel (none→minimal, xhigh→high); Fireworks — low/medium/high/none (xhigh→high); opencode — low/medium/high/none (xhigh→high; none у deepseek → дефолт через фоллбэк).")
+            lines.append("\nНеподдерживаемый моделью уровень приводится к ближайшему: o3 — low/medium/high (none→low, xhigh→high); o4-mini без none; Gemini → thinkingLevel (none→minimal, xhigh→high); Fireworks — low/medium/high/none (xhigh→high); opencode — low/medium/high/none (xhigh→high; none у deepseek → дефолт через фоллбэк); DeepSeek — none(off)/high/max (xhigh→max, low/medium→high).")
             lines.append("Быстрый выбор из списка `/model`: номер `N.M` (N — модель, M — сила ризонинга, M=1 — мощнейший).")
             if not _supports_reasoning(active_provider):
-                lines.append("⚠️ Активная модель не поддерживает управление ризонингом — настройка сработает после выбора GPT/o3/Gemini/Fireworks/opencode.")
+                lines.append("⚠️ Активная модель не поддерживает управление ризонингом — настройка сработает после выбора GPT/o3/Gemini/Fireworks/opencode/DeepSeek.")
             await event.edit("\n".join(lines)[:4000])
             return
         if rarg.isdigit() and 1 <= int(rarg) <= len(_REASONING_RANK) + 1:
@@ -5108,7 +5147,7 @@ async def model_command(event):
                 if applied != rarg:
                     note = f" (для активной {MODEL_REGISTRY[ACTIVE_MODEL][2]} применится `{applied}`)"
             else:
-                note = " — сработает на моделях OpenAI (GPT-5.x / o3), Gemini, Fireworks и opencode"
+                note = " — сработает на моделях OpenAI (GPT-5.x / o3), Gemini, Fireworks, opencode и DeepSeek"
             log("MODEL", f"Ризонинг: {rarg}")
             await event.edit(f"✅ Глубина размышлений: `{rarg}`{note}")
             return
@@ -5204,7 +5243,7 @@ async def model_command(event):
         provider_nm, _midn, label_nm, ctx_nm, _sn = MODEL_REGISTRY[slug_nm]
         levels = _reasoning_levels(slug_nm)
         if not levels:
-            await event.edit(f"Вариации `{n}.M` (сила ризонинга) доступны для OpenAI (GPT-5.x / o3), Gemini, Fireworks и opencode. Для {label_nm} — просто `/model {n}`.")
+            await event.edit(f"Вариации `{n}.M` (сила ризонинга) доступны для OpenAI (GPT-5.x / o3), Gemini, Fireworks, opencode и DeepSeek. Для {label_nm} — просто `/model {n}`.")
             return
         if not (1 <= mlev <= len(levels)):
             opts = " · ".join(f"`{n}.{j}` {lv}" for j, lv in enumerate(levels, 1))
