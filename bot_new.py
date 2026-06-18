@@ -264,16 +264,14 @@ MODEL_REGISTRY = {
     "deepseek-flash": ("deepseek", "deepseek-v4-flash", "DeepSeek V4 Flash", 1000000, 1.15),  # прямой API
 }
 # Реестр почищен (2026-06-14): оставлены только новейшие версии каждой модели на КАЖДОМ провайдере
-# (разный провайдер/транспорт — отдельная модель). Убраны устаревшие: glm-5 (есть glm-5.1 на opencode),
-# kimi-k2.5, minimax-m2.5/m2.7, qwen3.5/3.6-plus, mimo-v2.5/v2-pro. GLM-5.1 на opencode оставлен —
-# это другой транспорт, чем GLM-5.2 на z.ai (там vision-вариант, тут текстовый).
+# (разный провайдер/транспорт — отдельная модель). Убраны устаревшие: glm-5/5.1 (на opencode появился
+# glm-5.2 — см. ниже), kimi-k2.5, minimax-m2.5/m2.7, qwen3.5/3.6-plus, mimo-v2.5/v2-pro.
 for _mid, _label, _ctx, _safety in [
     ("deepseek-v4-pro",  "DeepSeek V4 Pro",   1000000, 1.15),
     ("deepseek-v4-flash","DeepSeek V4 Flash", 1000000, 1.15),
     ("kimi-k2.6",        "Kimi K2.6",          262000, 2.50),
     ("kimi-k2.7-code",   "Kimi K2.7 Code",     262000, 2.50),
     ("minimax-m3",       "MiniMax M3",        1000000, 1.30),
-    ("glm-5.1",          "GLM-5.1",            203000, 1.30),
     ("qwen3.7-plus",     "Qwen3.7 Plus",       262000, 1.15),
     ("mimo-v2.5",        "MiMo V2.5",         1000000, 1.50),
     ("mimo-v2.5-pro",    "MiMo V2.5 Pro",     1000000, 1.50),
@@ -281,6 +279,10 @@ for _mid, _label, _ctx, _safety in [
     ("hy3-preview",      "Hunyuan 3 Preview",  256000, 1.50),
 ]:
     MODEL_REGISTRY[_mid] = ("opencode", _mid, _label, _ctx, _safety)
+# GLM-5.2 на opencode (текст, tools, reasoning_content отделяется — проверено вживую 2026-06-17;
+# заменил glm-5.1 по принципу «новейшая на провайдере»). Слаг с суффиксом -oc, т.к. голый "glm-5.2"
+# занят z.ai; api-id = "glm-5.2". Окно каталог не отдаёт — берём 203k (как прежние GLM на opencode).
+MODEL_REGISTRY["glm-5.2-oc"] = ("opencode", "glm-5.2", "GLM-5.2 (OC)", 203000, 1.30)
 # qwen3.7-max — opencode отдаёт её только в формате Anthropic Messages → провайдер "oc_anthropic"
 # (свой адаптер-обёртка под OpenAI-интерфейс; полноценный tool-loop/голос, как у прочих).
 MODEL_REGISTRY["qwen3.7-max"] = ("oc_anthropic", "qwen3.7-max", "Qwen3.7 Max", 262000, 1.15)
