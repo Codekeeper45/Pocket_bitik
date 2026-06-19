@@ -5159,7 +5159,7 @@ async def model_command(event):
             "╭───────────────────────╮",
             "│   🧠  МОДЕЛИ ОТВЕТОВ   │",
             "╰───────────────────────╯",
-            "▶ активная · 🪟 окно · 👁 видит картинки (-g) · 🔧 поиск · 🚫 нет · ❔ не проверено",
+            "▶ активная · 🪟 окно · 👁 картинки (-g) · 🤔 глубина размышлений (N.M) · 🔧 поиск · 🚫 нет · ❔ не проверено",
         ]
         cur_provider = None
         for i, slug in enumerate(slugs, 1):
@@ -5178,15 +5178,8 @@ async def model_command(event):
             mark = f"▶{i}." if slug == ACTIVE_MODEL else f"{i}."
             warn = " ⚠️нет ключа" if not is_available(provider) else ""
             vmark = " 👁" if _model_supports_vision(slug) else ""  # видит картинки напрямую (-g)
-            lines.append(f"{mark} `{slug}` — {label}{vmark} · 🪟{_fmt_ctx(ctx)}{tool_mark(slug)}{warn}")
-            _levels = _reasoning_levels(slug)
-            if _levels:
-                # вариации силы ризонинга: выбор номером N.M (M=1 — мощнейший)
-                parts = []
-                for j, lv in enumerate(_levels, 1):
-                    cur = "▶" if (slug == ACTIVE_MODEL and REASONING_EFFORT and _clamp_reasoning(slug, REASONING_EFFORT) == _clamp_reasoning(slug, lv)) else ""
-                    parts.append(f"{cur}`{i}.{j}`{lv}")
-                lines.append("    🤔 " + " · ".join(parts))
+            rmark = " 🤔" if _reasoning_levels(slug) else ""        # умеет менять глубину размышлений (N.M); уровни — в памятке внизу
+            lines.append(f"{mark} `{slug}` — {label}{vmark}{rmark} · 🪟{_fmt_ctx(ctx)}{tool_mark(slug)}{warn}")
         if ACTIVE_MEDIA_MODEL in MEDIA_MODEL_REGISTRY:
             media_label = MEDIA_MODEL_REGISTRY[ACTIVE_MEDIA_MODEL][1]
         elif ACTIVE_MEDIA_MODEL in MEDIA_OPENCODE_SLUGS and ACTIVE_MEDIA_MODEL in MODEL_REGISTRY:
@@ -5196,7 +5189,7 @@ async def model_command(event):
         lines.append(f"\n🖼 медиа-модель: {media_label} · `/model media` — сменить")
         lines.append("`/model N` / `/model <slug>` — выбрать · `/model probe` — проверить поиск (❔→🔧/🚫)")
         reff = f"`{REASONING_EFFORT}`" if REASONING_EFFORT else "авто"
-        lines.append(f"`/model N.M` — GPT с силой ризонинга (M=1 мощнейший) · `/model reason` — глубина размышлений (сейчас: {reff})")
+        lines.append(f"🤔 — модель умеет менять глубину размышлений. `/model N.M`: M — сила (`.1` максимум → дальше слабее → последний мин/выкл). Точные уровни модели: `/model reason` (сейчас: {reff})")
         lines.append("`/model vendor/model` — добавить ЛЮБУЮ модель OpenRouter по id (напр. `/model openai/gpt-4o`)")
         lines.append("`/model fav` — избранные OR-модели · `/model remove <N|id>` — удалить кастомную")
         await event.edit("\n".join(lines)[:4000])
