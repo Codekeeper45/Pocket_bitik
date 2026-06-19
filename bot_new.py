@@ -433,6 +433,17 @@ def _clamp_reasoning(model_id: str, effort: str, provider: str = None) -> str:
     return min(levels, key=lambda lv: abs(_REASONING_RANK.index(lv) - r))
 
 
+def _fmt_rlevel(model_id: str, lv: str, provider: str) -> str:
+    """Имя ступени для таблицы /model reason: показывает реально применяемое значение
+    (xhigh→max у DeepSeek, xhigh→high у Fireworks/opencode/Gemini, none→off/minimal)."""
+    abbr = {"medium": "med", "minimal": "min", "none": "off"}
+    applied = _clamp_reasoning(model_id, lv, provider)
+    base = abbr.get(lv, lv)
+    if applied != lv:
+        return f"{base}→{abbr.get(applied, applied)}"
+    return base
+
+
 def _supports_reasoning(provider: str) -> bool:
     """Провайдеры с управляемой глубиной размышлений (/model reason): OpenAI, Google Gemini, Fireworks, opencode, DeepSeek."""
     return provider in ("openai", "google", "fireworks", "opencode", "deepseek")
@@ -5118,16 +5129,34 @@ async def model_command(event):
         rarg = arg[len("reason"):].strip().lower()
         active_provider = MODEL_REGISTRY.get(ACTIVE_MODEL, MODEL_REGISTRY["deepseek-pro"])[0]
         if not rarg:
-            lines = ["🤔 **Глубина размышлений** — OpenAI (GPT-5.x / o3), Gemini, Fireworks, opencode и DeepSeek:", ""]
-            for i, lv in enumerate(_REASONING_RANK, 1):
-                mk = "▶" if lv == REASONING_EFFORT else "  "
-                lines.append(f"{mk}{i}. `/model reason {lv}`")
-            mk = "▶" if REASONING_EFFORT is None else "  "
-            lines.append(f"{mk}{len(_REASONING_RANK) + 1}. `/model reason auto` — дефолт модели (5.5→medium, 5.4/5.4-mini→none, o3/o4-mini/Gemini→medium)")
-            lines.append("\nНеподдерживаемый моделью уровень приводится к ближайшему: o3 — low/medium/high (none→low, xhigh→high); o4-mini без none; Gemini → thinkingLevel (none→minimal, xhigh→high); Fireworks — low/medium/high/none (xhigh→high); opencode — low/medium/high/none (xhigh→high; none у deepseek → дефолт через фоллбэк); DeepSeek — none(off)/high/max (xhigh→max, low/medium→high).")
-            lines.append("Быстрый выбор из списка `/model`: номер `N.M` (N — модель, M — сила ризонинга, M=1 — мощнейший).")
+            reff_now = REASONING_EFFORT or "авто"
+            glob = " · ".join((f"▶`{lv}`" if lv == REASONING_EFFORT else f"`{lv}`") for lv in _REASONING_RANK)
+            glob += " · ▶`auto`" if REASONING_EFFORT is None else " · `auto`"
+            lines = [
+                f"🤔 **Глубина размышлений** · сейчас: `{reff_now}`",
+                "",
+                "**Глобально** для всех reasoning-моделей — `/model reason <уровень>`:",
+                "  " + glob,
+                "",
+                "**По моделям** — тапни `N.M` (N — № в `/model`, `.1` = максимум силы → дальше слабее → off):",
+            ]
+            # группируем по ФОРМЕ лесенки: одинаковые схлопываются (16 моделей Fireworks+opencode → одна строка),
+            # чтобы не плодить дубли. Под каждой формой — модели с тап-чипами N.M.
+            groups = {}  # ladder-строка → [(№, label, число ступеней)]
+            for i, slug in enumerate(slugs, 1):
+                lv = _reasoning_levels(slug)
+                if not lv:
+                    continue
+                prov, mid, label, _c, _s = MODEL_REGISTRY[slug]
+                ladder = " · ".join(f".{j} {_fmt_rlevel(mid, x, prov)}" for j, x in enumerate(lv, 1))
+                groups.setdefault(ladder, []).append((i, label, len(lv)))
+            for ladder, members in groups.items():
+                lines.append(f"\n▸ {ladder}")
+                for i, label, k in members:
+                    chips = " ".join(f"`{i}.{j}`" for j in range(1, k + 1))
+                    lines.append(f"   {chips} — {label}")
             if not _supports_reasoning(active_provider):
-                lines.append("⚠️ Активная модель не поддерживает управление ризонингом — настройка сработает после выбора GPT/o3/Gemini/Fireworks/opencode/DeepSeek.")
+                lines.append("\n⚠️ Активная модель без управления ризонингом — уровень применится после выбора reasoning-модели.")
             await event.edit("\n".join(lines)[:4000])
             return
         if rarg.isdigit() and 1 <= int(rarg) <= len(_REASONING_RANK) + 1:
@@ -5189,7 +5218,7 @@ async def model_command(event):
         lines.append(f"\n🖼 медиа-модель: {media_label} · `/model media` — сменить")
         lines.append("`/model N` / `/model <slug>` — выбрать · `/model probe` — проверить поиск (❔→🔧/🚫)")
         reff = f"`{REASONING_EFFORT}`" if REASONING_EFFORT else "авто"
-        lines.append(f"🤔 — модель умеет менять глубину размышлений. `/model N.M`: M — сила (`.1` максимум → дальше слабее → последний мин/выкл). Точные уровни модели: `/model reason` (сейчас: {reff})")
+        lines.append(f"🤔 — модель умеет менять глубину размышлений. `/model N.M`: M — сила (`.1` максимум → дальше слабее → последний мин/выкл). Лесенки всех моделей с тап-чипами: `/model reason` (сейчас: {reff})")
         lines.append("`/model vendor/model` — добавить ЛЮБУЮ модель OpenRouter по id (напр. `/model openai/gpt-4o`)")
         lines.append("`/model fav` — избранные OR-модели · `/model remove <N|id>` — удалить кастомную")
         await event.edit("\n".join(lines)[:4000])
