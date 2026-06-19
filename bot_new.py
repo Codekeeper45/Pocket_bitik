@@ -2559,10 +2559,21 @@ def _extract_content(message) -> str:
 
 
 async def _llm_create(messages: list, max_tokens: int = 4096, temperature: float = 1.0,
-                      reasoning=_NO_REASONING_OVERRIDE):
+                      reasoning=_NO_REASONING_OVERRIDE, model_slug: str = None):
     """reasoning — оверрайд глубины размышлений на этот вызов (утилитарные задачи: дайджест шлёт 'none',
-    чтобы reasoning-модель не съела бюджет размышлениями и не отдала сырой CoT). По умолчанию — глобальный."""
-    client_obj, model_id, label = get_active_model()
+    чтобы reasoning-модель не съела бюджет размышлениями и не отдала сырой CoT). По умолчанию — глобальный.
+    model_slug — пин конкретной модели реестра вместо активной (дайджест всегда на deepseek-flash);
+    если у её провайдера нет ключа — мягкий фоллбэк на активную модель."""
+    if model_slug and model_slug in MODEL_REGISTRY:
+        _prov, _mid, _lbl, _c, _s = MODEL_REGISTRY[model_slug]
+        _cli = _client_for_provider(_prov)
+        if _cli is not None:
+            client_obj, model_id, label = _cli, _mid, _lbl
+        else:
+            log("AI", f"Пин-модель {model_slug} недоступна (нет ключа {_prov}) — фоллбэк на активную")
+            client_obj, model_id, label = get_active_model()
+    else:
+        client_obj, model_id, label = get_active_model()
     if client_obj is None:
         log("AI", f"Активная модель {ACTIVE_MODEL} недоступна (нет ключа провайдера)")
         return None
@@ -4993,9 +5004,10 @@ async def send_digest(manual: bool):
             {"role": "system", "content": DIGEST_SYSTEM_PROMPT},
             {"role": "user", "content": "Посты за период:\n\n" + "\n\n".join(collected)},
         ],
-        max_tokens=8000,        # дайджест по 80 постам бывает длинным
+        max_tokens=8000,            # дайджест по 80 постам бывает длинным
         temperature=1.0,
-        reasoning="none",       # утилитарная задача: без размышлений (иначе CoT съедал бюджет и тёк в вывод)
+        reasoning="none",           # утилитарная задача: без размышлений (иначе CoT съедал бюджет и тёк в вывод)
+        model_slug="deepseek-flash",  # дайджест ВСЕГДА на DeepSeek V4 Flash (полный off ризонинга), не на активной
     )
     if not result:
         if manual:
