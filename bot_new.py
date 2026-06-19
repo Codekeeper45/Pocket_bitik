@@ -5253,6 +5253,9 @@ async def model_command(event):
             warn = " ⚠️нет ключа" if not is_available(provider) else ""
             vmark = " 👁" if _model_supports_vision(slug) else ""  # видит картинки напрямую (-g)
             rmark = " 🤔" if _reasoning_levels(slug) else ""        # умеет менять глубину размышлений (N.M); уровни — в памятке внизу
+            # на АКТИВНОЙ модели показываем применяемый уровень прямо на бейдже (🤔high), чтобы было видно что выбрано
+            if slug == ACTIVE_MODEL and _reasoning_levels(slug):
+                rmark = f" 🤔{_clamp_reasoning(_mid, REASONING_EFFORT, provider)}" if REASONING_EFFORT else " 🤔авто"
             lines.append(f"{mark} `{slug}` — {label}{vmark}{rmark} ({_fmt_ctx(ctx)}){tool_mark(slug)}{warn}")
         if ACTIVE_MEDIA_MODEL in MEDIA_MODEL_REGISTRY:
             media_label = MEDIA_MODEL_REGISTRY[ACTIVE_MEDIA_MODEL][1]
@@ -5371,7 +5374,7 @@ async def model_command(event):
     log("MODEL", f"Активная модель: {chosen} ({label})")
     rtag = ""
     if _supports_reasoning(provider):
-        rtag = f" · 🤔 ризонинг: `{_clamp_reasoning(_mid, REASONING_EFFORT)}`" if REASONING_EFFORT else " · 🤔 ризонинг: авто (`/model reason`)"
+        rtag = f" · 🤔 ризонинг: `{_clamp_reasoning(_mid, REASONING_EFFORT, provider)}`" if REASONING_EFFORT else " · 🤔 ризонинг: авто (`/model reason`)"
     await event.edit(f"✅ Модель ответов: {label} (окно {_fmt_ctx(ctx)}){rtag}")
 
 
@@ -6221,8 +6224,15 @@ async def status_command(event):
     L.append(f"\n🧠 **Модель ответов:** {label} (`{ACTIVE_MODEL}`)")
     L.append(f"   провайдер: {prov_name} · окно: {_fmt_ctx(ctx)} · поиск по каналам: {search_mark} · vision (`-g`): {vis_mark}")
     if _supports_reasoning(provider):
-        reff = f"`{_clamp_reasoning(_mid, REASONING_EFFORT)}`" if REASONING_EFFORT else "авто (дефолт модели)"
+        if REASONING_EFFORT:
+            applied = _clamp_reasoning(_mid, REASONING_EFFORT, provider)
+            reff = f"`{REASONING_EFFORT}`" + (f" → `{applied}` для этой модели" if applied != REASONING_EFFORT else "")
+        else:
+            reff = "авто (дефолт модели)"
         L.append(f"   🤔 глубина размышлений: {reff} · `/model reason` — сменить")
+    elif REASONING_EFFORT:
+        # активная модель ризонинг не поддерживает, но уровень выбран глобально — показываем, чтобы не терялся
+        L.append(f"   🤔 глубина размышлений: выбрана `{REASONING_EFFORT}` глобально, но {prov_name} её не использует · `/model reason`")
     if openai_api_key:
         _li, _lo, ltot = _openai_usage_today("large")
         _mi, _mo, mtot = _openai_usage_today("mini")
