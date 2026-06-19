@@ -5159,7 +5159,7 @@ async def model_command(event):
             "╭───────────────────────╮",
             "│   🧠  МОДЕЛИ ОТВЕТОВ   │",
             "╰───────────────────────╯",
-            "▶ активная · 🪟 окно · 👁 картинки (-g) · 🤔 глубина размышлений (N.M) · 🔧 поиск · 🚫 нет · ❔ не проверено",
+            "▶ активная · (N) окно · 👁 картинки (-g) · 🤔 глубина размышлений (N.M) · 🔧 поиск · 🚫 нет · ❔ не проверено",
         ]
         cur_provider = None
         for i, slug in enumerate(slugs, 1):
@@ -5179,7 +5179,7 @@ async def model_command(event):
             warn = " ⚠️нет ключа" if not is_available(provider) else ""
             vmark = " 👁" if _model_supports_vision(slug) else ""  # видит картинки напрямую (-g)
             rmark = " 🤔" if _reasoning_levels(slug) else ""        # умеет менять глубину размышлений (N.M); уровни — в памятке внизу
-            lines.append(f"{mark} `{slug}` — {label}{vmark}{rmark} · 🪟{_fmt_ctx(ctx)}{tool_mark(slug)}{warn}")
+            lines.append(f"{mark} `{slug}` — {label}{vmark}{rmark} ({_fmt_ctx(ctx)}){tool_mark(slug)}{warn}")
         if ACTIVE_MEDIA_MODEL in MEDIA_MODEL_REGISTRY:
             media_label = MEDIA_MODEL_REGISTRY[ACTIVE_MEDIA_MODEL][1]
         elif ACTIVE_MEDIA_MODEL in MEDIA_OPENCODE_SLUGS and ACTIVE_MEDIA_MODEL in MODEL_REGISTRY:
@@ -5251,7 +5251,7 @@ async def model_command(event):
         applied = _clamp_reasoning(_midn, REASONING_EFFORT, provider_nm)
         rnote = f"`{REASONING_EFFORT}`" + (f" (→ `{applied}`)" if applied != REASONING_EFFORT else "")
         log("MODEL", f"Активная модель: {slug_nm} ({label_nm}), ризонинг {REASONING_EFFORT}→{applied}")
-        await event.edit(f"✅ Модель ответов: {label_nm} (окно 🪟{_fmt_ctx(ctx_nm)}) · 🤔 ризонинг: {rnote}")
+        await event.edit(f"✅ Модель ответов: {label_nm} (окно {_fmt_ctx(ctx_nm)}) · 🤔 ризонинг: {rnote}")
         return
 
     chosen = None
@@ -5282,7 +5282,7 @@ async def model_command(event):
             ACTIVE_MODEL = arg
             _save_model_state()
             log("MODEL", f"Активная модель (кастомная OpenRouter): {arg}, окно {ctx}")
-            await event.edit(f"✅ Модель ответов: {label} (`{arg}`, OpenRouter, окно 🪟{_fmt_ctx(ctx)})")
+            await event.edit(f"✅ Модель ответов: {label} (`{arg}`, OpenRouter, окно {_fmt_ctx(ctx)})")
             return
         await event.edit(f"Нет такой модели: {arg}. `/model` — список, либо укажи id модели OpenRouter (vendor/model).")
         return
@@ -5298,7 +5298,7 @@ async def model_command(event):
     rtag = ""
     if _supports_reasoning(provider):
         rtag = f" · 🤔 ризонинг: `{_clamp_reasoning(_mid, REASONING_EFFORT)}`" if REASONING_EFFORT else " · 🤔 ризонинг: авто (`/model reason`)"
-    await event.edit(f"✅ Модель ответов: {label} (окно 🪟{_fmt_ctx(ctx)}){rtag}")
+    await event.edit(f"✅ Модель ответов: {label} (окно {_fmt_ctx(ctx)}){rtag}")
 
 
 def _sync_fish_search(query: str):
@@ -6145,7 +6145,7 @@ async def status_command(event):
     vis_mark = "✅ да" if sv is True else ("❌ нет" if sv is False else "❔ неизвестно")
     L.append("📊 **СТАТУС БОТА**")
     L.append(f"\n🧠 **Модель ответов:** {label} (`{ACTIVE_MODEL}`)")
-    L.append(f"   провайдер: {prov_name} · окно: 🪟{_fmt_ctx(ctx)} · поиск по каналам: {search_mark} · vision (`-g`): {vis_mark}")
+    L.append(f"   провайдер: {prov_name} · окно: {_fmt_ctx(ctx)} · поиск по каналам: {search_mark} · vision (`-g`): {vis_mark}")
     if _supports_reasoning(provider):
         reff = f"`{_clamp_reasoning(_mid, REASONING_EFFORT)}`" if REASONING_EFFORT else "авто (дефолт модели)"
         L.append(f"   🤔 глубина размышлений: {reff} · `/model reason` — сменить")
