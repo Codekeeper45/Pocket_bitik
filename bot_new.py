@@ -10,6 +10,7 @@ import os
 import re
 import io
 import asyncio
+import contextvars
 import base64
 import time
 import traceback
@@ -449,6 +450,19 @@ def _supports_reasoning(provider: str) -> bool:
     return provider in ("openai", "google", "fireworks", "opencode", "deepseek")
 
 
+# Task-локальный оверрайд глубины размышлений для утилитарных вызовов (дайджест): обёртки читают
+# _effective_reasoning() вместо глобального REASONING_EFFORT. contextvars изолирует значение по asyncio-таске
+# (параллельный /ask не затронут) и копируется в поток asyncio.to_thread, где крутится .create.
+_NO_REASONING_OVERRIDE = object()
+_REASONING_OVERRIDE = contextvars.ContextVar("reasoning_override", default=_NO_REASONING_OVERRIDE)
+
+
+def _effective_reasoning():
+    """Уровень ризонинга для ТЕКУЩЕГО вызова: оверрайд (если задан в этой таске) либо глобальный REASONING_EFFORT."""
+    ov = _REASONING_OVERRIDE.get()
+    return REASONING_EFFORT if ov is _NO_REASONING_OVERRIDE else ov
+
+
 def _reasoning_levels(slug: str):
     """Список уровней ризонинга для выбора `N.M` у модели (от мощного к слабому). None — не поддерживает."""
     spec = MODEL_REGISTRY.get(slug)
@@ -783,8 +797,9 @@ class _OpenAIReasoningClient:
             kwargs["max_completion_tokens"] = kwargs.pop("max_tokens")
         kwargs.pop("temperature", None)  # reasoning-модели принимают только default(1.0)
         model = kwargs.get("model", "")
-        if REASONING_EFFORT:
-            kwargs.setdefault("reasoning_effort", _clamp_reasoning(model, REASONING_EFFORT))
+        _eff = _effective_reasoning()
+        if _eff:
+            kwargs.setdefault("reasoning_effort", _clamp_reasoning(model, _eff))
         # Ризонинг-токены СЧИТАЮТСЯ в max_completion_tokens, но невидимы. На medium+ цепочка
         # может съесть весь потолок → finish=length и ПУСТОЙ видимый ответ. Поднимаем потолок
         # так, чтобы после размышлений гарантированно оставалось место на текст.
@@ -895,8 +910,9 @@ class _FireworksReasoningClient:
         self.chat = SimpleNamespace(completions=SimpleNamespace(create=self._create))
 
     def _create(self, **kwargs):
-        if REASONING_EFFORT:
-            kwargs.setdefault("reasoning_effort", _clamp_reasoning(kwargs.get("model", ""), REASONING_EFFORT, "fireworks"))
+        _eff = _effective_reasoning()
+        if _eff:
+            kwargs.setdefault("reasoning_effort", _clamp_reasoning(kwargs.get("model", ""), _eff, "fireworks"))
             _floor = {"medium": 24000, "high": 40000}.get(kwargs.get("reasoning_effort"))
             if _floor and int(kwargs.get("max_tokens") or 0) < _floor:
                 kwargs["max_tokens"] = _floor
@@ -916,9 +932,10 @@ class _OpencodeReasoningClient:
         self.chat = SimpleNamespace(completions=SimpleNamespace(create=self._create))
 
     def _create(self, **kwargs):
-        if not REASONING_EFFORT:
+        _eff = _effective_reasoning()
+        if not _eff:
             return self._c.chat.completions.create(**kwargs)
-        kwargs.setdefault("reasoning_effort", _clamp_reasoning(kwargs.get("model", ""), REASONING_EFFORT, "opencode"))
+        kwargs.setdefault("reasoning_effort", _clamp_reasoning(kwargs.get("model", ""), _eff, "opencode"))
         _floor = {"medium": 24000, "high": 40000}.get(kwargs.get("reasoning_effort"))
         if _floor and int(kwargs.get("max_tokens") or 0) < _floor:
             kwargs["max_tokens"] = _floor
@@ -949,8 +966,9 @@ class _DeepSeekReasoningClient:
         self.chat = SimpleNamespace(completions=SimpleNamespace(create=self._create))
 
     def _create(self, **kwargs):
-        if REASONING_EFFORT:
-            eff = _clamp_reasoning(kwargs.get("model", ""), REASONING_EFFORT, "deepseek")  # none/high/max
+        _eff = _effective_reasoning()
+        if _eff:
+            eff = _clamp_reasoning(kwargs.get("model", ""), _eff, "deepseek")  # none/high/max
             xb = dict(kwargs.pop("extra_body", None) or {})
             if eff == "none":
                 xb["thinking"] = {"type": "disabled"}
@@ -1145,8 +1163,9 @@ class _GoogleGeminiClient:
     def _create(self, *, model, messages, max_tokens=4096, temperature=1.0, tools=None, tool_choice=None, **_ignore):
         system, contents = self._to_gemini(messages)
         gen = {"maxOutputTokens": int(max_tokens), "temperature": float(temperature)}
-        if REASONING_EFFORT:
-            level = _clamp_reasoning(model, REASONING_EFFORT)
+        _eff = _effective_reasoning()
+        if _eff:
+            level = _clamp_reasoning(model, _eff)
             gen["thinkingConfig"] = {"thinkingLevel": level}
             # thinking-токены едят выходной бюджет → поднимаем потолок (как у OpenAI floor)
             floor = {"medium": 24000, "high": 40000}.get(level)
@@ -2539,7 +2558,10 @@ def _extract_content(message) -> str:
     return (getattr(message, "reasoning_content", None) or "").strip()
 
 
-async def _llm_create(messages: list, max_tokens: int = 4096, temperature: float = 1.0):
+async def _llm_create(messages: list, max_tokens: int = 4096, temperature: float = 1.0,
+                      reasoning=_NO_REASONING_OVERRIDE):
+    """reasoning — оверрайд глубины размышлений на этот вызов (утилитарные задачи: дайджест шлёт 'none',
+    чтобы reasoning-модель не съела бюджет размышлениями и не отдала сырой CoT). По умолчанию — глобальный."""
     client_obj, model_id, label = get_active_model()
     if client_obj is None:
         log("AI", f"Активная модель {ACTIVE_MODEL} недоступна (нет ключа провайдера)")
@@ -2568,35 +2590,45 @@ async def _llm_create(messages: list, max_tokens: int = 4096, temperature: float
         log("AI", f"  msg[{i}] {role}: {preview}")
     log("AI", f"Запрос {label} model={model_id} max_tokens={max_tokens} temp={temperature}")
 
-    for attempt in range(2):
-        try:
-            response = await asyncio.to_thread(
-                client_obj.chat.completions.create,
-                model=model_id,
-                messages=messages,
-                temperature=temperature,
-                max_tokens=max_tokens,
-            )
-            msg_obj = response.choices[0].message
-            content = _extract_content(msg_obj)
-            from_reasoning = bool(content) and not (getattr(msg_obj, "content", None) or "").strip()
-            finish = response.choices[0].finish_reason
-            usage = getattr(response, "usage", None)
-            tokens_info = f"prompt={usage.prompt_tokens}, completion={usage.completion_tokens}" if usage else "?"
-            src = " (из reasoning_content)" if from_reasoning else ""
-            log("AI", f"Ответ {label} (попытка {attempt + 1}): finish={finish} tokens={tokens_info} content_len={len(content)}{src} content=[{content[:300]}]")
-            if content:
-                return content
-            log("AI", f"Пустой ответ {label} (попытка {attempt + 1}/2) finish={finish}")
-        except Exception as e:
-            log("AI", f"Ошибка {label} (попытка {attempt + 1}/2): {e}")
-            # Переполнение окна — не глотаем, кидаем наверх, чтобы ask_command мог ретрайнуть с агрессивной обрезкой
-            if _is_context_overflow(e):
-                raise ContextOverflowError(str(e)) from e
-            if attempt == 1:
-                traceback.print_exc()
-            await asyncio.sleep(1)
-    return None
+    _rtok = _REASONING_OVERRIDE.set(reasoning) if reasoning is not _NO_REASONING_OVERRIDE else None
+    try:
+        for attempt in range(2):
+            try:
+                response = await asyncio.to_thread(
+                    client_obj.chat.completions.create,
+                    model=model_id,
+                    messages=messages,
+                    temperature=temperature,
+                    max_tokens=max_tokens,
+                )
+                msg_obj = response.choices[0].message
+                content = _extract_content(msg_obj)
+                from_reasoning = bool(content) and not (getattr(msg_obj, "content", None) or "").strip()
+                finish = response.choices[0].finish_reason
+                usage = getattr(response, "usage", None)
+                tokens_info = f"prompt={usage.prompt_tokens}, completion={usage.completion_tokens}" if usage else "?"
+                src = " (из reasoning_content)" if from_reasoning else ""
+                log("AI", f"Ответ {label} (попытка {attempt + 1}): finish={finish} tokens={tokens_info} content_len={len(content)}{src} content=[{content[:300]}]")
+                # Обрезанная цепочка размышлений (finish=length, видимого ответа нет) — это НЕ ответ.
+                # Не выдаём сырой CoT наружу (баг дайджеста): считаем попытку пустой → ретрай/фейл.
+                if from_reasoning and finish == "length":
+                    log("AI", f"{label}: только обрезанный reasoning без ответа — не выдаём CoT, ретрай")
+                    content = ""
+                if content:
+                    return content
+                log("AI", f"Пустой ответ {label} (попытка {attempt + 1}/2) finish={finish}")
+            except Exception as e:
+                log("AI", f"Ошибка {label} (попытка {attempt + 1}/2): {e}")
+                # Переполнение окна — не глотаем, кидаем наверх, чтобы ask_command мог ретрайнуть с агрессивной обрезкой
+                if _is_context_overflow(e):
+                    raise ContextOverflowError(str(e)) from e
+                if attempt == 1:
+                    traceback.print_exc()
+                await asyncio.sleep(1)
+        return None
+    finally:
+        if _rtok is not None:
+            _REASONING_OVERRIDE.reset(_rtok)
 
 
 def _build_ask_user_content(context: str, question: str, caller: str = None, now_str: str = None) -> str:
@@ -4961,8 +4993,9 @@ async def send_digest(manual: bool):
             {"role": "system", "content": DIGEST_SYSTEM_PROMPT},
             {"role": "user", "content": "Посты за период:\n\n" + "\n\n".join(collected)},
         ],
-        max_tokens=4096,
+        max_tokens=8000,        # дайджест по 80 постам бывает длинным
         temperature=1.0,
+        reasoning="none",       # утилитарная задача: без размышлений (иначе CoT съедал бюджет и тёк в вывод)
     )
     if not result:
         if manual:
