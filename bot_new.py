@@ -4838,7 +4838,7 @@ async def auto_reply_incoming(event):
     AUTO_REPLY_TASKS[chat_id] = asyncio.create_task(flush_auto_reply_buffer(chat_id))
 
 
-@client.on(events.NewMessage(outgoing=True, pattern=r"^[./]song(?: |$)(.*)", from_users="me"))
+@client.on(events.NewMessage(outgoing=True, pattern=re.compile(r"^[./]song(?: |$)(.*)", re.DOTALL), from_users="me"))
 async def song_command(event):
     if await _slash_for_other_bot(event):
         return
