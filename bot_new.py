@@ -3161,18 +3161,31 @@ async def ask_agentic(context: str, question: str, must_search: bool = False, ca
     return await generate_ask_reply(context, question, caller=caller)
 
 
+def _lyric_steps(text: str, chunk_size: int):
+    """Нарезает текст на шаги анимации по ~chunk_size символов, НЕ разрывая слова: если граница
+    шага попала в середину слова — тянем её до ближайшего пробела/переноса (целиком открываем слово).
+    Граница, попавшая на пробел или на начало слова, остаётся как есть — chunk_size задаёт скорость."""
+    steps, i, n = [], 0, len(text)
+    while i < n:
+        j = min(i + max(1, chunk_size), n)
+        # j внутри слова (символ до и символ на границе оба не-пробельные) → дотянуть до конца слова
+        if j < n and not text[j - 1].isspace() and not text[j].isspace():
+            while j < n and not text[j].isspace():
+                j += 1
+        steps.append(text[i:j])
+        i = j
+    return steps
+
+
 async def print_lyrics(chat_id, text, chunk_size=3):
     text = text.replace("\r\n", "\n").replace("\r", "\n").strip()
     if not text:
         return
-    current_text = text[:chunk_size]
+    steps = _lyric_steps(text, chunk_size)
+    current_text = steps[0]
     msg = await client.send_message(chat_id, current_text)
-    for i in range(chunk_size, len(text), chunk_size):
-        chunk = text[i:i + chunk_size]
-        if "\n" in chunk:
-            await asyncio.sleep(0.8)
-        else:
-            await asyncio.sleep(0.2)
+    for chunk in steps[1:]:
+        await asyncio.sleep(0.8 if "\n" in chunk else 0.2)
         current_text += chunk
         try:
             await client.edit_message(chat_id, msg, current_text)
@@ -4823,9 +4836,15 @@ async def song_command(event):
     if await _slash_for_other_bot(event):
         return
     custom_text = event.pattern_match.group(1).strip()
+    # опциональное первое число = размер чанка (символов за шаг): `/song 5 текст` или `/song 5` (дефолтный текст)
+    chunk_size = 3
+    mnum = re.match(r"^(\d{1,3})(?:\s+(.*))?$", custom_text, re.DOTALL)
+    if mnum:
+        chunk_size = max(1, min(int(mnum.group(1)), 200))
+        custom_text = (mnum.group(2) or "").strip()
     text_to_print = custom_text if custom_text else SONG_TEXT
     await event.delete()
-    await print_lyrics(event.chat_id, text_to_print)
+    await print_lyrics(event.chat_id, text_to_print, chunk_size)
 
 
 @client.on(events.NewMessage(outgoing=True, pattern=r"^[./]channels(?:\s+(\w+))?(?:\s+(.+))?$", from_users="me"))
@@ -6167,9 +6186,15 @@ _HELP_SECTIONS = {
         "💡 Удобно, чтобы дать другу пользоваться ботом без передачи аккаунта."
     ),
     "song": (
-        "🎵 **`/song [текст]`** — печать с эффектом набора\n"
+        "🎵 **`/song [N] [текст]`** — печать с эффектом набора\n"
         "\n"
         "Постепенно «печатает» переданный текст, имитируя живой набор.\n"
+        "Слова не разрываются: если шаг попадает в середину слова, оно открывается целиком.\n"
+        "\n"
+        "   `/song привет мир` — печать со скоростью по умолчанию (3 символа за шаг).\n"
+        "   `/song 7 привет мир` — первое число = символов за шаг (1–200, больше = быстрее).\n"
+        "   `/song` или `/song 10` — печатает текст по умолчанию (с заданной скоростью).\n"
+        "\n"
         "Декоративная команда — на AI и ключи не влияет."
     ),
     "help": (
