@@ -946,7 +946,16 @@ class _SakanaReasoningClient:
     нет). На high/xhigh поднимаем max_tokens (оркестрация ест выходной бюджет; окно 1M → не переполнит)."""
 
     def __init__(self, api_key):
-        self._c = OpenAI(api_key=api_key, base_url=SAKANA_BASE_URL)
+        # Браузерные заголовки: эдж Sakana отдаёт HTML-403 на «ботовые» запросы с IP датацентров
+        # (на сервере было 403 Forbidden, локально-резидентно — ок). UA+Origin+Referer мимикрируют под
+        # запрос из console.sakana.ai и проходят WAF (как modelgate обходит CF-блок).
+        self._c = OpenAI(api_key=api_key, base_url=SAKANA_BASE_URL, default_headers={
+            "User-Agent": BROWSER_UA,
+            "Accept": "application/json, text/plain, */*",
+            "Accept-Language": "en-US,en;q=0.9",
+            "Origin": "https://console.sakana.ai",
+            "Referer": "https://console.sakana.ai/",
+        })
         self.chat = SimpleNamespace(completions=SimpleNamespace(create=self._create))
 
     def _create(self, **kwargs):
