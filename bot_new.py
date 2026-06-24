@@ -63,6 +63,7 @@ openai_api_key = os.getenv("OPENAI_API_KEY")  # официальный OpenAI AP
 zai_api_key = os.getenv("ZAI_API_KEY")  # z.ai (Zhipu) — модели GLM (OpenAI-совместимый, прямой Bearer)
 fireworks_api_key = os.getenv("FIREWORKS_API_KEY")  # Fireworks AI — serverless-модели (OpenAI-совместимый, прямой Bearer)
 sakana_api_key = os.getenv("SAKANA_API_KEY")  # Sakana AI — Fugu (оркестратор поверх фронтир-LLM, OpenAI-совместимый, прямой Bearer)
+sakana_proxy = os.getenv("SAKANA_PROXY")  # необяз. прокси для Sakana (WAF режет IP датацентров; формат http(s)://[user:pass@]host:port или socks5://…)
 tavily_api_key = os.getenv("TAVILY_API_KEY")  # веб-поиск/извлечение страниц для /ask (tavily.com); без ключа веб-инструменты выключены
 llama_cloud_api_key = os.getenv("LLAMA_CLOUD_API_KEY")  # OCR фото (LlamaParse); без него фото идут через vision
 
@@ -946,16 +947,21 @@ class _SakanaReasoningClient:
     нет). На high/xhigh поднимаем max_tokens (оркестрация ест выходной бюджет; окно 1M → не переполнит)."""
 
     def __init__(self, api_key):
-        # Браузерные заголовки: эдж Sakana отдаёт HTML-403 на «ботовые» запросы с IP датацентров
-        # (на сервере было 403 Forbidden, локально-резидентно — ок). UA+Origin+Referer мимикрируют под
-        # запрос из console.sakana.ai и проходят WAF (как modelgate обходит CF-блок).
-        self._c = OpenAI(api_key=api_key, base_url=SAKANA_BASE_URL, default_headers={
+        # Браузерные заголовки (мимикрия под запрос из console.sakana.ai). Помогают против UA/бот-фильтра, НО
+        # эдж Sakana (GCP WAF) режет ещё и по IP/ASN датацентра (Contabo и пр. → HTML-403, проверено на проде).
+        # Тогда заголовки бессильны → если задан SAKANA_PROXY, гоним запросы через прокси с «чистым» IP.
+        _headers = {
             "User-Agent": BROWSER_UA,
             "Accept": "application/json, text/plain, */*",
             "Accept-Language": "en-US,en;q=0.9",
             "Origin": "https://console.sakana.ai",
             "Referer": "https://console.sakana.ai/",
-        })
+        }
+        _kw = dict(api_key=api_key, base_url=SAKANA_BASE_URL, default_headers=_headers)
+        if sakana_proxy:
+            import httpx  # обёртка строится на старте, log() ещё не определён — без логирования здесь
+            _kw["http_client"] = httpx.Client(proxy=sakana_proxy, timeout=httpx.Timeout(600.0, connect=30.0))
+        self._c = OpenAI(**_kw)
         self.chat = SimpleNamespace(completions=SimpleNamespace(create=self._create))
 
     def _create(self, **kwargs):
