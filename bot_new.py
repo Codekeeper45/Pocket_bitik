@@ -2023,37 +2023,52 @@ _GEN_DAILY_MARKERS = (
 )
 
 
+def _img_mime_from_bytes(b: bytes) -> str:
+    """MIME картинки по magic-байтам (ответ Image API — сырые байты в b64_json, без data-URL)."""
+    if b[:8].startswith(b"\x89PNG"):
+        return "image/png"
+    if b[:3] == b"\xff\xd8\xff":
+        return "image/jpeg"
+    if b[:4] == b"RIFF" and b[8:12] == b"WEBP":
+        return "image/webp"
+    return "image/png"
+
+
 def _sync_generate_image(prompt: str, input_images_b64: list = None, model: str = None,
                          image_size: str = "2K", aspect_ratio: str = None) -> tuple:
-    """Генерация/редактирование изображения через OpenRouter (GPT Image 2 / Gemini). Возвращает (байты, mime).
-    Проверено живьём: modalities строго ["image"] (с "text" — 404), ответ приходит как webp data-URL.
-    modalities/message.images — нестандарт OpenAI, поэтому requests, а не SDK-клиент.
-    Ошибки: 5xx/сеть/таймаут — обычные исключения (временные, можно ретраить);
-    4xx и «нет картинки в ответе» — GenRejected (нужна правка промпта)."""
-    content = [{"type": "text", "text": prompt}]
-    for b64 in (input_images_b64 or []):
-        content.append({"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{b64}"}})
-    # image_config (живьём проверено): image_size 1K/2K/4K — реальное разрешение выхода
-    # (1K=1024², 2K=2048², 4K только Pro), aspect_ratio — точная ориентация. Без него ~1K (мыло).
-    image_config = {"image_size": image_size}
+    """Генерация/редактирование через OpenRouter Unified Image API (POST /api/v1/images). Возвращает (байты, mime).
+    Проверено живьём: gpt-image-2 и gemini-flash-image обе работают ТОЛЬКО на этом эндпоинте
+    (chat/completions для pure-image моделей даёт 500). resolution=1K/2K/4K, aspect_ratio — точная ориентация,
+    референсы — input_references:[{type:image_url,image_url:{url:data-URL}}], ответ data[0].b64_json (сырые байты).
+    Ошибки: 5xx/сеть/таймаут — обычные исключения (временные, ретрай); 4xx/нет картинки — GenRejected (правка промпта)."""
+    body = {
+        "model": model or OPENROUTER_IMAGE_MODEL,
+        "prompt": prompt,
+        "resolution": image_size,  # 1K/2K/4K — реальное разрешение выхода
+        "n": 1,
+    }
     if aspect_ratio:
-        image_config["aspect_ratio"] = aspect_ratio
+        body["aspect_ratio"] = aspect_ratio
+    refs = []
+    for b64 in (input_images_b64 or []):
+        try:
+            mime = _img_mime_from_bytes(base64.b64decode(b64)[:16])
+        except Exception:
+            mime = "image/jpeg"
+        refs.append({"type": "image_url", "image_url": {"url": f"data:{mime};base64,{b64}"}})
+    if refs:
+        body["input_references"] = refs
     resp = requests.post(
-        f"{OPENROUTER_BASE_URL}/chat/completions",
+        f"{OPENROUTER_BASE_URL}/images",
         headers={"Authorization": f"Bearer {openrouter_api_key}", "Content-Type": "application/json"},
-        json={
-            "model": model or OPENROUTER_IMAGE_MODEL,
-            "messages": [{"role": "user", "content": content}],
-            "modalities": ["image"],
-            "image_config": image_config,
-        },
-        timeout=300,  # генерация медленная (reasoning-модель, в тесте ~2.5 мин)
+        json=body,
+        timeout=300,  # генерация медленная (gpt-image-2 ~25с, иногда до минуты)
     )
     if resp.status_code >= 500:
         resp.raise_for_status()  # 5xx — временная ошибка провайдера → ретрай тем же промптом
     if not resp.ok:  # 4xx: РАЗДЕЛЯЕМ дневной лимит / RPM-лимит-перегрузку / реальную модерацию
         try:
-            detail = resp.json().get("error", {}).get("message") or resp.text
+            detail = (resp.json().get("error") or {}).get("message") or resp.text
         except Exception:
             detail = resp.text
         s = str(detail)
@@ -2064,9 +2079,10 @@ def _sync_generate_image(prompt: str, input_images_b64: list = None, model: str 
             raise GenTransient(f"HTTP {resp.status_code}: {s[:200]}")
         raise GenRejected(f"HTTP {resp.status_code}: {s[:200]}")
     data = resp.json()
-    images = (data.get("choices") or [{}])[0].get("message", {}).get("images") or []
-    if not images:
-        err = (data.get("choices") or [{}])[0].get("message", {}).get("content") or data.get("error", {}).get("message") or "пустой ответ"
+    items = data.get("data") or []
+    b64_out = items[0].get("b64_json") if items else None
+    if not b64_out:
+        err = (data.get("error") or {}).get("message") or "пустой ответ"
         err_s = str(err)
         low = err_s.lower()
         # HTTP 200 без картинки: дневной лимит / перегрузка-RPM (временно) / реальная модерация.
@@ -2075,10 +2091,8 @@ def _sync_generate_image(prompt: str, input_images_b64: list = None, model: str 
         if any(mk in low for mk in _GEN_TRANSIENT_MARKERS):
             raise GenTransient(f"провайдер не отдал картинку (временно): {err_s[:200]}")
         raise GenRejected(f"модель не вернула изображение: {err_s[:200]}")
-    url = images[0]["image_url"]["url"]
-    head, b64_out = url.split(",", 1)
-    mime = head.split(":", 1)[-1].split(";", 1)[0] or "image/webp"  # "data:image/webp;base64"
-    return base64.b64decode(b64_out), mime
+    raw = base64.b64decode(b64_out)
+    return raw, (items[0].get("media_type") or _img_mime_from_bytes(raw[:16]))
 
 
 async def _webp_to_png(raw: bytes) -> bytes:
@@ -4693,8 +4707,6 @@ async def _gen_one_image(final_prompt, input_b64s, image_size, aspect_ratio, all
             if not used_fallback and OPENROUTER_IMAGE_FALLBACK and OPENROUTER_IMAGE_FALLBACK != gen_model:
                 used_fallback = True
                 gen_model = OPENROUTER_IMAGE_FALLBACK
-                if size == "4K":
-                    size = "2K"
                 log("GEN", f"Пробую запасную {gen_model} (у неё своя квота)…")
                 await _s("🔁 Дневной лимит основной модели — пробую запасную (Gemini)…")
                 continue
@@ -4718,9 +4730,6 @@ async def _gen_one_image(final_prompt, input_b64s, image_size, aspect_ratio, all
                 gen_model = OPENROUTER_IMAGE_FALLBACK
                 transient_left = 2
                 attempt = 0
-                if size == "4K":  # Gemini Flash Image не умеет 4K → понижаем до 2K
-                    size = "2K"
-                    log("GEN", "Запасная Gemini не поддерживает 4K — понижаю до 2K")
                 log("GEN", f"Основная модель отдаёт {_http_code} — сразу переключаюсь на запасную {gen_model}")
                 await _s("🔁 Основная модель недоступна — пробую запасную (Gemini)…")
                 continue
@@ -4737,9 +4746,6 @@ async def _gen_one_image(final_prompt, input_b64s, image_size, aspect_ratio, all
                 gen_model = OPENROUTER_IMAGE_FALLBACK
                 transient_left = 2
                 attempt = 0
-                if size == "4K":  # Gemini Flash Image не умеет 4K → понижаем до 2K
-                    size = "2K"
-                    log("GEN", "Запасная Gemini не поддерживает 4K — понижаю до 2K")
                 log("GEN", f"Основная модель не отвечает — переключаюсь на запасную {gen_model}")
                 await _s("🔁 Основная модель перегружена — пробую запасную (Gemini)…")
                 continue
@@ -4787,7 +4793,7 @@ async def gen_command(event):
     improve = any(t in ("-i", "-improve") for t in toks)        # уточнить/улучшить промпт (edit при референсе)
     creative = any(t in ("-c", "-creative") for t in toks)      # креатив: ИИ сочиняет промпт-ОТВЕТ (не редактирует)
     noimg = any(t in ("-ni", "-noimg") for t in toks)           # не брать картинки из истории чата в референсы
-    aspect_ratio = None                                         # ориентация → image_config.aspect_ratio (точно)
+    aspect_ratio = None                                         # ориентация → aspect_ratio Image API (точно)
     for t in toks:
         if t in ("-v", "-vertical"): aspect_ratio = "9:16"
         elif t in ("-h", "-horizontal"): aspect_ratio = "16:9"
@@ -6363,10 +6369,10 @@ _HELP_SECTIONS = {
         "**Ориентация (точное соотношение сторон):** `-v` вертикаль 9:16 · `-h` горизонталь 16:9 · `-sq` квадрат 1:1\n"
         "   `/gen -v аниме девушка у окна` · `/gen -h пейзаж гор` · комбинируется: `/gen -c -v <ссылка> …`\n"
         "\n"
-        "**Качество (разрешение):** по умолчанию **2K** (2048²). `-4k` максимум (только Pro, медленнее), `-1k` быстрее/мельче.\n"
+        "**Качество (разрешение):** по умолчанию **2K** (2048²). `-4k` максимум (медленнее, дороже), `-1k` быстрее/мельче.\n"
         "   `/gen -4k постер с текстом` — чёткий мелкий текст · `/gen -1k черновик` — быстро.\n"
         "   ⚠️ Telegram пережимает фото при отправке — для пиксель-в-пиксель оригинала это не панацея,\n"
-        "   но 2K/4K заметно чётче дефолтного 1K. (Запасная Gemini не умеет 4K → авто-понижение до 2K.)\n"
+        "   но 2K/4K заметно чётче дефолтного 1K.\n"
         "\n"
         "**Пакет `-xK` — много вариантов в Избранное:** `-x8` → 8 вариантов уйдут тебе в **Saved Messages**\n"
         "   (не в текущий чат — там только прогресс), макс. 20. Активная модель пишет КАЖДОМУ варианту свой\n"
