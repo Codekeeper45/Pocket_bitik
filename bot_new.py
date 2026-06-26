@@ -2144,7 +2144,7 @@ _IMAGE_GEN_WITH_REFS_SYSTEM = (
 
 
 def _sync_image_prompt(user_prompt: str, context_text: str = None, image_desc: str = None,
-                       edit_mode: bool = False, previous_prompts: list = None) -> str:
+                       edit_mode: bool = False, previous_prompts: list = None, temperature: float = None) -> str:
     """Финальный промпт генерации через DeepSeek (официальный). При недоступности — исходный промпт.
     edit_mode (есть референсы) — только уточнение формулировок, без отсебятины;
     иначе — творческий детальный промпт. image_desc — vision-описания референсов (DeepSeek сам не видит).
@@ -2168,8 +2168,8 @@ def _sync_image_prompt(user_prompt: str, context_text: str = None, image_desc: s
             messages=[{"role": "system", "content": _IMAGE_EDIT_SYSTEM if edit_mode else _IMAGE_PROMPT_SYSTEM},
                       {"role": "user", "content": "\n\n".join(parts)}],
             max_tokens=ASK_MAX_TOKENS,  # deepseek-v4-pro — reasoning-модель: 600 токенов съедались размышлениями
-            # пакет (есть история) → выше температура для разнообразия; редактирование — точность, создание — креатив
-            temperature=(1.0 if previous_prompts else (0.4 if edit_mode else 0.7)),
+            # temperature задаёт вызывающий (по режиму -c/-i); иначе: пакет→разнообразие, edit→точность, создание→креатив
+            temperature=(temperature if temperature is not None else (1.0 if previous_prompts else (0.4 if edit_mode else 0.7))),
         )
         choice = resp.choices[0]
         out = _strip_think((choice.message.content or "").strip())  # вырезаем inline <think>, если есть
@@ -2185,7 +2185,7 @@ def _sync_image_prompt(user_prompt: str, context_text: str = None, image_desc: s
 
 async def _build_gen_prompt(user_prompt: str, context_text: str = None, image_desc: str = None,
                             edit_mode: bool = False, previous_prompts: list = None,
-                            catalog: list = None) -> tuple:
+                            catalog: list = None, creative: bool = False, improve: bool = False) -> tuple:
     """Финальный промпт генерации на АКТИВНОЙ модели-ответчике (/model). Vision-модель видит каталожные
     картинки из истории чата напрямую, текстовая — по их описаниям (медиа-модель). При наличии catalog ИИ
     может выбрать референсы по номерам — возвращаем (промпт, [выбранные idx]); иначе ([], только промпт).
@@ -2239,19 +2239,30 @@ async def _build_gen_prompt(user_prompt: str, context_text: str = None, image_de
     else:
         user_content = text_block
 
+    # температура по режиму: -c (creative) — свободный креатив; -i (improve) — уточнение; иначе пакет/edit/дефолт
+    if creative:
+        temp = 1.1
+    elif improve:
+        temp = 0.7
+    elif previous_prompts:
+        temp = 1.0  # пакет: разнообразие вариантов
+    elif edit_mode and not catalog:
+        temp = 0.4  # редактирование референса — точность
+    else:
+        temp = 0.7
     out = None
     try:
         out = await _llm_create(
             [{"role": "system", "content": system}, {"role": "user", "content": user_content}],
             max_tokens=ASK_MAX_TOKENS,
-            temperature=(1.0 if previous_prompts else (0.4 if edit_mode and not catalog else 0.7)),
+            temperature=temp,
             reasoning="none",
         )
     except Exception as e:
         log("GEN", f"Активная модель не построила промпт ({e})")
     if not out:  # активная недоступна/пустой ответ → DeepSeek-фолбэк (без выбора картинок)
         log("GEN", "Промпт активной моделью не получен — фолбэк на DeepSeek")
-        fb = await asyncio.to_thread(_sync_image_prompt, user_prompt, context_text, image_desc, edit_mode, previous_prompts)
+        fb = await asyncio.to_thread(_sync_image_prompt, user_prompt, context_text, image_desc, edit_mode, previous_prompts, temp)
         return fb, []
 
     out = _strip_think(out).strip()
@@ -4959,7 +4970,7 @@ async def gen_command(event):
                     log("GEN", f"Дневной лимит исчерпан — останавливаю пакет на варианте {i + 1}/{batch_count}")
                     break
                 cat_i = (catalog or None) if i == 0 else None  # каталог (и картинки vision) — только 1-му варианту
-                fp, sel = await _build_gen_prompt(user_prompt, context_text, image_desc, edit_mode, prompts, cat_i)
+                fp, sel = await _build_gen_prompt(user_prompt, context_text, image_desc, edit_mode, prompts, cat_i, creative=creative, improve=improve)
                 by_ai = fp != user_prompt
                 if i == 0 and sel:  # выбор референсов из истории — общий для всего пакета
                     input_b64s = _merge_catalog_refs(input_b64s, catalog, sel)
@@ -4985,7 +4996,7 @@ async def gen_command(event):
         final_prompt, prompt_by_ai = user_prompt, False
         if ai_prompt:
             await set_status(f"🧠 {get_active_model()[2]} готовит промпт…")
-            final_prompt, sel = await _build_gen_prompt(user_prompt, context_text, image_desc, edit_mode, None, catalog or None)
+            final_prompt, sel = await _build_gen_prompt(user_prompt, context_text, image_desc, edit_mode, None, catalog or None, creative=creative, improve=improve)
             prompt_by_ai = final_prompt != user_prompt
             input_b64s = _merge_catalog_refs(input_b64s, catalog, sel)  # выбранные ИИ картинки из истории → референсы
             log("GEN", f"Промпт: by_ai={prompt_by_ai} · режим={'edit' if edit_mode else 'creative'} · ref-вложений={'есть' if image_desc else 'нет'} · из истории refs={len(sel)} · len={len(final_prompt)}")
