@@ -94,9 +94,9 @@ OPENROUTER_VISION_MODEL = "google/gemini-3.1-flash-lite"  # дефолт vision 
 # заменены на дешёвые STT (проверено живьём: HTTP 200, ogg напрямую). Gemini для STT дорог.
 OPENROUTER_AUDIO_MODEL = "nvidia/parakeet-tdt-0.6b-v3"
 OPENROUTER_AUDIO_FALLBACK = "mistralai/voxtral-mini-transcribe"  # запасная, если Parakeet не отвечает
-OPENROUTER_IMAGE_MODEL = "sourceful/riverflow-v2.5-pro:free"  # /gen: text→image и image→image, бесплатная
-OPENROUTER_IMAGE_FALLBACK = "sourceful/riverflow-v2.5-fast:free"  # запасная при перегрузке основной
-GEN_IMAGE_MAX_INPUT = 3_000_000  # Sourceful лимитирует запрос 4.5 МБ; base64 ×1.33 → входное фото до ~3 МБ
+OPENROUTER_IMAGE_MODEL = "openai/gpt-image-2"  # /gen: text→image и image→image (OpenAI GPT Image 2, платная)
+OPENROUTER_IMAGE_FALLBACK = "google/gemini-3.1-flash-image"  # запасная при сбое/перегрузке основной (4K не умеет → авто-даунгрейд до 2K)
+GEN_IMAGE_MAX_INPUT = 3_000_000  # лимит входного запроса ~4.5 МБ; base64 ×1.33 → входное фото до ~3 МБ
 GEN_BATCH_MAX = 20          # /gen -xN: максимум вариантов за команду (каждый ~40с–2мин)
 GEN_BATCH_CONCURRENCY = 2   # сколько вариантов генерим одновременно (баланс скорость/лимиты free-модели)
 # OCR фото в /ask по умолчанию (cost-effective вместо vision-модели; флаг -m возвращает vision).
@@ -2023,7 +2023,7 @@ _GEN_DAILY_MARKERS = (
 
 def _sync_generate_image(prompt: str, input_images_b64: list = None, model: str = None,
                          image_size: str = "2K", aspect_ratio: str = None) -> tuple:
-    """Генерация/редактирование изображения через OpenRouter (Riverflow). Возвращает (байты, mime).
+    """Генерация/редактирование изображения через OpenRouter (GPT Image 2 / Gemini). Возвращает (байты, mime).
     Проверено живьём: modalities строго ["image"] (с "text" — 404), ответ приходит как webp data-URL.
     modalities/message.images — нестандарт OpenAI, поэтому requests, а не SDK-клиент.
     Ошибки: 5xx/сеть/таймаут — обычные исключения (временные, можно ретраить);
@@ -4462,8 +4462,8 @@ async def _gen_collect_input_images(event, reply_msg, extra_msgs=None):
     return out, skipped
 
 
-# Глобальный rate-gate для image-API: free Pro у Sourceful = 5 запросов/мин. Разносим вызовы во
-# времени, чтобы не ловить RPM-429 и не жечь дневную квоту на провальных ретраях (failed тоже списываются).
+# Глобальный rate-gate для image-API: разносим вызовы во времени, чтобы не ловить RPM-429
+# и не жечь деньги/квоту на провальных ретраях (failed-попытки тоже списываются).
 _GEN_RATE_LOCK = asyncio.Lock()
 _GEN_RATE_MIN_INTERVAL = 13.0  # сек между запросами к генератору (~4–5/мин)
 _GEN_LAST_CALL = [0.0]
@@ -4506,7 +4506,7 @@ async def _gen_one_image(final_prompt, input_b64s, image_size, aspect_ratio, all
                 if size == "4K":
                     size = "2K"
                 log("GEN", f"Пробую запасную {gen_model} (у неё своя квота)…")
-                await _s("🔁 Дневной лимит основной модели — пробую запасную (fast)…")
+                await _s("🔁 Дневной лимит основной модели — пробую запасную (Gemini)…")
                 continue
             return None, "exhausted", None, used_fallback
         except GenRejected as e:
@@ -4521,6 +4521,19 @@ async def _gen_one_image(final_prompt, input_b64s, image_size, aspect_ratio, all
                 log("GEN", "Repair не изменил промпт (DeepSeek недоступен/сам фильтрует) — отказ")
             return None, "moderation", None, used_fallback
         except (GenTransient, requests.exceptions.RequestException) as e:
+            # 5xx от ОСНОВНОЙ модели = провайдер/адаптер лежит, ждать бессмысленно → сразу на запасную (без 2× пауз).
+            _http_code = getattr(getattr(e, "response", None), "status_code", 0) or 0
+            if _http_code >= 500 and not used_fallback and OPENROUTER_IMAGE_FALLBACK and OPENROUTER_IMAGE_FALLBACK != gen_model:
+                used_fallback = True
+                gen_model = OPENROUTER_IMAGE_FALLBACK
+                transient_left = 2
+                attempt = 0
+                if size == "4K":  # Gemini Flash Image не умеет 4K → понижаем до 2K
+                    size = "2K"
+                    log("GEN", "Запасная Gemini не поддерживает 4K — понижаю до 2K")
+                log("GEN", f"Основная модель отдаёт {_http_code} — сразу переключаюсь на запасную {gen_model}")
+                await _s("🔁 Основная модель недоступна — пробую запасную (Gemini)…")
+                continue
             if transient_left > 0:
                 transient_left -= 1
                 attempt += 1
@@ -4534,11 +4547,11 @@ async def _gen_one_image(final_prompt, input_b64s, image_size, aspect_ratio, all
                 gen_model = OPENROUTER_IMAGE_FALLBACK
                 transient_left = 2
                 attempt = 0
-                if size == "4K":  # Fast не умеет 4K → понижаем до 2K
+                if size == "4K":  # Gemini Flash Image не умеет 4K → понижаем до 2K
                     size = "2K"
-                    log("GEN", "Запасная Fast не поддерживает 4K — понижаю до 2K")
+                    log("GEN", "Запасная Gemini не поддерживает 4K — понижаю до 2K")
                 log("GEN", f"Основная модель не отвечает — переключаюсь на запасную {gen_model}")
-                await _s("🔁 Основная модель перегружена — пробую запасную (fast)…")
+                await _s("🔁 Основная модель перегружена — пробую запасную (Gemini)…")
                 continue
             return None, "overload", None, used_fallback
 
@@ -4569,7 +4582,7 @@ async def _gen_send_image(chat, raw, mime, final_prompt, prompt_by_ai, reply_to)
 
 @client.on(events.NewMessage(pattern=r"^[./]gen(?:\s+(\d+))?((?:\s+-(?:improve|creative|vertical|horizontal|square|sq|4k|2k|1k|x\d+|i|c|v|h))+)?((?:\s+!?@\w+)+)?\s+(.+)$"))
 async def gen_command(event):
-    """Генерация изображений (Riverflow via OpenRouter). Промпт как есть, либо его строит/улучшает DeepSeek
+    """Генерация изображений (GPT Image 2 via OpenRouter). Промпт как есть, либо его строит/улучшает DeepSeek
     из контекста (N последних сообщений / текст reply / флаг -i). Фото в сообщении/reply → image-to-image."""
     if await _slash_for_other_bot(event):
         return  # /команда в личке с ботом адресована ему, не юзерботу (используй .gen)
@@ -6121,7 +6134,7 @@ _HELP_SECTIONS = {
     "gen": (
         "🎨 **`/gen` — генерация и редактирование изображений**\n"
         "\n"
-        "Модель: Riverflow V2.5 Pro (OpenRouter, бесплатная), при перегрузке — запасная Fast. Нужен `OPENROUTER_API_KEY`.\n"
+        "Модель: GPT Image 2 (OpenRouter, платная), при сбое/перегрузке — запасная Gemini 3.1 Flash Image. Нужен `OPENROUTER_API_KEY`.\n"
         "\n"
         "**Синтаксис:** `/gen [N] [-i|-c] [-v|-h|-sq] [-2k|-4k|-1k] [-xK] [@юзер|!@юзер] <промпт>`\n"
         "   `/gen аниме кот в очках` — генерация ровно по твоему промпту\n"
@@ -6140,7 +6153,7 @@ _HELP_SECTIONS = {
         "**Качество (разрешение):** по умолчанию **2K** (2048²). `-4k` максимум (только Pro, медленнее), `-1k` быстрее/мельче.\n"
         "   `/gen -4k постер с текстом` — чёткий мелкий текст · `/gen -1k черновик` — быстро.\n"
         "   ⚠️ Telegram пережимает фото при отправке — для пиксель-в-пиксель оригинала это не панацея,\n"
-        "   но 2K/4K заметно чётче дефолтного 1K. (Запасная Fast не умеет 4K → авто-понижение до 2K.)\n"
+        "   но 2K/4K заметно чётче дефолтного 1K. (Запасная Gemini не умеет 4K → авто-понижение до 2K.)\n"
         "\n"
         "**Пакет `-xK` — много вариантов в Избранное:** `-x8` → 8 вариантов уйдут тебе в **Saved Messages**\n"
         "   (не в текущий чат — там только прогресс), макс. 20. DeepSeek пишет КАЖДОМУ варианту свой\n"
@@ -6375,7 +6388,7 @@ async def status_command(event):
     _dig = load_json(DIGEST_STATE_PATH, {}).get("digest_time", "09:00")
     L.append(f"📡 **Каналы:** подключено {len(get_tracked())} · дайджест в {_dig}")
     # — генерация изображений —
-    L.append(f"🎨 **Генерация (`/gen`):** Riverflow V2.5 Pro → Fast (free, фолбэк) {'✅' if openrouter_client is not None else '❌ нет OPENROUTER_API_KEY'}")
+    L.append(f"🎨 **Генерация (`/gen`):** GPT Image 2 → Gemini 3.1 Flash Image (фолбэк) {'✅' if openrouter_client is not None else '❌ нет OPENROUTER_API_KEY'}")
     # — избранное —
     L.append(f"⭐ **Избранное:** {len(FISH_FAVORITES)} Fish-голос(ов) · {len(CUSTOM_MODELS)} кастомных моделей")
     # — ключи —
