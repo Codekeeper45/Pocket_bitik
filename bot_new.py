@@ -4894,7 +4894,7 @@ async def _gen_send_image(chat, raw, mime, final_prompt, prompt_by_ai, reply_to,
             log("GEN", f"Строка референсов не отправилась: {e}")
 
 
-@client.on(events.NewMessage(pattern=r"^[./]gen(?:\s+(\d+))?((?:\s+-(?:improve|creative|vertical|horizontal|square|sq|4k|2k|1k|x\d+|noimg|ni|m|i|c|v|h))+)?((?:\s+!?@\w+)+)?\s+(.+)$"))
+@client.on(events.NewMessage(pattern=r"^[./]gen(?:\s+(\d+))?((?:\s+-(?:improve|creative|vertical|horizontal|square|sq|4k|2k|1k|x\d+|noimg|ni|raw|m|r|i|c|v|h))+)?((?:\s+!?@\w+)+)?\s+(.+)$"))
 async def gen_command(event):
     """Генерация изображений (GPT Image 2 via OpenRouter). Промпт как есть, либо его строит/улучшает DeepSeek
     из контекста (N последних сообщений / текст reply / флаг -i). Фото в сообщении/reply → image-to-image."""
@@ -4912,6 +4912,7 @@ async def gen_command(event):
     creative = any(t in ("-c", "-creative") for t in toks)      # креатив: ИИ сочиняет промпт-ОТВЕТ (не редактирует)
     noimg = any(t in ("-ni", "-noimg") for t in toks)           # не брать картинки из истории чата в референсы
     force_desc = any(t == "-m" for t in toks)                   # -m: всегда через ОПИСАНИЯ (даже vision-модель), но больший пул кандидатов
+    raw = any(t in ("-r", "-raw") for t in toks)                # -r: БЕЗ ИИ — твой промпт дословно в генератор (literal)
     aspect_ratio = None                                         # ориентация → aspect_ratio Image API (точно)
     for t in toks:
         if t in ("-v", "-vertical"): aspect_ratio = "9:16"
@@ -4947,7 +4948,8 @@ async def gen_command(event):
 
     # Креативный режим — ПО УМОЛЧАНИЮ (как -c, указывать не нужно): без приложенного фото-референса ИИ
     # сочиняет промпт со своим видением. Приложил фото на правку → остаётся точный edit-режим (если только не -c).
-    if not input_b64s:
+    # Флаг -r (raw) отключает ИИ полностью → промпт уходит в генератор дословно.
+    if not input_b64s and not raw:
         creative = True
 
     if is_owner and not _is_attached_photo(event.message):
@@ -5014,7 +5016,7 @@ async def gen_command(event):
 
         # ── каталог фото из истории чата: по умолчанию для /gen N ИИ сам выберет из них референсы ──
         catalog = []
-        if n > 0 and not noimg:
+        if n > 0 and not noimg and not raw:
             want_vision = active_model_supports_vision()
             if want_vision is None:  # кастомная OR-модель без флага — спросим вживую
                 try:
@@ -5028,7 +5030,7 @@ async def gen_command(event):
             catalog = await _gen_history_catalog(ordered, want_vision, limit=cand_limit, timeout=cat_timeout, progress_cb=set_status)
 
         gen_refs_line = None  # строка «Референсы:» со ссылками на сообщения-источники (заполнится, если ИИ возьмёт фото из истории)
-        ai_prompt = bool(context_text or improve or creative or catalog)  # промпт строит активная модель
+        ai_prompt = (not raw) and bool(context_text or improve or creative or catalog)  # -r → ИИ не строит промпт (literal)
         edit_mode = bool(input_b64s) and not creative  # -c → творческий режим даже с референсом
         # Активная текстовая модель не видит вложенные референсы → их описывает медиа-модель (с кэшем). Считаем ОДИН раз на весь пакет.
         image_desc = None
@@ -6486,7 +6488,7 @@ _HELP_SECTIONS = {
         "Модель-генератор: GPT Image 2 (OpenRouter, платная), при сбое/перегрузке — запасная Gemini 3.1 Flash Image. Нужен `OPENROUTER_API_KEY`.\n"
         "Промпт строит **активная модель-ответчик** (`/model`); если она с vision — сама смотрит картинки чата, если текстовая — по их описаниям (медиа-модель `/media`). DeepSeek — фолбэк.\n"
         "\n"
-        "**Синтаксис:** `/gen [N] [-i|-c] [-ni|-m] [-v|-h|-sq] [-2k|-4k|-1k] [-xK] [@юзер|!@юзер] <промпт>`\n"
+        "**Синтаксис:** `/gen [N] [-i|-c|-r] [-ni|-m] [-v|-h|-sq] [-2k|-4k|-1k] [-xK] [@юзер|!@юзер] <промпт>`\n"
         "   `/gen аниме кот в очках` — генерация ровно по твоему промпту\n"
         "   `/gen -i закат над морем` — активная модель улучшит/уточнит промпт (`-i` или `-improve`)\n"
         "   `/gen 100 нарисуй о чём мы спорим` — модель составит промпт по последним 100 сообщениям чата\n"
@@ -6508,6 +6510,8 @@ _HELP_SECTIONS = {
         "   ИСКЛЮЧЕНИЕ — когда приложил/реплайнул ФОТО на правку: тогда режим РЕДАКТИРОВАНИЯ (точно, без отсебятины);\n"
         "   добавь `-c` к фото, если хочешь творческую переработку, или `-i` — аккуратное уточнение твоего промпта.\n"
         "   `/gen 200 что хочет нарисовать чат?` · `/gen аниме кот` — оба уже креативные.\n"
+        "   **`-r` (raw)** — БЕЗ ИИ: твой промпт уходит в генератор ДОСЛОВНО (ни расширения, ни истории-картинок).\n"
+        "   `/gen -r a cat in a hat, watercolor` — что написал, то и сгенерится.\n"
         "\n"
         "**Ориентация (точное соотношение сторон):** `-v` вертикаль 9:16 · `-h` горизонталь 16:9 · `-sq` квадрат 1:1\n"
         "   `/gen -v аниме девушка у окна` · `/gen -h пейзаж гор` · комбинируется: `/gen -c -v <ссылка> …`\n"
