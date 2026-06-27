@@ -100,7 +100,6 @@ GEN_IMAGE_MAX_INPUT = 3_000_000  # лимит входного запроса ~4
 GEN_CTX_IMG_MAX = 20        # /gen: макс. фото-кандидатов из истории, предлагаемых ИИ на выбор (паритет с DIRECT_VISION_MAX_IMAGES)
 GEN_CTX_REF_MAX = 4         # из них ИИ реально берёт в референсы генератора (gpt-image-2/gemini тянут несколько)
 GEN_CTX_THUMB_PX = 768      # /gen: сторона уменьшенной копии фото-кандидата для ПРОМПТЕРА (vision-вход/описание) — иначе 20 полных фото бьют лимит запроса (Alibaba ~28МБ)
-GEN_PROMPT_CTX_MAX = 24000  # /gen: макс. символов контекста чата, отдаваемых промптеру (не гнать 200k токенов в LLM → таймауты)
 GEN_CATALOG_TIMEOUT = 75    # /gen: тайм-бюджет (сек) на скачивание+сжатие и на описание каталога истории
 GEN_BATCH_MAX = 20          # /gen -xN: максимум вариантов за команду (каждый ~40с–2мин)
 GEN_BATCH_CONCURRENCY = 2   # сколько вариантов генерим одновременно (баланс скорость/лимиты free-модели)
@@ -1912,6 +1911,7 @@ async def describe_image(image_bytes: bytes, caption: str = "", model: str = Non
                     {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{b64}", "detail": detail}},
                 ]}],
                 max_tokens=4096,
+                timeout=60,  # иначе дефолт SDK = 600с: один залипший запрос вешал /gen-каталог на 10 мин
             )
             return _strip_think((response.choices[0].message.content or "").strip()) or "[изображение]"
         except Exception as e:
@@ -1949,6 +1949,7 @@ async def describe_album(images: list, caption: str = "", model: str = None, det
                 model=model,
                 messages=[{"role": "user", "content": content}],
                 max_tokens=4096,
+                timeout=90,  # альбом тяжелее одного фото, но не 600с дефолта SDK
             )
             return _strip_think((response.choices[0].message.content or "").strip())
         except Exception as e:
@@ -2224,10 +2225,6 @@ async def _build_gen_prompt(user_prompt: str, context_text: str = None, image_de
         except Exception:
             want_vision = False
     want_vision = bool(want_vision)
-
-    # контекст промптеру кэпим: не гнать 200k-токенный лог в LLM (был 10-мин таймаут на /gen 5000); держим хвост (свежее)
-    if context_text and len(context_text) > GEN_PROMPT_CTX_MAX:
-        context_text = "[…ранний контекст обрезан…]\n" + context_text[-GEN_PROMPT_CTX_MAX:]
 
     parts = []
     if context_text:
