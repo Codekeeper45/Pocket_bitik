@@ -4711,15 +4711,15 @@ async def _gen_history_catalog(ordered, want_vision: bool, limit: int = GEN_CTX_
     return catalog
 
 
-def _merge_catalog_refs(input_b64s: list, catalog: list, sel: list) -> list:
+def _merge_catalog_refs(input_b64s: list, catalog: list, sel: list) -> tuple:
     """Добавляет выбранные ИИ картинки каталога (по idx из sel) к input_b64s генератора, соблюдая
-    GEN_CTX_REF_MAX и общий лимит GEN_IMAGE_MAX_INPUT. Возвращает новый список base64."""
+    GEN_CTX_REF_MAX и общий лимит GEN_IMAGE_MAX_INPUT. Возвращает (новый список base64, реально взятые idx)."""
     if not (catalog and sel):
-        return input_b64s
+        return input_b64s, []
     out = list(input_b64s or [])
     total = sum(len(b) * 3 // 4 for b in out)  # оценка уже накопленных сырых байт (base64 ×4/3)
     by_idx = {it["idx"]: it for it in catalog}
-    added = 0
+    added, used = 0, []
     for k in sel:
         if added >= GEN_CTX_REF_MAX:
             break
@@ -4732,9 +4732,28 @@ def _merge_catalog_refs(input_b64s: list, catalog: list, sel: list) -> list:
         total += len(blob)
         out.append(base64.b64encode(blob).decode("utf-8"))
         added += 1
+        used.append(k)
     if added:
         log("GEN", f"Из истории добавлено {added} картинок-референсов (выбор ИИ: {sel})")
-    return out
+    return out, used
+
+
+def _gen_refs_line(chat_ent, catalog: list, used_idxs: list) -> str:
+    """Строка «Референсы:» со ссылками на сообщения, чьи фото реально ушли в генерацию (markdown)."""
+    if not (chat_ent and catalog and used_idxs):
+        return None
+    by_idx = {it["idx"]: it for it in catalog}
+    parts = []
+    for k in used_idxs:
+        it = by_idx.get(k)
+        mid = it.get("mid") if it else None
+        if not mid:
+            continue
+        try:
+            parts.append(f"[#{k}]({build_msg_link(chat_ent, mid)})")
+        except Exception:
+            continue
+    return ("📎 Референсы (фото из чата): " + " · ".join(parts)) if parts else None
 
 
 # Глобальный rate-gate для image-API: разносим вызовы во времени, чтобы не ловить RPM-429
@@ -4823,28 +4842,35 @@ async def _gen_one_image(final_prompt, input_b64s, image_size, aspect_ratio, all
             return None, "overload", None, used_fallback
 
 
-async def _gen_send_image(chat, raw, mime, final_prompt, prompt_by_ai, reply_to):
+async def _gen_send_image(chat, raw, mime, final_prompt, prompt_by_ai, reply_to, refs_line=None):
     """Отправляет готовую картинку: webp→png, и при AI-промпте — свёрнутая подпись (или отдельным
-    сообщением, если длинная). chat='me' = Saved Messages."""
+    сообщением, если длинная). refs_line — строка «Референсы:» со ссылками (отдельным сообщением-ответом
+    под картинкой). chat='me' = Saved Messages."""
     if "webp" in mime:
         raw = await _webp_to_png(raw)  # webp Telegram шлёт стикером — конвертим
     bio = io.BytesIO(raw)
     bio.name = "gen.png" if raw[:8].startswith(b"\x89PNG") else "gen.webp"
-    if prompt_by_ai:  # промпт от DeepSeek — СВЁРНУТОЙ цитатой и БЕЗ обрезки
+    sent = None
+    if prompt_by_ai:  # промпт от ИИ — СВЁРНУТОЙ цитатой и БЕЗ обрезки
         cap_text = "🎨 " + final_prompt
         if len(cap_text) <= 1000:  # влезает в лимит подписи Telegram (1024)
             try:
                 cap, cap_ents = _collapsed_entities(cap_text, parse_html=False)
-                await client.send_file(chat, bio, caption=cap, formatting_entities=cap_ents, reply_to=reply_to)
+                sent = await client.send_file(chat, bio, caption=cap, formatting_entities=cap_ents, reply_to=reply_to)
             except Exception as e:
                 log("GEN", f"Свёрнутая подпись не отправилась ({e}) — шлю обычной")
                 bio.seek(0)
-                await client.send_file(chat, bio, caption=cap_text, reply_to=reply_to)
+                sent = await client.send_file(chat, bio, caption=cap_text, reply_to=reply_to)
         else:  # длинный промпт: картинка без подписи + полный промпт отдельной свёрнутой цитатой
             sent = await client.send_file(chat, bio, reply_to=reply_to)
             await send_long(chat, cap_text, parse_mode=None, reply_to=getattr(sent, "id", None), collapse_threshold=0)
     else:
-        await client.send_file(chat, bio, reply_to=reply_to)
+        sent = await client.send_file(chat, bio, reply_to=reply_to)
+    if refs_line:  # ссылки на сообщения-источники референсов — отдельным сообщением под картинкой
+        try:
+            await client.send_message(chat, refs_line, parse_mode="md", reply_to=getattr(sent, "id", None), link_preview=False)
+        except Exception as e:
+            log("GEN", f"Строка референсов не отправилась: {e}")
 
 
 @client.on(events.NewMessage(pattern=r"^[./]gen(?:\s+(\d+))?((?:\s+-(?:improve|creative|vertical|horizontal|square|sq|4k|2k|1k|x\d+|noimg|ni|m|i|c|v|h))+)?((?:\s+!?@\w+)+)?\s+(.+)$"))
@@ -4975,6 +5001,7 @@ async def gen_command(event):
             cat_timeout = GEN_CATALOG_TIMEOUT if want_vision else GEN_DESC_TIMEOUT
             catalog = await _gen_history_catalog(ordered, want_vision, limit=cand_limit, timeout=cat_timeout, progress_cb=set_status)
 
+        gen_refs_line = None  # строка «Референсы:» со ссылками на сообщения-источники (заполнится, если ИИ возьмёт фото из истории)
         ai_prompt = bool(context_text or improve or creative or catalog)  # промпт строит активная модель
         edit_mode = bool(input_b64s) and not creative  # -c → творческий режим даже с референсом
         # Активная текстовая модель не видит вложенные референсы → их описывает медиа-модель (с кэшем). Считаем ОДИН раз на весь пакет.
@@ -5014,7 +5041,7 @@ async def gen_command(event):
                     counter["done"] += 1
                     if raw_i is not None:
                         try:
-                            await _gen_send_image("me", raw_i, mime_i, used_fp, by_ai, None)
+                            await _gen_send_image("me", raw_i, mime_i, used_fp, by_ai, None, refs_line=gen_refs_line)
                             counter["ok"] += 1
                         except Exception as e:
                             log("GEN", f"Вариант {idx + 1}: отправка в Избранное не удалась: {e}")
@@ -5036,7 +5063,11 @@ async def gen_command(event):
                 fp, sel = await _build_gen_prompt(user_prompt, context_text, image_desc, edit_mode, prompts, cat_i, creative=creative, improve=improve, force_desc=force_desc)
                 by_ai = fp != user_prompt
                 if i == 0 and sel:  # выбор референсов из истории — общий для всего пакета
-                    input_b64s = _merge_catalog_refs(input_b64s, catalog, sel)
+                    input_b64s, _used = _merge_catalog_refs(input_b64s, catalog, sel)
+                    try:
+                        gen_refs_line = _gen_refs_line(await event.get_chat(), catalog, _used)
+                    except Exception:
+                        gen_refs_line = None
                 log("GEN", f"Вариант {i + 1}/{batch_count}: промпт by_ai={by_ai} refs={len(sel) if i == 0 else '—'} len={len(fp)}")
                 prompts.append(fp)
                 tasks.append(asyncio.create_task(_gen_and_send(i, fp, by_ai)))
@@ -5061,8 +5092,13 @@ async def gen_command(event):
             await set_status(f"🧠 {get_active_model()[2]} {'смотрит фото и пишет промпт' if catalog else 'готовит промпт'}…")
             final_prompt, sel = await _build_gen_prompt(user_prompt, context_text, image_desc, edit_mode, None, catalog or None, creative=creative, improve=improve, force_desc=force_desc)
             prompt_by_ai = final_prompt != user_prompt
-            input_b64s = _merge_catalog_refs(input_b64s, catalog, sel)  # выбранные ИИ картинки из истории → референсы
-            log("GEN", f"Промпт: by_ai={prompt_by_ai} · режим={'edit' if edit_mode else 'creative'} · ref-вложений={'есть' if image_desc else 'нет'} · из истории refs={len(sel)} · len={len(final_prompt)}")
+            input_b64s, _used = _merge_catalog_refs(input_b64s, catalog, sel)  # выбранные ИИ картинки из истории → референсы
+            if _used:
+                try:
+                    gen_refs_line = _gen_refs_line(await event.get_chat(), catalog, _used)
+                except Exception:
+                    gen_refs_line = None
+            log("GEN", f"Промпт: by_ai={prompt_by_ai} · режим={'edit' if edit_mode else 'creative'} · ref-вложений={'есть' if image_desc else 'нет'} · из истории refs={len(_used)} · len={len(final_prompt)}")
         await set_status("🎨 Генерирую изображение… (может занять до пары минут)")
         t0 = time.time()
         # allow_repair: ИИ-промпт был ЗАПРОШЕН (даже если его первая попытка вернула пустое и промпт ушёл исходным)
@@ -5081,7 +5117,7 @@ async def gen_command(event):
                                  f"Попробуй ещё раз через минуту: `/gen {user_prompt[:200]}`")
             return
         log("GEN", f"Готово за {time.time() - t0:.1f}с · {len(raw) / 1024:.0f} КБ · {mime} · prompt_by_ai={prompt_by_ai} · модель={'fast(запасная)' if used_fb else 'pro'}")
-        await _gen_send_image(event.chat_id, raw, mime, used_fp, prompt_by_ai, reply_target_id)
+        await _gen_send_image(event.chat_id, raw, mime, used_fp, prompt_by_ai, reply_target_id, refs_line=gen_refs_line)
         await status.delete()
     except Exception as e:
         log("GEN", f"Ошибка /gen: {e}")
