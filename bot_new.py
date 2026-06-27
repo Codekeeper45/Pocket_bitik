@@ -100,6 +100,7 @@ GEN_IMAGE_MAX_INPUT = 3_000_000  # лимит входного запроса ~4
 GEN_CTX_IMG_MAX = 20        # /gen: макс. фото-кандидатов из истории, предлагаемых ИИ на выбор (паритет с DIRECT_VISION_MAX_IMAGES)
 GEN_CTX_REF_MAX = 4         # из них ИИ реально берёт в референсы генератора (gpt-image-2/gemini тянут несколько)
 GEN_CTX_THUMB_PX = 768      # /gen: сторона уменьшенной копии фото-кандидата для ПРОМПТЕРА (vision-вход/описание) — иначе 20 полных фото бьют лимит запроса (Alibaba ~28МБ)
+GEN_VISION_RETRY_N = 8      # /gen: если vision-промптер отверг полный каталог (лимит числа картинок у провайдера, напр. Mistral/Pixtral) — повтор с этим числом
 GEN_CATALOG_TIMEOUT = 75    # /gen: тайм-бюджет (сек) на скачивание+сжатие и на описание каталога истории
 GEN_BATCH_MAX = 20          # /gen -xN: максимум вариантов за команду (каждый ~40с–2мин)
 GEN_BATCH_CONCURRENCY = 2   # сколько вариантов генерим одновременно (баланс скорость/лимиты free-модели)
@@ -2226,43 +2227,40 @@ async def _build_gen_prompt(user_prompt: str, context_text: str = None, image_de
             want_vision = False
     want_vision = bool(want_vision)
 
-    parts = []
-    if context_text:
-        parts.append(f"Контекст чата:\n{context_text}")
-    if image_desc:
-        parts.append(f"Описание референсных изображений (поданы модели на вход):\n{image_desc}")
-    if catalog:
-        cat_lines = []
-        for it in catalog:
-            head = f"#{it['idx']}"
-            cap = (it.get("caption") or "").strip()
-            if cap:
-                head += f" (подпись: {cap[:120]})"
-            if not want_vision:
-                d = (it.get("desc") or "").strip()
-                head += f": {d}" if d else ": [описание недоступно]"
-            cat_lines.append(head)
-        parts.append("Доступные изображения из чата (можно выбрать как референсы по номерам):\n" + "\n".join(cat_lines))
-    parts.append(f"Запрос пользователя: {user_prompt}")
-    if previous_prompts:
-        joined = "\n".join(f"{i}. {p}" for i, p in enumerate(previous_prompts, 1))
-        parts.append("Это ОЧЕРЕДНОЙ вариант того же запроса. Уже придуманы такие промпты — НЕ повторяй их "
-                     "(ни идею, ни композицию, ни ракурс, ни формулировки):\n" + joined +
-                     "\n\nПридумай СВЕЖИЙ, заметно непохожий вариант — доверься своей фантазии, удиви.")
-    text_block = "\n\n".join(parts)
+    system = _IMAGE_GEN_WITH_REFS_SYSTEM if catalog else (_IMAGE_EDIT_SYSTEM if edit_mode else _IMAGE_PROMPT_SYSTEM)
 
-    if catalog:
-        system = _IMAGE_GEN_WITH_REFS_SYSTEM
-    else:
-        system = _IMAGE_EDIT_SYSTEM if edit_mode else _IMAGE_PROMPT_SYSTEM
-
-    if want_vision and catalog:  # уменьшенные копии уходят активной модели НАПРЯМУЮ (в порядке idx; thumb, не оригинал → лимит запроса)
-        user_content = [{"type": "text", "text": text_block}]
-        for it in catalog:
-            b64 = base64.b64encode(it.get("thumb") or it["bytes"]).decode("utf-8")
-            user_content.append({"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{b64}", "detail": "low"}})
-    else:
-        user_content = text_block
+    def _compose(cat_used):  # запрос для подмножества каталога (текст-листинг и картинки согласованы → можно повторять с меньшим числом)
+        parts = []
+        if context_text:
+            parts.append(f"Контекст чата:\n{context_text}")
+        if image_desc:
+            parts.append(f"Описание референсных изображений (поданы модели на вход):\n{image_desc}")
+        if cat_used:
+            cat_lines = []
+            for it in cat_used:
+                head = f"#{it['idx']}"
+                cap = (it.get("caption") or "").strip()
+                if cap:
+                    head += f" (подпись: {cap[:120]})"
+                if not want_vision:
+                    d = (it.get("desc") or "").strip()
+                    head += f": {d}" if d else ": [описание недоступно]"
+                cat_lines.append(head)
+            parts.append("Доступные изображения из чата (можно выбрать как референсы по номерам):\n" + "\n".join(cat_lines))
+        parts.append(f"Запрос пользователя: {user_prompt}")
+        if previous_prompts:
+            joined = "\n".join(f"{i}. {p}" for i, p in enumerate(previous_prompts, 1))
+            parts.append("Это ОЧЕРЕДНОЙ вариант того же запроса. Уже придуманы такие промпты — НЕ повторяй их "
+                         "(ни идею, ни композицию, ни ракурс, ни формулировки):\n" + joined +
+                         "\n\nПридумай СВЕЖИЙ, заметно непохожий вариант — доверься своей фантазии, удиви.")
+        text_block = "\n\n".join(parts)
+        if want_vision and cat_used:  # уменьшенные копии — активной модели НАПРЯМУЮ (thumb, не оригинал → лимит размера запроса)
+            uc = [{"type": "text", "text": text_block}]
+            for it in cat_used:
+                b64 = base64.b64encode(it.get("thumb") or it["bytes"]).decode("utf-8")
+                uc.append({"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{b64}", "detail": "low"}})
+            return uc
+        return text_block
 
     # температура по режиму: -c (creative) — свободный креатив; -i (improve) — уточнение; иначе пакет/edit/дефолт
     if creative:
@@ -2275,16 +2273,26 @@ async def _build_gen_prompt(user_prompt: str, context_text: str = None, image_de
         temp = 0.4  # редактирование референса — точность
     else:
         temp = 0.7
+
+    # попытки: полный каталог → (если vision и картинок больше лимита) усечённый — провайдеры вроде Mistral/Pixtral режут ЧИСЛО картинок на запрос
+    tries = [catalog]
+    if want_vision and catalog and len(catalog) > GEN_VISION_RETRY_N:
+        tries.append(catalog[:GEN_VISION_RETRY_N])
     out = None
-    try:
-        out = await _llm_create(
-            [{"role": "system", "content": system}, {"role": "user", "content": user_content}],
-            max_tokens=ASK_MAX_TOKENS,
-            temperature=temp,
-            reasoning="none",
-        )
-    except Exception as e:
-        log("GEN", f"Активная модель не построила промпт ({e})")
+    for ti, cat_used in enumerate(tries):
+        try:
+            out = await _llm_create(
+                [{"role": "system", "content": system}, {"role": "user", "content": _compose(cat_used)}],
+                max_tokens=ASK_MAX_TOKENS, temperature=temp, reasoning="none",
+            )
+        except Exception as e:
+            log("GEN", f"Активная модель не построила промпт ({e})")
+        if out:
+            if ti > 0:
+                log("GEN", f"vision-промптер: ужал каталог до {len(cat_used)} картинок (лимит провайдера)")
+            break
+        if ti + 1 < len(tries):
+            log("GEN", f"vision-промптер не принял {len(cat_used) if cat_used else 0} картинок — повтор с {len(tries[ti + 1])}")
     if not out:  # активная недоступна/пустой ответ → DeepSeek-фолбэк (без выбора картинок)
         log("GEN", "Промпт активной моделью не получен — фолбэк на DeepSeek")
         fb = await asyncio.to_thread(_sync_image_prompt, user_prompt, context_text, image_desc, edit_mode, previous_prompts, temp)
