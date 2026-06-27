@@ -99,6 +99,9 @@ OPENROUTER_IMAGE_FALLBACK = "google/gemini-3.1-flash-image"  # запасная 
 GEN_IMAGE_MAX_INPUT = 3_000_000  # лимит входного запроса ~4.5 МБ; base64 ×1.33 → входное фото до ~3 МБ
 GEN_CTX_IMG_MAX = 20        # /gen: макс. фото-кандидатов из истории, предлагаемых ИИ на выбор (паритет с DIRECT_VISION_MAX_IMAGES)
 GEN_CTX_REF_MAX = 4         # из них ИИ реально берёт в референсы генератора (gpt-image-2/gemini тянут несколько)
+GEN_CTX_THUMB_PX = 768      # /gen: сторона уменьшенной копии фото-кандидата для ПРОМПТЕРА (vision-вход/описание) — иначе 20 полных фото бьют лимит запроса (Alibaba ~28МБ)
+GEN_PROMPT_CTX_MAX = 24000  # /gen: макс. символов контекста чата, отдаваемых промптеру (не гнать 200k токенов в LLM → таймауты)
+GEN_CATALOG_TIMEOUT = 75    # /gen: тайм-бюджет (сек) на скачивание+сжатие и на описание каталога истории
 GEN_BATCH_MAX = 20          # /gen -xN: максимум вариантов за команду (каждый ~40с–2мин)
 GEN_BATCH_CONCURRENCY = 2   # сколько вариантов генерим одновременно (баланс скорость/лимиты free-модели)
 # OCR фото в /ask по умолчанию (cost-effective вместо vision-модели; флаг -m возвращает vision).
@@ -2113,6 +2116,27 @@ async def _webp_to_png(raw: bytes) -> bytes:
     return raw
 
 
+async def _downscale_img(raw: bytes, max_side: int = GEN_CTX_THUMB_PX) -> bytes:
+    """Уменьшает картинку в JPEG (вписать в max_side²) через ffmpeg — для отправки ПРОМПТЕРУ (vision-вход
+    или описание): 20 полноразмерных фото base64 бьют лимит размера запроса (Alibaba/Qwen режут ~28МБ).
+    Только для каталога-промптера; оригинал в генератор уходит как есть. При сбое — исходные байты."""
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            "ffmpeg", "-i", "pipe:0",
+            "-vf", f"scale={max_side}:{max_side}:force_original_aspect_ratio=decrease",
+            "-f", "image2", "-c:v", "mjpeg", "-q:v", "5", "pipe:1",
+            stdin=asyncio.subprocess.PIPE,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.DEVNULL,
+        )
+        out, _ = await proc.communicate(input=raw)
+        if out and len(out) > 100:
+            return out
+    except Exception as e:
+        log("GEN", f"ffmpeg downscale не сработал: {e}")
+    return raw
+
+
 _IMAGE_PROMPT_SYSTEM = (
     "Ты — промпт-инженер для генерации изображений. По запросу пользователя (и контексту чата, если он дан) "
     "составь ОДИН финальный промпт для модели генерации изображений: детальный, визуальный (композиция, стиль, "
@@ -2201,6 +2225,10 @@ async def _build_gen_prompt(user_prompt: str, context_text: str = None, image_de
             want_vision = False
     want_vision = bool(want_vision)
 
+    # контекст промптеру кэпим: не гнать 200k-токенный лог в LLM (был 10-мин таймаут на /gen 5000); держим хвост (свежее)
+    if context_text and len(context_text) > GEN_PROMPT_CTX_MAX:
+        context_text = "[…ранний контекст обрезан…]\n" + context_text[-GEN_PROMPT_CTX_MAX:]
+
     parts = []
     if context_text:
         parts.append(f"Контекст чата:\n{context_text}")
@@ -2231,11 +2259,11 @@ async def _build_gen_prompt(user_prompt: str, context_text: str = None, image_de
     else:
         system = _IMAGE_EDIT_SYSTEM if edit_mode else _IMAGE_PROMPT_SYSTEM
 
-    if want_vision and catalog:  # картинки уходят активной модели НАПРЯМУЮ (в порядке idx)
+    if want_vision and catalog:  # уменьшенные копии уходят активной модели НАПРЯМУЮ (в порядке idx; thumb, не оригинал → лимит запроса)
         user_content = [{"type": "text", "text": text_block}]
         for it in catalog:
-            b64 = base64.b64encode(it["bytes"]).decode("utf-8")
-            user_content.append({"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{b64}", "detail": "high"}})
+            b64 = base64.b64encode(it.get("thumb") or it["bytes"]).decode("utf-8")
+            user_content.append({"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{b64}", "detail": "low"}})
     else:
         user_content = text_block
 
@@ -4591,11 +4619,12 @@ async def _gen_collect_input_images(event, reply_msg, extra_msgs=None):
     return out, skipped
 
 
-async def _gen_history_catalog(ordered, want_vision: bool, limit: int = GEN_CTX_IMG_MAX) -> list:
-    """Каталог фото из истории чата для /gen: новейшие ≤limit фото из ordered (дедуп по file-id),
-    скачанные байты + (для ТЕКСТОВОЙ активной модели) описание через медиа-модель (кэш общий с /ask).
-    Vision-модель получит сами картинки, поэтому ей описания не считаем. Нумерация idx с 1
-    (хронологически). Возвращает [{idx, mid, bytes, caption, desc}]."""
+async def _gen_history_catalog(ordered, want_vision: bool, limit: int = GEN_CTX_IMG_MAX, progress_cb=None) -> list:
+    """Каталог фото из истории чата для /gen: новейшие ≤limit фото из ordered (дедуп по file-id).
+    Для каждого: оригинал `bytes` (уйдёт В ГЕНЕРАТОР как референс) + уменьшенная копия `thumb`
+    (уйдёт ПРОМПТЕРУ — vision напрямую / для описания; без неё 20 полных фото бьют лимит запроса).
+    Для ТЕКСТОВОЙ активной модели считаем описание (медиа-модель, кэш общий с /ask). Этапы шлёт progress_cb,
+    всё под общим тайм-бюджетом GEN_CATALOG_TIMEOUT. Возвращает [{idx, mid, bytes, thumb, caption, desc}]."""
     photos, seen = [], set()
     for m in ordered:  # ordered — хронологический
         if not getattr(m, "photo", None):
@@ -4609,40 +4638,58 @@ async def _gen_history_catalog(ordered, want_vision: bool, limit: int = GEN_CTX_
     if not photos:
         return []
 
+    if progress_cb:
+        await progress_cb(f"📥 Скачиваю фото из чата ({len(photos)})…")
+
     async def _dl(m):
         try:
-            return await m.download_media(bytes)
+            raw = await m.download_media(bytes)
         except Exception as e:
             log("GEN", f"Каталог: фото id={getattr(m, 'id', '?')} не скачалось: {e}")
             return None
-    blobs = await asyncio.gather(*[_dl(m) for m in photos])
+        if not raw:
+            return None
+        return (raw, await _downscale_img(raw))  # (оригинал, уменьшенная копия)
+    try:
+        results = await asyncio.wait_for(asyncio.gather(*[_dl(m) for m in photos]), timeout=GEN_CATALOG_TIMEOUT)
+    except asyncio.TimeoutError:
+        log("GEN", "Каталог: скачивание/сжатие фото превысило тайм-бюджет — пропускаю историю-картинки")
+        return []
 
     catalog = []
-    for m, blob in zip(photos, blobs):
-        if not blob:
+    for m, res in zip(photos, results):
+        if not res:
             continue
-        catalog.append({"idx": 0, "mid": getattr(m, "id", None), "bytes": blob,
+        raw, thumb = res
+        catalog.append({"idx": 0, "mid": getattr(m, "id", None), "bytes": raw, "thumb": thumb,
                         "caption": (m.raw_text or "").strip(), "desc": None, "_m": m})
 
-    if not want_vision and catalog:  # текстовой модели нужны описания (с переиспользованием кэша /ask)
+    if not want_vision and catalog:  # текстовой модели нужны описания (по уменьшенным копиям — быстрее; кэш /ask)
         sem = asyncio.Semaphore(4)
+        done = [0]
 
         async def _desc(it):
             key = _media_key(it["_m"])
             cached = MEDIA_CACHE.get(key)
             if cached and cached not in MEDIA_FAILURE_MARKERS:
                 it["desc"] = cached
-                return
-            async with sem:
-                try:
-                    d = await describe_image(it["bytes"], caption=it["caption"])
-                except Exception as e:
-                    log("GEN", f"Каталог: описание не удалось: {e}")
-                    d = None
-            if d and d not in MEDIA_FAILURE_MARKERS and not _looks_like_refusal(d):
-                it["desc"] = d
-                _media_cache_set(key, d)
-        await asyncio.gather(*[_desc(it) for it in catalog])
+            else:
+                async with sem:
+                    try:
+                        d = await describe_image(it["thumb"], caption=it["caption"])
+                    except Exception as e:
+                        log("GEN", f"Каталог: описание не удалось: {e}")
+                        d = None
+                if d and d not in MEDIA_FAILURE_MARKERS and not _looks_like_refusal(d):
+                    it["desc"] = d
+                    _media_cache_set(key, d)
+            done[0] += 1
+            if progress_cb and done[0] % 3 == 0:
+                await progress_cb(f"🖋 Описываю фото для модели ({done[0]}/{len(catalog)})…")
+        try:
+            await asyncio.wait_for(asyncio.gather(*[_desc(it) for it in catalog]), timeout=GEN_CATALOG_TIMEOUT)
+        except asyncio.TimeoutError:
+            log("GEN", "Каталог: описания превысили тайм-бюджет — часть фото пойдёт без описания")
 
     for i, it in enumerate(catalog, 1):  # финальная нумерация 1..K, убираем временное поле
         it["idx"] = i
@@ -4909,8 +4956,7 @@ async def gen_command(event):
                     _ex, want_vision, _ctx, _nm = await _openrouter_model_info(_mid)
                 except Exception:
                     want_vision = False
-            await set_status("👁 Подбираю картинки из чата…")
-            catalog = await _gen_history_catalog(ordered, bool(want_vision))
+            catalog = await _gen_history_catalog(ordered, bool(want_vision), progress_cb=set_status)
 
         ai_prompt = bool(context_text or improve or creative or catalog)  # промпт строит активная модель
         edit_mode = bool(input_b64s) and not creative  # -c → творческий режим даже с референсом
@@ -4995,7 +5041,7 @@ async def gen_command(event):
         # ── одиночная генерация ──
         final_prompt, prompt_by_ai = user_prompt, False
         if ai_prompt:
-            await set_status(f"🧠 {get_active_model()[2]} готовит промпт…")
+            await set_status(f"🧠 {get_active_model()[2]} {'смотрит фото и пишет промпт' if catalog else 'готовит промпт'}…")
             final_prompt, sel = await _build_gen_prompt(user_prompt, context_text, image_desc, edit_mode, None, catalog or None, creative=creative, improve=improve)
             prompt_by_ai = final_prompt != user_prompt
             input_b64s = _merge_catalog_refs(input_b64s, catalog, sel)  # выбранные ИИ картинки из истории → референсы
