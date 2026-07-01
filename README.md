@@ -174,6 +174,7 @@ pip install -r requirements.txt
 | **z.ai (GLM)** | ⬜ Нет | Модели **GLM** (GLM-5.2 / 4.7 Flash / 4.6V Flash) для ответов через `/model`. GLM-4.6V Flash видит картинки (`-g`); Flash-модели бесплатны |
 | **Fireworks** | ⬜ Нет | Модели **MiniMax M3 / Nemotron 3 Ultra / DeepSeek V4 Pro / GLM-5.2 / Kimi K2.6** через `/model`. MiniMax M3 и Kimi K2.6 видят картинки (`-g`) |
 | **Sakana AI (Fugu)** | ⬜ Нет | Модели **Fugu / Fugu Ultra** через `/model` — оркестратор поверх фронтир-LLM. Обе видят картинки (`-g`), окно 1M; Fugu Ultra — мульти-агентная (сильная, может быть медленной) |
+| **LLM API FUN (Gloy AI)** | ⬜ Нет | Модели **Gloy AI 1.0 / 2.0** через `/model` (`GLOY_API_KEY`) — OpenAI-совместимый провайдер. Только текст (без картинок и без веб-поиска инструментами) |
 | **Google GenAI** | ⬜ Нет | Текстовые модели **Gemini** (3.5 Flash / 3 Flash / 3.1 Flash Lite, видят картинки `-g`) для ответов через `/model` **И голосовые ответы** в `/ask` (`/voice` + флаг `-v`, озвучка Gemini TTS). Один ключ на оба |
 | **Fish Audio** | ⬜ Нет | Альтернативный TTS-движок с большим выбором голосов (`/voice engine fish`, `/voice fish`) |
 | **LlamaCloud** | ⬜ Нет | Дешёвый **OCR фото** в `/ask` по умолчанию (текст с картинок); без него фото описывает vision-модель |
