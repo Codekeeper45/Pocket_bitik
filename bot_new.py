@@ -64,6 +64,7 @@ zai_api_key = os.getenv("ZAI_API_KEY")  # z.ai (Zhipu) — модели GLM (Ope
 fireworks_api_key = os.getenv("FIREWORKS_API_KEY")  # Fireworks AI — serverless-модели (OpenAI-совместимый, прямой Bearer)
 sakana_api_key = os.getenv("SAKANA_API_KEY")  # Sakana AI — Fugu (оркестратор поверх фронтир-LLM, OpenAI-совместимый, прямой Bearer)
 sakana_proxy = os.getenv("SAKANA_PROXY")  # необяз. прокси для Sakana (WAF режет IP датацентров; формат http(s)://[user:pass@]host:port или socks5://…)
+gloy_api_key = os.getenv("GLOY_API_KEY")  # LLM API FUN (Gloy AI) — OpenAI-совместимый, прямой Bearer
 tavily_api_key = os.getenv("TAVILY_API_KEY")  # веб-поиск/извлечение страниц для /ask (tavily.com); без ключа веб-инструменты выключены
 llama_cloud_api_key = os.getenv("LLAMA_CLOUD_API_KEY")  # OCR фото (LlamaParse); без него фото идут через vision
 
@@ -149,6 +150,7 @@ OPENAI_BASE_URL = "https://api.openai.com/v1"
 ZAI_BASE_URL = "https://api.z.ai/api/paas/v4"  # z.ai (Zhipu) международный, OpenAI-совместимый
 FIREWORKS_BASE_URL = "https://api.fireworks.ai/inference/v1"  # Fireworks AI, OpenAI-совместимый
 SAKANA_BASE_URL = "https://api.sakana.ai/v1"  # Sakana AI (Fugu), OpenAI-совместимый
+GLOY_BASE_URL = "https://api.gloyai.fun/v1"  # LLM API FUN (Gloy AI), OpenAI-совместимый
 
 # --- Google Gemini Flash TTS (голосовые ответы в /ask) ---
 GEMINI_TTS_MODEL = os.getenv("GEMINI_TTS_MODEL", "gemini-3.1-flash-tts-preview")
@@ -360,6 +362,16 @@ for _skid, _sklabel, _skctx in [
 ]:
     MODEL_REGISTRY[_skid] = ("sakana", _skid, _sklabel, _skctx, 1.15)
 SAKANA_VISION = {"fugu", "fugu-ultra"}  # обе модели Sakana принимают картинки (проверено вживую)
+
+# LLM API FUN (api.gloyai.fun) — Gloy AI. OpenAI-совместимый, прямой Bearer. Проверено вживую 2026-07:
+# текст ОК и уважает системный промпт; vision НЕ надёжен (сервер перезаливает картинку на 0x0.st → 460);
+# нативных tool_calls НЕТ (форс отдаёт JSON в content) → в /model probe не зондируем, форс-поиск → auto;
+# внутренний reasoning ест токены (нужен большой max_tokens). Окно 128k — оценка (реальное неизвестно), safety 1.15.
+for _glid, _glapi, _gllabel in [
+    ("gloy-1", "gloy_1.0", "Gloy AI 1.0"),
+    ("gloy-2", "gloy_2.0", "Gloy AI 2.0"),
+]:
+    MODEL_REGISTRY[_glid] = ("gloy", _glapi, _gllabel, 128000, 1.15)
 # Уровни глубины размышлений (reasoning_effort) OpenAI-моделей, от мощного к слабому.
 # API жёстко валидирует значение ПО МОДЕЛИ (неподдерживаемое → 400): gpt-5.4/5.5 принимают
 # none/low/medium/high/xhigh, o3 — только low/medium/high. Дефолты: 5.5 → medium, 5.4 → none, o3 → medium.
@@ -1296,6 +1308,7 @@ google_client = _GoogleGeminiClient(GOOGLE_TTS_KEYS) if GOOGLE_TTS_KEYS else Non
 zai_client = OpenAI(api_key=zai_api_key, base_url=ZAI_BASE_URL) if zai_api_key else None  # z.ai GLM (OpenAI-совместимый)
 fireworks_client = _FireworksReasoningClient(fireworks_api_key) if fireworks_api_key else None  # Fireworks (OpenAI-совместимый, с управляемым reasoning_effort)
 sakana_client = _SakanaReasoningClient(sakana_api_key) if sakana_api_key else None  # Sakana AI (Fugu, OpenAI-совместимый, reasoning high/xhigh/max)
+gloy_client = OpenAI(api_key=gloy_api_key, base_url=GLOY_BASE_URL) if gloy_api_key else None  # LLM API FUN (Gloy AI, OpenAI-совместимый; без reasoning-параметра и без tools-натива)
 
 AUTO_REPLY_BUFFERS: dict = {}
 AUTO_REPLY_TASKS: dict = {}
@@ -1425,6 +1438,8 @@ def _client_for_provider(provider):
         return fireworks_client
     if provider == "sakana":
         return sakana_client
+    if provider == "gloy":
+        return gloy_client
     if provider == "opencode":
         return opencode_reasoning_client  # путь ответов с инжектом reasoning_effort
     return opencode_client  # неизвестный провайдер — сырой клиент (фоллбэк)
@@ -3210,7 +3225,7 @@ async def ask_agentic(context: str, question: str, must_search: bool = False, ca
                 kwargs["tools"] = tools_list
                 # Sakana молча игнорит ПРИНУДИТЕЛЬНЫЙ tool_choice (без ошибки → откат на auto не сработал бы) →
                 # для него сразу auto: на auto Fugu сам вызывает поиск (проверено вживую).
-                _force_now = force_tool and MODEL_REGISTRY.get(ACTIVE_MODEL, ("",))[0] != "sakana"
+                _force_now = force_tool and MODEL_REGISTRY.get(ACTIVE_MODEL, ("",))[0] not in ("sakana", "gloy")
                 kwargs["tool_choice"] = {"type": "function", "function": {"name": force_tool_name}} if _force_now else "auto"
 
             try:
@@ -5701,6 +5716,7 @@ async def model_command(event):
                          "zai": "━━ z.ai (GLM) ━━",
                          "fireworks": "━━ Fireworks ━━",
                          "sakana": "━━ Sakana AI (Fugu) ━━",
+                         "gloy": "━━ LLM API FUN (Gloy AI) ━━",
                          "openrouter": "━━ OpenRouter (кастом) ━━"}.get(provider, f"━━ {provider} ━━")
                 lines.append(f"\n{title}")
             mark = f"▶{i}." if slug == ACTIVE_MODEL else f"{i}."
@@ -5731,8 +5747,8 @@ async def model_command(event):
         tested = 0
         for slug in slugs:
             provider, mid, _label, _ctx, _safety = MODEL_REGISTRY[slug]
-            if provider in ("oc_anthropic", "openai", "google", "zai", "fireworks", "sakana"):
-                continue  # qwen3.7-max / gpt-5.x / o3 / Gemini / Fireworks / Sakana: tools работают на auto, но forced пробник врёт (Sakana игнорит forced, reasoning-модели режут) — флаг учится на лету в реальном /ask
+            if provider in ("oc_anthropic", "openai", "google", "zai", "fireworks", "sakana", "gloy"):
+                continue  # qwen3.7-max / gpt-5.x / o3 / Gemini / Fireworks / Sakana / Gloy: tools работают на auto, но forced пробник врёт (Sakana/Gloy отдают не tool_call) — флаг учится на лету в реальном /ask
             cl = _client_for_provider(provider)
             if cl is None:
                 continue
@@ -6579,6 +6595,8 @@ _HELP_SECTIONS = {
         "   `SAKANA_API_KEY` — даёт модели **Sakana AI / Fugu** (Fugu / Fugu Ultra) для ответов\n"
         "      (`/model` → раздел «Sakana AI (Fugu)»). Обе видят картинки (`-g`), окно 1M; Fugu Ultra — мульти-агентный\n"
         "      оркестратор поверх фронтир-LLM (сильный, но может быть медленным).\n"
+        "   `GLOY_API_KEY` — даёт модели **LLM API FUN / Gloy AI** (Gloy AI 1.0 / 2.0) для ответов\n"
+        "      (`/model` → раздел «LLM API FUN (Gloy AI)»). Только текст (без картинок и без веб-поиска инструментами).\n"
         "   `GOOGLE_GENAI_API_KEY` — даёт модели **Google Gemini** (Gemini 3.5 Flash / 3.1 Flash Lite)\n"
         "      для ответов (`/model` → раздел «Google Gemini»; видят картинки `-g`) И **голосовые\n"
         "      ответы** (`/voice`, флаг `-v`) — один ключ на оба. Можно указать несколько ключей\n"
@@ -6696,7 +6714,7 @@ async def status_command(event):
     prov_name = {"deepseek": "DeepSeek", "openrouter": "OpenRouter", "opencode": "OpenCode Go",
                  "oc_anthropic": "OpenCode (нативный)", "modelgate": "ModelGate (Claude)",
                  "openai": "OpenAI", "google": "Google Gemini", "zai": "z.ai (GLM)", "fireworks": "Fireworks",
-                 "sakana": "Sakana AI (Fugu)"}.get(provider, provider)
+                 "sakana": "Sakana AI (Fugu)", "gloy": "LLM API FUN (Gloy AI)"}.get(provider, provider)
     ts = MODEL_TOOLS_SUPPORT.get(ACTIVE_MODEL)
     search_mark = "🔧 есть" if ts is True else ("🚫 нет" if ts is False else "❔ не проверен")
     sv = active_model_supports_vision()
