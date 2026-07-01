@@ -151,6 +151,7 @@ ZAI_BASE_URL = "https://api.z.ai/api/paas/v4"  # z.ai (Zhipu) междунаро
 FIREWORKS_BASE_URL = "https://api.fireworks.ai/inference/v1"  # Fireworks AI, OpenAI-совместимый
 SAKANA_BASE_URL = "https://api.sakana.ai/v1"  # Sakana AI (Fugu), OpenAI-совместимый
 GLOY_BASE_URL = "https://api.gloyai.fun/v1"  # LLM API FUN (Gloy AI), OpenAI-совместимый
+GLOY_MAX_TOKENS = 8192  # Gloy жёстко режет max_tokens ∈ [1,8192] (400 иначе) — клампим (ASK_MAX_TOKENS=16000 не пройдёт)
 
 # --- Google Gemini Flash TTS (голосовые ответы в /ask) ---
 GEMINI_TTS_MODEL = os.getenv("GEMINI_TTS_MODEL", "gemini-3.1-flash-tts-preview")
@@ -1027,6 +1028,23 @@ class _OpencodeReasoningClient:
 opencode_reasoning_client = _OpencodeReasoningClient(opencode_api_key) if opencode_api_key else None  # путь ответов (медиа — на сыром opencode_client)
 
 
+class _GloyClient:
+    """Адаптер под интерфейс OpenAI-клиента для LLM API FUN (Gloy AI, api.gloyai.fun, OpenAI-совместимый).
+    Gloy жёстко валидирует max_tokens ∈ [1,8192] (400 «max_tokens must be between 1 and 8192» иначе), а бот
+    шлёт ASK_MAX_TOKENS=16000 из /ask и agentic-loop → клампим сверху. Reasoning-параметра и tools-натива нет
+    (см. [[davinchik-gloy-provider]]) — обёртка только урезает max_tokens, остальное пробрасывает как есть."""
+
+    def __init__(self, api_key):
+        self._c = OpenAI(api_key=api_key, base_url=GLOY_BASE_URL)
+        self.chat = SimpleNamespace(completions=SimpleNamespace(create=self._create))
+
+    def _create(self, **kwargs):
+        _mt = kwargs.get("max_tokens")
+        if _mt is not None and int(_mt) > GLOY_MAX_TOKENS:
+            kwargs["max_tokens"] = GLOY_MAX_TOKENS
+        return self._c.chat.completions.create(**kwargs)
+
+
 class _DeepSeekReasoningClient:
     """Адаптер для официального DeepSeek (api.deepseek.com, OpenAI-совместимый). V4-модели: мышление
     вкл/выкл через `extra_body.thinking`, глубина — `reasoning_effort` (различимы high и max; low/medium→high,
@@ -1308,7 +1326,7 @@ google_client = _GoogleGeminiClient(GOOGLE_TTS_KEYS) if GOOGLE_TTS_KEYS else Non
 zai_client = OpenAI(api_key=zai_api_key, base_url=ZAI_BASE_URL) if zai_api_key else None  # z.ai GLM (OpenAI-совместимый)
 fireworks_client = _FireworksReasoningClient(fireworks_api_key) if fireworks_api_key else None  # Fireworks (OpenAI-совместимый, с управляемым reasoning_effort)
 sakana_client = _SakanaReasoningClient(sakana_api_key) if sakana_api_key else None  # Sakana AI (Fugu, OpenAI-совместимый, reasoning high/xhigh/max)
-gloy_client = OpenAI(api_key=gloy_api_key, base_url=GLOY_BASE_URL) if gloy_api_key else None  # LLM API FUN (Gloy AI, OpenAI-совместимый; без reasoning-параметра и без tools-натива)
+gloy_client = _GloyClient(gloy_api_key) if gloy_api_key else None  # LLM API FUN (Gloy AI, OpenAI-совместимый; клампит max_tokens≤8192, без reasoning-параметра и без tools-натива)
 
 AUTO_REPLY_BUFFERS: dict = {}
 AUTO_REPLY_TASKS: dict = {}
