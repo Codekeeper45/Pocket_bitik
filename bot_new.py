@@ -2182,8 +2182,16 @@ _IDEA_CORE = (  # общий принцип идеи — вшивается во
     "РАЗВЕЙ полно в промпте: покажи идею конкретными визуальными средствами — что происходит в кадре и как это "
     "читается, композиция и ракурс, действие и эмоции персонажей, ключевые детали-акценты, свет, атмосфера, "
     "стиль. Генератор видит только текст промпта — всё, что несёт идею, должно быть в нём прописано явно, иначе "
-    "замысел потеряется. При этом каждая деталь работает на идею: случайные предметы, лишние стили и "
-    "нагромождение эффектов её размывают. Хороший ориентир промпта ~100–180 слов."
+    "замысел потеряется.\n"
+    "САМОДОСТАТОЧНОСТЬ: зритель увидит ТОЛЬКО картинку — без подписи, запроса и контекста чата. История должна "
+    "читаться из самого изображения: покажи причину и следствие в кадре, выстрой мизансцену так, чтобы происходящее "
+    "было очевидно. Если замысел понятен лишь по подписи — постановка слабая, переделай сцену, а не подпись.\n"
+    "Если в идее есть событие или поворот — покажи его ПИК: реакция, эмоция и поза персонажей в сам момент "
+    "события, а не спокойное «до» или «после».\n"
+    "Надписи в кадре: максимум одна ключевая и короткая (несколько слов, она должна помогать читать сцену, а не "
+    "рассказывать её за картинку); фоновые тексты — отдельные короткие слова, длинные фразы генератор искажает.\n"
+    "Каждая деталь работает на идею: случайные предметы, лишние стили и нагромождение эффектов её размывают. "
+    "Хороший ориентир промпта ~100–180 слов."
 )
 
 _IMAGE_PROMPT_SYSTEM = (
@@ -2195,6 +2203,7 @@ _IMAGE_PROMPT_SYSTEM = (
     "результата, не подменяя и не сужая.\n"
     "Ответь строго в формате (без лишнего текста):\n"
     "IDEA: <одна фраза на русском — суть изображения>\n"
+    "ASPECT: <ориентация кадра под идею: 9:16 (вертикаль) | 16:9 (горизонталь) | 1:1 (квадрат)>\n"
     "PROMPT: <финальный английский промпт>"
 )
 
@@ -2206,6 +2215,7 @@ _IMAGE_IMPROVE_SYSTEM = (
     "формулировку сильной и понятной генератору.\n"
     "Ответь строго в формате (без лишнего текста):\n"
     "IDEA: <одна фраза на русском — суть запроса пользователя>\n"
+    "ASPECT: <ориентация кадра под идею: 9:16 (вертикаль) | 16:9 (горизонталь) | 1:1 (квадрат)>\n"
     "PROMPT: <финальный английский промпт>"
 )
 
@@ -2218,6 +2228,7 @@ _IMAGE_EDIT_SYSTEM = (
     "unchanged», «не меняй остальное» и подобных) и не тоннелируй запрос — живо опиши желаемую картинку.\n"
     "Ответь строго в формате (без лишнего текста):\n"
     "IDEA: <одна фраза на русском — суть изображения>\n"
+    "ASPECT: <ориентация кадра под идею: 9:16 (вертикаль) | 16:9 (горизонталь) | 1:1 (квадрат)>\n"
     "PROMPT: <финальный английский промпт>"
 )
 
@@ -2246,8 +2257,9 @@ _IMAGE_GEN_WITH_REFS_SYSTEM = (
     "(нужно лицо конкретного человека, и оно есть лишь там). По возможности опирайся на органичные фото других "
     "участников.\n"
     "Если подходящих фото нет — оставь список референсов пустым.\n"
-    "Ответь СТРОГО в формате (три строки, без лишнего текста):\n"
+    "Ответь СТРОГО в формате (четыре строки, без лишнего текста):\n"
     "IDEA: <одна фраза на русском — суть изображения>\n"
+    "ASPECT: <ориентация кадра под идею: 9:16 (вертикаль) | 16:9 (горизонталь) | 1:1 (квадрат)>\n"
     "REFS: <выбранные номера, каждый с коротким «зачем» в скобках, напр. 3 (лицо Димы), 7 (стиль неона); или пусто>\n"
     "PROMPT: <финальный английский промпт>"
 )
@@ -2419,24 +2431,29 @@ async def _build_gen_prompt(user_prompt: str, context_text: str = None, image_de
     if not out:  # активная недоступна/пустой ответ → DeepSeek-фолбэк (без выбора картинок)
         log("GEN", "Промпт активной моделью не получен — фолбэк на DeepSeek")
         fb = await asyncio.to_thread(_sync_image_prompt, user_prompt, context_text, image_desc, edit_mode, previous_prompts, temp)
-        p, _r, idea = _parse_gen_prompt_out(fb, None)  # фолбэк ходит с теми же system → тоже IDEA/PROMPT
-        return (p or user_prompt), [], idea
+        p, _r, idea, asp = _parse_gen_prompt_out(fb, None)  # фолбэк ходит с теми же system → тоже IDEA/PROMPT
+        return (p or user_prompt), [], idea, asp
 
-    prompt_text, refs, idea = _parse_gen_prompt_out(_strip_think(out).strip(), catalog)
-    return (prompt_text or user_prompt), refs, idea
+    prompt_text, refs, idea, asp = _parse_gen_prompt_out(_strip_think(out).strip(), catalog)
+    return (prompt_text or user_prompt), refs, idea, asp
 
 
 def _parse_gen_prompt_out(out: str, catalog: list) -> tuple:
-    """Парсит ответ промптера /gen формата IDEA:/REFS:/PROMPT: → (prompt, refs, idea).
+    """Парсит ответ промптера /gen формата IDEA:/ASPECT:/REFS:/PROMPT: → (prompt, refs, idea, aspect).
     refs — [(idx, reason|None), …] по каталогу (валидация диапазона, дедуп, кап GEN_CTX_REF_MAX);
-    без catalog REFS не ищем. Нет PROMPT: — промптом считаем текст без служебных строк."""
+    без catalog REFS не ищем. aspect — 9:16|16:9|1:1 или None (применяется, если юзер не задал -v/-h/-sq).
+    Нет PROMPT: — промптом считаем текст без служебных строк."""
     out = (out or "").strip()
     if not out:
-        return "", [], None
+        return "", [], None, None
     idea = None
     m_idea = re.search(r"(?im)^\s*IDEA:\s*(.+)$", out)
     if m_idea:
         idea = m_idea.group(1).strip() or None
+    aspect = None
+    m_asp = re.search(r"(?im)^\s*ASPECT:\s*([0-9]+:[0-9]+)", out)
+    if m_asp and m_asp.group(1) in ("9:16", "16:9", "1:1"):
+        aspect = m_asp.group(1)
     refs = []
     m_refs = re.search(r"(?im)^\s*REFS:\s*(.*)$", out) if catalog else None
     if m_refs:
@@ -2450,8 +2467,8 @@ def _parse_gen_prompt_out(out: str, catalog: list) -> tuple:
     if m_prompt:
         prompt_text = m_prompt.group(1).strip()
     else:  # формат не соблюдён — выкидываем служебные строки, остальное считаем промптом
-        prompt_text = re.sub(r"(?im)^\s*(IDEA|REFS):.*$", "", out).strip()
-    return prompt_text, refs, idea
+        prompt_text = re.sub(r"(?im)^\s*(IDEA|REFS|ASPECT):.*$", "", out).strip()
+    return prompt_text, refs, idea, aspect
 
 
 _IMAGE_REPAIR_SYSTEM = (
@@ -5270,7 +5287,7 @@ async def gen_command(event):
                     log("GEN", f"Дневной лимит исчерпан — останавливаю пакет на варианте {i + 1}/{batch_count}")
                     break
                 cat_i = (catalog or None) if i == 0 else None  # каталог (и картинки vision) — только 1-му варианту
-                fp, sel, idea_i = await _build_gen_prompt(user_prompt, context_text, image_desc, edit_mode, prompts, cat_i, creative=creative, improve=improve, force_desc=force_desc, past_gens=past_gens)
+                fp, sel, idea_i, asp_i = await _build_gen_prompt(user_prompt, context_text, image_desc, edit_mode, prompts, cat_i, creative=creative, improve=improve, force_desc=force_desc, past_gens=past_gens)
                 by_ai = fp != user_prompt
                 if i == 0 and sel:  # выбор референсов из истории — общий для всего пакета
                     input_b64s, _used = _merge_catalog_refs(input_b64s, catalog, [k for k, _ in sel])
@@ -5278,6 +5295,9 @@ async def gen_command(event):
                         gen_refs_line = _gen_refs_line(await event.get_chat(), catalog, _used, reasons=dict(sel))
                     except Exception:
                         gen_refs_line = None
+                if i == 0 and aspect_ratio is None and asp_i:  # ориентацию под идею выбирает модель (флаг юзера важнее); общая на пакет
+                    aspect_ratio = asp_i
+                    log("GEN", f"Ориентация от модели: {asp_i}")
                 log("GEN", f"Вариант {i + 1}/{batch_count}: промпт by_ai={by_ai} refs={len(sel) if i == 0 else '—'} idea={idea_i or '—'} len={len(fp)}")
                 prompts.append(fp)
                 tasks.append(asyncio.create_task(_gen_and_send(i, fp, by_ai, idea_i)))
@@ -5300,8 +5320,11 @@ async def gen_command(event):
         final_prompt, prompt_by_ai, gen_idea = user_prompt, False, None
         if ai_prompt:
             await set_status(f"🧠 {get_active_model()[2]} {'смотрит фото и пишет промпт' if catalog else 'готовит промпт'}…")
-            final_prompt, sel, gen_idea = await _build_gen_prompt(user_prompt, context_text, image_desc, edit_mode, None, catalog or None, creative=creative, improve=improve, force_desc=force_desc, past_gens=past_gens)
+            final_prompt, sel, gen_idea, gen_asp = await _build_gen_prompt(user_prompt, context_text, image_desc, edit_mode, None, catalog or None, creative=creative, improve=improve, force_desc=force_desc, past_gens=past_gens)
             prompt_by_ai = final_prompt != user_prompt
+            if aspect_ratio is None and gen_asp:  # ориентацию под идею выбирает модель; явный флаг -v/-h/-sq важнее
+                aspect_ratio = gen_asp
+                log("GEN", f"Ориентация от модели: {gen_asp}")
             input_b64s, _used = _merge_catalog_refs(input_b64s, catalog, [k for k, _ in sel])  # выбранные ИИ картинки из истории → референсы
             if _used:
                 try:
@@ -6702,6 +6725,8 @@ _HELP_SECTIONS = {
         "   ДОСЛОВНО (ни расширения, ни истории-картинок). `/gen -r a cat in a hat, watercolor`.\n"
         "\n"
         "**Ориентация (точное соотношение сторон):** `-v` вертикаль 9:16 · `-h` горизонталь 16:9 · `-sq` квадрат 1:1\n"
+        "   Без флага ИИ-промптер САМ выбирает ориентацию под идею (вертикаль для персонажа в рост,\n"
+        "   горизонталь для пейзажа и т.п.); твой флаг всегда важнее.\n"
         "   `/gen -v аниме девушка у окна` · `/gen -h пейзаж гор` · комбинируется: `/gen -c -v <ссылка> …`\n"
         "\n"
         "**Качество (разрешение):** по умолчанию **2K** (2048²). `-4k` максимум (медленнее, дороже), `-1k` быстрее/мельче.\n"
