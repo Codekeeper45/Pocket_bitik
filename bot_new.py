@@ -2308,7 +2308,7 @@ def _sync_image_prompt(user_prompt: str, context_text: str = None, image_desc: s
 async def _build_gen_prompt(user_prompt: str, context_text: str = None, image_desc: str = None,
                             edit_mode: bool = False, previous_prompts: list = None,
                             catalog: list = None, creative: bool = False, improve: bool = False,
-                            force_desc: bool = False) -> tuple:
+                            force_desc: bool = False, past_gens: list = None) -> tuple:
     """Финальный промпт генерации на АКТИВНОЙ модели-ответчике (/model). Vision-модель видит каталожные
     картинки из истории чата напрямую, текстовая — по их описаниям (медиа-модель). При наличии catalog ИИ
     может выбрать референсы по номерам — возвращаем (промпт, [выбранные idx]); иначе ([], только промпт).
@@ -2359,6 +2359,13 @@ async def _build_gen_prompt(user_prompt: str, context_text: str = None, image_de
                     head += f": {d}" if d else ": [описание недоступно]"
                 cat_lines.append(head)
             parts.append("Доступные изображения из чата (можно выбрать как референсы по номерам):\n" + "\n".join(cat_lines))
+        if past_gens:  # прошлые генерации из лога чата (их идеи/промпты модель видит в контексте) — анти-повтор
+            joined = "\n".join(f"- {p}" for p in past_gens)
+            parts.append("УЖЕ СГЕНЕРИРОВАНО РАНЕЕ в этом чате (идеи прошлых генераций):\n" + joined +
+                         "\nПридумай ДРУГОЕ: не переиспользуй из этого списка ни идею, ни сюжет, ни место действия, "
+                         "ни ключевые объекты и завязку — даже частично и даже если тема запроса похожа. Считай эти "
+                         "образы израсходованными. Исключение: пользователь явно просит повторить/переделать/сделать "
+                         "вариацию.")
         parts.append(f"Запрос пользователя: {user_prompt}")
         if mode_line:
             parts.append(mode_line)
@@ -5164,6 +5171,28 @@ async def gen_command(event):
             cat_timeout = GEN_CATALOG_TIMEOUT if want_vision else GEN_DESC_TIMEOUT
             catalog = await _gen_history_catalog(ordered, want_vision, limit=cand_limit, timeout=cat_timeout, progress_cb=set_status)
 
+        # ── анти-повтор: подписи прошлых генераций (💡 идея / 🎨 промпт, шлёт сам юзербот → m.out) лежат в логе
+        # как обычные сообщения — модель охотно берёт оттуда готовую идею и повторяет уже сделанное. Собираем их
+        # явным списком «уже сгенерировано» для промптера ──
+        past_gens, _pg_seen = [], set()
+        if n > 0 and not raw:
+            for m in ordered:
+                if not getattr(m, "out", False):
+                    continue
+                t = (m.raw_text or "").strip()
+                if t.startswith("💡"):  # подпись «💡 идея\n🎨 промпт» — идея (первая строка) самодостаточна
+                    pg = t.splitlines()[0].lstrip("💡").strip()[:300]
+                elif t.startswith("🎨"):  # старые подписи без идеи — начало промпта
+                    pg = t.lstrip("🎨").strip()[:200]
+                else:
+                    continue
+                if pg and pg not in _pg_seen:
+                    _pg_seen.add(pg)
+                    past_gens.append(pg)
+            past_gens = past_gens[-8:]  # последние 8 — достаточно против повтора, не раздувая запрос
+            if past_gens:
+                log("GEN", f"Анти-повтор: в окне {len(past_gens)} прошлых генераций — передаю промптеру список «не повторяй»")
+
         gen_refs_line = None  # строка «Референсы:» со ссылками на сообщения-источники (заполнится, если ИИ возьмёт фото из истории)
         ai_prompt = (not raw) and bool(context_text or improve or creative or catalog)  # -r → ИИ не строит промпт (literal)
         edit_mode = bool(input_b64s) and not creative  # -c → творческий режим даже с референсом
@@ -5223,7 +5252,7 @@ async def gen_command(event):
                     log("GEN", f"Дневной лимит исчерпан — останавливаю пакет на варианте {i + 1}/{batch_count}")
                     break
                 cat_i = (catalog or None) if i == 0 else None  # каталог (и картинки vision) — только 1-му варианту
-                fp, sel, idea_i = await _build_gen_prompt(user_prompt, context_text, image_desc, edit_mode, prompts, cat_i, creative=creative, improve=improve, force_desc=force_desc)
+                fp, sel, idea_i = await _build_gen_prompt(user_prompt, context_text, image_desc, edit_mode, prompts, cat_i, creative=creative, improve=improve, force_desc=force_desc, past_gens=past_gens)
                 by_ai = fp != user_prompt
                 if i == 0 and sel:  # выбор референсов из истории — общий для всего пакета
                     input_b64s, _used = _merge_catalog_refs(input_b64s, catalog, [k for k, _ in sel])
@@ -5253,7 +5282,7 @@ async def gen_command(event):
         final_prompt, prompt_by_ai, gen_idea = user_prompt, False, None
         if ai_prompt:
             await set_status(f"🧠 {get_active_model()[2]} {'смотрит фото и пишет промпт' if catalog else 'готовит промпт'}…")
-            final_prompt, sel, gen_idea = await _build_gen_prompt(user_prompt, context_text, image_desc, edit_mode, None, catalog or None, creative=creative, improve=improve, force_desc=force_desc)
+            final_prompt, sel, gen_idea = await _build_gen_prompt(user_prompt, context_text, image_desc, edit_mode, None, catalog or None, creative=creative, improve=improve, force_desc=force_desc, past_gens=past_gens)
             prompt_by_ai = final_prompt != user_prompt
             input_b64s, _used = _merge_catalog_refs(input_b64s, catalog, [k for k, _ in sel])  # выбранные ИИ картинки из истории → референсы
             if _used:
