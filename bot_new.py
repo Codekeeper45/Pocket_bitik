@@ -4709,6 +4709,14 @@ def _is_attached_photo(msg):
     return not isinstance(getattr(msg, "media", None), MessageMediaWebPage)
 
 
+def _is_attached_image_doc(msg):
+    """Картинка, отправленная ФАЙЛОМ/документом (webp/png/jpeg — в т.ч. стикеры и старые генерации бота,
+    уходившие как .webp): у таких msg.photo пуст, поэтому отдельная проверка по mime документа."""
+    doc = getattr(msg, "document", None)
+    mime = (getattr(doc, "mime_type", None) or "").lower() if doc else ""
+    return mime in ("image/webp", "image/png", "image/jpeg") and (getattr(doc, "size", 0) or 0) <= 15_000_000
+
+
 async def _gen_collect_input_images(event, reply_msg, extra_msgs=None):
     """Референс-фото для /gen: из самого сообщения с командой (включая его альбом), из реплая
     (включая альбом реплая) и из extra_msgs (ссылки — ТОЛЬКО указанное фото, без альбома).
@@ -4720,7 +4728,7 @@ async def _gen_collect_input_images(event, reply_msg, extra_msgs=None):
         if msg is None:
             return
         batch = []
-        if _is_attached_photo(msg) and msg.id not in seen:
+        if (_is_attached_photo(msg) or _is_attached_image_doc(msg)) and msg.id not in seen:
             seen.add(msg.id)
             batch.append(msg)
         gid = getattr(msg, "grouped_id", None)
@@ -4738,7 +4746,7 @@ async def _gen_collect_input_images(event, reply_msg, extra_msgs=None):
     await _add_with_album(event.message)  # сначала мои приложенные фото, потом фото реплая
     await _add_with_album(reply_msg)
     for m in (extra_msgs or []):  # ссылки-референсы: ровно указанное фото, без альбома
-        if m is not None and getattr(m, "photo", None) and m.id not in seen:
+        if m is not None and (getattr(m, "photo", None) or _is_attached_image_doc(m)) and m.id not in seen:
             seen.add(m.id)
             sources.append(m)
     out, total, skipped = [], 0, 0
@@ -4753,6 +4761,8 @@ async def _gen_collect_input_images(event, reply_msg, extra_msgs=None):
             img = None
         if not img:
             continue
+        if img[:4] == b"RIFF" and img[8:12] == b"WEBP":  # webp-документ/стикер → png (генератор webp на входе не ждёт)
+            img = await _webp_to_png(img)
         if total + len(img) > GEN_IMAGE_MAX_INPUT:
             skipped += 1
             continue
@@ -5102,8 +5112,8 @@ async def gen_command(event):
     if not input_b64s and not raw and not improve:
         creative = True
 
-    if is_owner and not _is_attached_photo(event.message):
-        await event.delete()  # чистим команду; ОСТАВЛЯЕМ только при реально приложенном фото-референсе
+    if is_owner and not (_is_attached_photo(event.message) or _is_attached_image_doc(event.message)):
+        await event.delete()  # чистим команду; ОСТАВЛЯЕМ только при реально приложенном фото/картинке-файле
         # (веб-превью t.me-ссылки — не вложение, поэтому команду со ссылками тоже удаляем)
     status = await client.send_message(event.chat_id, "🎨 Готовлю генерацию…")
 
