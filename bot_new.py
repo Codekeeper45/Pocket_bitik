@@ -2380,7 +2380,7 @@ async def _build_gen_prompt(user_prompt: str, context_text: str = None, image_de
     if creative:
         temp = 1.1
     elif improve:
-        temp = 0.45  # точная переформулировка — без творческого дрейфа
+        temp = 0.7  # переформулировка: живой язык, но без подмены идеи (0.45 давал слишком сухие формулировки)
     elif previous_prompts:
         temp = 1.0  # пакет: разнообразие вариантов
     elif edit_mode and not catalog:
