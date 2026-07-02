@@ -1930,13 +1930,16 @@ def _looks_like_refusal(text: str) -> bool:
     return any(m in low for m in _REFUSAL_MARKERS)
 
 
-async def describe_image(image_bytes: bytes, caption: str = "", model: str = None, detail: str = "high") -> str:
+async def describe_image(image_bytes: bytes, caption: str = "", model: str = None, detail: str = "high", prompt: str = None) -> str:
     model = model or get_active_media_model()
     media_client = _client_for_media_model(model)  # OpenRouter или OpenCode-Go по id модели
     if not media_client:
         return caption or "[изображение]"
     b64 = base64.b64encode(image_bytes).decode("utf-8")
-    prompt_text = f"Опиши это изображение подробно на русском языке. Подпись к фото: \"{caption}\"" if caption else "Опиши это изображение подробно на русском языке."
+    if prompt:  # кастомная инструкция (напр. _GEN_DESC_PROMPT для каталога /gen)
+        prompt_text = f"{prompt}\nПодпись к фото: \"{caption}\"" if caption else prompt
+    else:
+        prompt_text = f"Опиши это изображение подробно на русском языке. Подпись к фото: \"{caption}\"" if caption else "Опиши это изображение подробно на русском языке."
     for attempt in range(3):
         try:
             response = await asyncio.to_thread(
@@ -2174,41 +2177,62 @@ async def _downscale_img(raw: bytes, max_side: int = GEN_CTX_THUMB_PX) -> bytes:
     return raw
 
 
+_IDEA_CORE = (  # общий принцип идеи — вшивается во все промптеры /gen
+    "Главное — ОДНА ясная идея изображения: что зритель поймёт с первого взгляда. Сначала найди её, потом пиши "
+    "промпт, где каждая деталь работает на эту идею — композиция, свет, стиль подчинены ей. Детали ради деталей "
+    "(случайные предметы, лишние стили, нагромождение эффектов) размывают картинку — хороший ориентир промпта "
+    "~60–120 слов."
+)
+
 _IMAGE_PROMPT_SYSTEM = (
     "Ты — креативный арт-директор и промпт-инженер с собственным вкусом и художественным видением. "
-    "Преврати запрос пользователя (и контекст чата, если дан) в ОДИН сильный финальный промпт на английском для "
-    "модели генерации изображений — живой и визуальный: композиция, стиль, свет, настроение, выразительные детали.\n"
-    "Подстройся под запрос. Если он ОТКРЫТЫЙ или общий — добавь СВОЁ видение: выбери стиль и атмосферу, придумай "
-    "сильный неожиданный образ, удиви; ты соавтор и помогаешь пользователю. Если запрос КОНКРЕТНЫЙ и подробный — "
-    "следуй его замыслу и РАСШИРЯЙ его — добавляй детали, атмосферу и проработку в духе запроса, доводи до "
-    "выразительного результата, не подменяя саму идею пользователя своей и не сужая её.\n"
-    "Верни ТОЛЬКО промпт, без пояснений, кавычек и преамбул."
+    "Преврати запрос пользователя (и контекст чата, если дан) в ОДИН финальный промпт на английском для "
+    "модели генерации изображений.\n" + _IDEA_CORE + "\n"
+    "Подстройся под запрос. Если он ОТКРЫТЫЙ или общий — идея твоя: придумай сильный неожиданный образ, удиви; "
+    "ты соавтор. Если запрос КОНКРЕТНЫЙ — идея пользователя: следуй замыслу и доводи его до выразительного "
+    "результата, не подменяя и не сужая.\n"
+    "Ответь строго в формате (без лишнего текста):\n"
+    "IDEA: <одна фраза на русском — суть изображения>\n"
+    "PROMPT: <финальный английский промпт>"
+)
+
+_IMAGE_IMPROVE_SYSTEM = (
+    "Ты — промпт-инженер для модели генерации изображений. Пользователь уже придумал, что хочет увидеть — твоя "
+    "задача ТОЧНО ПЕРЕФОРМУЛИРОВАТЬ его запрос в качественный визуальный промпт на английском: ясный визуальный "
+    "язык, конкретика вместо расплывчатости, композиция/свет/стиль — только там, где пользователь их подразумевает. "
+    "Своих идей, новых объектов и сюжетов не добавляй — идея целиком принадлежит пользователю, ты лишь делаешь её "
+    "формулировку сильной и понятной генератору.\n"
+    "Ответь строго в формате (без лишнего текста):\n"
+    "IDEA: <одна фраза на русском — суть запроса пользователя>\n"
+    "PROMPT: <финальный английский промпт>"
 )
 
 _IMAGE_EDIT_SYSTEM = (
     "Ты — креативный арт-директор. Пользователь дал референсное изображение (его описание/само фото ниже) и "
-    "запрос, что с ним сделать. Составь ОДИН промпт на английском для image-to-image: возьми референс за основу, "
-    "исполни запрос пользователя и творчески РАСШИРЬ его — добавляй уместные детали, атмосферу, свет, проработку, "
-    "доводи идею до выразительного результата, а не сухо-буквального. Опирайся на референс и держи его суть и "
-    "узнаваемость, но НЕ пиши служебных оговорок («keep everything else unchanged», «не меняй остальное» и "
-    "подобных) и не тоннелируй запрос — просто живо и полно опиши желаемую картинку. Верни ТОЛЬКО промпт на "
-    "английском, без пояснений и кавычек."
+    "запрос, что с ним сделать. Составь ОДИН промпт на английском для image-to-image: возьми референс за основу и "
+    "исполни запрос пользователя.\n" + _IDEA_CORE + "\n"
+    "Развивай запрос в его же духе — атмосфера, свет, проработка, — доводя идею до выразительного результата, а не "
+    "сухо-буквального. Держи суть и узнаваемость референса, но НЕ пиши служебных оговорок («keep everything else "
+    "unchanged», «не меняй остальное» и подобных) и не тоннелируй запрос — живо опиши желаемую картинку.\n"
+    "Ответь строго в формате (без лишнего текста):\n"
+    "IDEA: <одна фраза на русском — суть изображения>\n"
+    "PROMPT: <финальный английский промпт>"
 )
 
 _IMAGE_GEN_WITH_REFS_SYSTEM = (
     "Ты — креативный арт-директор и промпт-инженер с собственным вкусом, работающий по логу чата. Тебе дан "
     "контекст чата и набор ДОСТУПНЫХ изображений из чата, пронумерованных #1, #2, … (показаны напрямую и/или их "
-    "описания). Их можно подать генератору как референсы. Составь ОДИН сильный финальный визуальный промпт на "
-    "английском.\n"
-    "Видение: если запрос ОТКРЫТЫЙ — добавь своё художественное видение, придумай сильный образ, удиви и помоги; "
-    "если запрос КОНКРЕТНЫЙ — следуй замыслу и РАСШИРЯЙ его деталями и проработкой в духе запроса, не подменяя "
-    "идею пользователя своей и не сужая её.\n"
+    "описания). Их можно подать генератору как референсы. Составь ОДИН финальный визуальный промпт на "
+    "английском.\n" + _IDEA_CORE + "\n"
+    "Видение: если запрос ОТКРЫТЫЙ — идея твоя: придумай сильный образ, удиви и помоги; если запрос КОНКРЕТНЫЙ — "
+    "идея пользователя: следуй замыслу и доводи его, не подменяя и не сужая.\n"
     "Референсы выбирай по номерам и в промпте явно говори, что с ними делать (взять персонажа/лицо, перенять стиль, "
     "использовать как фон, объединить).\n"
-    "ОТБОР (качество важнее количества): каждый референс должен НЕСТИ ИДЕЮ — конкретного персонажа/лицо, "
-    "узнаваемый стиль, ключевой объект или фон, — а не быть «просто похожим» или случайным. Среди десятков "
-    "доступных фото выбирай придирчиво: обычно достаточно ДО 5 референсов, чтобы донести идею; не набирай больше "
-    "без реальной необходимости (исключение — когда нужно несколько РАЗНЫХ персонажей, тогда по фото на каждого).\n"
+    "ОТБОР (качество важнее количества): каждый референс должен работать на идею — конкретный персонаж/лицо, "
+    "узнаваемый стиль, ключевой объект или фон, — а не быть «просто похожим» или случайным. Выбирай придирчиво: "
+    "обычно хватает до 5 референсов (исключение — несколько РАЗНЫХ персонажей, тогда по фото на каждого). "
+    "Скриншоты переписок и интерфейсов, превью ссылок, мемы с текстом и прочие служебные картинки как референсы "
+    "не годятся — если только запрос не про них самих.\n"
     "ПЕРСОНАЖИ: если в запросе люди/участники чата («нарисуй нас», «чатеры», "
     "ники/@упоминания, «пожелай им…»), а среди фото есть их — возьми эти фото и укажи использовать ВНЕШНОСТЬ/ЛИЦО с "
     "конкретного номера (напр. 'use the face and appearance from image #3'): это для узнаваемости, не выдумывай "
@@ -2219,9 +2243,21 @@ _IMAGE_GEN_WITH_REFS_SYSTEM = (
     "(нужно лицо конкретного человека, и оно есть лишь там). По возможности опирайся на органичные фото других "
     "участников.\n"
     "Если подходящих фото нет — оставь список референсов пустым.\n"
-    "Ответь СТРОГО в формате (две строки, без лишнего текста):\n"
-    "REFS: <номера выбранных через запятую, или пусто>\n"
+    "Ответь СТРОГО в формате (три строки, без лишнего текста):\n"
+    "IDEA: <одна фраза на русском — суть изображения>\n"
+    "REFS: <выбранные номера, каждый с коротким «зачем» в скобках, напр. 3 (лицо Димы), 7 (стиль неона); или пусто>\n"
     "PROMPT: <финальный английский промпт>"
+)
+
+_GEN_DESC_PROMPT = (  # компакт-описание кандидата каталога /gen: тип + визуальная суть (по нему текстовая модель отбирает референсы)
+    "Кратко разметь изображение для отбора референсов генерации. Ответь строго в формате:\n"
+    "ТИП: <одно из: скриншот | мем | фото людей | фото сцены | арт | прочее>\n"
+    "СУТЬ: <1–2 фразы на русском — что видно визуально; текст на картинке не пересказывай>\n"
+    "ЛЮДИ: <кто виден и насколько узнаваемо лицо (крупно/в профиль/со спины), или «нет»>\n"
+    "«скриншот» — снимок ЭКРАНА, где главное — интерфейс: переписка, сайт, меню, плеер, таблица. "
+    "Обычная фотография человека или места (в т.ч. с веб-камеры, селфи, вертикалка из сторис) — это «фото людей» "
+    "или «фото сцены», НЕ скриншот. Если на изображении реальный человек с различимым лицом — это «фото людей». "
+    "«мем» — картинка-шутка с накладным текстом; «арт» — рисунок/рендер/сгенерированное."
 )
 
 
@@ -2284,7 +2320,20 @@ async def _build_gen_prompt(user_prompt: str, context_text: str = None, image_de
             want_vision = False
     want_vision = bool(want_vision) and not force_desc  # -m → промптеру даём описания, картинки напрямую не шлём
 
-    system = _IMAGE_GEN_WITH_REFS_SYSTEM if catalog else (_IMAGE_EDIT_SYSTEM if edit_mode else _IMAGE_PROMPT_SYSTEM)
+    if catalog:
+        system = _IMAGE_GEN_WITH_REFS_SYSTEM
+    elif edit_mode:
+        system = _IMAGE_EDIT_SYSTEM
+    elif improve:
+        system = _IMAGE_IMPROVE_SYSTEM  # -i: чистая переформулировка без своих идей
+    else:
+        system = _IMAGE_PROMPT_SYSTEM
+    # режим-строка для каталожного system (он один на оба режима — уточняем поведение)
+    mode_line = None
+    if catalog and improve:
+        mode_line = "Режим: точная переформулировка — не добавляй своих идей, референсы бери только явно требуемые запросом."
+    elif catalog and creative:
+        mode_line = "Режим: своё видение — но вокруг одной ясной идеи."
 
     def _compose(cat_used):  # запрос для подмножества каталога (текст-листинг и картинки согласованы → можно повторять с меньшим числом)
         parts = []
@@ -2302,11 +2351,13 @@ async def _build_gen_prompt(user_prompt: str, context_text: str = None, image_de
                 if cap:
                     head += f" (подпись: {cap[:120]})"
                 if not want_vision:
-                    d = (it.get("desc") or "").strip()
+                    d = re.sub(r"\s*\n\s*", " · ", (it.get("desc") or "").strip())  # ТИП/СУТЬ/ЛЮДИ — в одну строку листинга
                     head += f": {d}" if d else ": [описание недоступно]"
                 cat_lines.append(head)
             parts.append("Доступные изображения из чата (можно выбрать как референсы по номерам):\n" + "\n".join(cat_lines))
         parts.append(f"Запрос пользователя: {user_prompt}")
+        if mode_line:
+            parts.append(mode_line)
         if previous_prompts:
             joined = "\n".join(f"{i}. {p}" for i, p in enumerate(previous_prompts, 1))
             parts.append("Это ОЧЕРЕДНОЙ вариант того же запроса. Уже придуманы такие промпты — НЕ повторяй их "
@@ -2325,7 +2376,7 @@ async def _build_gen_prompt(user_prompt: str, context_text: str = None, image_de
     if creative:
         temp = 1.1
     elif improve:
-        temp = 0.7
+        temp = 0.45  # точная переформулировка — без творческого дрейфа
     elif previous_prompts:
         temp = 1.0  # пакет: разнообразие вариантов
     elif edit_mode and not catalog:
@@ -2355,24 +2406,39 @@ async def _build_gen_prompt(user_prompt: str, context_text: str = None, image_de
     if not out:  # активная недоступна/пустой ответ → DeepSeek-фолбэк (без выбора картинок)
         log("GEN", "Промпт активной моделью не получен — фолбэк на DeepSeek")
         fb = await asyncio.to_thread(_sync_image_prompt, user_prompt, context_text, image_desc, edit_mode, previous_prompts, temp)
-        return fb, []
+        p, _r, idea = _parse_gen_prompt_out(fb, None)  # фолбэк ходит с теми же system → тоже IDEA/PROMPT
+        return (p or user_prompt), [], idea
 
-    out = _strip_think(out).strip()
-    refs, prompt_text = [], out
-    if catalog:  # вытаскиваем REFS:/PROMPT:
-        m_refs = re.search(r"(?im)^\s*REFS:\s*(.*)$", out)
-        m_prompt = re.search(r"(?is)PROMPT:\s*(.+)$", out)
-        if m_refs:
-            for tok in re.findall(r"\d+", m_refs.group(1)):
-                k = int(tok)
-                if any(it["idx"] == k for it in catalog) and k not in refs:
-                    refs.append(k)
-            refs = refs[:GEN_CTX_REF_MAX]
-        if m_prompt:
-            prompt_text = m_prompt.group(1).strip()
-        elif m_refs:  # нет явного PROMPT: — выкидываем строку REFS, остальное считаем промптом
-            prompt_text = re.sub(r"(?im)^\s*REFS:.*$", "", out).strip()
-    return (prompt_text or user_prompt), refs
+    prompt_text, refs, idea = _parse_gen_prompt_out(_strip_think(out).strip(), catalog)
+    return (prompt_text or user_prompt), refs, idea
+
+
+def _parse_gen_prompt_out(out: str, catalog: list) -> tuple:
+    """Парсит ответ промптера /gen формата IDEA:/REFS:/PROMPT: → (prompt, refs, idea).
+    refs — [(idx, reason|None), …] по каталогу (валидация диапазона, дедуп, кап GEN_CTX_REF_MAX);
+    без catalog REFS не ищем. Нет PROMPT: — промптом считаем текст без служебных строк."""
+    out = (out or "").strip()
+    if not out:
+        return "", [], None
+    idea = None
+    m_idea = re.search(r"(?im)^\s*IDEA:\s*(.+)$", out)
+    if m_idea:
+        idea = m_idea.group(1).strip() or None
+    refs = []
+    m_refs = re.search(r"(?im)^\s*REFS:\s*(.*)$", out) if catalog else None
+    if m_refs:
+        # «3 (лицо Димы), 7 (стиль неона)» ИЛИ голые «3, 7» — причина опциональна
+        for num, reason in re.findall(r"(\d+)\s*(?:\(([^)]*)\))?", m_refs.group(1)):
+            k = int(num)
+            if any(it["idx"] == k for it in catalog) and all(r[0] != k for r in refs):
+                refs.append((k, (reason or "").strip() or None))
+        refs = refs[:GEN_CTX_REF_MAX]
+    m_prompt = re.search(r"(?is)PROMPT:\s*(.+)$", out)
+    if m_prompt:
+        prompt_text = m_prompt.group(1).strip()
+    else:  # формат не соблюдён — выкидываем служебные строки, остальное считаем промптом
+        prompt_text = re.sub(r"(?im)^\s*(IDEA|REFS):.*$", "", out).strip()
+    return prompt_text, refs, idea
 
 
 _IMAGE_REPAIR_SYSTEM = (
@@ -4690,15 +4756,22 @@ async def _gen_history_catalog(ordered, want_vision: bool, limit: int = GEN_CTX_
     (уйдёт ПРОМПТЕРУ — vision напрямую / для описания; без неё 20 полных фото бьют лимит запроса).
     Для ТЕКСТОВОЙ активной модели считаем описание (медиа-модель, кэш общий с /ask). Этапы шлёт progress_cb,
     всё под общим тайм-бюджетом GEN_CATALOG_TIMEOUT. Возвращает [{idx, mid, bytes, thumb, caption, desc}]."""
-    photos, seen = [], set()
+    photos, seen, n_preview = [], set(), 0
     for m in ordered:  # ordered — хронологический
         if not getattr(m, "photo", None):
+            continue
+        # m.photo у Telethon включает и фото веб-превью (обложки YouTube и пр.) и сервисные
+        # (смена аватарки чата) — это не референсы, отсекаем сразу
+        if isinstance(getattr(m, "media", None), MessageMediaWebPage) or getattr(m, "action", None):
+            n_preview += 1
             continue
         k = _media_key(m)
         if k in seen:
             continue
         seen.add(k)
         photos.append(m)
+    if n_preview:
+        log("GEN", f"Каталог: отсеяно {n_preview} превью ссылок/сервисных фото")
     photos = photos[-limit:]  # хвост = самые свежие
     if not photos:
         return []
@@ -4731,19 +4804,19 @@ async def _gen_history_catalog(ordered, want_vision: bool, limit: int = GEN_CTX_
                         "from_owner": bool(getattr(m, "out", False)),  # моё фото / прошлая генерация — для пометки «не повторяй»
                         "_m": m})
 
-    if not want_vision and catalog:  # текстовой модели нужны описания (по уменьшенным копиям — быстрее; кэш /ask)
+    if not want_vision and catalog:  # текстовой модели нужны описания: ген-формат ТИП/СУТЬ/ЛЮДИ (свой кэш-неймспейс, /ask-кэш не трогаем)
         sem = asyncio.Semaphore(4)
         done = [0]
 
         async def _desc(it):
-            key = _media_key(it["_m"])
+            key = "gen:" + _media_key(it["_m"])
             cached = MEDIA_CACHE.get(key)
             if cached and cached not in MEDIA_FAILURE_MARKERS:
                 it["desc"] = cached
             else:
                 async with sem:
                     try:
-                        d = await describe_image(it["thumb"], caption=it["caption"])
+                        d = await describe_image(it["thumb"], caption=it["caption"], prompt=_GEN_DESC_PROMPT)
                     except Exception as e:
                         log("GEN", f"Каталог: описание не удалось: {e}")
                         d = None
@@ -4758,11 +4831,25 @@ async def _gen_history_catalog(ordered, want_vision: bool, limit: int = GEN_CTX_
         except asyncio.TimeoutError:
             log("GEN", "Каталог: описания превысили тайм-бюджет — часть фото пойдёт без описания")
 
+        # пре-фильтр по типу: скриншоты (переписки/интерфейсы/превью) и мемы промптеру не показываем вовсе —
+        # именно этот мусор текстовые модели тащили в референсы. Нужен скриншот — юзер приложит его реплаем.
+        # Фото без описания (тайм-аут) остаются: недоступность — не повод выкидывать.
+        junk = [it for it in catalog if _gen_desc_kind(it.get("desc")) in ("скриншот", "мем")]
+        if junk:
+            catalog = [it for it in catalog if it not in junk]
+            log("GEN", f"Каталог: исключено {len(junk)} (скриншоты/мемы) из кандидатов")
+
     for i, it in enumerate(catalog, 1):  # финальная нумерация 1..K, убираем временное поле
         it["idx"] = i
         it.pop("_m", None)
     log("GEN", f"Каталог истории: {len(catalog)} фото (vision={want_vision}, с описанием={sum(1 for it in catalog if it.get('desc'))})")
     return catalog
+
+
+def _gen_desc_kind(desc: str) -> str:
+    """Тип картинки из ген-описания («ТИП: скриншот | мем | фото людей | …») — первое слово, lower."""
+    m = re.search(r"(?im)^\s*ТИП:\s*(\S+)", desc or "")
+    return m.group(1).strip().lower().rstrip(".,;") if m else ""
 
 
 def _merge_catalog_refs(input_b64s: list, catalog: list, sel: list) -> tuple:
@@ -4792,8 +4879,9 @@ def _merge_catalog_refs(input_b64s: list, catalog: list, sel: list) -> tuple:
     return out, used
 
 
-def _gen_refs_line(chat_ent, catalog: list, used_idxs: list) -> str:
-    """Строка «Референсы:» со ссылками на сообщения, чьи фото реально ушли в генерацию (markdown)."""
+def _gen_refs_line(chat_ent, catalog: list, used_idxs: list, reasons: dict = None) -> str:
+    """Строка «Референсы:» со ссылками на сообщения, чьи фото реально ушли в генерацию (markdown).
+    reasons — {idx: «зачем взят»} от промптера (из REFS: 3 (лицо Димы), …), добавляется к ссылке."""
     if not (chat_ent and catalog and used_idxs):
         return None
     by_idx = {it["idx"]: it for it in catalog}
@@ -4804,9 +4892,11 @@ def _gen_refs_line(chat_ent, catalog: list, used_idxs: list) -> str:
         if not mid:
             continue
         try:
-            parts.append(f"[#{k}]({build_msg_link(chat_ent, mid)})")
+            link = f"[#{k}]({build_msg_link(chat_ent, mid)})"
         except Exception:
             continue
+        why = (reasons or {}).get(k)
+        parts.append(f"{link} — {why}" if why else link)
     return ("📎 Референсы (фото из чата): " + " · ".join(parts)) if parts else None
 
 
@@ -4896,28 +4986,35 @@ async def _gen_one_image(final_prompt, input_b64s, image_size, aspect_ratio, all
             return None, "overload", None, used_fallback
 
 
-async def _gen_send_image(chat, raw, mime, final_prompt, prompt_by_ai, reply_to, refs_line=None):
+async def _gen_send_image(chat, raw, mime, final_prompt, prompt_by_ai, reply_to, refs_line=None, idea=None):
     """Отправляет готовую картинку: webp→png, и при AI-промпте — свёрнутая подпись (или отдельным
     сообщением, если длинная). refs_line — строка «Референсы:» со ссылками (отдельным сообщением-ответом
-    под картинкой). chat='me' = Saved Messages."""
+    под картинкой). idea — фраза-идея от промптера: видимой строкой 💡 над свёрнутым промптом.
+    chat='me' = Saved Messages."""
     if "webp" in mime:
         raw = await _webp_to_png(raw)  # webp Telegram шлёт стикером — конвертим
     bio = io.BytesIO(raw)
     bio.name = "gen.png" if raw[:8].startswith(b"\x89PNG") else "gen.webp"
     sent = None
-    if prompt_by_ai:  # промпт от ИИ — СВЁРНУТОЙ цитатой и БЕЗ обрезки
-        cap_text = "🎨 " + final_prompt
+    idea_line = f"💡 {idea.strip()}\n" if (idea and str(idea).strip()) else ""
+    if prompt_by_ai:  # промпт от ИИ — СВЁРНУТОЙ цитатой и БЕЗ обрезки; идея — видимой строкой над ней
+        cap_text = idea_line + "🎨 " + final_prompt
         if len(cap_text) <= 1000:  # влезает в лимит подписи Telegram (1024)
             try:
-                cap, cap_ents = _collapsed_entities(cap_text, parse_html=False)
+                cap, cap_ents = _collapsed_entities("🎨 " + final_prompt, parse_html=False)
+                if idea_line:  # идею НЕ сворачиваем: префиксуем и сдвигаем entities цитаты (offsets в UTF-16)
+                    shift = len(add_surrogate(idea_line))
+                    for e in cap_ents:
+                        e.offset += shift
+                    cap = idea_line + cap
                 sent = await client.send_file(chat, bio, caption=cap, formatting_entities=cap_ents, reply_to=reply_to)
             except Exception as e:
                 log("GEN", f"Свёрнутая подпись не отправилась ({e}) — шлю обычной")
                 bio.seek(0)
                 sent = await client.send_file(chat, bio, caption=cap_text, reply_to=reply_to)
-        else:  # длинный промпт: картинка без подписи + полный промпт отдельной свёрнутой цитатой
-            sent = await client.send_file(chat, bio, reply_to=reply_to)
-            await send_long(chat, cap_text, parse_mode=None, reply_to=getattr(sent, "id", None), collapse_threshold=0)
+        else:  # длинный промпт: картинка с идеей в подписи + полный промпт отдельной свёрнутой цитатой
+            sent = await client.send_file(chat, bio, caption=(idea_line.strip() or None), reply_to=reply_to)
+            await send_long(chat, "🎨 " + final_prompt, parse_mode=None, reply_to=getattr(sent, "id", None), collapse_threshold=0)
     else:
         sent = await client.send_file(chat, bio, reply_to=reply_to)
     if refs_line:  # ссылки на сообщения-источники референсов — отдельным сообщением под картинкой
@@ -5092,7 +5189,7 @@ async def gen_command(event):
             counter = {"done": 0, "ok": 0, "exhausted": False}
             sem = asyncio.Semaphore(GEN_BATCH_CONCURRENCY)
 
-            async def _gen_and_send(idx, fp, by_ai):
+            async def _gen_and_send(idx, fp, by_ai, idea_i=None):
                 async with sem:
                     if counter["exhausted"]:  # дневной лимит уже исчерпан — не тратим квоту на обречённый запрос
                         counter["done"] += 1
@@ -5102,7 +5199,7 @@ async def gen_command(event):
                     counter["done"] += 1
                     if raw_i is not None:
                         try:
-                            await _gen_send_image("me", raw_i, mime_i, used_fp, by_ai, None, refs_line=gen_refs_line)
+                            await _gen_send_image("me", raw_i, mime_i, used_fp, by_ai, None, refs_line=gen_refs_line, idea=idea_i)
                             counter["ok"] += 1
                         except Exception as e:
                             log("GEN", f"Вариант {idx + 1}: отправка в Избранное не удалась: {e}")
@@ -5121,17 +5218,17 @@ async def gen_command(event):
                     log("GEN", f"Дневной лимит исчерпан — останавливаю пакет на варианте {i + 1}/{batch_count}")
                     break
                 cat_i = (catalog or None) if i == 0 else None  # каталог (и картинки vision) — только 1-му варианту
-                fp, sel = await _build_gen_prompt(user_prompt, context_text, image_desc, edit_mode, prompts, cat_i, creative=creative, improve=improve, force_desc=force_desc)
+                fp, sel, idea_i = await _build_gen_prompt(user_prompt, context_text, image_desc, edit_mode, prompts, cat_i, creative=creative, improve=improve, force_desc=force_desc)
                 by_ai = fp != user_prompt
                 if i == 0 and sel:  # выбор референсов из истории — общий для всего пакета
-                    input_b64s, _used = _merge_catalog_refs(input_b64s, catalog, sel)
+                    input_b64s, _used = _merge_catalog_refs(input_b64s, catalog, [k for k, _ in sel])
                     try:
-                        gen_refs_line = _gen_refs_line(await event.get_chat(), catalog, _used)
+                        gen_refs_line = _gen_refs_line(await event.get_chat(), catalog, _used, reasons=dict(sel))
                     except Exception:
                         gen_refs_line = None
-                log("GEN", f"Вариант {i + 1}/{batch_count}: промпт by_ai={by_ai} refs={len(sel) if i == 0 else '—'} len={len(fp)}")
+                log("GEN", f"Вариант {i + 1}/{batch_count}: промпт by_ai={by_ai} refs={len(sel) if i == 0 else '—'} idea={idea_i or '—'} len={len(fp)}")
                 prompts.append(fp)
-                tasks.append(asyncio.create_task(_gen_and_send(i, fp, by_ai)))
+                tasks.append(asyncio.create_task(_gen_and_send(i, fp, by_ai, idea_i)))
                 if i + 1 < batch_count:
                     await set_status(f"🧠 Промпты {i + 1}/{batch_count} · 🎨 {counter['done']}/{batch_count} готово…")
             await asyncio.gather(*tasks)
@@ -5148,18 +5245,18 @@ async def gen_command(event):
             return
 
         # ── одиночная генерация ──
-        final_prompt, prompt_by_ai = user_prompt, False
+        final_prompt, prompt_by_ai, gen_idea = user_prompt, False, None
         if ai_prompt:
             await set_status(f"🧠 {get_active_model()[2]} {'смотрит фото и пишет промпт' if catalog else 'готовит промпт'}…")
-            final_prompt, sel = await _build_gen_prompt(user_prompt, context_text, image_desc, edit_mode, None, catalog or None, creative=creative, improve=improve, force_desc=force_desc)
+            final_prompt, sel, gen_idea = await _build_gen_prompt(user_prompt, context_text, image_desc, edit_mode, None, catalog or None, creative=creative, improve=improve, force_desc=force_desc)
             prompt_by_ai = final_prompt != user_prompt
-            input_b64s, _used = _merge_catalog_refs(input_b64s, catalog, sel)  # выбранные ИИ картинки из истории → референсы
+            input_b64s, _used = _merge_catalog_refs(input_b64s, catalog, [k for k, _ in sel])  # выбранные ИИ картинки из истории → референсы
             if _used:
                 try:
-                    gen_refs_line = _gen_refs_line(await event.get_chat(), catalog, _used)
+                    gen_refs_line = _gen_refs_line(await event.get_chat(), catalog, _used, reasons=dict(sel))
                 except Exception:
                     gen_refs_line = None
-            log("GEN", f"Промпт: by_ai={prompt_by_ai} · режим={'edit' if edit_mode else 'creative'} · ref-вложений={'есть' if image_desc else 'нет'} · из истории refs={len(_used)} · len={len(final_prompt)}")
+            log("GEN", f"Промпт: by_ai={prompt_by_ai} · режим={'edit' if edit_mode else ('improve' if improve else 'creative')} · ref-вложений={'есть' if image_desc else 'нет'} · из истории refs={len(_used)} · idea={gen_idea or '—'} · len={len(final_prompt)}")
         await set_status("🎨 Генерирую изображение… (может занять до пары минут)")
         t0 = time.time()
         # allow_repair: ИИ-промпт был ЗАПРОШЕН (даже если его первая попытка вернула пустое и промпт ушёл исходным)
@@ -5178,7 +5275,7 @@ async def gen_command(event):
                                  f"Попробуй ещё раз через минуту: `/gen {user_prompt[:200]}`")
             return
         log("GEN", f"Готово за {time.time() - t0:.1f}с · {len(raw) / 1024:.0f} КБ · {mime} · prompt_by_ai={prompt_by_ai} · модель={'fast(запасная)' if used_fb else 'pro'}")
-        await _gen_send_image(event.chat_id, raw, mime, used_fp, prompt_by_ai, reply_target_id, refs_line=gen_refs_line)
+        await _gen_send_image(event.chat_id, raw, mime, used_fp, prompt_by_ai, reply_target_id, refs_line=gen_refs_line, idea=gen_idea)
         await status.delete()
     except Exception as e:
         log("GEN", f"Ошибка /gen: {e}")
@@ -6523,8 +6620,9 @@ _HELP_SECTIONS = {
         "Промпт строит **активная модель-ответчик** (`/model`); если она с vision — сама смотрит картинки чата, если текстовая — по их описаниям (медиа-модель `/media`). DeepSeek — фолбэк.\n"
         "\n"
         "**Синтаксис:** `/gen [N] [-i|-c|-r] [-ni|-m] [-v|-h|-sq] [-2k|-4k|-1k] [-xK] [@юзер|!@юзер] <промпт>`\n"
-        "   `/gen аниме кот в очках` — генерация ровно по твоему промпту\n"
-        "   `/gen -i закат над морем` — активная модель улучшит/уточнит промпт (`-i` или `-improve`)\n"
+        "   `/gen аниме кот в очках` — креатив: модель развернёт запрос в промпт вокруг одной идеи\n"
+        "   `/gen -i закат над морем` — ТОЧНАЯ переформулировка: модель лишь сделает твой промпт качественным,\n"
+        "     ничего своего не добавляя (`-i` или `-improve`)\n"
         "   `/gen 100 нарисуй о чём мы спорим` — модель составит промпт по последним 100 сообщениям чата\n"
         "\n"
         "**🖼 Картинки из истории как референсы (по умолчанию для `/gen N`):** модель видит фото в окне N,\n"
@@ -6533,19 +6631,23 @@ _HELP_SECTIONS = {
         "   до 16 выбранных (потолок GPT Image 2).\n"
         "   • **vision-модель** смотрит фото НАПРЯМУЮ — до 20 свежих;\n"
         "   • **текстовая модель** или флаг **`-m`** — по ОПИСАНИЯМ (медиа-модель), но больший пул — до 300 фото\n"
-        "     (больше выбор; первый прогон дольше — описания кэшируются и в `/ask`);\n"
+        "     (больше выбор; первый прогон дольше — описания кэшируются);\n"
         "   • **`-ni`** (синоним `-noimg`) — вообще не брать картинки из истории (только текст; это НЕ `-i`).\n"
+        "   🧹 Мусор в референсы не идёт: превью ссылок (обложки YouTube и т.п.) отсекаются сразу, скриншоты\n"
+        "   переписок/интерфейсов и мемы — по авто-разметке типов. Нужен скриншот — приложи его или реплайни.\n"
         "   После генерации, если ИИ взял фото из истории, под картинкой придёт строка **«📎 Референсы»**\n"
-        "   со ссылками на сообщения-источники этих фото.\n"
+        "   со ссылками на сообщения-источники и пометкой, ЗАЧЕМ взят каждый (лицо/стиль/фон).\n"
         "\n"
         "**Креативный режим — ПО УМОЛЧАНИЮ (флаг `-c` указывать не нужно):**\n"
-        "   Активная модель сама СОЧИНЯЕТ промпт со своим художественным видением (не правит твой текст дословно).\n"
+        "   Активная модель сама СОЧИНЯЕТ промпт со своим художественным видением — но всегда вокруг ОДНОЙ\n"
+        "   ясной идеи (она приходит строкой 💡 в подписи к картинке), а не грудой случайных деталей.\n"
         "   Так работает любой `/gen` БЕЗ приложенного фото. `-c` остаётся как явный синоним.\n"
         "   ИСКЛЮЧЕНИЕ — когда приложил/реплайнул ФОТО на правку: тогда режим РЕДАКТИРОВАНИЯ (точно, без отсебятины);\n"
         "   добавь `-c` к фото, если хочешь творческую переработку, или `-i` — аккуратное уточнение твоего промпта.\n"
         "   `/gen 200 что хочет нарисовать чат?` · `/gen аниме кот` — оба уже креативные.\n"
-        "   **`-r` (raw)** — БЕЗ ИИ: твой промпт уходит в генератор ДОСЛОВНО (ни расширения, ни истории-картинок).\n"
-        "   `/gen -r a cat in a hat, watercolor` — что написал, то и сгенерится.\n"
+        "   **`-i` (improve)** — идея целиком ТВОЯ: модель только переформулирует запрос в сильный визуальный\n"
+        "   английский промпт, без своих идей и объектов. **`-r` (raw)** — вообще БЕЗ ИИ: промпт уходит в генератор\n"
+        "   ДОСЛОВНО (ни расширения, ни истории-картинок). `/gen -r a cat in a hat, watercolor`.\n"
         "\n"
         "**Ориентация (точное соотношение сторон):** `-v` вертикаль 9:16 · `-h` горизонталь 16:9 · `-sq` квадрат 1:1\n"
         "   `/gen -v аниме девушка у окна` · `/gen -h пейзаж гор` · комбинируется: `/gen -c -v <ссылка> …`\n"
