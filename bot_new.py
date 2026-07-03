@@ -9955,6 +9955,27 @@ async def entity_admin_command(event):
 _scheduler_started = False
 
 
+async def _index_boot_resume():
+    """Автовозобновление индексации после рестарта: подхватывает чаты, что были в статусе 'running'
+    (их фоновая задача умерла вместе с процессом). Прогресс checkpoint'ится в БД, продолжаем с чекпоинта.
+    Паузу ('paused') и ошибку ('error') НЕ трогаем — их продолжает пользователь вручную."""
+    if _index_available():   # DSN не настроен → индекс-памяти нет
+        return
+    try:
+        await _index_ensure_ddl()
+        rows = await db_read("SELECT DISTINCT chat_id FROM idx_state WHERE status='running'")
+    except Exception as e:
+        log("INDEX", f"Автовозобновление: состояние недоступно ({e})")
+        return
+    for r in rows:
+        cid = r["chat_id"]
+        if cid in _INDEX_TASKS:
+            continue
+        _INDEX_CONTROL[cid] = "run"
+        _INDEX_TASKS[cid] = asyncio.create_task(_index_pipeline(cid, None))  # status_msg=None → прогресс молча в лог
+        log("INDEX", f"Автовозобновление индексации чата {cid} (с последнего чекпоинта)")
+
+
 async def main():
     """Канонический async-паттерн: всё внутри корутины, await start/get_me/run.
     Запускается через client.loop.run_until_complete (НЕ asyncio.run — иначе сменится loop)."""
@@ -9971,6 +9992,7 @@ async def main():
     if not _scheduler_started:
         asyncio.create_task(scheduler_loop())  # один раз на процесс
         _scheduler_started = True
+    asyncio.create_task(_index_boot_resume())  # подхватить прерванную рестартом индексацию (с чекпоинта)
     log("BOOT", "Userbot запущен.")
     await client.run_until_disconnected()
 
