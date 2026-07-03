@@ -139,6 +139,7 @@ INDEX_SCENE_GAP_SEC = 15 * 60 # stage 2: разрыв >15 мин между со
 INDEX_SCENE_TOKEN_CAP = 8000  # stage 2: мягкий потолок токенов сцены (длинная беседа рвётся принудительно)
 INDEX_SCENE_MIN_TOKENS = 1000 # stage 2: сцены короче — доклеиваем к следующей (не дробим на мелочь)
 INDEX_SCENE_HARD_GAP_SEC = 6 * 60 * 60  # даже короткую сцену не склеиваем через многочасовую паузу
+INDEX_STAGE2_CONCURRENCY = 6  # stage 2: сколько сцен экстрагировать параллельно (перекрыть ~34с латентность на вызов)
 INDEX_STAGE1_MICRO_TOKENS = 32_000      # stage 1: размер блока экстракции (вывод не режется — cap поднят до INDEX_EXTRACT_MAX_TOKENS)
 INDEX_EXTRACT_MAX_TOKENS = 64_000       # ПОТОЛОК ВЫВОДА экстракции: JSON + reasoning-токены (V4 Flash думает в тот же бюджет!) не режем. Провайдер принимает ≥200k
 INDEX_SUMMARY_MAX_TOKENS = 64_000       # ПОТОЛОК ВЫВОДА саммари (досье/роллапы): запас под reasoning, чтобы CoT не съедал бюджет до самого текста. Оплата — по факту токенов
@@ -7677,6 +7678,7 @@ async def _index_extract(system: str, user: str, max_tokens: int = INDEX_EXTRACT
                     response_format={"type": "json_object"},
                     messages=[{"role": "system", "content": system}, {"role": "user", "content": user}],
                     timeout=240,
+                    extra_body={"reasoning": {"enabled": False}},  # JSON-экстракция: CoT — пустая трата токенов/времени
                 )
                 got_response = True
                 content = resp.choices[0].message.content or ""
@@ -8440,6 +8442,53 @@ async def _index_stage2_graph(chat_id: int, progress_cb=None):
         # медиа НЕ качаем в Stage 2 (это блокировало граф на часы) — фото обрабатывает отдельная Stage 5
         await _write_chunk(sc, scene_text, rels_applied, touched, 0, failed=failed)
 
+    # --- параллельная экстракция: завершённые сцены копятся в batch → экстрагируются concurrently → применяются по очереди ---
+    batch = []
+
+    async def _extract_scene(sc):
+        """Параллелизуемая часть: справочник + LLM-экстракция связей. → (scene_text, name2id, data, s_date)."""
+        s_date = sc[-1]["date"]
+        lines = [f"[{r['msg_id']}] {amap.get(r['author_id'], 'user' + str(r['author_id']))}: {r['txt']}"
+                 for r in sc if (r["txt"] or "").strip()]
+        scene_text = "\n".join(lines)
+        registry, name2id = await _index_relation_registry(chat_id, scene_text)
+        data = None
+        if scene_text.strip():
+            data = await _index_extract(_INDEX_REL_SYSTEM + "\n\nСПРАВОЧНИК:\n" + registry, "СЦЕНА:\n" + scene_text)
+        return scene_text, name2id, data, s_date
+
+    async def _apply_scene(sc, scene_text, name2id, data, s_date):
+        """Серийная часть: применяет связи + пишет чанк. Poison (data невалиден) → sequential split через _finalize."""
+        if scene_text.strip() and (data is None or not isinstance(data.get("relations"), list)):
+            await _finalize(sc)  # редкий poison-путь: пере-извлечёт и раздробит/запишет failed
+            return
+        rels_applied, touched = 0, set()
+        if data and isinstance(data.get("relations"), list):
+            rels_applied, touched = await _index_apply_relations(chat_id, data["relations"], name2id, s_date)
+        await _write_chunk(sc, scene_text, rels_applied, touched, 0, failed=False)
+
+    async def _flush_batch():
+        """Экстрагирует batch параллельно, применяет по очереди, чекпоинтит по каждой сцене. IndexTransientError пробрасывается."""
+        nonlocal batch
+        if not batch:
+            return
+        sem = asyncio.Semaphore(INDEX_STAGE2_CONCURRENCY)
+
+        async def _one(sc):
+            async with sem:
+                return await _extract_scene(sc)
+
+        results = await asyncio.gather(*[_one(sc) for sc in batch])  # транзиент пробросится (и отменит остальные)
+        for sc, res in zip(batch, results):
+            await _apply_scene(sc, *res)
+            await _idx_set_state(chat_id, 2, cursor={"last_msg_id": sc[-1]["msg_id"]}, stats={"scenes": scenes_done})
+            await db_write(
+                "UPDATE index_failed_ranges SET status='resolved' WHERE chat_id=%s AND stage=2 AND status='retrying' AND end_msg_id<=%s",
+                (chat_id, sc[-1]["msg_id"]))
+        if progress_cb:
+            await progress_cb(f"🕸 Граф: {scenes_done} сцен (до id {batch[-1][-1]['msg_id']})…")
+        batch = []
+
     while True:
         if _INDEX_CONTROL.get(chat_id) == "pause":
             await _idx_set_state(chat_id, 2, status="paused")
@@ -8457,35 +8506,34 @@ async def _index_stage2_graph(chat_id: int, progress_cb=None):
                 or (gap > INDEX_SCENE_GAP_SEC and scene_tok >= INDEX_SCENE_MIN_TOKENS)
             )
             if should_split:
-                try:
-                    await _finalize(scene)
-                except IndexTransientError as e:  # авария провайдера — не двигаем курсор, встаём в error
-                    await _idx_set_state(chat_id, 2, status="error")
-                    log("INDEX", f"Stage2 транзиентный сбой на сцене до {scene[-1]['msg_id']}: {e} — стадия в error")
-                    return "error"
-                await _idx_set_state(chat_id, 2, cursor={"last_msg_id": scene[-1]["msg_id"]}, stats={"scenes": scenes_done})
-                await db_write(
-                    "UPDATE index_failed_ranges SET status='resolved' WHERE chat_id=%s AND stage=2 AND status='retrying' AND end_msg_id<=%s",
-                    (chat_id, scene[-1]["msg_id"]))
-                if progress_cb and scenes_done % 5 == 0:
-                    await progress_cb(f"🕸 Граф: {scenes_done} сцен (до id {scene[-1]['msg_id']})…")
+                batch.append(scene)
                 scene, scene_tok, prev_date = [], 0, None
+                if len(batch) >= INDEX_STAGE2_CONCURRENCY:
+                    try:
+                        await _flush_batch()
+                    except IndexTransientError as e:
+                        await _idx_set_state(chat_id, 2, status="error")
+                        log("INDEX", f"Stage2 транзиентный сбой: {e} — стадия в error")
+                        return "error"
             scene.append(r)
             scene_tok += count_tokens(r["txt"] or "")
             prev_date = r["date"]
             cursor = r["msg_id"]
-        # окно кончилось — не финализируем открытую сцену (доберём в следующем окне)
-    if scene:  # последняя сцена чата
+        # окно кончилось — дожимаем завершённые сцены (batch), открытую сцену держим до следующего окна
         try:
-            await _finalize(scene)
+            await _flush_batch()
+        except IndexTransientError as e:
+            await _idx_set_state(chat_id, 2, status="error")
+            log("INDEX", f"Stage2 транзиентный сбой: {e} — стадия в error")
+            return "error"
+    if scene:  # последняя открытая сцена чата
+        batch.append(scene)
+        try:
+            await _flush_batch()
         except IndexTransientError as e:
             await _idx_set_state(chat_id, 2, status="error")
             log("INDEX", f"Stage2 транзиентный сбой на последней сцене: {e} — стадия в error")
             return "error"
-        await _idx_set_state(chat_id, 2, cursor={"last_msg_id": scene[-1]["msg_id"]}, stats={"scenes": scenes_done})
-        await db_write(
-            "UPDATE index_failed_ranges SET status='resolved' WHERE chat_id=%s AND stage=2 AND status='retrying' AND end_msg_id<=%s",
-            (chat_id, scene[-1]["msg_id"]))
 
     await _idx_set_state(chat_id, 2, status="done", stats={"scenes": scenes_done})
     nrel = (await db_read("SELECT COUNT(*) c FROM relations WHERE chat_id=%s", (chat_id,)))[0]["c"]
