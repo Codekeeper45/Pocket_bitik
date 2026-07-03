@@ -129,8 +129,8 @@ GEN_BATCH_MAX = 20          # /gen -xN: максимум вариантов за
 GEN_BATCH_CONCURRENCY = 2   # сколько вариантов генерим одновременно (баланс скорость/лимиты free-модели)
 
 # --- /index: GraphRAG-память по истории чата (MariaDB + numpy-вектора) ---
-INDEX_EXTRACT_MODEL = "deepseek/deepseek-v4-flash"   # экстракция досье/графа (текст): окно 1M, дёшево (OpenRouter)
-INDEX_EXTRACT_FALLBACK = "deepseek/deepseek-v3.2-exp"  # если v4-flash недоступен ключу (проверяется пробным вызовом на фазе A)
+INDEX_EXTRACT_MODEL = "deepseek-v4-flash"   # экстракция досье/графа через официальный DeepSeek API: 1M context, большой output
+INDEX_EXTRACT_FALLBACK = "deepseek-v4-pro"  # запасной официальный DeepSeek, дороже; используем только если Flash недоступен/сыпется
 INDEX_EMBED_TEXT_MODEL = "openai/text-embedding-3-small"   # тексты: досье, связи, сцены, описания фото ($0.02/1M, 1536d)
 INDEX_EMBED_IMAGE_MODEL = "google/gemini-embedding-2"      # картинки (сам файл) + кросс-модальный текст-запрос (GA-слаг, 3072d)
 INDEX_EMBED_DIM = 1536        # рабочая размерность (text-emb-3-small нативно 1536; gemini-emb-2 усекаем Matryoshka с 3072)
@@ -141,10 +141,12 @@ INDEX_SCENE_MIN_TOKENS = 1000 # stage 2: сцены короче — докле�
 INDEX_SCENE_HARD_GAP_SEC = 6 * 60 * 60  # даже короткую сцену не склеиваем через многочасовую паузу
 INDEX_STAGE2_CONCURRENCY = 6  # stage 2: сколько сцен экстрагировать параллельно (перекрыть ~34с латентность на вызов)
 INDEX_STAGE1_MICRO_TOKENS = 32_000      # stage 1: размер блока экстракции (вывод не режется — cap поднят до INDEX_EXTRACT_MAX_TOKENS)
-INDEX_EXTRACT_MAX_TOKENS = 64_000       # ПОТОЛОК ВЫВОДА экстракции: JSON + reasoning-токены (V4 Flash думает в тот же бюджет!) не режем. Провайдер принимает ≥200k
-INDEX_MODEL_MAX_OUT = {                  # per-model кламп потолка вывода (страховка от иного роутинга; текущий тянет и 200k)
+INDEX_EXTRACT_MAX_TOKENS = 64_000       # ПОТОЛОК ВЫВОДА экстракции: official DeepSeek V4 допускает до 384k; thinking отключаем для JSON
+INDEX_MODEL_MAX_OUT = {                  # per-model кламп потолка вывода; OpenRouter-fallback может быть ниже official DeepSeek
+    "deepseek-v4-flash": 384_000,
+    "deepseek-v4-pro": 384_000,
     "deepseek/deepseek-v4-flash": 16_384,
-    "deepseek/deepseek-v3.2-exp": 65_536,
+    "deepseek/deepseek-v4-pro": 384_000,
 }
 INDEX_SUMMARY_MAX_TOKENS = 64_000       # ПОТОЛОК ВЫВОДА саммари (досье/роллапы): запас под reasoning, чтобы CoT не съедал бюджет до самого текста. Оплата — по факту токенов
 INDEX_STAGE1_MICRO_MESSAGES = 800
@@ -6935,8 +6937,9 @@ _HELP_SECTIONS = {
         "   `/entity rename <id> <имя>` · `/entity alias <id> <алиас>` · `/entity split <id> <алиас>`\n"
         "   `/entity relink` — привязать несопоставленных участников к их Telegram-id (по author_id)\n"
         "\n"
-        "⚙️ Нужны: `INDEX_DB_URL` (MariaDB/MySQL) в `.env`, пакеты `pymysql`+`numpy`, `OPENROUTER_API_KEY`.\n"
-        "🧠 Модели: DeepSeek V4 Flash (экстракция), медиа-модель `/media` (фото),\n"
+        "⚙️ Нужны: `INDEX_DB_URL` (MariaDB/MySQL), `DEEPSEEK_API_KEY` для экстракции,\n"
+        "   `OPENROUTER_API_KEY` для embeddings, пакеты `pymysql`+`numpy`.\n"
+        "🧠 Модели: официальный DeepSeek V4 Flash (экстракция), медиа-модель `/media` (фото),\n"
         "   text-embedding-3-small (тексты) + gemini-embedding-2 (картинки)."
     ),
     "keys": (
@@ -6949,6 +6952,7 @@ _HELP_SECTIONS = {
         "**НЕОБЯЗАТЕЛЬНЫЕ** (без них бот НЕ падает — просто часть функций выключена):\n"
         "   `OPENROUTER_API_KEY` — даёт:\n"
         "      • распознавание картинок/кружков в `/ask` (vision-модели `[OR]`);\n"
+        "      • embeddings для `/index` (text-embedding-3-small + gemini-embedding-2);\n"
         "      • возможность ставить любую модель OpenRouter для ответов (`/model vendor/model`).\n"
         "   `OPENCODE_API_KEY` — даёт vision-модели `[OC]` (Kimi / GLM / Qwen / MiMo) в `/model media`.\n"
         "   `MODELGATE_API_KEY` — даёт модели **Claude** (Opus / Sonnet / Haiku) для ответов\n"
@@ -7244,8 +7248,10 @@ def _index_available() -> str:
         return "нет пакета numpy (добавь в requirements и переустанови зависимости)"
     if not index_db_url:
         return "не задан INDEX_DB_URL в .env (строка подключения к MariaDB)"
+    if deepseek_client is None:
+        return "нет DEEPSEEK_API_KEY (нужен для экстракции /index через официальный DeepSeek API)"
     if openrouter_client is None:
-        return "нет OPENROUTER_API_KEY (нужен для экстракции и эмбеддингов)"
+        return "нет OPENROUTER_API_KEY (нужен для embeddings /index)"
     return ""
 
 
@@ -7665,25 +7671,40 @@ def _json_from_llm(text: str):
 
 
 async def _index_extract(system: str, user: str, max_tokens: int = INDEX_EXTRACT_MAX_TOKENS):
-    """Экстракция через INDEX_EXTRACT_MODEL (V4 Flash) с JSON-mode; фолбэк на запасную.
+    """Экстракция через официальный DeepSeek API (V4 Flash) с JSON-mode; OpenRouter — аварийный fallback.
     Возвращает dict при успехе; None — если провайдер ОТВЕТИЛ, но контент не парсится как JSON
-    (детерминированный «poison» — можно дробить/скипать). Если провайдер ни разу не ответил
-    (сеть/5xx/timeout на всех попытках) — raise IndexTransientError (это авария, а не poison:
-    стадия должна встать в error, а не фрагментировать блок в ложные skip)."""
+    (детерминированный «poison» — можно дробить/скипать). Ошибки транспорта/ключа/квоты/параметров
+    останавливают stage через IndexTransientError, чтобы не превращать системную проблему в skipped ranges."""
     global _INDEX_EXTRACT_OK
-    models = [INDEX_EXTRACT_MODEL, INDEX_EXTRACT_FALLBACK]
+    routes = []
+    if deepseek_client is not None:
+        routes.append(("deepseek", deepseek_client, INDEX_EXTRACT_MODEL))
+        routes.append(("deepseek", deepseek_client, INDEX_EXTRACT_FALLBACK))
+    if openrouter_client is not None:  # аварийный путь: lower output cap, но лучше чем полный простой
+        routes.append(("openrouter", openrouter_client, "deepseek/deepseek-v4-flash"))
     got_response = False  # был ли хоть один валидный ответ провайдера (пусть и не-JSON)
-    for mi, model in enumerate(models):
+    for ri, (provider, llm_client, model) in enumerate(routes):
         for attempt in range(1, INDEX_EXTRACT_RETRIES + 1):
             try:
                 mt = min(max_tokens, INDEX_MODEL_MAX_OUT.get(model, max_tokens))  # кламп под реальный лимит модели
+                kwargs = {
+                    "model": model,
+                    "max_tokens": mt,
+                    "temperature": 0.2,
+                    "response_format": {"type": "json_object"},
+                    "messages": [{"role": "system", "content": system}, {"role": "user", "content": user}],
+                    "timeout": 240,
+                }
+                if provider == "deepseek":
+                    # Официальный DeepSeek: extraction должен возвращать JSON, поэтому thinking выключаем
+                    # и не тратим output budget на reasoning_content.
+                    kwargs["extra_body"] = {"thinking": {"type": "disabled"}}
+                else:
+                    # OpenRouter принимает reasoning как провайдерский параметр в теле запроса.
+                    kwargs["extra_body"] = {"reasoning": {"enabled": False}}
                 resp = await asyncio.to_thread(
-                    openrouter_client.chat.completions.create,
-                    model=model, max_tokens=mt, temperature=0.2,
-                    response_format={"type": "json_object"},
-                    messages=[{"role": "system", "content": system}, {"role": "user", "content": user}],
-                    timeout=240,
-                    extra_body={"reasoning": {"enabled": False}},  # JSON-экстракция: CoT — пустая трата токенов/времени
+                    llm_client.chat.completions.create,
+                    **kwargs,
                 )
                 got_response = True
                 content = resp.choices[0].message.content or ""
@@ -7692,7 +7713,7 @@ async def _index_extract(system: str, user: str, max_tokens: int = INDEX_EXTRACT
                     _INDEX_EXTRACT_OK = True
                     return data
                 fin = resp.choices[0].finish_reason
-                log("INDEX", f"Экстракция {model}: не распарсил JSON (finish={fin}, попытка {attempt})")
+                log("INDEX", f"Экстракция {provider}/{model}: не распарсил JSON (finish={fin}, попытка {attempt})")
                 if fin == "length":
                     # ответ обрезан по потолку токенов — повтор того же запроса даст ту же обрезку,
                     # смена модели тоже (блок/сцена слишком «плотные»). Детерминированно, но НЕ poison:
@@ -7701,22 +7722,29 @@ async def _index_extract(system: str, user: str, max_tokens: int = INDEX_EXTRACT
             except Exception as e:
                 code = getattr(e, "status_code", None) or getattr(getattr(e, "response", None), "status_code", None)
                 if code in (401, 402):  # ключ/квота — фатально, НЕ poison: стопим стадию (иначе весь чат уйдёт в ложные skip)
-                    raise IndexTransientError(f"config {code} (ключ/квота недоступны) — стоп, не poison: {e}")
+                    raise IndexTransientError(f"{provider}/{model}: config {code} (ключ/квота недоступны) — стоп, не poison: {e}")
                 if code in (403, 404):  # доступ/модель-not-found — пробуем запасную; если и она недоступна → transient-стоп (не skip)
-                    log("INDEX", f"Экстракция {model}: {code} (доступ/модель) — пробую запасную")
+                    log("INDEX", f"Экстракция {provider}/{model}: {code} (доступ/модель) — пробую запасную")
                     break  # got_response НЕ ставим → обе недоступны дадут transient-стоп, а не poison
-                if code in (413, 422):  # payload/param слишком большой — дробим вход (как finish=length), не skip
-                    log("INDEX", f"Экстракция {model}: {code} (payload/param) — дроблю вход")
-                    return None
-                if code and 400 <= code < 500 and code != 429:  # прочие 4xx — детерминированный poison-контент
-                    got_response = True
-                    log("INDEX", f"Экстракция {model}: детерминированный {code} — не ретраю (poison): {e}")
-                    break
-                log("INDEX", f"Экстракция {model} ошибка (попытка {attempt}): {e}")
+                if code in (413, 422):
+                    low = str(e).lower()
+                    if any(k in low for k in ("token", "context", "length", "too large", "payload", "maximum")):
+                        log("INDEX", f"Экстракция {provider}/{model}: {code} (слишком большой payload/context) — дроблю вход")
+                        return None
+                    raise IndexTransientError(f"{provider}/{model}: invalid params {code} — стоп, не poison: {e}")
+                if code == 400:
+                    low = str(e).lower()
+                    if any(k in low for k in ("token", "context", "length", "too large", "payload", "maximum")):
+                        log("INDEX", f"Экстракция {provider}/{model}: 400 по размеру payload/context — дроблю вход")
+                        return None
+                    raise IndexTransientError(f"{provider}/{model}: invalid request 400 — стоп, не poison: {e}")
+                if code and 400 <= code < 500 and code != 429:
+                    raise IndexTransientError(f"{provider}/{model}: deterministic API {code} — стоп, не poison: {e}")
+                log("INDEX", f"Экстракция {provider}/{model} ошибка (попытка {attempt}): {e}")
             if attempt < INDEX_EXTRACT_RETRIES:
                 await asyncio.sleep(min(30, 2 ** attempt) + random.random())
-        if mi == 0:
-            log("INDEX", f"Экстракция {model}: пробую запасную модель")
+        if ri < len(routes) - 1:
+            log("INDEX", f"Экстракция {provider}/{model}: пробую запасной маршрут")
     if not got_response:  # провайдер недоступен — транзиент, НЕ poison
         raise IndexTransientError("extract: провайдер не ответил ни разу (сеть/5xx/timeout)")
     return None
