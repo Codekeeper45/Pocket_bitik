@@ -7455,11 +7455,12 @@ async def _idx_get_state(chat_id: int, stage: int) -> dict:
 
 async def _idx_set_state(chat_id: int, stage: int, cursor=None, stats=None, status=None):
     await db_write(
-        """INSERT INTO idx_state (chat_id, stage, `cursor`, stats, status) VALUES (%s,%s,%s,%s,%s)
+        """INSERT INTO idx_state (chat_id, stage, `cursor`, stats, status)
+             VALUES (%s,%s,%s,%s,COALESCE(%s,'running'))
            ON DUPLICATE KEY UPDATE `cursor`=COALESCE(VALUES(`cursor`),`cursor`),
-             stats=COALESCE(VALUES(stats),stats), status=COALESCE(VALUES(status),status)""",
+             stats=COALESCE(VALUES(stats),stats), status=COALESCE(%s,status)""",
         (chat_id, stage, json.dumps(cursor, ensure_ascii=False) if cursor is not None else None,
-         json.dumps(stats, ensure_ascii=False) if stats is not None else None, status))
+         json.dumps(stats, ensure_ascii=False) if stats is not None else None, status, status))
 
 
 def _index_scene_key(chat_id: int, start_msg_id: int, end_msg_id: int) -> str:
