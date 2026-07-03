@@ -8620,7 +8620,9 @@ async def _index_stage2_graph(chat_id: int, progress_cb=None):
         await _write_chunk(sc, scene_text, rels_applied, touched, 0, failed=False)
 
     async def _flush_batch():
-        """Экстрагирует batch параллельно, применяет по очереди, чекпоинтит по каждой сцене. IndexTransientError пробрасывается."""
+        """Экстрагирует batch параллельно, применяет по очереди, чекпоинтит по сцене. Устойчив к транзиентам:
+        один-два блипа из батча не роняют стадию — точечный ретрай; в error уходим, только если сцена не
+        поднялась даже после ретрая (провайдер реально сыпется). Чекпоинтим НЕПРЕРЫВНЫЙ префикс успехов → нет дыр."""
         nonlocal batch
         if not batch:
             return
@@ -8630,16 +8632,34 @@ async def _index_stage2_graph(chat_id: int, progress_cb=None):
             async with sem:
                 return await _extract_scene(sc)
 
-        results = await asyncio.gather(*[_one(sc) for sc in batch])  # транзиент пробросится (и отменит остальные)
+        # return_exceptions=True: транзиент одной сцены НЕ отменяет остальные и не роняет стадию мгновенно
+        results = await asyncio.gather(*[_one(sc) for sc in batch], return_exceptions=True)
+        failed = [i for i, r in enumerate(results) if isinstance(r, Exception)]
+        if failed:  # точечный ретрай упавших (пауза даёт провайдеру выдохнуть после всплеска параллельных вызовов)
+            log("INDEX", f"Stage2: {len(failed)}/{len(batch)} сцен упали транзиентом — точечный ретрай")
+            await asyncio.sleep(2 + random.random() * 3)
+            for i in failed:
+                try:
+                    results[i] = await _extract_scene(batch[i])
+                except Exception as e:
+                    results[i] = e
+        # применяем НЕПРЕРЫВНЫЙ префикс успехов, чекпоинтя после КАЖДОЙ сцены (чтобы не было дыр и потерь прогресса)
+        last_ok, stopped = None, False
         for sc, res in zip(batch, results):
+            if isinstance(res, Exception):
+                stopped = True
+                break
             await _apply_scene(sc, *res)
-            await _idx_set_state(chat_id, 2, cursor={"last_msg_id": sc[-1]["msg_id"]}, stats={"scenes": scenes_done})
+            last_ok = sc[-1]["msg_id"]
+            await _idx_set_state(chat_id, 2, cursor={"last_msg_id": last_ok}, stats={"scenes": scenes_done})
             await db_write(
                 "UPDATE index_failed_ranges SET status='resolved' WHERE chat_id=%s AND stage=2 AND status='retrying' AND end_msg_id<=%s",
-                (chat_id, sc[-1]["msg_id"]))
-        if progress_cb:
-            await progress_cb(f"🕸 Граф: {scenes_done} сцен (до id {batch[-1][-1]['msg_id']})…")
+                (chat_id, last_ok))
+        if progress_cb and last_ok is not None:
+            await progress_cb(f"🕸 Граф: {scenes_done} сцен (до id {last_ok})…")
         batch = []
+        if stopped:  # сцена не извлеклась даже после ретрая → встаём в error (чекпоинт на last_ok, /index resume добёрет без дыр)
+            raise IndexTransientError("Stage2: сцена не извлеклась даже после точечного ретрая — провайдер сыпется")
 
     while True:
         if _INDEX_CONTROL.get(chat_id) == "pause":
@@ -10375,14 +10395,15 @@ _scheduler_started = False
 
 
 async def _index_boot_resume():
-    """Автовозобновление индексации после рестарта: подхватывает чаты, что были в статусе 'running'
-    (их фоновая задача умерла вместе с процессом). Прогресс checkpoint'ится в БД, продолжаем с чекпоинта.
-    Паузу ('paused') и ошибку ('error') НЕ трогаем — их продолжает пользователь вручную."""
+    """Автовозобновление индексации после рестарта: подхватывает чаты в статусе 'running' (их фоновая задача
+    умерла с процессом) И 'error' (транзиентный сбой провайдера — рестарт даёт свежую попытку). Прогресс
+    checkpoint'ится в БД, продолжаем с чекпоинта. Паузу ('paused') НЕ трогаем — её продолжает пользователь вручную.
+    Одна попытка на буст (не тайт-луп): если снова упадёт — стадия опять встанет в error, ждёт следующего рестарта/resume."""
     if _index_available():   # DSN не настроен → индекс-памяти нет
         return
     try:
         await _index_ensure_ddl()
-        rows = await db_read("SELECT DISTINCT chat_id FROM idx_state WHERE status='running'")
+        rows = await db_read("SELECT DISTINCT chat_id FROM idx_state WHERE status IN ('running','error')")
     except Exception as e:
         log("INDEX", f"Автовозобновление: состояние недоступно ({e})")
         return
