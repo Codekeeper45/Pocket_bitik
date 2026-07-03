@@ -7338,6 +7338,274 @@ async def _index_stage0_dump(chat_id: int, progress_cb=None):
     return "done"
 
 
+# --- LLM-экстракция (V4 Flash, JSON-mode) ---
+def _json_from_llm(text: str):
+    """Достаёт JSON-объект из ответа модели (снимает ```-ограждения, берёт первый {...})."""
+    if not text:
+        return None
+    t = _strip_think(text).strip()
+    t = re.sub(r"^```(?:json)?\s*|\s*```$", "", t.strip(), flags=re.I).strip()
+    try:
+        return json.loads(t)
+    except Exception:
+        pass
+    a, b = t.find("{"), t.rfind("}")
+    if a >= 0 and b > a:
+        try:
+            return json.loads(t[a:b + 1])
+        except Exception:
+            return None
+    return None
+
+
+async def _index_extract(system: str, user: str, max_tokens: int = 8000):
+    """Экстракция через INDEX_EXTRACT_MODEL (V4 Flash) с JSON-mode; фолбэк на запасную. Возвращает dict|None."""
+    global _INDEX_EXTRACT_OK
+    models = [INDEX_EXTRACT_MODEL, INDEX_EXTRACT_FALLBACK]
+    for mi, model in enumerate(models):
+        try:
+            resp = await asyncio.to_thread(
+                openrouter_client.chat.completions.create,
+                model=model, max_tokens=max_tokens, temperature=0.2,
+                response_format={"type": "json_object"},
+                messages=[{"role": "system", "content": system}, {"role": "user", "content": user}],
+                timeout=240,
+            )
+            content = resp.choices[0].message.content or ""
+            data = _json_from_llm(content)
+            if data is not None:
+                _INDEX_EXTRACT_OK = True
+                return data
+            log("INDEX", f"Экстракция {model}: не распарсил JSON (finish={resp.choices[0].finish_reason})")
+        except Exception as e:
+            log("INDEX", f"Экстракция {model} ошибка: {e}" + (" — пробую запасную" if mi == 0 else ""))
+    return None
+
+
+# --- STAGE 1: досье («снежный ком») ---
+_INDEX_AUTHORS: dict = {}  # {chat_id: {author_id: name}} — кэш имён участников на процесс
+
+
+async def _index_author_map(chat_id: int) -> dict:
+    """Имена участников чата {id: имя} для подписи сообщений (best-effort; лурки-без-имени → user{id})."""
+    if chat_id in _INDEX_AUTHORS:
+        return _INDEX_AUTHORS[chat_id]
+    amap = {}
+    try:
+        parts = await client.get_participants(chat_id, aggressive=False)
+        for p in parts:
+            amap[p.id] = utils.get_display_name(p) or f"user{p.id}"
+    except Exception as e:
+        log("INDEX", f"Участники чата {chat_id} недоступны ({e}) — подписи по id")
+    _INDEX_AUTHORS[chat_id] = amap
+    return amap
+
+
+def _norm_claim(s: str) -> str:
+    return re.sub(r"\s+", " ", (s or "").strip().lower())[:400]
+
+
+async def _index_load_registry(chat_id: int) -> tuple:
+    """Реестр сущностей для промпта: (текст-листинг, {id: row}). Компактно: id/имя/тип/алиасы (+суть если влезает)."""
+    rows = await db_read(
+        "SELECT id, name, entity_type, aliases, canon_summary FROM entities WHERE chat_id=%s ORDER BY id", (chat_id,))
+    by_id = {r["id"]: r for r in rows}
+    lines = []
+    for r in rows:
+        al = json.loads(r["aliases"]) if r["aliases"] else []
+        head = f"[id={r['id']}] {r['name']} ({r['entity_type']}) алиасы: {', '.join(al) if al else '—'}"
+        lines.append(head)
+    listing = "\n".join(lines) if lines else "(пусто — сущностей ещё нет)"
+    # если реестр огромен — не раздуваем (имена+алиасы уже без сути); грубый предохранитель
+    if count_tokens(listing) > 60000:
+        listing = "\n".join(lines[:1500]) + f"\n… (+{max(0, len(lines) - 1500)} ещё; показаны первые)"
+    return listing, by_id
+
+
+_INDEX_STAGE1_SYSTEM = (
+    "Ты — аналитик истории чата. Из лога извлекаешь СУЩНОСТИ (реальных участников чата и вымышленных "
+    "персонажей/лор) и факты о них. Тебе дан РЕЕСТР уже известных сущностей (с их id) и НОВЫЙ БЛОК сообщений "
+    "в формате [msg_id] Автор: текст.\n"
+    "Верни СТРОГО JSON (без пояснений):\n"
+    '{"entities":[{"ref": <id из реестра, если сущность уже там, иначе null>,'
+    ' "name": "<основное имя>", "type": "user"|"character",'
+    ' "aliases": ["<все прозвища и РАСКРЫТЫЕ тождества>"],'
+    ' "canon": [{"claim":"<твёрдый факт о персонаже/вселенной>","evidence":[<msg_id>]}],'
+    ' "fanon": [{"claim":"<мнение/отношение участников>","evidence":[<msg_id>]}]}]}\n'
+    "Правила: если из беседы следует, что два имени — одна сущность (напр. раскрыто «X это Y»), это ОДНА "
+    "сущность, оба имени в aliases. canon — факты вселенной, заявленные как истина (Evidence-based: только то, "
+    "что участники утверждают как факт). fanon — их эмоции/оценки/отношение. evidence — реальные msg_id из блока, "
+    "откуда взят факт. Извлекай ТОЛЬКО значимые сущности (о ком реально говорят / кто активно участвует), не плоди "
+    "запись на каждого случайного автора. Если новых фактов о сущности нет — можно её не возвращать."
+)
+
+
+async def _index_apply_entities(chat_id: int, ents: list, name2author: dict):
+    """UPSERT сущностей и claim'ов из ответа модели. name2author — {lower(name): author_id} для tg_user_id."""
+    if not ents:
+        return 0
+    touched = 0
+    for e in ents:
+        if not isinstance(e, dict):
+            continue
+        name = (e.get("name") or "").strip()
+        if not name:
+            continue
+        etype = "character" if str(e.get("type")).lower().startswith("char") else "user"
+        aliases = [a.strip() for a in (e.get("aliases") or []) if isinstance(a, str) and a.strip()]
+        ref = e.get("ref")
+        ent_id = None
+        if isinstance(ref, int) and ref > 0:
+            rows = await db_read("SELECT id, aliases FROM entities WHERE chat_id=%s AND id=%s", (chat_id, ref))
+            if rows:
+                ent_id = rows[0]["id"]
+                old = json.loads(rows[0]["aliases"]) if rows[0]["aliases"] else []
+                merged = list(dict.fromkeys(old + aliases + [name]))
+                await db_write("UPDATE entities SET aliases=%s WHERE id=%s",
+                               (json.dumps(merged, ensure_ascii=False), ent_id))
+        if ent_id is None:  # ищем по имени/алиасу, чтобы не задваивать (снежный ком мог не подставить ref)
+            rows = await db_read("SELECT id FROM entities WHERE chat_id=%s AND name=%s", (chat_id, name))
+            if rows:
+                ent_id = rows[0]["id"]
+        if ent_id is None:  # новая сущность
+            tg = name2author.get(name.lower()) if etype == "user" else None
+            _, ent_id = await db_write(
+                "INSERT INTO entities (chat_id,name,entity_type,tg_user_id,aliases) VALUES (%s,%s,%s,%s,%s)",
+                (chat_id, name, etype, tg, json.dumps(list(dict.fromkeys([name] + aliases)), ensure_ascii=False)))
+        # claim'ы (дедуп по нормализованному тексту в пределах сущности)
+        existing = await db_read("SELECT id, kind, claim, evidence FROM entity_claims WHERE chat_id=%s AND entity_id=%s",
+                                 (chat_id, ent_id))
+        seen = {(_norm_claim(r["claim"]), r["kind"]): r for r in existing}
+        for kind in ("canon", "fanon"):
+            for c in (e.get(kind) or []):
+                if not isinstance(c, dict):
+                    continue
+                claim = (c.get("claim") or "").strip()
+                if not claim:
+                    continue
+                ev = [int(x) for x in (c.get("evidence") or []) if isinstance(x, (int, str)) and str(x).isdigit()]
+                keyc = (_norm_claim(claim), kind)
+                if keyc in seen:  # уже есть — доклеим evidence
+                    r = seen[keyc]
+                    old_ev = json.loads(r["evidence"]) if r["evidence"] else []
+                    new_ev = list(dict.fromkeys(old_ev + ev))
+                    if new_ev != old_ev:
+                        await db_write("UPDATE entity_claims SET evidence=%s WHERE id=%s",
+                                       (json.dumps(new_ev, ensure_ascii=False), r["id"]))
+                else:
+                    await db_write(
+                        "INSERT INTO entity_claims (chat_id,entity_id,kind,claim,evidence) VALUES (%s,%s,%s,%s,%s)",
+                        (chat_id, ent_id, kind, claim, json.dumps(ev, ensure_ascii=False)))
+                    seen[keyc] = {"id": None, "kind": kind, "claim": claim, "evidence": json.dumps(ev)}
+        touched += 1
+    return touched
+
+
+async def _index_stage1_dossiers(chat_id: int, progress_cb=None):
+    """Снежный ком: блоки текстовых сообщений → V4 Flash → сущности+claim'ы. Чекпоинт по msg_id блока."""
+    st = await _idx_get_state(chat_id, 1)
+    cursor = int(st["cursor"].get("last_msg_id", 0))
+    ents_seen = int(st["stats"].get("blocks", 0))
+    await _idx_set_state(chat_id, 1, status="running")
+    amap = await _index_author_map(chat_id)
+    name2author = {}
+    for aid, nm in amap.items():
+        name2author.setdefault(nm.lower(), aid)
+    log("INDEX", f"Stage1 досье чата {chat_id}: с msg_id>{cursor}")
+
+    blocks_done = ents_seen
+    while True:
+        if _INDEX_CONTROL.get(chat_id) == "pause":
+            await _idx_set_state(chat_id, 1, status="paused")
+            return "paused"
+        # набираем блок текстовых сообщений до токен-бюджета
+        rows = await db_read(
+            "SELECT msg_id, author_id, txt FROM messages WHERE chat_id=%s AND msg_id>%s AND txt IS NOT NULL AND txt<>'' "
+            "ORDER BY msg_id ASC LIMIT 6000", (chat_id, cursor))
+        if not rows:
+            break
+        lines, tok, last = [], 0, cursor
+        for r in rows:
+            nm = amap.get(r["author_id"], f"user{r['author_id']}" if r["author_id"] else "?")
+            line = f"[{r['msg_id']}] {nm}: {r['txt']}"
+            lines.append(line)
+            tok += count_tokens(line)
+            last = r["msg_id"]
+            if tok >= INDEX_STAGE1_BLOCK_TOKENS:
+                break
+        registry, _ = await _index_load_registry(chat_id)
+        user = f"РЕЕСТР (известные сущности):\n{registry}\n\nНОВЫЙ БЛОК:\n" + "\n".join(lines)
+        data = await _index_extract(_INDEX_STAGE1_SYSTEM, user)
+        if data and isinstance(data.get("entities"), list):
+            await _index_apply_entities(chat_id, data["entities"], name2author)
+        else:
+            log("INDEX", f"Stage1 блок до msg_id={last}: экстракция пустая/битая — пропускаю блок")
+        cursor = last
+        blocks_done += 1
+        await _idx_set_state(chat_id, 1, cursor={"last_msg_id": cursor}, stats={"blocks": blocks_done})
+        if progress_cb:
+            cnt = (await db_read("SELECT COUNT(*) c FROM entities WHERE chat_id=%s", (chat_id,)))[0]["c"]
+            await progress_cb(f"🧠 Досье: блок {blocks_done} (до id {cursor}) · сущностей {cnt}…")
+
+    # синтез компактных досье canon/fanon из claim'ов
+    await _index_summarize_entities(chat_id, progress_cb)
+    await _idx_set_state(chat_id, 1, status="done", stats={"blocks": blocks_done})
+    cnt = (await db_read("SELECT COUNT(*) c FROM entities WHERE chat_id=%s", (chat_id,)))[0]["c"]
+    log("INDEX", f"Stage1 чата {chat_id}: готово, сущностей {cnt}, блоков {blocks_done}")
+    return "done"
+
+
+_INDEX_SUMM_SYSTEM = (
+    "Ты пишешь компактное досье персонажа/участника чата по собранным фактам. Даны CANON-факты (что считается "
+    "правдой о нём) и FANON-факты (мнения и отношение участников). Верни СТРОГО JSON: "
+    '{"canon":"<2–4 предложения: кто это, ключевой лор/роль, только по фактам>",'
+    ' "fanon":"<1–3 предложения: как к нему относятся в чате>"}. Без выдумок сверх фактов; если фактов нет — пустая строка.'
+)
+
+
+async def _index_summarize_entities(chat_id: int, progress_cb=None):
+    """Из claim'ов синтезирует entities.canon_summary/fanon_summary. Чекпоинт по entity id."""
+    st = await _idx_get_state(chat_id, 1)
+    after = int(st["cursor"].get("summ_after_id", 0))
+    ents = await db_read(
+        "SELECT id, name FROM entities WHERE chat_id=%s AND id>%s ORDER BY id", (chat_id, after))
+    sem = asyncio.Semaphore(4)
+    total = len(ents)
+    done = 0
+
+    async def _one(ent):
+        nonlocal done
+        claims = await db_read(
+            "SELECT kind, claim FROM entity_claims WHERE chat_id=%s AND entity_id=%s ORDER BY id", (chat_id, ent["id"]))
+        canon = [c["claim"] for c in claims if c["kind"] == "canon"]
+        fanon = [c["claim"] for c in claims if c["kind"] == "fanon"]
+        if not canon and not fanon:
+            csum = fsum = ""
+        else:
+            body = (f"Персонаж/участник: {ent['name']}\nCANON-факты:\n" + ("\n".join(f"- {c}" for c in canon) or "(нет)")
+                    + "\nFANON-факты:\n" + ("\n".join(f"- {c}" for c in fanon) or "(нет)"))
+            async with sem:
+                data = await _index_extract(_INDEX_SUMM_SYSTEM, body, max_tokens=1200)
+            if isinstance(data, dict):
+                csum, fsum = (data.get("canon") or "").strip(), (data.get("fanon") or "").strip()
+            else:  # фолбэк — просто склейка фактов
+                csum = " ".join(canon)[:1500]
+                fsum = " ".join(fanon)[:800]
+        await db_write("UPDATE entities SET canon_summary=%s, fanon_summary=%s WHERE id=%s", (csum, fsum, ent["id"]))
+        done += 1
+
+    # обрабатываем чанками, чекпоинтя max id (устойчиво к рестарту)
+    for i in range(0, total, 20):
+        if _INDEX_CONTROL.get(chat_id) == "pause":
+            return
+        chunk = ents[i:i + 20]
+        await asyncio.gather(*[_one(e) for e in chunk])
+        await _idx_set_state(chat_id, 1, cursor={"last_msg_id": st["cursor"].get("last_msg_id", 0),
+                                                  "summ_after_id": chunk[-1]["id"]})
+        if progress_cb:
+            await progress_cb(f"📝 Досье-саммари: {min(i + 20, total)}/{total}…")
+
+
 # --- оркестратор пайплайна ---
 async def _index_pipeline(chat_id: int, status_msg):
     """Прогоняет этапы по порядку, уважая паузу. Пока реализован Stage 0 (дамп);
@@ -7349,17 +7617,29 @@ async def _index_pipeline(chat_id: int, status_msg):
             pass
     try:
         await _index_ensure_ddl()
-        res = await _index_stage0_dump(chat_id, progress_cb=upd)
-        if res == "paused":
-            await upd("⏸ Индексация на паузе (Stage 0). `/index resume` — продолжить.")
-            return
-        if res == "floodwait":
-            await upd("⏳ Telegram притормозил выгрузку (FloodWait). `/index resume` позже — дожму остаток.")
-            return
+        # Stage 0 — дамп (если ещё не done)
+        st0 = await _idx_get_state(chat_id, 0)
+        if st0["status"] != "done":
+            res = await _index_stage0_dump(chat_id, progress_cb=upd)
+            if res == "paused":
+                await upd("⏸ Индексация на паузе (Stage 0 — дамп). `/index resume` — продолжить.")
+                return
+            if res == "floodwait":
+                await upd("⏳ Telegram притормозил выгрузку (FloodWait). `/index resume` позже — дожму остаток.")
+                return
         st0 = await _idx_get_state(chat_id, 0)
         n = int(st0["stats"].get("dumped", 0))
-        await upd(f"✅ Stage 0 готов: выкачано **{n}** сообщений в память.\n"
-                  f"Этапы 1–3 (досье · граф · вектора) — в следующих обновлениях бота.")
+        # Stage 1 — досье
+        st1 = await _idx_get_state(chat_id, 1)
+        if st1["status"] != "done":
+            await upd(f"✅ Дамп: {n} сообщений. 🧠 Строю досье (может занять долго)…")
+            res1 = await _index_stage1_dossiers(chat_id, progress_cb=upd)
+            if res1 == "paused":
+                await upd("⏸ Индексация на паузе (Stage 1 — досье). `/index resume` — продолжить.")
+                return
+        cnt = (await db_read("SELECT COUNT(*) c FROM entities WHERE chat_id=%s", (chat_id,)))[0]["c"]
+        await upd(f"✅ Дамп ({n} сообщений) и досье (**{cnt}** сущностей) готовы.\n"
+                  f"Смотри: `/entity show <имя>`. Этапы 2–3 (граф · вектора) — в следующих обновлениях.")
     except Exception as e:
         log("INDEX", f"Пайплайн чата {chat_id} упал: {e}")
         traceback.print_exc()
@@ -7461,6 +7741,75 @@ async def index_command(event):
         status_msg = await event.reply("▶️ Продолжаю индексацию с последнего чекпоинта…")
         _INDEX_TASKS[chat_id] = asyncio.create_task(_index_pipeline(chat_id, status_msg))
         return
+
+
+async def _index_find_entity(chat_id: int, query: str):
+    """Ищет сущность по имени или алиасу (точное → префикс → подстрока/алиас). Возвращает row|None."""
+    q = query.strip()
+    rows = await db_read("SELECT * FROM entities WHERE chat_id=%s AND name=%s LIMIT 1", (chat_id, q))
+    if rows:
+        return rows[0]
+    rows = await db_read(
+        "SELECT * FROM entities WHERE chat_id=%s AND (name LIKE %s OR aliases LIKE %s) ORDER BY CHAR_LENGTH(name) LIMIT 1",
+        (chat_id, q + "%", f'%"{q}"%'))
+    if rows:
+        return rows[0]
+    rows = await db_read("SELECT * FROM entities WHERE chat_id=%s AND name LIKE %s ORDER BY CHAR_LENGTH(name) LIMIT 1",
+                         (chat_id, f"%{q}%"))
+    return rows[0] if rows else None
+
+
+@client.on(events.NewMessage(pattern=r"^[./]entity\s+show\s+(.+)$"))
+async def entity_show_command(event):
+    if await _slash_for_other_bot(event):
+        return
+    if not event.out:
+        return
+    reason = _index_available()
+    if reason:
+        await event.reply(f"⚠️ /entity недоступен: {reason}")
+        return
+    chat_id = event.chat_id
+    query = event.pattern_match.group(1).strip()
+    ent = await _index_find_entity(chat_id, query)
+    if not ent:
+        await event.reply(f"🔍 Не нашёл сущность «{query}» в этом чате. Сначала проиндексируй: `/index go`.")
+        return
+    aliases = json.loads(ent["aliases"]) if ent["aliases"] else []
+    type_label = "🎭 персонаж" if ent["entity_type"] == "character" else "👤 участник"
+    parts = [f"**{ent['name']}** — {type_label}"]
+    if aliases and aliases != [ent["name"]]:
+        parts.append(f"_алиасы:_ {', '.join(a for a in aliases if a != ent['name'])}")
+    if (ent.get("canon_summary") or "").strip():
+        parts.append(f"\n📖 **Canon:** {ent['canon_summary'].strip()}")
+    if (ent.get("fanon_summary") or "").strip():
+        parts.append(f"💬 **Fanon (мнение чата):** {ent['fanon_summary'].strip()}")
+    if (ent.get("visual_features") or "").strip():
+        parts.append(f"🖼 **Внешность:** {ent['visual_features'].strip()}")
+    # топ-факты с evidence-ссылками
+    claims = await db_read(
+        "SELECT kind, claim, evidence FROM entity_claims WHERE chat_id=%s AND entity_id=%s ORDER BY id", (chat_id, ent["id"]))
+    try:
+        chat_ent = await event.get_chat()
+    except Exception:
+        chat_ent = None
+    for kind, title in (("canon", "📌 Факты (canon)"), ("fanon", "💭 Мнения (fanon)")):
+        ck = [c for c in claims if c["kind"] == kind][:6]
+        if not ck:
+            continue
+        parts.append(f"\n{title}:")
+        for c in ck:
+            ev = json.loads(c["evidence"]) if c["evidence"] else []
+            link = ""
+            if chat_ent and ev:
+                try:
+                    link = f" [↗]({build_msg_link(chat_ent, ev[0])})"
+                except Exception:
+                    link = ""
+            parts.append(f"• {c['claim']}{link}")
+    n_claims = len(claims)
+    parts.append(f"\n_id {ent['id']} · фактов: {n_claims}_")
+    await send_long(chat_id, "\n".join(parts), parse_mode="md", reply_to=event.id)
 
 
 # --- Запуск ---
