@@ -161,6 +161,8 @@ INDEX_EMBED_RETRIES = 3       # embeddings: 429/5xx у провайдера не
 INDEX_MATRIX_CACHE_MAX_ROWS = 10_000  # больше ищем потоково, без полной матрицы в RAM
 INDEX_SEARCH_DB_BATCH = 5_000
 INDEX_COUNT_TTL = 60          # сек: кэш COUNT(*) для выбора backend поиска (инвалидируется на каждую запись индекса)
+INDEX_SEARCH_FLOOR = 0.15     # ниже этого косинуса результат не показываем вообще
+INDEX_SEARCH_CONFIDENT = 0.28 # ниже — «слабое» совпадение: помечаем и просим модель переспросить/веб (Corrective RAG)
 INDEX_EVAL_CASES_PATH = "index_eval_cases.json"
 GEN_INDEX_REF_MAX = 8         # /gen: сколько фото-референсов подтягивать из индекс-памяти (смысловой поиск по всей истории)
 # OCR фото в /ask по умолчанию (cost-effective вместо vision-модели; флаг -m возвращает vision).
@@ -3308,7 +3310,7 @@ async def _run_reply_tool(args: dict, chat_id, msg_by_id: dict, reply_sent: list
     return " ".join(parts)
 
 
-async def ask_agentic(context: str, question: str, must_search: bool = False, caller: str = None, ctx_tokens_est: int = None, voice_mode: str = "off", images: list = None, chat_id=None, msg_by_id: dict = None, memory_allowed: bool = True) -> str:
+async def ask_agentic(context: str, question: str, must_search: bool = False, caller: str = None, ctx_tokens_est: int = None, voice_mode: str = "off", images: list = None, chat_id=None, msg_by_id: dict = None, memory_allowed: bool = True, asker_id=None) -> str:
     """Agentic ask: модель сама решает, искать ли информацию в каналах.
     ctx_tokens_est — tiktoken-оценка контекста (для логирования Δ с реальным API).
     voice_mode: "off" — обычный текст; "force" — ответ под озвучку (флаг -v); "auto" — модель сама может выбрать голос (маркер [[VOICE]]).
@@ -3361,7 +3363,10 @@ async def ask_agentic(context: str, question: str, must_search: bool = False, ca
                           "досье персонажа/участника по имени или прозвищу — canon-факты, мнение чата, связи), "
                           "memory_media (найти и переслать в чат фото из истории по описанию). Используй их для вопросов "
                           "про историю чата, лор, персонажей, прошлые споры и события, про которых нет в текущем контексте, "
-                          "и когда просят найти/скинуть старое фото. Имена и прозвища разрешаются автоматически.")
+                          "и когда просят найти/скинуть старое фото. Имена и прозвища разрешаются автоматически. "
+                          "Если memory_search вернул слабые/пустые совпадения (помечено ⚠️) — не выдавай догадку за факт: "
+                          "переспроси другими словами (конкретнее имена/событие) один раз или, для внешних тем, используй веб. "
+                          "Иногда к вопросу приложена справка о спрашивающем из памяти — учитывай её, только если релевантно.")
     if must_search and (has_channels or has_web):
         force_name = "telegram_search" if has_channels else "web_search"
         system_prompt += f"\n\nОБЯЗАТЕЛЬНО используй {force_name} хотя бы один раз перед тем как ответить."
@@ -3371,6 +3376,13 @@ async def ask_agentic(context: str, question: str, must_search: bool = False, ca
         system_prompt += _voice_auto_hint(TTS_ENGINE, FISH_TTS_MODEL)
 
     user_text = _build_ask_user_content(context, question, caller, now_str)
+    if has_memory and asker_id:  # персональная память: бот узнаёт спрашивающего и подтягивает его досье
+        try:
+            _who = await _index_asker_brief(chat_id, asker_id)
+            if _who:
+                user_text += "\n\n" + _who
+        except Exception as e:
+            log("ASK", f"Справка о спрашивающем не собралась: {e}")
     if images:
         # Мультимодальный content: текст + сами картинки (/ask -g)
         user_content = [{"type": "text", "text": user_text}]
@@ -4656,7 +4668,7 @@ async def ask_command(event):
                 log("ASK", f"-g: картинок напрямую модели: {len(images_sorted)}")
             await set_status(f"🤖 Думаю над ответом…{retry_suffix}")
             try:
-                reply = await ask_agentic(context, question, must_search=must_search, caller=caller, ctx_tokens_est=ctx_tokens, voice_mode=voice_mode, images=images_sorted, chat_id=event.chat_id, msg_by_id=msg_by_id, memory_allowed=_index_memory_allowed(is_owner))
+                reply = await ask_agentic(context, question, must_search=must_search, caller=caller, ctx_tokens_est=ctx_tokens, voice_mode=voice_mode, images=images_sorted, chat_id=event.chat_id, msg_by_id=msg_by_id, memory_allowed=_index_memory_allowed(is_owner), asker_id=event.sender_id)
                 t_llm = time.time()
                 break  # успех
             except ContextOverflowError as e:
@@ -8865,9 +8877,11 @@ async def _index_tool_search(chat_id: int, query: str, kind: str = "all") -> str
     ent = await _index_chat_entity(chat_id)
     kinds = {"scenes": ["chunks"], "dossiers": ["entities"], "relations": ["relations"]}.get(kind, ["chunks", "entities", "relations"])
     out = []
+    best = 0.0
     for k in kinds:
         for h in await _index_vector_search(chat_id, k, qv, 5):
-            if h["score"] < 0.15:
+            best = max(best, h["score"])
+            if h["score"] < INDEX_SEARCH_FLOOR:
                 continue
             if k == "chunks":
                 link = (f" {build_msg_link(ent, h['start_msg_id'])}" if ent and h.get("start_msg_id") else "")
@@ -8880,7 +8894,16 @@ async def _index_tool_search(chat_id: int, query: str, kind: str = "all") -> str
                 st = "" if h.get("status") == "active" else " (в прошлом)"
                 out.append(f"• [связь {h['score']}] {n.get(h['source_id'], '?')} → {n.get(h['target_id'], '?')}: "
                            f"{h.get('relation_type') or ''}{st} — {_idx_snip(h.get('context_summary'), 140)}")
-    return "\n".join(out) if out else "Ничего похожего в памяти не нашёл."
+    # Corrective RAG: явно сигналим модели о слабой/пустой выдаче, чтобы она переспросила или пошла в веб,
+    # а не отвечала уверенно по нерелевантному совпадению.
+    if not out:
+        note = f" (лучшее совпадение score {best:.2f})" if best else ""
+        return (f"В памяти ничего релевантного не нашёл{note}. Переформулируй запрос другими словами "
+                f"(конкретнее: имена, о чём именно спор/событие) или, если вопрос про внешний мир, используй web_search.")
+    if best < INDEX_SEARCH_CONFIDENT:
+        out.append(f"⚠️ Совпадения слабые (макс score {best:.2f}) — возможно, точного ответа в памяти нет. "
+                   f"Если это не то, переспроси другими словами или проверь web_search; не выдавай догадку за факт.")
+    return "\n".join(out)
 
 
 async def _index_entity_report(chat_id: int, ent: dict) -> str:
@@ -8927,6 +8950,42 @@ async def _index_tool_entity(chat_id: int, name: str) -> str:
     return await _index_entity_report(chat_id, ent)
 
 
+async def _index_asker_brief(chat_id: int, tg_id: int) -> str:
+    """Компактная справка о СПРАШИВАЮЩЕМ (persona-A): по tg_user_id находит его сущность в графе и
+    отдаёт имя + сжатые canon/fanon + топ активных связей. None, если участник не в памяти или про него
+    ничего содержательного нет (только имя — не тащим). Кладётся в конец user-контента (не в систему — prompt-кэш)."""
+    if not tg_id:
+        return None
+    rows = await db_read(
+        "SELECT id, name, canon_summary, fanon_summary, visual_features FROM entities "
+        "WHERE chat_id=%s AND tg_user_id=%s ORDER BY id LIMIT 1", (chat_id, tg_id))
+    if not rows:
+        return None
+    e = rows[0]
+    bits = []
+    if (e.get("canon_summary") or "").strip():
+        bits.append("О нём: " + _idx_snip(e["canon_summary"], 300))
+    if (e.get("fanon_summary") or "").strip():
+        bits.append("Мнение чата о нём: " + _idx_snip(e["fanon_summary"], 200))
+    if (e.get("visual_features") or "").strip():
+        bits.append("Внешность: " + _idx_snip(e["visual_features"], 160))
+    rels = await db_read(
+        "SELECT source_id, target_id, relation_type FROM relations WHERE chat_id=%s AND status='active' "
+        "AND (source_id=%s OR target_id=%s) ORDER BY weight DESC LIMIT 5", (chat_id, e["id"], e["id"]))
+    if rels:
+        need = {r["source_id"] for r in rels} | {r["target_id"] for r in rels}
+        nm = await db_read("SELECT id, name FROM entities WHERE id IN (%s)" % ",".join(str(int(i)) for i in need))
+        n2 = {r["id"]: r["name"] for r in nm}
+        pairs = [f"{n2.get(r['target_id'] if r['source_id'] == e['id'] else r['source_id'], '?')} ({r['relation_type']})"
+                 for r in rels]
+        if pairs:
+            bits.append("Связи: " + ", ".join(pairs))
+    if not bits:  # только имя, без фактов — незачем шуметь
+        return None
+    return (f"[Справка о спрашивающем из памяти чата — участник известен как «{e['name']}». "
+            f"Учитывай, только если это релевантно вопросу; не притягивай насильно.]\n" + " ".join(bits))
+
+
 async def _index_tool_media(chat_id: int, query: str, count: int = 1, visual: bool = False, query_image: bytes = None) -> str:
     """Поиск фото по описанию (текст → emb_text) или ПО КАРТИНКЕ (visual=true, приложенное/реплай-фото →
     emb_image, «найди похожие арты»). Найденное пересылается в чат."""
@@ -8941,9 +9000,12 @@ async def _index_tool_media(chat_id: int, query: str, count: int = 1, visual: bo
         space = "media_text"
     if qv is None:
         return "Не удалось векторизовать запрос."
-    hits = [h for h in await _index_vector_search(chat_id, space, qv, 6) if h["score"] >= 0.15][:count]
+    all_hits = await _index_vector_search(chat_id, space, qv, 6)
+    best = max((h["score"] for h in all_hits), default=0.0)
+    hits = [h for h in all_hits if h["score"] >= INDEX_SEARCH_FLOOR][:count]
     if not hits:
-        return "Подходящих фото в памяти не нашёл."
+        note = f" (лучшее score {best:.2f})" if best else ""
+        return f"Подходящих фото в памяти не нашёл{note}. Опиши искомое иначе — что на фото, кто, какое событие."
     msg_ids = [h["msg_id"] for h in hits]
     try:
         await client.forward_messages(chat_id, msg_ids, chat_id)
