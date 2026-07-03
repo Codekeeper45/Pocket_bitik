@@ -156,7 +156,8 @@ INDEX_REGISTRY_EXACT_LIMIT = 200
 INDEX_REGISTRY_SEMANTIC_LIMIT = 50
 INDEX_REGISTRY_NEIGHBOR_LIMIT = 100
 INDEX_REGISTRY_FALLBACK_LIMIT = 300
-INDEX_MEDIA_PAUSE = (2.0, 4.0)  # stage 2: пауза между скачиваниями фото (анти-FloodWait юзербота)
+INDEX_MEDIA_PAUSE = (2.0, 4.0)  # stage 5: пауза между скачиваниями фото (анти-FloodWait юзербота)
+INDEX_MEDIA_DL_TIMEOUT = 60     # stage 5: таймаут на одно скачивание фото — зависшая картинка не морозит стадию
 INDEX_EMBED_BATCH = 96        # stage 3: строк на батч эмбеддинга
 INDEX_EXTRACT_RETRIES = 3     # LLM/JSON extractor: не двигаем чекпоинт после временного сбоя
 INDEX_EMBED_RETRIES = 3       # embeddings: 429/5xx у провайдера не должны превращаться в "done"
@@ -6913,9 +6914,9 @@ _HELP_SECTIONS = {
         "   `/index retry failed [1|2]` — переиндексировать пропущенные блоки/сцены точечно\n"
         "   `/index eval template|run|report` — шаблон и прогон smoke-eval качества поиска\n"
         "\n"
-        "**Этапы:** 0 — дамп истории в БД · 1 — досье и алиасы · 2 — граф связей и распознавание фото ·\n"
-        "   3 — вектора для поиска · 4 — сводки по месяцам (для вопросов «как менялось со временем»).\n"
-        "   При рестарте бота индексация продолжается с последнего чекпоинта.\n"
+        "**Этапы:** 0 — дамп истории в БД · 1 — досье и алиасы · 2 — граф связей · 3 — вектора для поиска ·\n"
+        "   4 — сводки по месяцам («как менялось со временем») · 5 — фото (последней, не блокирует поиск).\n"
+        "   При рестарте бота индексация продолжается с последнего чекпоинта (авто).\n"
         "\n"
         "**🔎 Поиск в `/ask`:** после индексации у `/ask` в этом чате появляются инструменты памяти —\n"
         "   у владельца модель сама решает, когда лезть в базу: смысловой поиск по сценам/досье/связям, полное досье\n"
@@ -8271,19 +8272,23 @@ async def _index_apply_relations(chat_id: int, rels: list, name2id: dict, scene_
 
 
 async def _index_download_media(msg):
-    """Скачивает фото сообщения строго по одному с паузой и обработкой FloodWait (анти-бан юзербота)."""
-    async with _INDEX_MEDIA_SEM:
-        for attempt in range(3):
-            try:
-                raw = await msg.download_media(bytes)
-                await asyncio.sleep(random.uniform(*INDEX_MEDIA_PAUSE))
-                return raw
-            except FloodWaitError as e:
-                log("INDEX", f"Медиа: FloodWait {e.seconds}с — жду")
-                await asyncio.sleep(e.seconds + 1)
-            except Exception as e:
-                log("INDEX", f"Медиа id={getattr(msg, 'id', '?')} не скачалось: {e}")
-                return None
+    """Скачивает фото сообщения по одному с паузой, таймаутом и обработкой FloodWait (анти-бан юзербота).
+    Семафор держим ТОЛЬКО на само скачивание — во время FloodWait-сна он отпущен (иначе один чат морозил бы медиа другого)."""
+    for attempt in range(3):
+        try:
+            async with _INDEX_MEDIA_SEM:
+                raw = await asyncio.wait_for(msg.download_media(bytes), timeout=INDEX_MEDIA_DL_TIMEOUT)
+            await asyncio.sleep(random.uniform(*INDEX_MEDIA_PAUSE))
+            return raw
+        except FloodWaitError as e:  # семафор уже отпущен (вышли из with на исключении) → спим, не блокируя других
+            log("INDEX", f"Медиа: FloodWait {e.seconds}с — жду (семафор отпущен)")
+            await asyncio.sleep(e.seconds + 1)
+        except asyncio.TimeoutError:
+            log("INDEX", f"Медиа id={getattr(msg, 'id', '?')}: таймаут {INDEX_MEDIA_DL_TIMEOUT}с — пропускаю")
+            return None
+        except Exception as e:
+            log("INDEX", f"Медиа id={getattr(msg, 'id', '?')} не скачалось: {e}")
+            return None
     return None
 
 
@@ -8432,18 +8437,8 @@ async def _index_stage2_graph(chat_id: int, progress_cb=None):
                 log("INDEX", f"Stage2 poison scene skipped: {sc[0]['msg_id']}..{sc[-1]['msg_id']}")
             else:
                 rels_applied, touched = await _index_apply_relations(chat_id, data["relations"], name2id, s_date)
-        image_ids = [r["msg_id"] for r in sc if r["media_kind"] in (1, 2)]
-        media_done = 0
-        if image_ids:
-            try:
-                image_msgs = []
-                for i in range(0, len(image_ids), 100):
-                    msgs = await client.get_messages(chat_id, ids=image_ids[i:i + 100])
-                    image_msgs += [m for m in msgs if _index_is_image_msg(m)]
-                media_done = await _index_process_media(chat_id, image_msgs, scene_text, registry, name2id)
-            except Exception as e:
-                log("INDEX", f"Stage2: медиа сцены не обработалось: {e}")
-        await _write_chunk(sc, scene_text, rels_applied, touched, media_done, failed=failed)
+        # медиа НЕ качаем в Stage 2 (это блокировало граф на часы) — фото обрабатывает отдельная Stage 5
+        await _write_chunk(sc, scene_text, rels_applied, touched, 0, failed=failed)
 
     while True:
         if _INDEX_CONTROL.get(chat_id) == "pause":
@@ -8807,6 +8802,60 @@ async def _index_stage4_rollups(chat_id: int, progress_cb=None):
         return "error"
     await _idx_set_state(chat_id, 4, status="done", stats={"months": len(months)})
     log("INDEX", f"Stage4 чата {chat_id}: готово, месяцев {len(months)} (обновлено {changed})")
+    return "done"
+
+
+# --- STAGE 5: фото (развязано с графом — идёт последней, не блокирует, полностью возобновляема) ---
+async def _index_stage5_media(chat_id: int, progress_cb=None):
+    """Скачивает/описывает/эмбеддит картинки по сценам. НЕ в Stage 2 — иначе тысячи фото через FloodWait
+    морозили граф на часы. Чекпоинт по chunk id → resume-safe; уже обработанные фото пропускаются (exists)."""
+    st = await _idx_get_state(chat_id, 5)
+    cursor = int(st["cursor"].get("last_chunk_id", 0))
+    done = int(st["stats"].get("photos", 0))
+    await _idx_set_state(chat_id, 5, status="running")
+    total_ph = (await db_read("SELECT COUNT(*) c FROM messages WHERE chat_id=%s AND media_kind IN (1,2)", (chat_id,)))[0]["c"]
+    log("INDEX", f"Stage5 фото чата {chat_id}: с chunk_id>{cursor} (всего фото ~{total_ph})")
+    while True:
+        if _INDEX_CONTROL.get(chat_id) == "pause":
+            await _idx_set_state(chat_id, 5, status="paused")
+            return "paused"
+        chunks = await db_read(
+            "SELECT id, start_msg_id, end_msg_id, enriched_text FROM chat_chunks WHERE chat_id=%s AND id>%s ORDER BY id LIMIT 30",
+            (chat_id, cursor))
+        if not chunks:
+            break
+        for ch in chunks:
+            img_ids = [r["msg_id"] for r in await db_read(
+                "SELECT msg_id FROM messages WHERE chat_id=%s AND msg_id BETWEEN %s AND %s AND media_kind IN (1,2) ORDER BY msg_id",
+                (chat_id, ch["start_msg_id"], ch["end_msg_id"]))]
+            if img_ids:
+                scene_text = ch["enriched_text"] or ""
+                registry, name2id = await _index_relation_registry(chat_id, scene_text)
+                try:
+                    image_msgs = []
+                    for i in range(0, len(img_ids), 100):
+                        msgs = await client.get_messages(chat_id, ids=img_ids[i:i + 100])
+                        image_msgs += [m for m in msgs if _index_is_image_msg(m)]
+                    done += await _index_process_media(chat_id, image_msgs, scene_text, registry, name2id)
+                except Exception as e:
+                    log("INDEX", f"Stage5: медиа сцены {ch['id']} не обработалось: {e}")
+            cursor = ch["id"]
+            await _idx_set_state(chat_id, 5, cursor={"last_chunk_id": cursor}, stats={"photos": done})
+            if progress_cb:
+                await progress_cb(f"🖼 Фото: обработано {done}/~{total_ph}…")
+    # эмбеддинг описаний фото (emb_text): Stage 3 их не застал (медиа теперь после него)
+    res, n = await _index_vectorize_loop(chat_id, "media_assets", "msg_id", "emb_text",
+                                         lambda r: (r.get("image_description") or "изображение")[:8000], progress_cb, "фото-описания")
+    if n:
+        _index_invalidate(chat_id, "media_text")
+    if res == "paused":
+        await _idx_set_state(chat_id, 5, status="paused")
+        return "paused"
+    if res == "error":
+        await _idx_set_state(chat_id, 5, status="error")
+        return "error"
+    await _idx_set_state(chat_id, 5, status="done", stats={"photos": done})
+    log("INDEX", f"Stage5 чата {chat_id}: готово, фото {done}")
     return "done"
 
 
@@ -9356,15 +9405,27 @@ async def _index_pipeline(chat_id: int, status_msg):
             if res4 == "error":
                 await upd("❌ Индексация остановлена на Stage 4: LLM не дала сводку периода. `/index resume` повторит.")
                 return
+        # Stage 5 — фото (последней; текстовый граф уже готов и ищется, фото доливаются в фоне)
+        st5 = await _idx_get_state(chat_id, 5)
+        if st5["status"] != "done":
+            await upd("✅ Граф, вектора и сводки готовы — поиск по тексту уже работает. 🖼 Дообрабатываю фото (долго, по одному)…")
+            res5 = await _index_stage5_media(chat_id, progress_cb=upd)
+            if res5 == "paused":
+                await upd("⏸ Индексация на паузе (Stage 5 — фото). `/index resume` — продолжить. Текстовый поиск уже работает.")
+                return
+            if res5 == "error":
+                await upd("⚠️ Часть фото не векторизовалась (Stage 5). `/index resume` дожмёт. Текстовый поиск уже работает.")
+                return
         skipped = await _index_failed_count(chat_id, "skipped")
         skip_note = (f"\n⚠️ Пропущено poison-диапазонов: {skipped}. "
                      f"Смотри `/index failed`, повтор: `/index retry failed`.") if skipped else ""
+        nmedia = (await db_read("SELECT COUNT(*) c FROM media_assets WHERE chat_id=%s", (chat_id,)))[0]["c"]
         await upd(f"🎉 Индексация завершена: {n} сообщений · {cnt} сущностей · {nrel} связей · {nmedia} фото."
                   f"{skip_note}\nДосье: `/entity show <имя>`. Поиск в `/ask` уже подключён для владельца.")
     except Exception as e:
         log("INDEX", f"Пайплайн чата {chat_id} упал: {e}")
         traceback.print_exc()
-        for stg in (0, 1, 2, 3, 4):
+        for stg in (0, 1, 2, 3, 4, 5):
             s = await _idx_get_state(chat_id, stg)
             if s["status"] != "done":
                 await _idx_set_state(chat_id, stg, status="error")
@@ -9452,7 +9513,8 @@ async def index_command(event):
         # status
         running = chat_id in _INDEX_TASKS
         parts = ["📊 **Статус индексации этого чата:**"]
-        for stg, label in ((0, "Дамп"), (1, "Досье"), (2, "Граф+медиа"), (3, "Вектора"), (4, "Сводки периодов")):
+        for stg, label in ((0, "Дамп"), (1, "Досье"), (2, "Граф связей"), (3, "Вектора"),
+                           (4, "Сводки периодов"), (5, "Фото")):
             s = await _idx_get_state(chat_id, stg)
             if s["status"]:
                 extra = ""
@@ -9460,6 +9522,8 @@ async def index_command(event):
                     extra = f" · {s['stats']['dumped']} сообщ."
                 elif stg == 4 and s["stats"].get("months"):
                     extra = f" · {s['stats']['months']} мес."
+                elif stg == 5 and s["stats"].get("photos"):
+                    extra = f" · {s['stats']['photos']} фото"
                 parts.append(f"• Stage {stg} {label}: {s['status']}{extra}")
         skipped = await _index_failed_count(chat_id, "skipped")
         retrying = await _index_failed_count(chat_id, "retrying")
@@ -9488,7 +9552,7 @@ async def index_command(event):
         if st0["status"] is None:
             await event.reply("📭 Чат ещё не индексировался. Запусти `/index go`.")
             return
-        for stg in (0, 1, 2, 3, 4):
+        for stg in (0, 1, 2, 3, 4, 5):
             s = await _idx_get_state(chat_id, stg)
             if s["status"] == "done":
                 if stg in (1, 2):
