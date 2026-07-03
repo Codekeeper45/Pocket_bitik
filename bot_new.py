@@ -13,6 +13,7 @@ import io
 import asyncio
 import contextvars
 import base64
+import random
 import threading
 import time
 import traceback
@@ -7606,6 +7607,254 @@ async def _index_summarize_entities(chat_id: int, progress_cb=None):
             await progress_cb(f"📝 Досье-саммари: {min(i + 20, total)}/{total}…")
 
 
+# --- STAGE 2: сцены → граф связей + распознавание медиа ---
+_INDEX_MEDIA_SEM = asyncio.Semaphore(1)  # скачиваем фото строго по одному (анти-FloodWait юзербота)
+
+_INDEX_REL_SYSTEM = (
+    "Ты — аналитик связей в чате. Дан СПРАВОЧНИК сущностей (имена и алиасы) и одна СЦЕНА диалога в формате "
+    "[msg_id] Автор: текст. Верни СТРОГО JSON (без пояснений):\n"
+    '{"relations":[{"source":"<имя из справочника>","target":"<имя из справочника>",'
+    ' "type":"<тип связи по-русски: глагол/отношение>","polarity":"pos|neg|neutral",'
+    ' "summary":"<суть связи или конфликта в этой сцене>","evidence":[<msg_id>]}]}\n'
+    "Только связи, ЯВНО проявленные в этой сцене (кто с кем взаимодействует, что заявлено об отношениях). "
+    "source и target — строго имена ИЗ СПРАВОЧНИКА; если участник связи не из справочника — пропусти связь. "
+    "polarity: pos (тепло/союз/симпатия/примирение), neg (конфликт/вражда/насмешка/ссора), "
+    "neutral (родство/роль/структурный факт без оценки). evidence — msg_id из сцены."
+)
+
+_INDEX_MEDIA_SYSTEM = (
+    "Ты описываешь изображение из чата для базы знаний. Даны СПРАВОЧНИК персонажей и контекст сцены вокруг фото. "
+    "Верни СТРОГО JSON:\n"
+    '{"description":"<насыщенное фактами описание: что и кто изображён, что происходит, связь со сценой>",'
+    ' "characters":[{"name":"<имя из справочника, если узнан>","appearance":"<внешность/визуальные приметы>"}]}\n'
+    "Узнавай персонажей из справочника по контексту сцены и подписям. Если узнаваемых нет — characters пустой. "
+    "Не выдумывай имена не из справочника."
+)
+
+
+async def _index_relation_registry(chat_id: int) -> tuple:
+    """(листинг справочника для системного префикса, {lower(имя/алиас): entity_id})."""
+    rows = await db_read("SELECT id, name, entity_type, aliases FROM entities WHERE chat_id=%s ORDER BY id", (chat_id,))
+    name2id, lines = {}, []
+    for r in rows:
+        al = json.loads(r["aliases"]) if r["aliases"] else []
+        name2id[r["name"].lower()] = r["id"]
+        for a in al:
+            name2id.setdefault(a.lower(), r["id"])
+        tag = "персонаж" if r["entity_type"] == "character" else "участник"
+        extra = f" (алиасы: {', '.join(a for a in al if a != r['name'])})" if len(al) > 1 else ""
+        lines.append(f"{r['name']} — {tag}{extra}")
+    listing = "\n".join(lines) if lines else "(справочник пуст)"
+    if count_tokens(listing) > 50000:  # предохранитель для огромных чатов
+        listing = "\n".join(lines[:2000]) + f"\n… (+{max(0, len(lines) - 2000)} ещё)"
+    return listing, name2id
+
+
+async def _index_apply_relations(chat_id: int, rels: list, name2id: dict, scene_date) -> tuple:
+    """Темпоральный UPSERT связей. Сентимент-ребро (pos/neg) одно на пару (s→t): смена полярности
+    закрывает старое и открывает новое (событие «поссорились/помирились»). neutral — отдельное стойкое ребро.
+    Возвращает (число применённых, множество затронутых entity_id)."""
+    applied, touched = 0, set()
+    for rel in rels or []:
+        if not isinstance(rel, dict):
+            continue
+        s = name2id.get(str(rel.get("source", "")).lower().strip())
+        t = name2id.get(str(rel.get("target", "")).lower().strip())
+        if not s or not t or s == t:
+            continue
+        touched.add(s)
+        touched.add(t)
+        pol = str(rel.get("polarity", "neutral")).lower()
+        if pol not in ("pos", "neg", "neutral"):
+            pol = "neutral"
+        rtype = (rel.get("type") or "")[:64]
+        summ = (rel.get("summary") or "")[:2000]
+        ev = [int(x) for x in (rel.get("evidence") or []) if str(x).isdigit()]
+        if pol == "neutral":
+            cond = "AND canonical_type='neutral'"
+        else:
+            cond = "AND canonical_type IN ('pos','neg')"
+        cur = await db_read(
+            f"SELECT id, canonical_type, weight, evidence FROM relations WHERE chat_id=%s AND source_id=%s AND target_id=%s "
+            f"AND status='active' {cond} ORDER BY id DESC LIMIT 1", (chat_id, s, t))
+        if cur:
+            row = cur[0]
+            if pol != "neutral" and row["canonical_type"] != pol:  # полярность сменилась → закрываем старое ребро
+                await db_write("UPDATE relations SET status='closed' WHERE id=%s", (row["id"],))
+                await db_write(
+                    """INSERT INTO relations (chat_id,source_id,target_id,relation_type,canonical_type,context_summary,
+                       weight,first_seen,last_seen,status,evidence) VALUES (%s,%s,%s,%s,%s,%s,1,%s,%s,'active',%s)""",
+                    (chat_id, s, t, rtype, pol, summ, scene_date, scene_date, json.dumps(ev, ensure_ascii=False)))
+            else:  # то же ребро — усиливаем, обновляем summary/last_seen, доклеиваем evidence
+                old_ev = json.loads(row["evidence"]) if row["evidence"] else []
+                new_ev = list(dict.fromkeys(old_ev + ev))[:50]
+                await db_write(
+                    "UPDATE relations SET weight=weight+1, last_seen=%s, relation_type=%s, context_summary=%s, evidence=%s WHERE id=%s",
+                    (scene_date, rtype, summ, json.dumps(new_ev, ensure_ascii=False), row["id"]))
+        else:
+            await db_write(
+                """INSERT INTO relations (chat_id,source_id,target_id,relation_type,canonical_type,context_summary,
+                   weight,first_seen,last_seen,status,evidence) VALUES (%s,%s,%s,%s,%s,%s,1,%s,%s,'active',%s)""",
+                (chat_id, s, t, rtype, pol, summ, scene_date, scene_date, json.dumps(ev, ensure_ascii=False)))
+        applied += 1
+    return applied, touched
+
+
+async def _index_download_media(msg):
+    """Скачивает фото сообщения строго по одному с паузой и обработкой FloodWait (анти-бан юзербота)."""
+    async with _INDEX_MEDIA_SEM:
+        for attempt in range(3):
+            try:
+                raw = await msg.download_media(bytes)
+                await asyncio.sleep(random.uniform(*INDEX_MEDIA_PAUSE))
+                return raw
+            except FloodWaitError as e:
+                log("INDEX", f"Медиа: FloodWait {e.seconds}с — жду")
+                await asyncio.sleep(e.seconds + 1)
+            except Exception as e:
+                log("INDEX", f"Медиа id={getattr(msg, 'id', '?')} не скачалось: {e}")
+                return None
+    return None
+
+
+async def _index_process_media(chat_id: int, photo_msgs: list, scene_text: str, registry: str, name2id: dict):
+    """Распознаёт фото сцены медиа-моделью → media_assets + visual-факты сущностям. Возвращает число обработанных."""
+    model = get_active_media_model()
+    mclient = _client_for_media_model(model)
+    if not mclient:
+        return 0
+    done = 0
+    for msg in photo_msgs:
+        raw = await _index_download_media(msg)
+        if not raw:
+            continue
+        try:
+            b64 = base64.b64encode(raw).decode("utf-8")
+            user = (f"Справочник персонажей:\n{registry[:4000]}\n\nКонтекст сцены:\n{scene_text[:2500]}")
+            resp = await asyncio.to_thread(
+                mclient.chat.completions.create, model=model, max_tokens=1500, timeout=90,
+                messages=[{"role": "user", "content": [
+                    {"type": "text", "text": _INDEX_MEDIA_SYSTEM + "\n\n" + user},
+                    {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{b64}", "detail": "high"}}]}])
+            data = _json_from_llm(resp.choices[0].message.content or "")
+        except Exception as e:
+            log("INDEX", f"Медиа-описание id={msg.id} не удалось: {e}")
+            data = None
+        if not isinstance(data, dict):
+            continue
+        desc = (data.get("description") or "").strip()
+        ent_ids = []
+        for c in (data.get("characters") or []):
+            if not isinstance(c, dict):
+                continue
+            eid = name2id.get(str(c.get("name", "")).lower().strip())
+            if not eid:
+                continue
+            ent_ids.append(eid)
+            app = (c.get("appearance") or "").strip()
+            if app:  # копим внешность у сущности (капом), + visual-claim с пруфом
+                rows = await db_read("SELECT visual_features FROM entities WHERE id=%s", (eid,))
+                old = (rows[0]["visual_features"] or "") if rows else ""
+                if app.lower() not in old.lower():
+                    newvf = (old + " · " + app).strip(" ·")[:2000]
+                    await db_write("UPDATE entities SET visual_features=%s WHERE id=%s", (newvf, eid))
+                await db_write(
+                    "INSERT INTO entity_claims (chat_id,entity_id,kind,claim,evidence) VALUES (%s,%s,'visual',%s,%s)",
+                    (chat_id, eid, app, json.dumps([msg.id], ensure_ascii=False)))
+        uid, _ = _media_meta(msg)
+        await db_write(
+            """INSERT INTO media_assets (chat_id,msg_id,file_uid,image_description,entity_ids)
+               VALUES (%s,%s,%s,%s,%s) ON DUPLICATE KEY UPDATE image_description=VALUES(image_description),
+               entity_ids=VALUES(entity_ids), file_uid=VALUES(file_uid)""",
+            (chat_id, msg.id, uid, desc, json.dumps(ent_ids, ensure_ascii=False)))
+        done += 1
+    return done
+
+
+async def _index_stage2_graph(chat_id: int, progress_cb=None):
+    """Нарезает сцены (гэп >15 мин или токен-кап), строит граф связей и распознаёт фото. Чекпоинт по msg_id сцены.
+    Пишет chat_chunks (enriched_text + мета) с embedding=NULL — векторизует Stage 3."""
+    st = await _idx_get_state(chat_id, 2)
+    cursor = int(st["cursor"].get("last_msg_id", 0))
+    scenes_done = int(st["stats"].get("scenes", 0))
+    await _idx_set_state(chat_id, 2, status="running")
+    registry, name2id = await _index_relation_registry(chat_id)
+    amap = await _index_author_map(chat_id)
+    log("INDEX", f"Stage2 граф чата {chat_id}: с msg_id>{cursor}, справочник {len(name2id)} имён")
+
+    scene, scene_tok, prev_date = [], 0, None
+
+    async def _finalize(sc):
+        nonlocal scenes_done
+        if not sc:
+            return
+        s_date = sc[-1]["date"]
+        lines = [f"[{r['msg_id']}] {amap.get(r['author_id'], 'user' + str(r['author_id'])) }: {r['txt']}"
+                 for r in sc if (r["txt"] or "").strip()]
+        scene_text = "\n".join(lines)
+        rels_applied, touched = 0, set()
+        if scene_text.strip():
+            data = await _index_extract(_INDEX_REL_SYSTEM + "\n\nСПРАВОЧНИК:\n" + registry, "СЦЕНА:\n" + scene_text)
+            if data and isinstance(data.get("relations"), list):
+                rels_applied, touched = await _index_apply_relations(chat_id, data["relations"], name2id, s_date)
+        # медиа сцены
+        photo_ids = [r["msg_id"] for r in sc if r["media_kind"] == 1]
+        media_done = 0
+        if photo_ids:
+            try:
+                photo_msgs = []
+                for i in range(0, len(photo_ids), 100):  # get_messages(ids=…) — до ~100 за вызов
+                    msgs = await client.get_messages(chat_id, ids=photo_ids[i:i + 100])
+                    photo_msgs += [m for m in msgs if m and getattr(m, "photo", None)]
+                media_done = await _index_process_media(chat_id, photo_msgs, scene_text, registry, name2id)
+            except Exception as e:
+                log("INDEX", f"Stage2: медиа сцены не обработалось: {e}")
+        # chat_chunk (enriched) — вектор проставит Stage 3. Участники сцены = концы найденных связей (дёшево, без скана справочника)
+        ent_ids = sorted(touched)
+        meta = {"entities": ent_ids[:60], "relations": rels_applied, "photos": media_done}
+        enriched = scene_text
+        if ent_ids:
+            names = await db_read("SELECT name FROM entities WHERE id IN (%s)" %
+                                  ",".join(str(int(i)) for i in ent_ids[:30]))
+            enriched += "\n[Участники сцены: " + ", ".join(n["name"] for n in names) + "]"
+        await db_write(
+            """INSERT INTO chat_chunks (chat_id,start_msg_id,end_msg_id,scene_date,enriched_text,meta)
+               VALUES (%s,%s,%s,%s,%s,%s)""",
+            (chat_id, sc[0]["msg_id"], sc[-1]["msg_id"], s_date, enriched[:60000], json.dumps(meta, ensure_ascii=False)))
+        scenes_done += 1
+
+    while True:
+        if _INDEX_CONTROL.get(chat_id) == "pause":
+            await _idx_set_state(chat_id, 2, status="paused")
+            return "paused"
+        rows = await db_read(
+            "SELECT msg_id, date, author_id, txt, media_kind FROM messages WHERE chat_id=%s AND msg_id>%s "
+            "ORDER BY msg_id ASC LIMIT 2000", (chat_id, cursor))
+        if not rows:
+            break
+        for r in rows:
+            gap = (r["date"] - prev_date).total_seconds() if (prev_date and r["date"]) else 0
+            if scene and (gap > INDEX_SCENE_GAP_SEC or scene_tok >= INDEX_SCENE_TOKEN_CAP):
+                await _finalize(scene)
+                await _idx_set_state(chat_id, 2, cursor={"last_msg_id": scene[-1]["msg_id"]}, stats={"scenes": scenes_done})
+                if progress_cb and scenes_done % 5 == 0:
+                    await progress_cb(f"🕸 Граф: {scenes_done} сцен (до id {scene[-1]['msg_id']})…")
+                scene, scene_tok, prev_date = [], 0, None
+            scene.append(r)
+            scene_tok += count_tokens(r["txt"] or "")
+            prev_date = r["date"]
+            cursor = r["msg_id"]
+        # окно кончилось — не финализируем открытую сцену (доберём в следующем окне)
+    if scene:  # последняя сцена чата
+        await _finalize(scene)
+        await _idx_set_state(chat_id, 2, cursor={"last_msg_id": scene[-1]["msg_id"]}, stats={"scenes": scenes_done})
+
+    await _idx_set_state(chat_id, 2, status="done", stats={"scenes": scenes_done})
+    nrel = (await db_read("SELECT COUNT(*) c FROM relations WHERE chat_id=%s", (chat_id,)))[0]["c"]
+    log("INDEX", f"Stage2 чата {chat_id}: готово, сцен {scenes_done}, связей {nrel}")
+    return "done"
+
+
 # --- оркестратор пайплайна ---
 async def _index_pipeline(chat_id: int, status_msg):
     """Прогоняет этапы по порядку, уважая паузу. Пока реализован Stage 0 (дамп);
@@ -7638,8 +7887,18 @@ async def _index_pipeline(chat_id: int, status_msg):
                 await upd("⏸ Индексация на паузе (Stage 1 — досье). `/index resume` — продолжить.")
                 return
         cnt = (await db_read("SELECT COUNT(*) c FROM entities WHERE chat_id=%s", (chat_id,)))[0]["c"]
-        await upd(f"✅ Дамп ({n} сообщений) и досье (**{cnt}** сущностей) готовы.\n"
-                  f"Смотри: `/entity show <имя>`. Этапы 2–3 (граф · вектора) — в следующих обновлениях.")
+        # Stage 2 — граф связей + медиа
+        st2 = await _idx_get_state(chat_id, 2)
+        if st2["status"] != "done":
+            await upd(f"✅ Досье: {cnt} сущностей. 🕸 Строю граф связей и разбираю фото (долго — фото по одному)…")
+            res2 = await _index_stage2_graph(chat_id, progress_cb=upd)
+            if res2 == "paused":
+                await upd("⏸ Индексация на паузе (Stage 2 — граф). `/index resume` — продолжить.")
+                return
+        nrel = (await db_read("SELECT COUNT(*) c FROM relations WHERE chat_id=%s AND status='active'", (chat_id,)))[0]["c"]
+        nmedia = (await db_read("SELECT COUNT(*) c FROM media_assets WHERE chat_id=%s", (chat_id,)))[0]["c"]
+        await upd(f"✅ Готово: {n} сообщений · {cnt} сущностей · **{nrel}** активных связей · **{nmedia}** описанных фото.\n"
+                  f"Смотри: `/entity show <имя>`. Этап 3 (вектора для поиска) — в следующем обновлении.")
     except Exception as e:
         log("INDEX", f"Пайплайн чата {chat_id} упал: {e}")
         traceback.print_exc()
@@ -7807,8 +8066,33 @@ async def entity_show_command(event):
                 except Exception:
                     link = ""
             parts.append(f"• {c['claim']}{link}")
+    # связи из графа (активные и закрытые) — Stage 2
+    id2name = {}
+    rels = await db_read(
+        """SELECT source_id, target_id, relation_type, canonical_type, context_summary, status, weight
+           FROM relations WHERE chat_id=%s AND (source_id=%s OR target_id=%s) ORDER BY status, weight DESC LIMIT 20""",
+        (chat_id, ent["id"], ent["id"]))
+    if rels:
+        need = {r["source_id"] for r in rels} | {r["target_id"] for r in rels}
+        nm = await db_read("SELECT id, name FROM entities WHERE id IN (%s)" % ",".join(str(int(i)) for i in need))
+        id2name = {r["id"]: r["name"] for r in nm}
+        pol_emoji = {"pos": "💚", "neg": "💢", "neutral": "▫️"}
+        active = [r for r in rels if r["status"] == "active"]
+        closed = [r for r in rels if r["status"] != "active"]
+        if active:
+            parts.append("\n🔗 **Связи:**")
+            for r in active[:10]:
+                other = id2name.get(r["target_id"] if r["source_id"] == ent["id"] else r["source_id"], "?")
+                arrow = "→" if r["source_id"] == ent["id"] else "←"
+                parts.append(f"{pol_emoji.get(r['canonical_type'], '▫️')} {arrow} **{other}** — {r['relation_type']} "
+                             f"(×{int(r['weight'])})")
+        if closed:
+            parts.append("\n🕯 _Бывшие связи (изменились со временем):_")
+            for r in closed[:5]:
+                other = id2name.get(r["target_id"] if r["source_id"] == ent["id"] else r["source_id"], "?")
+                parts.append(f"• {other} — {r['relation_type']} (было)")
     n_claims = len(claims)
-    parts.append(f"\n_id {ent['id']} · фактов: {n_claims}_")
+    parts.append(f"\n_id {ent['id']} · фактов: {n_claims} · связей: {len(rels)}_")
     await send_long(chat_id, "\n".join(parts), parse_mode="md", reply_to=event.id)
 
 
