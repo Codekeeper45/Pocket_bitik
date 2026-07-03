@@ -139,7 +139,7 @@ INDEX_SCENE_GAP_SEC = 15 * 60 # stage 2: разрыв >15 мин между со
 INDEX_SCENE_TOKEN_CAP = 8000  # stage 2: мягкий потолок токенов сцены (длинная беседа рвётся принудительно)
 INDEX_SCENE_MIN_TOKENS = 1000 # stage 2: сцены короче — доклеиваем к следующей (не дробим на мелочь)
 INDEX_SCENE_HARD_GAP_SEC = 6 * 60 * 60  # даже короткую сцену не склеиваем через многочасовую паузу
-INDEX_STAGE1_MICRO_TOKENS = 24_000      # stage 1: micro extraction вместо 300k mega-block
+INDEX_STAGE1_MICRO_TOKENS = 16_000      # stage 1: micro extraction (запас под 8k-потолок вывода экстракции, иначе finish=length→дробление)
 INDEX_STAGE1_MICRO_MESSAGES = 800
 INDEX_STAGE1_BLOCK_TOKENS = INDEX_STAGE1_MICRO_TOKENS  # legacy alias для старых комментариев/логов
 INDEX_FAILED_MIN_MESSAGES = 1
@@ -6906,6 +6906,7 @@ _HELP_SECTIONS = {
         "   `/entity show <имя|алиас>` — карточка: canon-факты, мнение чата, связи (со ссылками на сообщения)\n"
         "   `/entity merge <id1> <id2>` — слить две сущности (id2 → id1)\n"
         "   `/entity rename <id> <имя>` · `/entity alias <id> <алиас>` · `/entity split <id> <алиас>`\n"
+        "   `/entity relink` — привязать несопоставленных участников к их Telegram-id (по author_id)\n"
         "\n"
         "⚙️ Нужны: `INDEX_DB_URL` (MariaDB/MySQL) в `.env`, пакеты `pymysql`+`numpy`, `OPENROUTER_API_KEY`.\n"
         "🧠 Модели: DeepSeek V4 Flash (экстракция), медиа-модель `/media` (фото),\n"
@@ -7654,7 +7655,13 @@ async def _index_extract(system: str, user: str, max_tokens: int = 8000):
                 if data is not None:
                     _INDEX_EXTRACT_OK = True
                     return data
-                log("INDEX", f"Экстракция {model}: не распарсил JSON (finish={resp.choices[0].finish_reason}, попытка {attempt})")
+                fin = resp.choices[0].finish_reason
+                log("INDEX", f"Экстракция {model}: не распарсил JSON (finish={fin}, попытка {attempt})")
+                if fin == "length":
+                    # ответ обрезан по потолку токенов — повтор того же запроса даст ту же обрезку,
+                    # смена модели тоже (блок/сцена слишком «плотные»). Детерминированно, но НЕ poison:
+                    # возвращаем None сразу → caller дробит единицу пополам (меньше вход → влезет вывод).
+                    return None
             except Exception as e:
                 code = getattr(e, "status_code", None) or getattr(getattr(e, "response", None), "status_code", None)
                 if code and 400 <= code < 500 and code != 429:
@@ -7730,6 +7737,19 @@ _INDEX_STAGE1_SYSTEM = (
 )
 
 
+_INDEX_USERID_RE = re.compile(r"^user(-?\d+)$")
+
+
+def _index_resolve_tg(name2author: dict, name: str, aliases: list):
+    """Определяет tg_user_id участника: по имени/алиасу через name2author, иначе разбирает fallback-имя user{id}."""
+    for cand in [name, *(aliases or [])]:
+        aid = name2author.get((cand or "").strip().lower())
+        if aid:
+            return aid
+    m = _INDEX_USERID_RE.match((name or "").strip())
+    return int(m.group(1)) if m else None
+
+
 async def _index_apply_entities(chat_id: int, ents: list, name2author: dict):
     """UPSERT сущностей и claim'ов из ответа модели. name2author — {lower(name): author_id} для tg_user_id."""
     if not ents:
@@ -7751,7 +7771,7 @@ async def _index_apply_entities(chat_id: int, ents: list, name2author: dict):
         dirty_summary = False
         dirty_embedding = False
         if ref and ref > 0:
-            rows = await db_read("SELECT id, aliases FROM entities WHERE chat_id=%s AND id=%s", (chat_id, ref))
+            rows = await db_read("SELECT id, aliases, tg_user_id FROM entities WHERE chat_id=%s AND id=%s", (chat_id, ref))
             if rows:
                 ent_id = rows[0]["id"]
                 old = json.loads(rows[0]["aliases"]) if rows[0]["aliases"] else []
@@ -7760,12 +7780,16 @@ async def _index_apply_entities(chat_id: int, ents: list, name2author: dict):
                     await db_write("UPDATE entities SET aliases=%s, embedding=NULL WHERE chat_id=%s AND id=%s",
                                    (json.dumps(merged, ensure_ascii=False), chat_id, ent_id))
                     dirty_embedding = True
+                if etype == "user" and rows[0].get("tg_user_id") is None:  # само-лечение привязки на update
+                    tg = _index_resolve_tg(name2author, name, merged)
+                    if tg:
+                        await db_write("UPDATE entities SET tg_user_id=%s WHERE chat_id=%s AND id=%s", (tg, chat_id, ent_id))
         if ent_id is None:  # ищем по имени/алиасу, чтобы не задваивать (снежный ком мог не подставить ref)
             for cand in list(dict.fromkeys([name] + aliases)):
                 if not _index_identity_key(cand):
                     continue
                 rows = await db_read(
-                    "SELECT id, aliases FROM entities WHERE chat_id=%s AND (name=%s OR aliases LIKE %s) LIMIT 1",
+                    "SELECT id, aliases, tg_user_id FROM entities WHERE chat_id=%s AND (name=%s OR aliases LIKE %s) LIMIT 1",
                     (chat_id, cand, f'%"{cand}"%'))
                 if rows:
                     ent_id = rows[0]["id"]
@@ -7775,9 +7799,13 @@ async def _index_apply_entities(chat_id: int, ents: list, name2author: dict):
                         await db_write("UPDATE entities SET aliases=%s, embedding=NULL WHERE chat_id=%s AND id=%s",
                                        (json.dumps(merged, ensure_ascii=False), chat_id, ent_id))
                         dirty_embedding = True
+                    if etype == "user" and rows[0].get("tg_user_id") is None:  # само-лечение привязки на update
+                        tg = _index_resolve_tg(name2author, name, merged)
+                        if tg:
+                            await db_write("UPDATE entities SET tg_user_id=%s WHERE chat_id=%s AND id=%s", (tg, chat_id, ent_id))
                     break
         if ent_id is None:  # новая сущность
-            tg = name2author.get(name.lower()) if etype == "user" else None
+            tg = _index_resolve_tg(name2author, name, aliases) if etype == "user" else None
             _, ent_id = await db_write(
                 "INSERT INTO entities (chat_id,name,entity_type,tg_user_id,aliases) VALUES (%s,%s,%s,%s,%s)",
                 (chat_id, name, etype, tg, json.dumps(list(dict.fromkeys([name] + aliases)), ensure_ascii=False)))
@@ -7913,6 +7941,9 @@ async def _index_stage1_dossiers(chat_id: int, progress_cb=None):
     name2author = {}
     for aid, nm in amap.items():
         name2author.setdefault(nm.lower(), aid)
+    # детерминированный слой: fallback-имена user{id} для ВСЕХ авторов чата (get_participants мог их не вернуть)
+    for r in await db_read("SELECT DISTINCT author_id FROM messages WHERE chat_id=%s AND author_id IS NOT NULL", (chat_id,)):
+        name2author.setdefault(f"user{r['author_id']}", r["author_id"])
     log("INDEX", f"Stage1 досье чата {chat_id}: с msg_id>{cursor}")
 
     blocks_done = ents_seen
@@ -9502,6 +9533,67 @@ async def entity_show_command(event):
     n_claims = len(claims)
     parts.append(f"\n_id {ent['id']} · фактов: {n_claims} · связей: {len(rels)}_")
     await send_long(chat_id, "\n".join(parts), parse_mode="md", reply_to=event.id)
+
+
+@client.on(events.NewMessage(pattern=r"^[./]entity\s+relink\s*$"))
+async def entity_relink_command(event):
+    """Бэкфилл tg_user_id: привязывает несопоставленных user-сущностей к участникам чата по author_id."""
+    if await _slash_for_other_bot(event):
+        return
+    if not event.out:
+        return
+    reason = _index_available()
+    if reason:
+        await event.reply(f"⚠️ /entity недоступен: {reason}")
+        return
+    try:
+        await _index_ensure_ddl()
+    except Exception as e:
+        await event.reply(f"❌ Не подключиться к базе индексации: {e}")
+        return
+    chat_id = event.chat_id
+
+    def _strip(s):
+        return re.sub(r"[^\w]+", "", s or "", flags=re.UNICODE).lower()
+
+    amap = await _index_author_map(chat_id)           # {author_id: display}
+    exact, norm = {}, {}                              # display.lower()→id, нормализованный display→id
+    for aid, nm in amap.items():
+        exact.setdefault((nm or "").lower(), aid)
+        k = _strip(nm)
+        if k:
+            norm.setdefault(k, aid)
+    for r in await db_read("SELECT DISTINCT author_id FROM messages WHERE chat_id=%s AND author_id IS NOT NULL", (chat_id,)):
+        exact.setdefault(f"user{r['author_id']}", r["author_id"])
+
+    rows = await db_read(
+        "SELECT id, name, aliases FROM entities WHERE chat_id=%s AND entity_type='user' AND tg_user_id IS NULL", (chat_id,))
+    total, linked = len(rows), 0
+    for r in rows:
+        cands = [r["name"]] + (json.loads(r["aliases"]) if r["aliases"] else [])
+        tg = None
+        for c in cands:
+            tg = exact.get((c or "").strip().lower()) or norm.get(_strip(c))
+            if tg:
+                break
+        if not tg:
+            m = _INDEX_USERID_RE.match((r["name"] or "").strip())
+            if m:
+                tg = int(m.group(1))
+        if not tg:
+            continue
+        disp = amap.get(tg)
+        if disp and _INDEX_USERID_RE.match((r["name"] or "").strip()):  # уродливое user{id} → реальный ник
+            await db_write("UPDATE entities SET tg_user_id=%s, name=%s, embedding=NULL WHERE chat_id=%s AND id=%s",
+                           (tg, disp, chat_id, r["id"]))
+        else:
+            await db_write("UPDATE entities SET tg_user_id=%s WHERE chat_id=%s AND id=%s", (tg, chat_id, r["id"]))
+        linked += 1
+    if linked:
+        _index_invalidate(chat_id, "entities")
+    tail = (f" Осталось {total - linked} (модель переименовала в непохожее имя — при желании поправь `/entity`)."
+            if total - linked else "")
+    await event.reply(f"🔗 Привязка участников: **{linked}** из {total} несопоставленных получили tg_user_id.{tail}")
 
 
 @client.on(events.NewMessage(pattern=r"^[./]entity\s+(merge|rename|alias|split)\s+(.+)$"))
