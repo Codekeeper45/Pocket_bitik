@@ -177,6 +177,11 @@ INDEX_COUNT_TTL = 60          # сек: кэш COUNT(*) для выбора back
 INDEX_ROLLUP_TOKEN_BATCH = 24_000  # stage 4: сколько токенов сцен сжимать за один map-вызов роллап-саммари
 INDEX_SEARCH_FLOOR = 0.15     # ниже этого косинуса результат не показываем вообще
 INDEX_SEARCH_CONFIDENT = 0.28 # ниже — «слабое» совпадение: помечаем и просим модель переспросить/веб (Corrective RAG)
+INDEX_RERANK_MODEL = "cohere/rerank-4-pro"  # OpenRouter /rerank (rerank-v4.0-pro): переупорядочивает кандидатов по ИСТИННОЙ релевантности (мультиязычный, проверено на русском)
+INDEX_RERANK_POOL = 8         # кандидатов на kind достаём вектором ПОД rerank (шире финальной выдачи)
+INDEX_RERANK_TOPN = 8         # финальная выдача после rerank
+INDEX_RERANK_MIN = 0.08       # rel-score ниже — не показываем (у v4-pro мусор ~0.12, точный ~0.9)
+INDEX_RERANK_CONFIDENT = 0.35 # ниже — «слабое» совпадение (Corrective-гейт по rerank-score)
 INDEX_EVAL_CASES_PATH = "index_eval_cases.json"
 GEN_INDEX_REF_MAX = 8         # /gen: сколько фото-референсов подтягивать из индекс-памяти (смысловой поиск по всей истории)
 # OCR фото в /ask по умолчанию (cost-effective вместо vision-модели; флаг -m возвращает vision).
@@ -8747,6 +8752,31 @@ async def _index_embed_texts(texts: list) -> list:
     return [_vec_pack(v) if v else None for v in vecs]
 
 
+def _sync_rerank(query: str, docs: list, top_n=None):
+    """OpenRouter /rerank → [(orig_index, relevance_score)] по убыванию релевантности."""
+    payload = {"model": INDEX_RERANK_MODEL, "query": query, "documents": docs}
+    if top_n:
+        payload["top_n"] = top_n
+    resp = requests.post(f"{OPENROUTER_BASE_URL}/rerank",
+                         headers={"Authorization": f"Bearer {openrouter_api_key}"},
+                         json=payload, timeout=30)
+    resp.raise_for_status()
+    j = resp.json()
+    return [(int(r["index"]), float(r["relevance_score"])) for r in j.get("results", []) if "index" in r]
+
+
+async def _index_rerank(query: str, docs: list, top_n=None):
+    """Переупорядочивает docs по истинной релевантности к query (cohere через OpenRouter).
+    Возвращает [(orig_index, score)] desc, или None при сбое (caller оставляет исходный порядок)."""
+    if not (query or "").strip() or not docs:
+        return None
+    try:
+        return await asyncio.to_thread(_sync_rerank, query, docs, top_n)
+    except Exception as e:
+        log("INDEX", f"Rerank не удался ({e}) — оставляю исходный порядок")
+        return None
+
+
 async def _index_embed_image(raw: bytes):
     try:
         return _vec_pack(await asyncio.to_thread(_sync_embed_image, raw))
@@ -9266,32 +9296,48 @@ async def _index_tool_search(chat_id: int, query: str, kind: str = "all") -> str
         return "Не удалось векторизовать запрос."
     ent = await _index_chat_entity(chat_id)
     kinds = {"scenes": ["chunks"], "dossiers": ["entities"], "relations": ["relations"]}.get(kind, ["chunks", "entities", "relations"])
-    out = []
-    best = 0.0
+    # 1) вектор достаёт ШИРОКИЙ пул кандидатов; для каждого — текст под rerank + строка вывода + косинус
+    cands = []  # {"doc","line","cos"}
     for k in kinds:
-        for h in await _index_vector_search(chat_id, k, qv, 5):
-            best = max(best, h["score"])
-            if h["score"] < INDEX_SEARCH_FLOOR:
-                continue
+        for h in await _index_vector_search(chat_id, k, qv, INDEX_RERANK_POOL):
             if k == "chunks":
                 link = (f" {build_msg_link(ent, h['start_msg_id'])}" if ent and h.get("start_msg_id") else "")
-                out.append(f"• [сцена {h['score']}] {_idx_snip(h.get('enriched_text'), 220)}{link}")
+                doc = _idx_snip(h.get("enriched_text"), 600)
+                line = f"• [сцена] {_idx_snip(h.get('enriched_text'), 220)}{link}"
             elif k == "entities":
-                out.append(f"• [досье {h['score']}] {h['name']} ({h['entity_type']}): {_idx_snip(h.get('canon_summary'), 160)}")
+                doc = f"{h['name']}: {_idx_snip(h.get('canon_summary') or h.get('fanon_summary'), 500)}"
+                line = f"• [досье] {h['name']} ({h['entity_type']}): {_idx_snip(h.get('canon_summary'), 160)}"
             elif k == "relations":
                 nm = await db_read("SELECT id, name FROM entities WHERE id IN (%s,%s)", (h["source_id"], h["target_id"]))
                 n = {r["id"]: r["name"] for r in nm}
+                a, b = n.get(h["source_id"], "?"), n.get(h["target_id"], "?")
                 st = "" if h.get("status") == "active" else " (в прошлом)"
-                out.append(f"• [связь {h['score']}] {n.get(h['source_id'], '?')} → {n.get(h['target_id'], '?')}: "
-                           f"{h.get('relation_type') or ''}{st} — {_idx_snip(h.get('context_summary'), 140)}")
-    # Corrective RAG: явно сигналим модели о слабой/пустой выдаче, чтобы она переспросила или пошла в веб,
-    # а не отвечала уверенно по нерелевантному совпадению.
+                doc = f"{a} → {b}: {h.get('relation_type') or ''} — {_idx_snip(h.get('context_summary'), 400)}"
+                line = f"• [связь] {a} → {b}: {h.get('relation_type') or ''}{st} — {_idx_snip(h.get('context_summary'), 140)}"
+            else:
+                continue
+            cands.append({"doc": doc, "line": line, "cos": h["score"]})
+    if not cands:
+        return ("В памяти ничего не нашёл. Переформулируй запрос другими словами (конкретнее: имена, о чём "
+                "именно спор/событие) или, если вопрос про внешний мир, используй web_search.")
+    # 2) cohere-rerank переупорядочивает пул по истинной релевантности; при сбое — косинус-порядок
+    order = await _index_rerank(query, [c["doc"] for c in cands], top_n=INDEX_RERANK_TOPN)
+    if order is not None:
+        kept = [(cands[i], rel) for i, rel in order if 0 <= i < len(cands) and rel >= INDEX_RERANK_MIN]
+        best = order[0][1] if order else 0.0
+        confident = INDEX_RERANK_CONFIDENT
+        out = [f"{c['line']} [rel {rel:.2f}]" for c, rel in kept]
+    else:  # фолбэк без rerank — косинус
+        cands.sort(key=lambda c: -c["cos"])
+        best = cands[0]["cos"] if cands else 0.0
+        confident = INDEX_SEARCH_CONFIDENT
+        out = [f"{c['line']} [{c['cos']:.2f}]" for c in cands[:INDEX_RERANK_TOPN] if c["cos"] >= INDEX_SEARCH_FLOOR]
+    # 3) Corrective RAG: слабая/пустая выдача → просим модель переспросить/веб, а не выдумывать
     if not out:
-        note = f" (лучшее совпадение score {best:.2f})" if best else ""
-        return (f"В памяти ничего релевантного не нашёл{note}. Переформулируй запрос другими словами "
-                f"(конкретнее: имена, о чём именно спор/событие) или, если вопрос про внешний мир, используй web_search.")
-    if best < INDEX_SEARCH_CONFIDENT:
-        out.append(f"⚠️ Совпадения слабые (макс score {best:.2f}) — возможно, точного ответа в памяти нет. "
+        return (f"В памяти ничего релевантного не нашёл (лучшее совпадение {best:.2f}). Переформулируй запрос "
+                f"другими словами или, если вопрос про внешний мир, используй web_search.")
+    if best < confident:
+        out.append(f"⚠️ Совпадения слабые (макс релевантность {best:.2f}) — возможно, точного ответа в памяти нет. "
                    f"Если это не то, переспроси другими словами или проверь web_search; не выдавай догадку за факт.")
     return "\n".join(out)
 
