@@ -21,6 +21,7 @@ import requests
 import json
 import glob
 import logging
+import hashlib
 
 try:
     import pymysql  # /index (GraphRAG-память, MariaDB); без пакета команда просто недоступна
@@ -30,6 +31,10 @@ try:
     import numpy as _np  # /index: numpy-cosine поиск по векторам-блобам
 except ImportError:
     _np = None
+try:
+    import hnswlib as _hnswlib  # optional /index ANN backend; потоковый поиск остаётся fallback
+except ImportError:
+    _hnswlib = None
 from types import SimpleNamespace
 from logging.handlers import RotatingFileHandler
 from datetime import datetime, timedelta, timezone
@@ -80,6 +85,8 @@ gloy_api_key = os.getenv("GLOY_API_KEY")  # LLM API FUN (Gloy AI) — OpenAI-с�
 tavily_api_key = os.getenv("TAVILY_API_KEY")  # веб-поиск/извлечение страниц для /ask (tavily.com); без ключа веб-инструменты выключены
 index_db_url = os.getenv("INDEX_DB_URL")  # MariaDB для /index (GraphRAG-память): mysql://user:pass@host:port/db (pass URL-encoded)
 llama_cloud_api_key = os.getenv("LLAMA_CLOUD_API_KEY")  # OCR фото (LlamaParse); без него фото идут через vision
+index_memory_for_guests = (os.getenv("INDEX_MEMORY_FOR_GUESTS") or "").lower() in ("1", "true", "yes", "on")
+index_use_hnsw = (os.getenv("INDEX_USE_HNSW") or "").lower() in ("1", "true", "yes", "on")
 
 
 def _collect_google_tts_keys() -> list:
@@ -131,9 +138,30 @@ INDEX_DUMP_BATCH = 1000       # stage 0: сообщений на пачку да
 INDEX_SCENE_GAP_SEC = 15 * 60 # stage 2: разрыв >15 мин между сообщениями рвёт сцену
 INDEX_SCENE_TOKEN_CAP = 8000  # stage 2: мягкий потолок токенов сцены (длинная беседа рвётся принудительно)
 INDEX_SCENE_MIN_TOKENS = 1000 # stage 2: сцены короче — доклеиваем к следующей (не дробим на мелочь)
-INDEX_STAGE1_BLOCK_TOKENS = 300_000  # stage 1: размер блока «снежного кома» досье
+INDEX_SCENE_HARD_GAP_SEC = 6 * 60 * 60  # даже короткую сцену не склеиваем через многочасовую паузу
+INDEX_STAGE1_MICRO_TOKENS = 24_000      # stage 1: micro extraction вместо 300k mega-block
+INDEX_STAGE1_MICRO_MESSAGES = 800
+INDEX_STAGE1_BLOCK_TOKENS = INDEX_STAGE1_MICRO_TOKENS  # legacy alias для старых комментариев/логов
+INDEX_FAILED_MIN_MESSAGES = 1
+INDEX_UPDATE_OVERLAP_MESSAGES = 300
+INDEX_UPDATE_OVERLAP_HOURS = 24
+INDEX_SUMMARY_CLAIM_BATCH = 80
+INDEX_SUMMARY_TOKEN_BATCH = 8_000
+INDEX_SUMMARY_MAPREDUCE_MIN_CLAIMS = 80
+INDEX_SUMMARY_MAPREDUCE_MIN_TOKENS = 20_000
+INDEX_CONSOLIDATE_EVERY_BLOCKS = 10
+INDEX_REGISTRY_EXACT_LIMIT = 200
+INDEX_REGISTRY_SEMANTIC_LIMIT = 50
+INDEX_REGISTRY_NEIGHBOR_LIMIT = 100
+INDEX_REGISTRY_FALLBACK_LIMIT = 300
 INDEX_MEDIA_PAUSE = (2.0, 4.0)  # stage 2: пауза между скачиваниями фото (анти-FloodWait юзербота)
 INDEX_EMBED_BATCH = 96        # stage 3: строк на батч эмбеддинга
+INDEX_EXTRACT_RETRIES = 3     # LLM/JSON extractor: не двигаем чекпоинт после временного сбоя
+INDEX_EMBED_RETRIES = 3       # embeddings: 429/5xx у провайдера не должны превращаться в "done"
+INDEX_MATRIX_CACHE_MAX_ROWS = 10_000  # больше ищем потоково, без полной матрицы в RAM
+INDEX_SEARCH_DB_BATCH = 5_000
+INDEX_COUNT_TTL = 60          # сек: кэш COUNT(*) для выбора backend поиска (инвалидируется на каждую запись индекса)
+INDEX_EVAL_CASES_PATH = "index_eval_cases.json"
 GEN_INDEX_REF_MAX = 8         # /gen: сколько фото-референсов подтягивать из индекс-памяти (смысловой поиск по всей истории)
 # OCR фото в /ask по умолчанию (cost-effective вместо vision-модели; флаг -m возвращает vision).
 # Проверено живьём: v2-поток (files → parse tier=cost_effective → poll → markdown_full), ~11с/фото,
@@ -3280,7 +3308,7 @@ async def _run_reply_tool(args: dict, chat_id, msg_by_id: dict, reply_sent: list
     return " ".join(parts)
 
 
-async def ask_agentic(context: str, question: str, must_search: bool = False, caller: str = None, ctx_tokens_est: int = None, voice_mode: str = "off", images: list = None, chat_id=None, msg_by_id: dict = None) -> str:
+async def ask_agentic(context: str, question: str, must_search: bool = False, caller: str = None, ctx_tokens_est: int = None, voice_mode: str = "off", images: list = None, chat_id=None, msg_by_id: dict = None, memory_allowed: bool = True) -> str:
     """Agentic ask: модель сама решает, искать ли информацию в каналах.
     ctx_tokens_est — tiktoken-оценка контекста (для логирования Δ с реальным API).
     voice_mode: "off" — обычный текст; "force" — ответ под озвучку (флаг -v); "auto" — модель сама может выбрать голос (маркер [[VOICE]]).
@@ -3296,7 +3324,7 @@ async def ask_agentic(context: str, question: str, must_search: bool = False, ca
     has_web = bool(tavily_api_key)        # веб-инструменты Tavily (web_search/web_extract/web_crawl/web_map)
     has_reply = chat_id is not None and bool(msg_by_id)  # адресный реплай по #id истории
     has_memory = False                    # GraphRAG-память /index (memory_search/entity/media) — если чат проиндексирован
-    if chat_id is not None and not _index_available():
+    if memory_allowed and chat_id is not None and not _index_available():
         try:
             has_memory = (await db_read("SELECT COUNT(*) c FROM entities WHERE chat_id=%s", (chat_id,)))[0]["c"] > 0
         except Exception as e:
@@ -4628,7 +4656,7 @@ async def ask_command(event):
                 log("ASK", f"-g: картинок напрямую модели: {len(images_sorted)}")
             await set_status(f"🤖 Думаю над ответом…{retry_suffix}")
             try:
-                reply = await ask_agentic(context, question, must_search=must_search, caller=caller, ctx_tokens_est=ctx_tokens, voice_mode=voice_mode, images=images_sorted, chat_id=event.chat_id, msg_by_id=msg_by_id)
+                reply = await ask_agentic(context, question, must_search=must_search, caller=caller, ctx_tokens_est=ctx_tokens, voice_mode=voice_mode, images=images_sorted, chat_id=event.chat_id, msg_by_id=msg_by_id, memory_allowed=_index_memory_allowed(is_owner))
                 t_llm = time.time()
                 break  # успех
             except ContextOverflowError as e:
@@ -5271,7 +5299,7 @@ async def gen_command(event):
                 cat_timeout = GEN_CATALOG_TIMEOUT if want_vision else GEN_DESC_TIMEOUT
                 catalog = await _gen_history_catalog(ordered, want_vision, limit=cand_limit, timeout=cat_timeout, progress_cb=set_status)
             # индекс-память: релевантные всему запросу фото и досье персонажей (внешность) — из ВСЕЙ истории, не только N
-            if await _index_chat_indexed(event.chat_id):
+            if _index_memory_allowed(is_owner) and await _index_chat_indexed(event.chat_id):
                 await set_status("🧠 Ищу референсы и контекст в памяти чата…")
                 idx_items, idx_ctx = await _gen_index_candidates(event.chat_id, user_prompt)
                 if idx_items:
@@ -6861,14 +6889,18 @@ _HELP_SECTIONS = {
         "   `/index status` — прогресс по этапам\n"
         "   `/index pause` / `/index resume` — пауза и продолжение (состояние на чекпоинтах в БД)\n"
         "   `/index update` — догнать новые сообщения после прошлой индексации\n"
+        "   `/index failed` — показать poison-диапазоны, которые были честно пропущены после дробления\n"
+        "   `/index retry failed [1|2]` — переиндексировать пропущенные блоки/сцены точечно\n"
+        "   `/index eval template|run|report` — шаблон и прогон smoke-eval качества поиска\n"
         "\n"
         "**Этапы:** 0 — дамп истории в БД · 1 — досье и алиасы · 2 — граф связей и распознавание фото ·\n"
         "   3 — вектора для поиска. При рестарте бота индексация продолжается с последнего чекпоинта.\n"
         "\n"
         "**🔎 Поиск в `/ask`:** после индексации у `/ask` в этом чате появляются инструменты памяти —\n"
-        "   модель сама решает, когда лезть в базу: смысловой поиск по сценам/досье/связям, полное досье\n"
+        "   у владельца модель сама решает, когда лезть в базу: смысловой поиск по сценам/досье/связям, полное досье\n"
         "   персонажа по имени, и поиск+пересылка старого фото по описанию. Спрашивай обычным `/ask`:\n"
         "   «кто такой Тостер?», «из-за чего спорили Дима и Олег?», «скинь ту картинку со спора про меч».\n"
+        "   Гостям из `/allow` память не выдаётся, если явно не включить `INDEX_MEMORY_FOR_GUESTS=1`.\n"
         "\n"
         "**📇 Досье и правка графа:**\n"
         "   `/entity show <имя|алиас>` — карточка: canon-факты, мнение чата, связи (со ссылками на сообщения)\n"
@@ -7168,6 +7200,12 @@ _INDEX_TASKS: dict = {}              # {chat_id: asyncio.Task} активных 
 _INDEX_CONTROL: dict = {}           # {chat_id: "run"|"pause"} — мягкая остановка на чекпоинтах
 _INDEX_DDL_DONE = False             # DDL применяется один раз за процесс
 _INDEX_EXTRACT_OK = None            # None=не проверяли, True/False — доступна ли INDEX_EXTRACT_MODEL нашему ключу
+_INDEX_COUNTS: dict = {}            # {(chat_id, kind): (count, monotonic_ts)} — кэш COUNT для выбора backend поиска
+
+
+class IndexTransientError(Exception):
+    """Провайдер экстракции недоступен (сеть/5xx/timeout) — авария, а не poison-контент.
+    Стадия должна встать в error и дождаться /index resume, НЕ дробить блок в ложные skip."""
 
 
 def _index_available() -> str:
@@ -7245,12 +7283,58 @@ def _db_read(sql, params=None):
     return _idx_run(_op)
 
 
+def _db_transaction(statements: list):
+    """Атомарно выполняет список (sql, params). Нужен для ручных правок графа."""
+    def _op(conn):
+        old_autocommit = conn.get_autocommit()
+        conn.autocommit(False)
+        try:
+            with conn.cursor() as cur:
+                for sql, params in statements:
+                    cur.execute(sql, params or ())
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            conn.autocommit(old_autocommit)
+    return _idx_run(_op)
+
+
 async def db_write(sql, params=None, many=False):
     return await asyncio.to_thread(_db_write, sql, params, many)
 
 
 async def db_read(sql, params=None):
     return await asyncio.to_thread(_db_read, sql, params)
+
+
+async def db_transaction(statements: list):
+    return await asyncio.to_thread(_db_transaction, statements)
+
+
+def _index_invalidate(chat_id: int, *kinds: str):
+    for kind in kinds:
+        _INDEX_MATRIX.pop((chat_id, kind), None)
+        _INDEX_HNSW.pop((chat_id, kind), None)  # ANN-индекс тоже пересобрать
+        _INDEX_COUNTS.pop((chat_id, kind), None)  # счётчик устарел
+
+
+async def _index_count_ok(chat_id: int, kind: str) -> int:
+    """COUNT(*) непустых векторов kind с кэшем INDEX_COUNT_TTL (выбор backend не должен сканить БД на каждый поиск)."""
+    ck = (chat_id, kind)
+    cached = _INDEX_COUNTS.get(ck)
+    now = time.monotonic()
+    if cached and (now - cached[1]) < INDEX_COUNT_TTL:
+        return cached[0]
+    table, emb_col, _key, _extra = _INDEX_KINDS[kind]
+    n = (await db_read(f"SELECT COUNT(*) c FROM {table} WHERE chat_id=%s AND {emb_col} IS NOT NULL", (chat_id,)))[0]["c"]
+    _INDEX_COUNTS[ck] = (n, now)
+    return n
+
+
+def _index_memory_allowed(is_owner: bool) -> bool:
+    return bool(is_owner or index_memory_for_guests)
 
 
 _INDEX_DDL = [
@@ -7287,6 +7371,39 @@ _INDEX_DDL = [
         id BIGINT AUTO_INCREMENT PRIMARY KEY, chat_id BIGINT NOT NULL, start_msg_id BIGINT NULL, end_msg_id BIGINT NULL,
         scene_date DATETIME NULL, enriched_text MEDIUMTEXT NULL, meta JSON NULL, embedding VARBINARY(4096) NULL,
         KEY k_chat (chat_id)) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4""",
+    """CREATE TABLE IF NOT EXISTS index_failed_ranges (
+        id BIGINT AUTO_INCREMENT PRIMARY KEY, chat_id BIGINT NOT NULL, stage TINYINT NOT NULL,
+        unit_type VARCHAR(32) NOT NULL, start_msg_id BIGINT NOT NULL, end_msg_id BIGINT NOT NULL,
+        reason MEDIUMTEXT NULL, attempts INT NOT NULL DEFAULT 1, status VARCHAR(16) NOT NULL DEFAULT 'skipped',
+        payload JSON NULL, created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+        UNIQUE KEY u_range (chat_id, stage, unit_type, start_msg_id, end_msg_id),
+        KEY k_status (chat_id, stage, status)) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4""",
+    """CREATE TABLE IF NOT EXISTS relation_events (
+        id BIGINT AUTO_INCREMENT PRIMARY KEY, chat_id BIGINT NOT NULL, scene_key VARCHAR(64) NOT NULL,
+        source_id BIGINT NOT NULL, target_id BIGINT NOT NULL, relation_type VARCHAR(64) NULL,
+        canonical_type VARCHAR(32) NULL, context_summary MEDIUMTEXT NULL, evidence JSON NULL, scene_date DATETIME NULL,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        UNIQUE KEY u_event (chat_id, scene_key, source_id, target_id, canonical_type, relation_type),
+        KEY k_pair (chat_id, source_id, target_id)) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4""",
+    """CREATE TABLE IF NOT EXISTS entity_summary_parts (
+        id BIGINT AUTO_INCREMENT PRIMARY KEY, chat_id BIGINT NOT NULL, entity_id BIGINT NOT NULL,
+        kind VARCHAR(16) NOT NULL, part_no INT NOT NULL, summary MEDIUMTEXT NULL, claim_count INT NOT NULL DEFAULT 0,
+        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+        UNIQUE KEY u_part (chat_id, entity_id, kind, part_no),
+        KEY k_ent (chat_id, entity_id)) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4""",
+    """CREATE TABLE IF NOT EXISTS index_eval_runs (
+        id BIGINT AUTO_INCREMENT PRIMARY KEY, chat_id BIGINT NOT NULL, created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        cases_json JSON NULL, result_json JSON NULL, KEY k_chat (chat_id, created_at)) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4""",
+]
+
+
+_INDEX_MIGRATIONS = [
+    """DELETE c1 FROM chat_chunks c1 JOIN chat_chunks c2
+       ON c1.chat_id=c2.chat_id AND c1.start_msg_id=c2.start_msg_id
+       AND c1.end_msg_id=c2.end_msg_id AND c1.id>c2.id""",
+    "ALTER TABLE chat_chunks ADD UNIQUE KEY u_scene (chat_id, start_msg_id, end_msg_id)",
+    "ALTER TABLE chat_chunks ADD KEY k_scene_range (chat_id, start_msg_id, end_msg_id)",
 ]
 
 
@@ -7296,6 +7413,13 @@ async def _index_ensure_ddl():
         return
     for ddl in _INDEX_DDL:
         await db_write(ddl)
+    for ddl in _INDEX_MIGRATIONS:
+        try:
+            await db_write(ddl)
+        except Exception as e:
+            msg = str(e).lower()
+            if "duplicate" not in msg and "already exists" not in msg:
+                log("INDEX", f"DDL migration skipped/failed: {e}")
     _INDEX_DDL_DONE = True
     log("INDEX", "DDL применён (таблицы готовы)")
 
@@ -7338,6 +7462,84 @@ async def _idx_set_state(chat_id: int, stage: int, cursor=None, stats=None, stat
          json.dumps(stats, ensure_ascii=False) if stats is not None else None, status))
 
 
+def _index_scene_key(chat_id: int, start_msg_id: int, end_msg_id: int) -> str:
+    raw = f"{chat_id}:{start_msg_id}:{end_msg_id}".encode("utf-8")
+    return hashlib.sha1(raw).hexdigest()
+
+
+def _index_relation_event_key(chat_id: int, scene_date, source_id: int, target_id: int,
+                              polarity: str, relation_type: str) -> str:
+    """Детерминированный, boundary- и evidence-независимый ключ события связи: дневной бакет.
+    Одна пара (source→target, polarity, тип) считается ОДНИМ событием в пределах суток → вес =
+    «в скольких разных днях проявлялась связь». Пере-обработка тех же сообщений (resume/update
+    overlap) даёт тот же день → INSERT IGNORE дедупит → вес не задваивается."""
+    if scene_date is None:
+        day = "0"
+    elif isinstance(scene_date, str):
+        day = scene_date[:10]  # 'YYYY-MM-DD…'
+    else:
+        day = scene_date.strftime("%Y-%m-%d")
+    raw = f"{chat_id}:{source_id}:{target_id}:{polarity}:{relation_type}:{day}"
+    return hashlib.sha1(raw.encode("utf-8")).hexdigest()
+
+
+def _index_rows_to_text(rows: list, amap: dict) -> str:
+    lines = []
+    for r in rows:
+        nm = amap.get(r["author_id"], f"user{r['author_id']}" if r.get("author_id") else "?")
+        lines.append(f"[{r['msg_id']}] {nm}: {r.get('txt') or ''}")
+    return "\n".join(lines)
+
+
+async def _index_record_failed_range(chat_id: int, stage: int, unit_type: str, start_msg_id: int,
+                                     end_msg_id: int, reason: str, payload=None, status: str = "skipped"):
+    await db_write(
+        """INSERT INTO index_failed_ranges
+           (chat_id,stage,unit_type,start_msg_id,end_msg_id,reason,attempts,status,payload)
+           VALUES (%s,%s,%s,%s,%s,%s,1,%s,%s)
+           ON DUPLICATE KEY UPDATE attempts=attempts+1, reason=VALUES(reason),
+             status=VALUES(status), payload=VALUES(payload)""",
+        (chat_id, stage, unit_type, int(start_msg_id), int(end_msg_id), str(reason)[:4000], status,
+         json.dumps(payload or {}, ensure_ascii=False)))
+
+
+async def _index_failed_count(chat_id: int, status: str = "skipped") -> int:
+    try:
+        return (await db_read(
+            "SELECT COUNT(*) c FROM index_failed_ranges WHERE chat_id=%s AND status=%s",
+            (chat_id, status)))[0]["c"]
+    except Exception:
+        return 0
+
+
+async def _index_failed_rows(chat_id: int, stage=None, status: str = "skipped", limit: int = 20) -> list:
+    if stage is None:
+        return await db_read(
+            "SELECT * FROM index_failed_ranges WHERE chat_id=%s AND status=%s ORDER BY stage,start_msg_id LIMIT %s",
+            (chat_id, status, limit))
+    return await db_read(
+        "SELECT * FROM index_failed_ranges WHERE chat_id=%s AND stage=%s AND status=%s ORDER BY start_msg_id LIMIT %s",
+        (chat_id, int(stage), status, limit))
+
+
+def _index_norm_name(s: str) -> str:
+    return re.sub(r"\s+", " ", (s or "").strip().lower())
+
+
+_INDEX_ALIAS_STOP = {
+    "я", "ты", "он", "она", "оно", "они", "мы", "вы",
+    "его", "ее", "её", "их", "мой", "моя", "твой", "твоя",
+    "автор", "участник", "админ", "бот", "человек", "персонаж",
+}
+
+
+def _index_identity_key(s: str) -> str:
+    key = _index_norm_name(s)
+    if len(key) < 2 or key in _INDEX_ALIAS_STOP:
+        return ""
+    return key
+
+
 def _media_meta(m):
     """(media_uid, media_kind) для сообщения: 1=фото, 2=картинка-документ, 3=прочий документ, 0=нет."""
     ph = getattr(m, "photo", None)
@@ -7348,6 +7550,10 @@ def _media_meta(m):
         mime = (getattr(doc, "mime_type", None) or "").lower()
         return (f"{getattr(doc, 'id', '')}", 2 if mime.startswith("image/") else 3)
     return (None, 0)
+
+
+def _index_is_image_msg(m) -> bool:
+    return bool(m and (_is_attached_photo(m) or _is_attached_image_doc(m)))
 
 
 # --- STAGE 0: сырой дамп истории в messages ---
@@ -7423,26 +7629,45 @@ def _json_from_llm(text: str):
 
 
 async def _index_extract(system: str, user: str, max_tokens: int = 8000):
-    """Экстракция через INDEX_EXTRACT_MODEL (V4 Flash) с JSON-mode; фолбэк на запасную. Возвращает dict|None."""
+    """Экстракция через INDEX_EXTRACT_MODEL (V4 Flash) с JSON-mode; фолбэк на запасную.
+    Возвращает dict при успехе; None — если провайдер ОТВЕТИЛ, но контент не парсится как JSON
+    (детерминированный «poison» — можно дробить/скипать). Если провайдер ни разу не ответил
+    (сеть/5xx/timeout на всех попытках) — raise IndexTransientError (это авария, а не poison:
+    стадия должна встать в error, а не фрагментировать блок в ложные skip)."""
     global _INDEX_EXTRACT_OK
     models = [INDEX_EXTRACT_MODEL, INDEX_EXTRACT_FALLBACK]
+    got_response = False  # был ли хоть один валидный ответ провайдера (пусть и не-JSON)
     for mi, model in enumerate(models):
-        try:
-            resp = await asyncio.to_thread(
-                openrouter_client.chat.completions.create,
-                model=model, max_tokens=max_tokens, temperature=0.2,
-                response_format={"type": "json_object"},
-                messages=[{"role": "system", "content": system}, {"role": "user", "content": user}],
-                timeout=240,
-            )
-            content = resp.choices[0].message.content or ""
-            data = _json_from_llm(content)
-            if data is not None:
-                _INDEX_EXTRACT_OK = True
-                return data
-            log("INDEX", f"Экстракция {model}: не распарсил JSON (finish={resp.choices[0].finish_reason})")
-        except Exception as e:
-            log("INDEX", f"Экстракция {model} ошибка: {e}" + (" — пробую запасную" if mi == 0 else ""))
+        for attempt in range(1, INDEX_EXTRACT_RETRIES + 1):
+            try:
+                resp = await asyncio.to_thread(
+                    openrouter_client.chat.completions.create,
+                    model=model, max_tokens=max_tokens, temperature=0.2,
+                    response_format={"type": "json_object"},
+                    messages=[{"role": "system", "content": system}, {"role": "user", "content": user}],
+                    timeout=240,
+                )
+                got_response = True
+                content = resp.choices[0].message.content or ""
+                data = _json_from_llm(content)
+                if data is not None:
+                    _INDEX_EXTRACT_OK = True
+                    return data
+                log("INDEX", f"Экстракция {model}: не распарсил JSON (finish={resp.choices[0].finish_reason}, попытка {attempt})")
+            except Exception as e:
+                code = getattr(e, "status_code", None) or getattr(getattr(e, "response", None), "status_code", None)
+                if code and 400 <= code < 500 and code != 429:
+                    # детерминированная ошибка запроса (не 429) — не транзиент; ретраить бессмысленно
+                    got_response = True
+                    log("INDEX", f"Экстракция {model}: детерминированный {code} — не ретраю: {e}")
+                    break
+                log("INDEX", f"Экстракция {model} ошибка (попытка {attempt}): {e}")
+            if attempt < INDEX_EXTRACT_RETRIES:
+                await asyncio.sleep(min(30, 2 ** attempt) + random.random())
+        if mi == 0:
+            log("INDEX", f"Экстракция {model}: пробую запасную модель")
+    if not got_response:  # провайдер недоступен — транзиент, НЕ poison
+        raise IndexTransientError("extract: провайдер не ответил ни разу (сеть/5xx/timeout)")
     return None
 
 
@@ -7517,25 +7742,46 @@ async def _index_apply_entities(chat_id: int, ents: list, name2author: dict):
             continue
         etype = "character" if str(e.get("type")).lower().startswith("char") else "user"
         aliases = [a.strip() for a in (e.get("aliases") or []) if isinstance(a, str) and a.strip()]
-        ref = e.get("ref")
+        try:
+            ref = int(e.get("ref")) if str(e.get("ref") or "").isdigit() else None
+        except Exception:
+            ref = None
         ent_id = None
-        if isinstance(ref, int) and ref > 0:
+        dirty_summary = False
+        dirty_embedding = False
+        if ref and ref > 0:
             rows = await db_read("SELECT id, aliases FROM entities WHERE chat_id=%s AND id=%s", (chat_id, ref))
             if rows:
                 ent_id = rows[0]["id"]
                 old = json.loads(rows[0]["aliases"]) if rows[0]["aliases"] else []
                 merged = list(dict.fromkeys(old + aliases + [name]))
-                await db_write("UPDATE entities SET aliases=%s WHERE id=%s",
-                               (json.dumps(merged, ensure_ascii=False), ent_id))
+                if merged != old:
+                    await db_write("UPDATE entities SET aliases=%s, embedding=NULL WHERE chat_id=%s AND id=%s",
+                                   (json.dumps(merged, ensure_ascii=False), chat_id, ent_id))
+                    dirty_embedding = True
         if ent_id is None:  # ищем по имени/алиасу, чтобы не задваивать (снежный ком мог не подставить ref)
-            rows = await db_read("SELECT id FROM entities WHERE chat_id=%s AND name=%s", (chat_id, name))
-            if rows:
-                ent_id = rows[0]["id"]
+            for cand in list(dict.fromkeys([name] + aliases)):
+                if not _index_identity_key(cand):
+                    continue
+                rows = await db_read(
+                    "SELECT id, aliases FROM entities WHERE chat_id=%s AND (name=%s OR aliases LIKE %s) LIMIT 1",
+                    (chat_id, cand, f'%"{cand}"%'))
+                if rows:
+                    ent_id = rows[0]["id"]
+                    old = json.loads(rows[0]["aliases"]) if rows[0]["aliases"] else []
+                    merged = list(dict.fromkeys(old + aliases + [name]))
+                    if merged != old:
+                        await db_write("UPDATE entities SET aliases=%s, embedding=NULL WHERE chat_id=%s AND id=%s",
+                                       (json.dumps(merged, ensure_ascii=False), chat_id, ent_id))
+                        dirty_embedding = True
+                    break
         if ent_id is None:  # новая сущность
             tg = name2author.get(name.lower()) if etype == "user" else None
             _, ent_id = await db_write(
                 "INSERT INTO entities (chat_id,name,entity_type,tg_user_id,aliases) VALUES (%s,%s,%s,%s,%s)",
                 (chat_id, name, etype, tg, json.dumps(list(dict.fromkeys([name] + aliases)), ensure_ascii=False)))
+            dirty_summary = True
+            dirty_embedding = True
         # claim'ы (дедуп по нормализованному тексту в пределах сущности)
         existing = await db_read("SELECT id, kind, claim, evidence FROM entity_claims WHERE chat_id=%s AND entity_id=%s",
                                  (chat_id, ent_id))
@@ -7556,13 +7802,103 @@ async def _index_apply_entities(chat_id: int, ents: list, name2author: dict):
                     if new_ev != old_ev:
                         await db_write("UPDATE entity_claims SET evidence=%s WHERE id=%s",
                                        (json.dumps(new_ev, ensure_ascii=False), r["id"]))
+                        dirty_summary = True
                 else:
                     await db_write(
                         "INSERT INTO entity_claims (chat_id,entity_id,kind,claim,evidence) VALUES (%s,%s,%s,%s,%s)",
                         (chat_id, ent_id, kind, claim, json.dumps(ev, ensure_ascii=False)))
                     seen[keyc] = {"id": None, "kind": kind, "claim": claim, "evidence": json.dumps(ev)}
+                    dirty_summary = True
+        if dirty_summary:
+            await db_write("DELETE FROM entity_summary_parts WHERE chat_id=%s AND entity_id=%s", (chat_id, ent_id))
+            await db_write(
+                "UPDATE entities SET canon_summary=NULL, fanon_summary=NULL, embedding=NULL WHERE chat_id=%s AND id=%s",
+                (chat_id, ent_id))
+            _index_invalidate(chat_id, "entities")
+        elif dirty_embedding:
+            _index_invalidate(chat_id, "entities")
         touched += 1
     return touched
+
+
+async def _index_merge_entity_ids(chat_id: int, keep_id: int, drop_id: int):
+    if keep_id == drop_id:
+        return
+    rows = await db_read("SELECT id, name, aliases FROM entities WHERE chat_id=%s AND id IN (%s,%s)",
+                         (chat_id, keep_id, drop_id))
+    by_id = {r["id"]: r for r in rows}
+    if keep_id not in by_id or drop_id not in by_id:
+        return
+    keep, drop = by_id[keep_id], by_id[drop_id]
+    al_keep = json.loads(keep["aliases"]) if keep["aliases"] else []
+    al_drop = json.loads(drop["aliases"]) if drop["aliases"] else []
+    merged = list(dict.fromkeys(al_keep + al_drop + [keep["name"], drop["name"]]))
+    await db_transaction([
+        ("UPDATE entities SET aliases=%s, canon_summary=NULL, fanon_summary=NULL, embedding=NULL WHERE chat_id=%s AND id=%s",
+         (json.dumps(merged, ensure_ascii=False), chat_id, keep_id)),
+        ("UPDATE entity_claims SET entity_id=%s WHERE chat_id=%s AND entity_id=%s", (keep_id, chat_id, drop_id)),
+        ("UPDATE relations SET source_id=%s, embedding=NULL WHERE chat_id=%s AND source_id=%s", (keep_id, chat_id, drop_id)),
+        ("UPDATE relations SET target_id=%s, embedding=NULL WHERE chat_id=%s AND target_id=%s", (keep_id, chat_id, drop_id)),
+        ("UPDATE IGNORE relation_events SET source_id=%s WHERE chat_id=%s AND source_id=%s", (keep_id, chat_id, drop_id)),
+        ("UPDATE IGNORE relation_events SET target_id=%s WHERE chat_id=%s AND target_id=%s", (keep_id, chat_id, drop_id)),
+        ("DELETE FROM relation_events WHERE chat_id=%s AND (source_id=%s OR target_id=%s)", (chat_id, drop_id, drop_id)),
+        ("DELETE FROM relations WHERE chat_id=%s AND source_id=target_id", (chat_id,)),
+        ("DELETE FROM relation_events WHERE chat_id=%s AND source_id=target_id", (chat_id,)),
+        ("DELETE FROM entity_summary_parts WHERE chat_id=%s AND entity_id IN (%s,%s)", (chat_id, keep_id, drop_id)),
+        ("DELETE FROM entities WHERE chat_id=%s AND id=%s", (chat_id, drop_id)),
+    ])
+    _index_invalidate(chat_id, "entities", "relations")
+
+
+async def _index_consolidate_exact_entities(chat_id: int) -> int:
+    """Консервативная консолидация: сливает только точные пересечения name/alias после нормализации."""
+    rows = await db_read("SELECT id, name, aliases FROM entities WHERE chat_id=%s ORDER BY id", (chat_id,))
+    owner, merges = {}, []
+    for r in rows:
+        names = [r["name"]]
+        if r["aliases"]:
+            names += json.loads(r["aliases"])
+        for nm in names:
+            key = _index_identity_key(nm)
+            if not key:
+                continue
+            if key in owner and owner[key] != r["id"]:
+                merges.append((min(owner[key], r["id"]), max(owner[key], r["id"])))
+            else:
+                owner[key] = r["id"]
+    done, seen = 0, set()
+    for keep_id, drop_id in merges:
+        if (keep_id, drop_id) in seen:
+            continue
+        seen.add((keep_id, drop_id))
+        await _index_merge_entity_ids(chat_id, keep_id, drop_id)
+        done += 1
+    if done:
+        log("INDEX", f"Консолидация сущностей: слито точных дублей {done}")
+    return done
+
+
+async def _index_stage1_extract_rows(chat_id: int, rows: list, amap: dict, name2author: dict, depth: int = 0) -> tuple:
+    """Обрабатывает micro-block; при poison failure дробит и в крайнем случае записывает skipped range."""
+    if not rows:
+        return 0, 0
+    start, end = rows[0]["msg_id"], rows[-1]["msg_id"]
+    registry, _ = await _index_load_registry(chat_id)
+    user = f"РЕЕСТР (известные сущности):\n{registry}\n\nНОВЫЙ БЛОК:\n" + _index_rows_to_text(rows, amap)
+    data = await _index_extract(_INDEX_STAGE1_SYSTEM, user)
+    if data and isinstance(data.get("entities"), list):
+        touched = await _index_apply_entities(chat_id, data["entities"], name2author)
+        return touched, 0
+    if len(rows) > INDEX_FAILED_MIN_MESSAGES:
+        mid = max(1, len(rows) // 2)
+        left_t, left_s = await _index_stage1_extract_rows(chat_id, rows[:mid], amap, name2author, depth + 1)
+        right_t, right_s = await _index_stage1_extract_rows(chat_id, rows[mid:], amap, name2author, depth + 1)
+        return left_t + right_t, left_s + right_s
+    reason = "Stage1 deterministic extraction failure after recursive split"
+    await _index_record_failed_range(chat_id, 1, "message", start, end, reason,
+                                     {"depth": depth, "text_preview": (rows[0].get("txt") or "")[:500]})
+    log("INDEX", f"Stage1 poison message skipped: {start}")
+    return 0, 1
 
 
 async def _index_stage1_dossiers(chat_id: int, progress_cb=None):
@@ -7570,6 +7906,7 @@ async def _index_stage1_dossiers(chat_id: int, progress_cb=None):
     st = await _idx_get_state(chat_id, 1)
     cursor = int(st["cursor"].get("last_msg_id", 0))
     ents_seen = int(st["stats"].get("blocks", 0))
+    skipped_seen = int(st["stats"].get("skipped", 0))
     await _idx_set_state(chat_id, 1, status="running")
     amap = await _index_author_map(chat_id)
     name2author = {}
@@ -7582,38 +7919,51 @@ async def _index_stage1_dossiers(chat_id: int, progress_cb=None):
         if _INDEX_CONTROL.get(chat_id) == "pause":
             await _idx_set_state(chat_id, 1, status="paused")
             return "paused"
-        # набираем блок текстовых сообщений до токен-бюджета
+        # набираем micro-block до токен/сообщение-бюджета; poison blocks дробятся внутри.
         rows = await db_read(
             "SELECT msg_id, author_id, txt FROM messages WHERE chat_id=%s AND msg_id>%s AND txt IS NOT NULL AND txt<>'' "
-            "ORDER BY msg_id ASC LIMIT 6000", (chat_id, cursor))
+            "ORDER BY msg_id ASC LIMIT %s", (chat_id, cursor, INDEX_STAGE1_MICRO_MESSAGES))
         if not rows:
             break
-        lines, tok, last = [], 0, cursor
+        block_rows, tok, last = [], 0, cursor
         for r in rows:
-            nm = amap.get(r["author_id"], f"user{r['author_id']}" if r["author_id"] else "?")
-            line = f"[{r['msg_id']}] {nm}: {r['txt']}"
-            lines.append(line)
+            author_name = amap.get(r["author_id"], f"user{r['author_id']}" if r.get("author_id") else "?")
+            line = f"[{r['msg_id']}] {author_name}: {r['txt']}"
+            block_rows.append(r)
             tok += count_tokens(line)
             last = r["msg_id"]
-            if tok >= INDEX_STAGE1_BLOCK_TOKENS:
+            if tok >= INDEX_STAGE1_MICRO_TOKENS:
                 break
-        registry, _ = await _index_load_registry(chat_id)
-        user = f"РЕЕСТР (известные сущности):\n{registry}\n\nНОВЫЙ БЛОК:\n" + "\n".join(lines)
-        data = await _index_extract(_INDEX_STAGE1_SYSTEM, user)
-        if data and isinstance(data.get("entities"), list):
-            await _index_apply_entities(chat_id, data["entities"], name2author)
-        else:
-            log("INDEX", f"Stage1 блок до msg_id={last}: экстракция пустая/битая — пропускаю блок")
+        try:
+            touched, skipped = await _index_stage1_extract_rows(chat_id, block_rows, amap, name2author)
+        except IndexTransientError as e:  # авария провайдера — не двигаем курсор, встаём в error
+            await _idx_set_state(chat_id, 1, status="error")
+            log("INDEX", f"Stage1 транзиентный сбой на блоке до {last}: {e} — стадия в error, /index resume добёрет")
+            return "error"
         cursor = last
         blocks_done += 1
-        await _idx_set_state(chat_id, 1, cursor={"last_msg_id": cursor}, stats={"blocks": blocks_done})
+        skipped_seen += skipped
+        if blocks_done % INDEX_CONSOLIDATE_EVERY_BLOCKS == 0:
+            await _index_consolidate_exact_entities(chat_id)
+        await _idx_set_state(chat_id, 1, cursor={"last_msg_id": cursor}, stats={"blocks": blocks_done, "skipped": skipped_seen})
+        await db_write(
+            "UPDATE index_failed_ranges SET status='resolved' WHERE chat_id=%s AND stage=1 AND status='retrying' AND end_msg_id<=%s",
+            (chat_id, cursor))
         if progress_cb:
             cnt = (await db_read("SELECT COUNT(*) c FROM entities WHERE chat_id=%s", (chat_id,)))[0]["c"]
-            await progress_cb(f"🧠 Досье: блок {blocks_done} (до id {cursor}) · сущностей {cnt}…")
+            await progress_cb(f"🧠 Досье: micro {blocks_done} (до id {cursor}) · сущностей {cnt} · skipped {skipped_seen}…")
 
     # синтез компактных досье canon/fanon из claim'ов
-    await _index_summarize_entities(chat_id, progress_cb)
-    await _idx_set_state(chat_id, 1, status="done", stats={"blocks": blocks_done})
+    try:
+        sum_res = await _index_summarize_entities(chat_id, progress_cb)
+    except IndexTransientError as e:  # провайдер недоступен на саммари — не закрываем стадию
+        await _idx_set_state(chat_id, 1, status="error")
+        log("INDEX", f"Stage1 саммари: транзиентный сбой ({e}) — стадия в error, /index resume добёрет")
+        return "error"
+    if sum_res == "paused":
+        await _idx_set_state(chat_id, 1, status="paused")
+        return "paused"
+    await _idx_set_state(chat_id, 1, status="done", stats={"blocks": blocks_done, "skipped": skipped_seen})
     cnt = (await db_read("SELECT COUNT(*) c FROM entities WHERE chat_id=%s", (chat_id,)))[0]["c"]
     log("INDEX", f"Stage1 чата {chat_id}: готово, сущностей {cnt}, блоков {blocks_done}")
     return "done"
@@ -7629,10 +7979,9 @@ _INDEX_SUMM_SYSTEM = (
 
 async def _index_summarize_entities(chat_id: int, progress_cb=None):
     """Из claim'ов синтезирует entities.canon_summary/fanon_summary. Чекпоинт по entity id."""
-    st = await _idx_get_state(chat_id, 1)
-    after = int(st["cursor"].get("summ_after_id", 0))
     ents = await db_read(
-        "SELECT id, name FROM entities WHERE chat_id=%s AND id>%s ORDER BY id", (chat_id, after))
+        "SELECT id, name FROM entities WHERE chat_id=%s AND (canon_summary IS NULL OR fanon_summary IS NULL) ORDER BY id",
+        (chat_id,))
     sem = asyncio.Semaphore(4)
     total = len(ents)
     done = 0
@@ -7646,6 +7995,12 @@ async def _index_summarize_entities(chat_id: int, progress_cb=None):
         if not canon and not fanon:
             csum = fsum = ""
         else:
+            total_body = (f"Персонаж/участник: {ent['name']}\nCANON-факты:\n" + ("\n".join(f"- {c}" for c in canon) or "(нет)")
+                          + "\nFANON-факты:\n" + ("\n".join(f"- {c}" for c in fanon) or "(нет)"))
+            if len(claims) > INDEX_SUMMARY_MAPREDUCE_MIN_CLAIMS or count_tokens(total_body) > INDEX_SUMMARY_MAPREDUCE_MIN_TOKENS:
+                await db_write("DELETE FROM entity_summary_parts WHERE chat_id=%s AND entity_id=%s", (chat_id, ent["id"]))
+                canon = await _index_summarize_claim_parts(chat_id, ent["id"], ent["name"], "canon", canon)
+                fanon = await _index_summarize_claim_parts(chat_id, ent["id"], ent["name"], "fanon", fanon)
             body = (f"Персонаж/участник: {ent['name']}\nCANON-факты:\n" + ("\n".join(f"- {c}" for c in canon) or "(нет)")
                     + "\nFANON-факты:\n" + ("\n".join(f"- {c}" for c in fanon) or "(нет)"))
             async with sem:
@@ -7655,19 +8010,58 @@ async def _index_summarize_entities(chat_id: int, progress_cb=None):
             else:  # фолбэк — просто склейка фактов
                 csum = " ".join(canon)[:1500]
                 fsum = " ".join(fanon)[:800]
-        await db_write("UPDATE entities SET canon_summary=%s, fanon_summary=%s WHERE id=%s", (csum, fsum, ent["id"]))
+        await db_write("UPDATE entities SET canon_summary=%s, fanon_summary=%s WHERE chat_id=%s AND id=%s",
+                       (csum, fsum, chat_id, ent["id"]))
         done += 1
 
     # обрабатываем чанками, чекпоинтя max id (устойчиво к рестарту)
     for i in range(0, total, 20):
         if _INDEX_CONTROL.get(chat_id) == "pause":
-            return
+            return "paused"
         chunk = ents[i:i + 20]
         await asyncio.gather(*[_one(e) for e in chunk])
-        await _idx_set_state(chat_id, 1, cursor={"last_msg_id": st["cursor"].get("last_msg_id", 0),
-                                                  "summ_after_id": chunk[-1]["id"]})
+        _index_invalidate(chat_id, "entities")
         if progress_cb:
             await progress_cb(f"📝 Досье-саммари: {min(i + 20, total)}/{total}…")
+    return "done"
+
+
+async def _index_summarize_claim_parts(chat_id: int, entity_id: int, name: str, kind: str, claims: list) -> list:
+    """Map-step для популярных сущностей: claims → compact part summaries."""
+    if not claims:
+        return []
+    out, batch, tok, part_no = [], [], 0, 0
+
+    async def _flush():
+        nonlocal batch, tok, part_no
+        if not batch:
+            return
+        part_no += 1
+        canon_lines = "\n".join(f"- {c}" for c in batch) if kind == "canon" else "(нет)"
+        fanon_lines = "\n".join(f"- {c}" for c in batch) if kind == "fanon" else "(нет)"
+        body = f"Персонаж/участник: {name}\nCANON-факты:\n{canon_lines}\nFANON-факты:\n{fanon_lines}"
+        data = await _index_extract(_INDEX_SUMM_SYSTEM, body, max_tokens=900)
+        if isinstance(data, dict):
+            summary = (data.get(kind) or data.get("canon") or data.get("fanon") or "").strip()
+        else:
+            summary = " ".join(batch)[:1200]
+        await db_write(
+            """INSERT INTO entity_summary_parts (chat_id,entity_id,kind,part_no,summary,claim_count)
+               VALUES (%s,%s,%s,%s,%s,%s)
+               ON DUPLICATE KEY UPDATE summary=VALUES(summary), claim_count=VALUES(claim_count)""",
+            (chat_id, entity_id, kind, part_no, summary, len(batch)))
+        if summary:
+            out.append(summary)
+        batch, tok = [], 0
+
+    for claim in claims:
+        ct = count_tokens(claim)
+        if batch and (len(batch) >= INDEX_SUMMARY_CLAIM_BATCH or tok + ct > INDEX_SUMMARY_TOKEN_BATCH):
+            await _flush()
+        batch.append(claim)
+        tok += ct
+    await _flush()
+    return out
 
 
 # --- STAGE 2: сцены → граф связей + распознавание медиа ---
@@ -7695,20 +8089,62 @@ _INDEX_MEDIA_SYSTEM = (
 )
 
 
-async def _index_relation_registry(chat_id: int) -> tuple:
-    """(листинг справочника для системного префикса, {lower(имя/алиас): entity_id})."""
+async def _index_relation_registry(chat_id: int, scene_text: str = None) -> tuple:
+    """(candidate-listing для prompt, полный {lower(имя/алиас): entity_id} для валидации)."""
     rows = await db_read("SELECT id, name, entity_type, aliases FROM entities WHERE chat_id=%s ORDER BY id", (chat_id,))
-    name2id, lines = {}, []
+    name2id, by_id = {}, {}
     for r in rows:
+        by_id[r["id"]] = r
         al = json.loads(r["aliases"]) if r["aliases"] else []
         name2id[r["name"].lower()] = r["id"]
         for a in al:
             name2id.setdefault(a.lower(), r["id"])
+    selected = []
+    if scene_text:
+        low = scene_text.lower()
+        exact = []
+        for r in rows:
+            names = [r["name"]] + (json.loads(r["aliases"]) if r["aliases"] else [])
+            if any(_index_identity_key(nm) and _index_identity_key(nm) in low for nm in names):
+                exact.append(r["id"])
+                if len(exact) >= INDEX_REGISTRY_EXACT_LIMIT:
+                    break
+        selected += exact
+        if exact:
+            ph = ",".join(str(int(i)) for i in exact)
+            rels = await db_read(
+                f"SELECT source_id,target_id,weight FROM relations WHERE chat_id=%s AND status='active' "
+                f"AND (source_id IN ({ph}) OR target_id IN ({ph})) ORDER BY weight DESC LIMIT %s",
+                (chat_id, INDEX_REGISTRY_NEIGHBOR_LIMIT))
+            for rel in rels:
+                selected.append(rel["source_id"])
+                selected.append(rel["target_id"])
+        try:
+            n_emb = (await db_read(
+                "SELECT COUNT(*) c FROM entities WHERE chat_id=%s AND embedding IS NOT NULL", (chat_id,)))[0]["c"]
+            if n_emb:
+                qv = await _index_embed_query(scene_text[:4000])
+                for h in await _index_vector_search(chat_id, "entities", qv, INDEX_REGISTRY_SEMANTIC_LIMIT):
+                    selected.append(h["key"])
+        except Exception as e:
+            log("INDEX", f"Registry semantic candidates не получились: {e}")
+    if not selected:
+        selected = [r["id"] for r in rows[:INDEX_REGISTRY_FALLBACK_LIMIT]]
+    selected_ids = []
+    seen = set()
+    for eid in selected:
+        if eid in by_id and eid not in seen:
+            selected_ids.append(eid)
+            seen.add(eid)
+    lines = []
+    for eid in selected_ids:
+        r = by_id[eid]
+        al = json.loads(r["aliases"]) if r["aliases"] else []
         tag = "персонаж" if r["entity_type"] == "character" else "участник"
         extra = f" (алиасы: {', '.join(a for a in al if a != r['name'])})" if len(al) > 1 else ""
         lines.append(f"{r['name']} — {tag}{extra}")
     listing = "\n".join(lines) if lines else "(справочник пуст)"
-    if count_tokens(listing) > 50000:  # предохранитель для огромных чатов
+    if count_tokens(listing) > 50000:
         listing = "\n".join(lines[:2000]) + f"\n… (+{max(0, len(lines) - 2000)} ещё)"
     return listing, name2id
 
@@ -7716,6 +8152,7 @@ async def _index_relation_registry(chat_id: int) -> tuple:
 async def _index_apply_relations(chat_id: int, rels: list, name2id: dict, scene_date) -> tuple:
     """Темпоральный UPSERT связей. Сентимент-ребро (pos/neg) одно на пару (s→t): смена полярности
     закрывает старое и открывает новое (событие «поссорились/помирились»). neutral — отдельное стойкое ребро.
+    Идемпотентность веса — через relation_events с дневным ключом (устойчив к resume/update overlap).
     Возвращает (число применённых, множество затронутых entity_id)."""
     applied, touched = 0, set()
     for rel in rels or []:
@@ -7730,9 +8167,17 @@ async def _index_apply_relations(chat_id: int, rels: list, name2id: dict, scene_
         pol = str(rel.get("polarity", "neutral")).lower()
         if pol not in ("pos", "neg", "neutral"):
             pol = "neutral"
-        rtype = (rel.get("type") or "")[:64]
+        rtype = (rel.get("type") or "связь")[:64]
         summ = (rel.get("summary") or "")[:2000]
         ev = [int(x) for x in (rel.get("evidence") or []) if str(x).isdigit()]
+        event_key = _index_relation_event_key(chat_id, scene_date, s, t, pol, rtype)
+        rowcount, _ = await db_write(
+            """INSERT IGNORE INTO relation_events
+               (chat_id,scene_key,source_id,target_id,relation_type,canonical_type,context_summary,evidence,scene_date)
+               VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s)""",
+            (chat_id, event_key, s, t, rtype, pol, summ, json.dumps(ev, ensure_ascii=False), scene_date))
+        if rowcount == 0:
+            continue
         if pol == "neutral":
             cond = "AND canonical_type='neutral'"
         else:
@@ -7743,17 +8188,19 @@ async def _index_apply_relations(chat_id: int, rels: list, name2id: dict, scene_
         if cur:
             row = cur[0]
             if pol != "neutral" and row["canonical_type"] != pol:  # полярность сменилась → закрываем старое ребро
-                await db_write("UPDATE relations SET status='closed' WHERE id=%s", (row["id"],))
+                await db_write("UPDATE relations SET status='closed' WHERE chat_id=%s AND id=%s", (chat_id, row["id"]))
                 await db_write(
                     """INSERT INTO relations (chat_id,source_id,target_id,relation_type,canonical_type,context_summary,
                        weight,first_seen,last_seen,status,evidence) VALUES (%s,%s,%s,%s,%s,%s,1,%s,%s,'active',%s)""",
                     (chat_id, s, t, rtype, pol, summ, scene_date, scene_date, json.dumps(ev, ensure_ascii=False)))
+                _index_invalidate(chat_id, "relations")
             else:  # то же ребро — усиливаем, обновляем summary/last_seen, доклеиваем evidence
                 old_ev = json.loads(row["evidence"]) if row["evidence"] else []
                 new_ev = list(dict.fromkeys(old_ev + ev))[:50]
                 await db_write(
-                    "UPDATE relations SET weight=weight+1, last_seen=%s, relation_type=%s, context_summary=%s, evidence=%s WHERE id=%s",
-                    (scene_date, rtype, summ, json.dumps(new_ev, ensure_ascii=False), row["id"]))
+                    "UPDATE relations SET weight=weight+1, last_seen=%s, relation_type=%s, context_summary=%s, evidence=%s, embedding=NULL WHERE chat_id=%s AND id=%s",
+                    (scene_date, rtype, summ, json.dumps(new_ev, ensure_ascii=False), chat_id, row["id"]))
+                _index_invalidate(chat_id, "relations")
         else:
             await db_write(
                 """INSERT INTO relations (chat_id,source_id,target_id,relation_type,canonical_type,context_summary,
@@ -7780,14 +8227,20 @@ async def _index_download_media(msg):
     return None
 
 
-async def _index_process_media(chat_id: int, photo_msgs: list, scene_text: str, registry: str, name2id: dict):
-    """Распознаёт фото сцены медиа-моделью → media_assets + visual-факты сущностям. Возвращает число обработанных."""
+async def _index_process_media(chat_id: int, image_msgs: list, scene_text: str, registry: str, name2id: dict):
+    """Распознаёт картинки сцены медиа-моделью → media_assets + visual-факты сущностям. Возвращает число обработанных."""
     model = get_active_media_model()
     mclient = _client_for_media_model(model)
     if not mclient:
         return 0
     done = 0
-    for msg in photo_msgs:
+    for msg in image_msgs:
+        exists = await db_read(
+            "SELECT image_description, emb_image FROM media_assets WHERE chat_id=%s AND msg_id=%s",
+            (chat_id, msg.id))
+        if exists and (exists[0].get("image_description") or "").strip() and exists[0].get("emb_image"):
+            done += 1
+            continue
         raw = await _index_download_media(msg)
         if not raw:
             continue
@@ -7820,18 +8273,27 @@ async def _index_process_media(chat_id: int, photo_msgs: list, scene_text: str, 
                 old = (rows[0]["visual_features"] or "") if rows else ""
                 if app.lower() not in old.lower():
                     newvf = (old + " · " + app).strip(" ·")[:2000]
-                    await db_write("UPDATE entities SET visual_features=%s WHERE id=%s", (newvf, eid))
+                    await db_write("UPDATE entities SET visual_features=%s, embedding=NULL WHERE chat_id=%s AND id=%s",
+                                   (newvf, chat_id, eid))
+                    _index_invalidate(chat_id, "entities")
                 await db_write(
-                    "INSERT INTO entity_claims (chat_id,entity_id,kind,claim,evidence) VALUES (%s,%s,'visual',%s,%s)",
-                    (chat_id, eid, app, json.dumps([msg.id], ensure_ascii=False)))
+                    """INSERT INTO entity_claims (chat_id,entity_id,kind,claim,evidence)
+                       SELECT %s,%s,'visual',%s,%s FROM DUAL
+                       WHERE NOT EXISTS (
+                         SELECT 1 FROM entity_claims
+                         WHERE chat_id=%s AND entity_id=%s AND kind='visual' AND claim=%s AND evidence=%s
+                         LIMIT 1)""",
+                    (chat_id, eid, app, json.dumps([msg.id], ensure_ascii=False),
+                     chat_id, eid, app, json.dumps([msg.id], ensure_ascii=False)))
         uid, _ = _media_meta(msg)
         # вектор САМОЙ картинки (gemini-embedding-2) считаем здесь, пока байты в руках — иначе Stage 3 качал бы фото повторно
         emb_img = await _index_embed_image(raw)
         await db_write(
             """INSERT INTO media_assets (chat_id,msg_id,file_uid,image_description,entity_ids,emb_image)
                VALUES (%s,%s,%s,%s,%s,%s) ON DUPLICATE KEY UPDATE image_description=VALUES(image_description),
-               entity_ids=VALUES(entity_ids), file_uid=VALUES(file_uid), emb_image=VALUES(emb_image)""",
+               entity_ids=VALUES(entity_ids), file_uid=VALUES(file_uid), emb_image=VALUES(emb_image), emb_text=NULL""",
             (chat_id, msg.id, uid, desc, json.dumps(ent_ids, ensure_ascii=False), emb_img))
+        _index_invalidate(chat_id, "media_text", "media_image")
         done += 1
     return done
 
@@ -7843,50 +8305,85 @@ async def _index_stage2_graph(chat_id: int, progress_cb=None):
     cursor = int(st["cursor"].get("last_msg_id", 0))
     scenes_done = int(st["stats"].get("scenes", 0))
     await _idx_set_state(chat_id, 2, status="running")
-    registry, name2id = await _index_relation_registry(chat_id)
     amap = await _index_author_map(chat_id)
-    log("INDEX", f"Stage2 граф чата {chat_id}: с msg_id>{cursor}, справочник {len(name2id)} имён")
+    # Выравнивание границ: курсор мог быть отмотан на произвольный msg_id (/index update, retry failed).
+    # Снапаем его на реальную границу ранее нарезанной сцены и сносим «хвост» чанков за ней, чтобы
+    # перенарезка не плодила перекрывающиеся сцены (u_scene upsert иначе бы промахнулся).
+    if cursor > 0:
+        snap = await db_read("SELECT MAX(end_msg_id) m FROM chat_chunks WHERE chat_id=%s AND end_msg_id<=%s", (chat_id, cursor))
+        aligned = int(snap[0]["m"]) if snap and snap[0]["m"] is not None else 0
+        if aligned < cursor:
+            log("INDEX", f"Stage2: курсор {cursor} → выравниваю на границу сцены {aligned}, сношу хвост чанков")
+            cursor = aligned
+        deleted, _ = await db_write("DELETE FROM chat_chunks WHERE chat_id=%s AND end_msg_id>%s", (chat_id, cursor))
+        if deleted:
+            _index_invalidate(chat_id, "chunks")
+            scenes_done = (await db_read("SELECT COUNT(*) c FROM chat_chunks WHERE chat_id=%s", (chat_id,)))[0]["c"]
+    ent_count = (await db_read("SELECT COUNT(*) c FROM entities WHERE chat_id=%s", (chat_id,)))[0]["c"]
+    log("INDEX", f"Stage2 граф чата {chat_id}: с msg_id>{cursor}, сущностей {ent_count}")
 
     scene, scene_tok, prev_date = [], 0, None
 
-    async def _finalize(sc):
+    async def _write_chunk(sc, scene_text, rels_applied, touched, media_done, failed=False):
         nonlocal scenes_done
+        if not sc:
+            return
+        s_date = sc[-1]["date"]
+        ent_ids = sorted(touched)
+        meta = {"entities": ent_ids[:60], "relations": rels_applied, "photos": media_done, "failed": bool(failed)}
+        enriched = scene_text
+        if ent_ids:
+            names = await db_read("SELECT name FROM entities WHERE id IN (%s)" %
+                                  ",".join(str(int(i)) for i in ent_ids[:30]))
+            enriched += "\n[Участники сцены: " + ", ".join(n["name"] for n in names) + "]"
+        rowcount, _ = await db_write(
+            """INSERT INTO chat_chunks (chat_id,start_msg_id,end_msg_id,scene_date,enriched_text,meta)
+               VALUES (%s,%s,%s,%s,%s,%s)
+               ON DUPLICATE KEY UPDATE scene_date=VALUES(scene_date), enriched_text=VALUES(enriched_text),
+                 meta=VALUES(meta), embedding=NULL""",
+            (chat_id, sc[0]["msg_id"], sc[-1]["msg_id"], s_date, enriched[:60000], json.dumps(meta, ensure_ascii=False)))
+        if rowcount:
+            _index_invalidate(chat_id, "chunks")
+        scenes_done += 1
+
+    async def _finalize(sc, depth=0):
         if not sc:
             return
         s_date = sc[-1]["date"]
         lines = [f"[{r['msg_id']}] {amap.get(r['author_id'], 'user' + str(r['author_id'])) }: {r['txt']}"
                  for r in sc if (r["txt"] or "").strip()]
         scene_text = "\n".join(lines)
+        registry, name2id = await _index_relation_registry(chat_id, scene_text)
         rels_applied, touched = 0, set()
+        failed = False
         if scene_text.strip():
             data = await _index_extract(_INDEX_REL_SYSTEM + "\n\nСПРАВОЧНИК:\n" + registry, "СЦЕНА:\n" + scene_text)
-            if data and isinstance(data.get("relations"), list):
+            if data is None or not isinstance(data.get("relations"), list):
+                if len(sc) > 1:
+                    mid = max(1, len(sc) // 2)
+                    await _finalize(sc[:mid], depth + 1)
+                    await _finalize(sc[mid:], depth + 1)
+                    return
+                failed = True
+                await _index_record_failed_range(
+                    chat_id, 2, "scene", sc[0]["msg_id"], sc[-1]["msg_id"],
+                    "Stage2 deterministic relation extraction failure after recursive split",
+                    {"depth": depth, "text_preview": scene_text[:500]})
+                log("INDEX", f"Stage2 poison scene skipped: {sc[0]['msg_id']}..{sc[-1]['msg_id']}")
+            else:
                 rels_applied, touched = await _index_apply_relations(chat_id, data["relations"], name2id, s_date)
-        # медиа сцены
-        photo_ids = [r["msg_id"] for r in sc if r["media_kind"] == 1]
+        image_ids = [r["msg_id"] for r in sc if r["media_kind"] in (1, 2)]
         media_done = 0
-        if photo_ids:
+        if image_ids:
             try:
-                photo_msgs = []
-                for i in range(0, len(photo_ids), 100):  # get_messages(ids=…) — до ~100 за вызов
-                    msgs = await client.get_messages(chat_id, ids=photo_ids[i:i + 100])
-                    photo_msgs += [m for m in msgs if m and getattr(m, "photo", None)]
-                media_done = await _index_process_media(chat_id, photo_msgs, scene_text, registry, name2id)
+                image_msgs = []
+                for i in range(0, len(image_ids), 100):
+                    msgs = await client.get_messages(chat_id, ids=image_ids[i:i + 100])
+                    image_msgs += [m for m in msgs if _index_is_image_msg(m)]
+                media_done = await _index_process_media(chat_id, image_msgs, scene_text, registry, name2id)
             except Exception as e:
                 log("INDEX", f"Stage2: медиа сцены не обработалось: {e}")
-        # chat_chunk (enriched) — вектор проставит Stage 3. Участники сцены = концы найденных связей (дёшево, без скана справочника)
-        ent_ids = sorted(touched)
-        meta = {"entities": ent_ids[:60], "relations": rels_applied, "photos": media_done}
-        enriched = scene_text
-        if ent_ids:
-            names = await db_read("SELECT name FROM entities WHERE id IN (%s)" %
-                                  ",".join(str(int(i)) for i in ent_ids[:30]))
-            enriched += "\n[Участники сцены: " + ", ".join(n["name"] for n in names) + "]"
-        await db_write(
-            """INSERT INTO chat_chunks (chat_id,start_msg_id,end_msg_id,scene_date,enriched_text,meta)
-               VALUES (%s,%s,%s,%s,%s,%s)""",
-            (chat_id, sc[0]["msg_id"], sc[-1]["msg_id"], s_date, enriched[:60000], json.dumps(meta, ensure_ascii=False)))
-        scenes_done += 1
+        await _write_chunk(sc, scene_text, rels_applied, touched, media_done, failed=failed)
 
     while True:
         if _INDEX_CONTROL.get(chat_id) == "pause":
@@ -7899,9 +8396,22 @@ async def _index_stage2_graph(chat_id: int, progress_cb=None):
             break
         for r in rows:
             gap = (r["date"] - prev_date).total_seconds() if (prev_date and r["date"]) else 0
-            if scene and (gap > INDEX_SCENE_GAP_SEC or scene_tok >= INDEX_SCENE_TOKEN_CAP):
-                await _finalize(scene)
+            should_split = scene and (
+                scene_tok >= INDEX_SCENE_TOKEN_CAP
+                or gap > INDEX_SCENE_HARD_GAP_SEC
+                or (gap > INDEX_SCENE_GAP_SEC and scene_tok >= INDEX_SCENE_MIN_TOKENS)
+            )
+            if should_split:
+                try:
+                    await _finalize(scene)
+                except IndexTransientError as e:  # авария провайдера — не двигаем курсор, встаём в error
+                    await _idx_set_state(chat_id, 2, status="error")
+                    log("INDEX", f"Stage2 транзиентный сбой на сцене до {scene[-1]['msg_id']}: {e} — стадия в error")
+                    return "error"
                 await _idx_set_state(chat_id, 2, cursor={"last_msg_id": scene[-1]["msg_id"]}, stats={"scenes": scenes_done})
+                await db_write(
+                    "UPDATE index_failed_ranges SET status='resolved' WHERE chat_id=%s AND stage=2 AND status='retrying' AND end_msg_id<=%s",
+                    (chat_id, scene[-1]["msg_id"]))
                 if progress_cb and scenes_done % 5 == 0:
                     await progress_cb(f"🕸 Граф: {scenes_done} сцен (до id {scene[-1]['msg_id']})…")
                 scene, scene_tok, prev_date = [], 0, None
@@ -7911,8 +8421,16 @@ async def _index_stage2_graph(chat_id: int, progress_cb=None):
             cursor = r["msg_id"]
         # окно кончилось — не финализируем открытую сцену (доберём в следующем окне)
     if scene:  # последняя сцена чата
-        await _finalize(scene)
+        try:
+            await _finalize(scene)
+        except IndexTransientError as e:
+            await _idx_set_state(chat_id, 2, status="error")
+            log("INDEX", f"Stage2 транзиентный сбой на последней сцене: {e} — стадия в error")
+            return "error"
         await _idx_set_state(chat_id, 2, cursor={"last_msg_id": scene[-1]["msg_id"]}, stats={"scenes": scenes_done})
+        await db_write(
+            "UPDATE index_failed_ranges SET status='resolved' WHERE chat_id=%s AND stage=2 AND status='retrying' AND end_msg_id<=%s",
+            (chat_id, scene[-1]["msg_id"]))
 
     await _idx_set_state(chat_id, 2, status="done", stats={"scenes": scenes_done})
     nrel = (await db_read("SELECT COUNT(*) c FROM relations WHERE chat_id=%s", (chat_id,)))[0]["c"]
@@ -7922,10 +8440,21 @@ async def _index_stage2_graph(chat_id: int, progress_cb=None):
 
 # --- эмбеддинги (OpenRouter /embeddings) ---
 def _sync_embed_texts(texts: list) -> list:
-    resp = requests.post(f"{OPENROUTER_BASE_URL}/embeddings",
-                         headers={"Authorization": f"Bearer {openrouter_api_key}"},
-                         json={"model": INDEX_EMBED_TEXT_MODEL, "input": texts}, timeout=180)
-    resp.raise_for_status()
+    last_err = None
+    for attempt in range(1, INDEX_EMBED_RETRIES + 1):
+        try:
+            resp = requests.post(f"{OPENROUTER_BASE_URL}/embeddings",
+                                 headers={"Authorization": f"Bearer {openrouter_api_key}"},
+                                 json={"model": INDEX_EMBED_TEXT_MODEL, "input": texts}, timeout=180)
+            resp.raise_for_status()
+            break
+        except Exception as e:
+            last_err = e
+            if attempt == INDEX_EMBED_RETRIES:
+                raise
+            time.sleep(min(30, 2 ** attempt) + random.random())
+    if last_err and "resp" not in locals():
+        raise last_err
     out = [None] * len(texts)
     for d in resp.json().get("data", []):
         i = d.get("index", 0)
@@ -7936,12 +8465,23 @@ def _sync_embed_texts(texts: list) -> list:
 
 def _sync_embed_image(raw: bytes) -> list:
     b64 = base64.b64encode(raw).decode("utf-8")
-    resp = requests.post(f"{OPENROUTER_BASE_URL}/embeddings",
-                         headers={"Authorization": f"Bearer {openrouter_api_key}"},
-                         json={"model": INDEX_EMBED_IMAGE_MODEL, "encoding_format": "float",
-                               "input": [{"content": [{"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{b64}"}}]}]},
-                         timeout=120)
-    resp.raise_for_status()
+    last_err = None
+    for attempt in range(1, INDEX_EMBED_RETRIES + 1):
+        try:
+            resp = requests.post(f"{OPENROUTER_BASE_URL}/embeddings",
+                                 headers={"Authorization": f"Bearer {openrouter_api_key}"},
+                                 json={"model": INDEX_EMBED_IMAGE_MODEL, "encoding_format": "float",
+                                       "input": [{"content": [{"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{b64}"}}]}]},
+                                 timeout=120)
+            resp.raise_for_status()
+            break
+        except Exception as e:
+            last_err = e
+            if attempt == INDEX_EMBED_RETRIES:
+                raise
+            time.sleep(min(30, 2 ** attempt) + random.random())
+    if last_err and "resp" not in locals():
+        raise last_err
     return resp.json()["data"][0]["embedding"]
 
 
@@ -7987,7 +8527,7 @@ async def _index_embed_query(text: str, image_space: bool = False):
 async def _index_vectorize_loop(chat_id, table, key_col, emb_col, textfn, progress_cb, label):
     """Батчами эмбеддит строки с пустым emb_col. Курсор по key_col в пределах прохода → нет вечного цикла
     на сбойных строках; NULL-фильтр = чекпоинт (повтор/resume пропускает уже готовые)."""
-    cur, done = 0, 0
+    cur, done, failed = 0, 0, 0
     while True:
         if _INDEX_CONTROL.get(chat_id) == "pause":
             return "paused", done
@@ -8003,8 +8543,56 @@ async def _index_vectorize_loop(chat_id, table, key_col, emb_col, textfn, progre
                 await db_write(f"UPDATE {table} SET {emb_col}=%s WHERE chat_id=%s AND {key_col}=%s",
                                (blob, chat_id, r[key_col]))
                 done += 1
+            else:
+                failed += 1
         if progress_cb:
             await progress_cb(f"🔢 Вектора {label}: {done}…")
+    if failed:
+        log("INDEX", f"Stage3 {label}: {failed} строк остались без вектора — stage не закрываю")
+        return "error", done
+    return "done", done
+
+
+async def _index_vectorize_missing_images(chat_id: int, progress_cb=None):
+    """Дозаполняет emb_image для media_assets, если Stage 2 временно не получил image embedding."""
+    cur, done, failed = 0, 0, []
+    while True:
+        if _INDEX_CONTROL.get(chat_id) == "pause":
+            return "paused", done
+        rows = await db_read(
+            "SELECT msg_id FROM media_assets WHERE chat_id=%s AND emb_image IS NULL AND msg_id>%s ORDER BY msg_id LIMIT %s",
+            (chat_id, cur, min(20, INDEX_EMBED_BATCH)))
+        if not rows:
+            break
+        ids = [r["msg_id"] for r in rows]
+        cur = ids[-1]
+        try:
+            msgs = await client.get_messages(chat_id, ids=ids)
+        except Exception as e:
+            log("INDEX", f"Stage3 image embeddings: get_messages не удался для {ids[:3]}…: {e}")
+            failed += ids
+            continue
+        msg_by_id = {m.id: m for m in (msgs or []) if getattr(m, "id", None) is not None}
+        for mid in ids:
+            msg = msg_by_id.get(mid)
+            if not _index_is_image_msg(msg):
+                failed.append(mid)
+                continue
+            raw = await _index_download_media(msg)
+            blob = await _index_embed_image(raw) if raw else None
+            if blob is None:
+                failed.append(msg.id)
+                continue
+            await db_write("UPDATE media_assets SET emb_image=%s WHERE chat_id=%s AND msg_id=%s", (blob, chat_id, msg.id))
+            done += 1
+        if progress_cb:
+            await progress_cb(f"🔢 Вектора картинок: {done}…")
+    if failed:
+        await _idx_set_state(chat_id, 3, stats={"failed_image_msg_ids": failed[:50]}, status="error")
+        log("INDEX", f"Stage3 image embeddings: {len(failed)} картинок остались без emb_image")
+        return "error", done
+    if done:
+        _index_invalidate(chat_id, "media_image")
     return "done", done
 
 
@@ -8024,11 +8612,30 @@ async def _index_stage3_vectors(chat_id: int, progress_cb=None):
         ("chat_chunks", "id", "embedding", lambda r: (r.get("enriched_text") or "сцена")[:8000], "сцены"),
         ("media_assets", "msg_id", "emb_text", lambda r: (r.get("image_description") or "изображение")[:8000], "фото"),
     ]
+    matrix_kind = {
+        ("entities", "embedding"): "entities",
+        ("relations", "embedding"): "relations",
+        ("chat_chunks", "embedding"): "chunks",
+        ("media_assets", "emb_text"): "media_text",
+    }
     for table, key_col, emb_col, textfn, label in targets:
         res, n = await _index_vectorize_loop(chat_id, table, key_col, emb_col, textfn, progress_cb, label)
+        kind = matrix_kind.get((table, emb_col))
+        if n and kind:
+            _index_invalidate(chat_id, kind)
         if res == "paused":
             return "paused"
+        if res == "error":
+            await _idx_set_state(chat_id, 3, stats={"failed_label": label}, status="error")
+            return "error"
         log("INDEX", f"Stage3 {label}: {n} векторов")
+    res_img, n_img = await _index_vectorize_missing_images(chat_id, progress_cb)
+    if res_img == "paused":
+        return "paused"
+    if res_img == "error":
+        return "error"
+    if n_img:
+        log("INDEX", f"Stage3 картинки: {n_img} векторов")
     await _idx_set_state(chat_id, 3, status="done")
     log("INDEX", f"Stage3 чата {chat_id}: готово")
     return "done"
@@ -8036,6 +8643,7 @@ async def _index_stage3_vectors(chat_id: int, progress_cb=None):
 
 # --- поиск по векторам (numpy-косинус; матрицы кэшируются per chat) ---
 _INDEX_MATRIX: dict = {}   # {(chat_id, kind): {"mat": ndarray, "ids": [...], "extra": [...], "n": int}}
+_INDEX_HNSW: dict = {}     # optional ANN cache {(chat_id, kind): {"idx": hnsw, "ids": [...], "extra": [...], "n": int}}
 # kind → (table, emb_col, key_col, доп.поля-для-сниппета)
 _INDEX_KINDS = {
     "entities":    ("entities", "embedding", "id", "name, entity_type, canon_summary, fanon_summary, visual_features"),
@@ -8050,7 +8658,7 @@ async def _index_load_matrix(chat_id: int, kind: str) -> dict:
     """Матрица векторов kind для чата с ленивым кэшем и досинхронизацией по числу строк."""
     table, emb_col, key_col, extra = _INDEX_KINDS[kind]
     ck = (chat_id, kind)
-    n_now = (await db_read(f"SELECT COUNT(*) c FROM {table} WHERE chat_id=%s AND {emb_col} IS NOT NULL", (chat_id,)))[0]["c"]
+    n_now = await _index_count_ok(chat_id, kind)
     cached = _INDEX_MATRIX.get(ck)
     if cached and cached["n"] == n_now:
         return cached
@@ -8080,12 +8688,95 @@ def _index_topk(mat, qvec, k: int) -> list:
 
 async def _index_vector_search(chat_id: int, kind: str, qvec, top_n: int = 8) -> list:
     """Топ-N совпадений: [{score, key, ...доп.поля}]."""
+    if qvec is None:
+        return []
+    table, emb_col, key_col, extra = _INDEX_KINDS[kind]
+    n_now = await _index_count_ok(chat_id, kind)  # кэш — не сканим БД на каждый поиск
+    if n_now > INDEX_MATRIX_CACHE_MAX_ROWS:
+        if index_use_hnsw and _hnswlib is not None:
+            h = await _index_load_hnsw(chat_id, kind, n_now)
+            if h:
+                return _index_hnsw_search(h, qvec, top_n)
+        return await _index_vector_search_stream(chat_id, kind, qvec, top_n)
     m = await _index_load_matrix(chat_id, kind)
     hits = _index_topk(m["mat"], qvec, top_n)
     out = []
     for ri, score in hits:
         item = {"score": round(score, 4), "key": m["ids"][ri]}
         item.update(m["extra"][ri])
+        out.append(item)
+    return out
+
+
+async def _index_load_hnsw(chat_id: int, kind: str, n_now: int = None):
+    table, emb_col, key_col, extra = _INDEX_KINDS[kind]
+    ck = (chat_id, kind)
+    if n_now is None:
+        n_now = await _index_count_ok(chat_id, kind)
+    cached = _INDEX_HNSW.get(ck)
+    if cached and cached["n"] == n_now:
+        return cached
+    if not n_now:
+        return None
+    try:
+        rows = await db_read(
+            f"SELECT {key_col} AS _k, {emb_col} AS _emb, {extra} FROM {table} WHERE chat_id=%s AND {emb_col} IS NOT NULL ORDER BY {key_col}",
+            (chat_id,))
+        mat = _np.vstack([_np.frombuffer(r["_emb"], dtype=_np.float16).astype(_np.float32) for r in rows])
+        idx = _hnswlib.Index(space="cosine", dim=INDEX_EMBED_DIM)
+        idx.init_index(max_elements=len(rows), ef_construction=100, M=16)
+        idx.add_items(mat, _np.arange(len(rows)))
+        idx.set_ef(min(100, max(10, len(rows))))
+        obj = {"idx": idx, "ids": [r["_k"] for r in rows],
+               "extra": [{k: v for k, v in r.items() if k not in ("_emb", "_k")} for r in rows], "n": n_now}
+        _INDEX_HNSW[ck] = obj
+        return obj
+    except Exception as e:
+        log("INDEX", f"HNSW build failed ({kind}): {e} — fallback stream search")
+        _INDEX_HNSW.pop(ck, None)
+        return None
+
+
+def _index_hnsw_search(obj: dict, qvec, top_n: int) -> list:
+    if qvec is None or not obj or not obj.get("ids"):
+        return []
+    k = min(top_n, len(obj["ids"]))
+    labels, distances = obj["idx"].knn_query(qvec.reshape(1, -1), k=k)
+    out = []
+    for lab, dist in zip(labels[0], distances[0]):
+        ri = int(lab)
+        item = {"score": round(1.0 - float(dist), 4), "key": obj["ids"][ri]}
+        item.update(obj["extra"][ri])
+        out.append(item)
+    return out
+
+
+async def _index_vector_search_stream(chat_id: int, kind: str, qvec, top_n: int = 8) -> list:
+    """Top-k по большим индексам без полной загрузки kind в память процесса."""
+    table, emb_col, key_col, extra = _INDEX_KINDS[kind]
+    cur, best = 0, []
+    while True:
+        rows = await db_read(
+            f"SELECT {key_col} AS _k, {emb_col} AS _emb, {extra} FROM {table} "
+            f"WHERE chat_id=%s AND {emb_col} IS NOT NULL AND {key_col}>%s ORDER BY {key_col} LIMIT %s",
+            (chat_id, cur, INDEX_SEARCH_DB_BATCH))
+        if not rows:
+            break
+        cur = rows[-1]["_k"]
+        mat = _np.vstack([_np.frombuffer(r["_emb"], dtype=_np.float16).astype(_np.float32) for r in rows])
+        sims = mat @ qvec
+        for i, score in enumerate(sims):
+            r = rows[i]
+            extra_item = {k: v for k, v in r.items() if k not in ("_emb", "_k")}
+            best.append((float(score), r["_k"], extra_item))
+        if len(best) > top_n * 4:
+            best.sort(key=lambda x: x[0], reverse=True)
+            best = best[:top_n]
+    best.sort(key=lambda x: x[0], reverse=True)
+    out = []
+    for score, key, extra_item in best[:top_n]:
+        item = {"score": round(score, 4), "key": key}
+        item.update(extra_item)
         out.append(item)
     return out
 
@@ -8232,7 +8923,8 @@ async def _index_tool_media(chat_id: int, query: str, count: int = 1, visual: bo
 async def _index_embed_query_image(raw: bytes):
     """Картинка запроса → нормированный np-вектор в пространстве картинок (gemini-embedding-2)."""
     try:
-        return _vec_unpack(await asyncio.to_thread(_sync_embed_image, raw))
+        v = await asyncio.to_thread(_sync_embed_image, raw)
+        return _vec_unpack(_vec_pack(v))
     except Exception as e:
         log("INDEX", f"Эмбеддинг картинки-запроса не удался: {e}")
         return None
@@ -8345,6 +9037,9 @@ async def _index_pipeline(chat_id: int, status_msg):
             if res1 == "paused":
                 await upd("⏸ Индексация на паузе (Stage 1 — досье). `/index resume` — продолжить.")
                 return
+            if res1 == "error":
+                await upd("❌ Индексация остановлена на Stage 1: LLM не вернула валидный JSON. `/index resume` попробует тот же блок ещё раз.")
+                return
         cnt = (await db_read("SELECT COUNT(*) c FROM entities WHERE chat_id=%s", (chat_id,)))[0]["c"]
         # Stage 2 — граф связей + медиа
         st2 = await _idx_get_state(chat_id, 2)
@@ -8353,6 +9048,9 @@ async def _index_pipeline(chat_id: int, status_msg):
             res2 = await _index_stage2_graph(chat_id, progress_cb=upd)
             if res2 == "paused":
                 await upd("⏸ Индексация на паузе (Stage 2 — граф). `/index resume` — продолжить.")
+                return
+            if res2 == "error":
+                await upd("❌ Индексация остановлена на Stage 2: LLM не вернула валидные связи. `/index resume` попробует сцену ещё раз.")
                 return
         nrel = (await db_read("SELECT COUNT(*) c FROM relations WHERE chat_id=%s AND status='active'", (chat_id,)))[0]["c"]
         nmedia = (await db_read("SELECT COUNT(*) c FROM media_assets WHERE chat_id=%s", (chat_id,)))[0]["c"]
@@ -8364,12 +9062,22 @@ async def _index_pipeline(chat_id: int, status_msg):
             if res3 == "paused":
                 await upd("⏸ Индексация на паузе (Stage 3 — вектора). `/index resume` — продолжить.")
                 return
-        await upd(f"🎉 Индексация завершена: {n} сообщений · {cnt} сущностей · {nrel} связей · {nmedia} фото.\n"
-                  f"Досье: `/entity show <имя>`. Поиск в `/ask` подключается в следующем обновлении.")
+            if res3 == "error":
+                await upd("❌ Индексация остановлена на Stage 3: часть embeddings не получена. `/index resume` повторит оставшиеся строки.")
+                return
+        skipped = await _index_failed_count(chat_id, "skipped")
+        skip_note = (f"\n⚠️ Пропущено poison-диапазонов: {skipped}. "
+                     f"Смотри `/index failed`, повтор: `/index retry failed`.") if skipped else ""
+        await upd(f"🎉 Индексация завершена: {n} сообщений · {cnt} сущностей · {nrel} связей · {nmedia} фото."
+                  f"{skip_note}\nДосье: `/entity show <имя>`. Поиск в `/ask` уже подключён для владельца.")
     except Exception as e:
         log("INDEX", f"Пайплайн чата {chat_id} упал: {e}")
         traceback.print_exc()
-        await _idx_set_state(chat_id, 0, status="error")
+        for stg in (0, 1, 2, 3):
+            s = await _idx_get_state(chat_id, stg)
+            if s["status"] != "done":
+                await _idx_set_state(chat_id, stg, status="error")
+                break
         await upd(f"❌ Индексация упала: {e}\nСостояние сохранено — `/index resume` продолжит с чекпоинта.")
     finally:
         _INDEX_CONTROL.pop(chat_id, None)
@@ -8399,6 +9107,33 @@ async def _index_preflight(event) -> str:
             f"• Ориентир стоимости полного прохода: **~${est_cost:.2f}** (экстракция+фото+вектора)\n"
             f"• Время: от нескольких минут до часов (зависит от объёма и лимитов Telegram)\n\n"
             f"Запусти: `/index go` · статус: `/index status` · пауза/продолжить: `/index pause` / `/index resume`")
+
+
+async def _index_update_rewind_cursor(chat_id: int) -> int:
+    rows = await db_read("SELECT MAX(msg_id) max_id, MAX(`date`) max_date FROM messages WHERE chat_id=%s", (chat_id,))
+    if not rows or not rows[0]["max_id"]:
+        return 0
+    max_id = int(rows[0]["max_id"])
+    candidates = [max_id]
+    by_count = await db_read(
+        "SELECT msg_id FROM messages WHERE chat_id=%s AND msg_id<=%s ORDER BY msg_id DESC LIMIT %s",
+        (chat_id, max_id, INDEX_UPDATE_OVERLAP_MESSAGES))
+    if by_count:
+        candidates.append(int(by_count[-1]["msg_id"]))
+    max_date = rows[0].get("max_date")
+    if isinstance(max_date, str):
+        try:
+            max_date = datetime.strptime(max_date, "%Y-%m-%d %H:%M:%S")
+        except Exception:
+            max_date = None
+    if max_date:
+        cutoff = max_date - timedelta(hours=INDEX_UPDATE_OVERLAP_HOURS)
+        by_time = await db_read(
+            "SELECT MIN(msg_id) m FROM messages WHERE chat_id=%s AND `date`>=%s",
+            (chat_id, cutoff.strftime("%Y-%m-%d %H:%M:%S")))
+        if by_time and by_time[0].get("m"):
+            candidates.append(int(by_time[0]["m"]))
+    return max(0, min(candidates) - 1)
 
 
 @client.on(events.NewMessage(pattern=r"^[./]index(?:\s+(go|status|pause|resume|stop|update))?\s*$"))
@@ -8433,6 +9168,10 @@ async def index_command(event):
                 if stg == 0 and s["stats"].get("dumped"):
                     extra = f" · {s['stats']['dumped']} сообщ."
                 parts.append(f"• Stage {stg} {label}: {s['status']}{extra}")
+        skipped = await _index_failed_count(chat_id, "skipped")
+        retrying = await _index_failed_count(chat_id, "retrying")
+        if skipped or retrying:
+            parts.append(f"• Failed ranges: skipped {skipped} · retrying {retrying} (`/index failed`)")
         if len(parts) == 1:
             parts.append("• ещё не запускалась — `/index go`")
         parts.append(f"\n{'🟢 сейчас работает в фоне' if running else '⚪️ фоновая задача не активна'}")
@@ -8459,7 +9198,11 @@ async def index_command(event):
         for stg in (0, 1, 2, 3):
             s = await _idx_get_state(chat_id, stg)
             if s["status"] == "done":
-                await _idx_set_state(chat_id, stg, status="running")  # курсоры/NULL-фильтры пропустят готовое, обработают новое
+                if stg in (1, 2):
+                    rewind = await _index_update_rewind_cursor(chat_id)
+                    await _idx_set_state(chat_id, stg, cursor={"last_msg_id": rewind}, status="running")
+                else:
+                    await _idx_set_state(chat_id, stg, status="running")
         _INDEX_CONTROL[chat_id] = "run"
         status_msg = await event.reply("🔄 Догоняю новые сообщения (досье · граф · вектора)…")
         _INDEX_TASKS[chat_id] = asyncio.create_task(_index_pipeline(chat_id, status_msg))
@@ -8489,6 +9232,176 @@ async def index_command(event):
         status_msg = await event.reply("▶️ Продолжаю индексацию с последнего чекпоинта…")
         _INDEX_TASKS[chat_id] = asyncio.create_task(_index_pipeline(chat_id, status_msg))
         return
+
+
+@client.on(events.NewMessage(pattern=r"^[./]index\s+failed(?:\s+([123]))?\s*$"))
+async def index_failed_command(event):
+    if await _slash_for_other_bot(event) or not event.out:
+        return
+    reason = _index_available()
+    if reason:
+        await event.reply(f"⚠️ /index недоступен: {reason}")
+        return
+    await _index_ensure_ddl()
+    chat_id = event.chat_id
+    stage = event.pattern_match.group(1)
+    rows = await _index_failed_rows(chat_id, int(stage) if stage else None, "skipped", 30)
+    if not rows:
+        await event.reply("✅ Skipped failed ranges нет.")
+        return
+    lines = ["⚠️ **Skipped failed ranges:**"]
+    for r in rows:
+        lines.append(f"• Stage {r['stage']} {r['unit_type']} {r['start_msg_id']}..{r['end_msg_id']} "
+                     f"attempts={r['attempts']} — {_idx_snip(r.get('reason'), 120)}")
+    lines.append("\nПовтор: `/index retry failed` или `/index retry failed 1|2`.")
+    await send_long(chat_id, "\n".join(lines), parse_mode="md", reply_to=event.id)
+
+
+@client.on(events.NewMessage(pattern=r"^[./]index\s+retry\s+failed(?:\s+([12]))?\s*$"))
+async def index_retry_failed_command(event):
+    if await _slash_for_other_bot(event) or not event.out:
+        return
+    reason = _index_available()
+    if reason:
+        await event.reply(f"⚠️ /index недоступен: {reason}")
+        return
+    await _index_ensure_ddl()
+    chat_id = event.chat_id
+    if chat_id in _INDEX_TASKS:
+        await event.reply("🟢 Индексация уже идёт — дождись завершения.")
+        return
+    stage_arg = event.pattern_match.group(1)
+    rows = await _index_failed_rows(chat_id, int(stage_arg) if stage_arg else None, "skipped", 500)
+    if not rows:
+        await event.reply("✅ Skipped failed ranges для повтора нет.")
+        return
+    min_stage = min(int(r["stage"]) for r in rows)
+    min_start = min(int(r["start_msg_id"]) for r in rows)
+    if stage_arg:
+        min_stage = int(stage_arg)
+    await db_write(
+        "UPDATE index_failed_ranges SET status='retrying' WHERE chat_id=%s AND status='skipped' AND stage>=%s",
+        (chat_id, min_stage))
+    if min_stage <= 1:
+        rewind = max(0, min_start - 1)
+        await _idx_set_state(chat_id, 1, cursor={"last_msg_id": rewind}, status="running")
+        await _idx_set_state(chat_id, 2, cursor={"last_msg_id": rewind}, status="running")
+        await _idx_set_state(chat_id, 3, status="running")
+    else:
+        rewind = max(0, min_start - 1)
+        await _idx_set_state(chat_id, 2, cursor={"last_msg_id": rewind}, status="running")
+        await _idx_set_state(chat_id, 3, status="running")
+    _INDEX_CONTROL[chat_id] = "run"
+    status_msg = await event.reply(f"🔁 Повторяю failed ranges со Stage {min_stage} от msg>{rewind}…")
+    _INDEX_TASKS[chat_id] = asyncio.create_task(_index_pipeline(chat_id, status_msg))
+
+
+_INDEX_EVAL_TEMPLATE = [
+    {"kind": "entity", "query": "кто такой Тостер", "expected": {"name": "Тостер"}},
+    {"kind": "scene", "query": "спор про меч", "expected": {"msg_ids": [12345]}},
+    {"kind": "relation", "query": "почему Иван спорил с Олегом", "expected": {"source_id": 1, "target_id": 2}},
+    {"kind": "media_text", "query": "арт с мечом", "expected": {"msg_id": 12345}}
+]
+
+
+def _index_eval_match(kind: str, hit: dict, expected: dict) -> bool:
+    if not hit:
+        return False
+    if kind == "entity":
+        eid = expected.get("entity_id") or expected.get("id")
+        nm = _index_norm_name(expected.get("name") or "")
+        return (eid and int(hit.get("key")) == int(eid)) or (nm and _index_norm_name(hit.get("name")) == nm)
+    if kind == "scene":
+        ids = expected.get("msg_ids") or []
+        return any(int(hit.get("start_msg_id") or 0) <= int(mid) <= int(hit.get("end_msg_id") or 0) for mid in ids)
+    if kind == "relation":
+        sid, tid = expected.get("source_id"), expected.get("target_id")
+        return sid and tid and int(hit.get("source_id") or 0) == int(sid) and int(hit.get("target_id") or 0) == int(tid)
+    if kind in ("media_text", "media_image"):
+        mid = expected.get("msg_id") or expected.get("media_msg_id")
+        return mid and int(hit.get("msg_id") or hit.get("key") or 0) == int(mid)
+    return False
+
+
+async def _index_eval_run(chat_id: int, cases: list) -> dict:
+    kind_map = {"entity": "entities", "scene": "chunks", "relation": "relations",
+                "media_text": "media_text", "media_image": "media_image"}
+    details, top1 = [], 0
+    top3 = 0
+    latencies = []
+    for case in cases:
+        t0 = time.time()
+        kind = case.get("kind")
+        query = case.get("query") or ""
+        expected = case.get("expected") or {}
+        space = kind_map.get(kind)
+        if not space or not query:
+            details.append({"case": case, "error": "bad kind/query"})
+            continue
+        qv = await _index_embed_query(query, image_space=(kind == "media_image"))
+        hits = await _index_vector_search(chat_id, space, qv, 3)
+        latencies.append(time.time() - t0)
+        h1 = bool(hits and _index_eval_match(kind, hits[0], expected))
+        h3 = any(_index_eval_match(kind, h, expected) for h in hits[:3])
+        top1 += int(h1)
+        top3 += int(h3)
+        details.append({"kind": kind, "query": query, "top1": h1, "top3": h3,
+                        "hits": [{"key": h.get("key"), "score": h.get("score")} for h in hits]})
+    total = len([c for c in cases if c.get("kind") in kind_map])
+    skipped = await _index_failed_count(chat_id, "skipped")
+    return {"total": total, "top1": top1, "top3": top3,
+            "top1_rate": round(top1 / total, 3) if total else 0,
+            "top3_rate": round(top3 / total, 3) if total else 0,
+            "avg_latency_sec": round(sum(latencies) / len(latencies), 3) if latencies else 0,
+            "skipped_ranges": skipped, "details": details}
+
+
+def _index_eval_report_text(result: dict) -> str:
+    return (f"📊 **Index eval:** cases {result.get('total', 0)} · "
+            f"top1 {result.get('top1_rate', 0)} · top3 {result.get('top3_rate', 0)} · "
+            f"avg {result.get('avg_latency_sec', 0)}s · skipped ranges {result.get('skipped_ranges', 0)}")
+
+
+@client.on(events.NewMessage(pattern=r"^[./]index\s+eval\s+(template|run|report)\s*$"))
+async def index_eval_command(event):
+    if await _slash_for_other_bot(event) or not event.out:
+        return
+    reason = _index_available()
+    if reason:
+        await event.reply(f"⚠️ /index недоступен: {reason}")
+        return
+    await _index_ensure_ddl()
+    chat_id = event.chat_id
+    action = event.pattern_match.group(1)
+    if action == "template":
+        await send_long(chat_id, "```json\n" + json.dumps(_INDEX_EVAL_TEMPLATE, ensure_ascii=False, indent=2) + "\n```",
+                        parse_mode="md", reply_to=event.id)
+        return
+    if action == "report":
+        rows = await db_read("SELECT result_json FROM index_eval_runs WHERE chat_id=%s ORDER BY id DESC LIMIT 1", (chat_id,))
+        if not rows:
+            await event.reply("📭 Eval ещё не запускался. Создай `index_eval_cases.json` и запусти `/index eval run`.")
+            return
+        result = json.loads(rows[0]["result_json"]) if rows[0]["result_json"] else {}
+        await send_long(chat_id, _index_eval_report_text(result) + "\n```json\n" +
+                        json.dumps(result.get("details", []), ensure_ascii=False, indent=2)[:6000] + "\n```",
+                        parse_mode="md", reply_to=event.id)
+        return
+    if not os.path.exists(INDEX_EVAL_CASES_PATH):
+        await send_long(chat_id, f"📭 Нет `{INDEX_EVAL_CASES_PATH}`. Шаблон:\n```json\n" +
+                        json.dumps(_INDEX_EVAL_TEMPLATE, ensure_ascii=False, indent=2) + "\n```",
+                        parse_mode="md", reply_to=event.id)
+        return
+    with open(INDEX_EVAL_CASES_PATH, "r", encoding="utf-8") as fh:
+        cases = json.load(fh)
+    if not isinstance(cases, list):
+        await event.reply("❌ `index_eval_cases.json` должен быть JSON-массивом cases.")
+        return
+    status = await event.reply("📊 Запускаю eval памяти…")
+    result = await _index_eval_run(chat_id, cases)
+    await db_write("INSERT INTO index_eval_runs (chat_id,cases_json,result_json) VALUES (%s,%s,%s)",
+                   (chat_id, json.dumps(cases, ensure_ascii=False), json.dumps(result, ensure_ascii=False)))
+    await status.edit(_index_eval_report_text(result))
 
 
 async def _index_find_entity(chat_id: int, query: str):
@@ -8624,13 +9537,16 @@ async def entity_admin_command(event):
             al1 = json.loads(e1["aliases"]) if e1["aliases"] else []
             al2 = json.loads(e2["aliases"]) if e2["aliases"] else []
             merged = list(dict.fromkeys(al1 + al2 + [e1["name"], e2["name"]]))
-            await db_write("UPDATE entities SET aliases=%s WHERE id=%s", (json.dumps(merged, ensure_ascii=False), a))
-            await db_write("UPDATE entity_claims SET entity_id=%s WHERE chat_id=%s AND entity_id=%s", (a, chat_id, b))
-            await db_write("UPDATE relations SET source_id=%s WHERE chat_id=%s AND source_id=%s", (a, chat_id, b))
-            await db_write("UPDATE relations SET target_id=%s WHERE chat_id=%s AND target_id=%s", (a, chat_id, b))
-            await db_write("DELETE FROM entities WHERE chat_id=%s AND id=%s", (chat_id, b))
-            await db_write("UPDATE entities SET embedding=NULL WHERE id=%s", (a,))  # пересоберётся на /index update
-            _INDEX_MATRIX.pop((chat_id, "entities"), None)
+            await db_transaction([
+                ("UPDATE entities SET aliases=%s, canon_summary=NULL, fanon_summary=NULL, embedding=NULL WHERE chat_id=%s AND id=%s",
+                 (json.dumps(merged, ensure_ascii=False), chat_id, a)),
+                ("UPDATE entity_claims SET entity_id=%s WHERE chat_id=%s AND entity_id=%s", (a, chat_id, b)),
+                ("UPDATE relations SET source_id=%s, embedding=NULL WHERE chat_id=%s AND source_id=%s", (a, chat_id, b)),
+                ("UPDATE relations SET target_id=%s, embedding=NULL WHERE chat_id=%s AND target_id=%s", (a, chat_id, b)),
+                ("DELETE FROM relations WHERE chat_id=%s AND source_id=target_id", (chat_id,)),
+                ("DELETE FROM entities WHERE chat_id=%s AND id=%s", (chat_id, b)),
+            ])
+            _index_invalidate(chat_id, "entities", "relations")
             await event.reply(f"✅ «{e2['name']}» (id {b}) влит в «{e1['name']}» (id {a}). "
                               f"Векторы досье обновятся на `/index update`.")
         elif action == "rename":  # rename <id> <новое имя>
@@ -8643,9 +9559,9 @@ async def entity_admin_command(event):
             al = json.loads(e["aliases"]) if e["aliases"] else []
             if newname not in al:
                 al.append(newname)
-            await db_write("UPDATE entities SET name=%s, aliases=%s, embedding=NULL WHERE id=%s",
-                           (newname, json.dumps(al, ensure_ascii=False), eid))
-            _INDEX_MATRIX.pop((chat_id, "entities"), None)
+            await db_write("UPDATE entities SET name=%s, aliases=%s, embedding=NULL WHERE chat_id=%s AND id=%s",
+                           (newname, json.dumps(al, ensure_ascii=False), chat_id, eid))
+            _index_invalidate(chat_id, "entities")
             await event.reply(f"✅ id {eid} переименован в «{newname}».")
         elif action == "alias":  # alias <id> <алиас>
             parts = rest.split(maxsplit=1)
@@ -8657,7 +9573,9 @@ async def entity_admin_command(event):
             al = json.loads(e["aliases"]) if e["aliases"] else []
             if alias not in al:
                 al.append(alias)
-            await db_write("UPDATE entities SET aliases=%s WHERE id=%s", (json.dumps(al, ensure_ascii=False), eid))
+            await db_write("UPDATE entities SET aliases=%s, embedding=NULL WHERE chat_id=%s AND id=%s",
+                           (json.dumps(al, ensure_ascii=False), chat_id, eid))
+            _index_invalidate(chat_id, "entities")
             await event.reply(f"✅ «{alias}» добавлен алиасом к «{e['name']}» (id {eid}).")
         elif action == "split":  # split <id> <алиас> — отцепляет алиас в НОВУЮ пустую сущность
             parts = rest.split(maxsplit=1)
@@ -8667,10 +9585,12 @@ async def entity_admin_command(event):
                 await event.reply("❌ id не найден.")
                 return
             al = [a for a in (json.loads(e["aliases"]) if e["aliases"] else []) if a.lower() != alias.lower()]
-            await db_write("UPDATE entities SET aliases=%s WHERE id=%s", (json.dumps(al, ensure_ascii=False), eid))
+            await db_write("UPDATE entities SET aliases=%s, embedding=NULL WHERE chat_id=%s AND id=%s",
+                           (json.dumps(al, ensure_ascii=False), chat_id, eid))
             _, nid = await db_write(
                 "INSERT INTO entities (chat_id,name,entity_type,aliases) VALUES (%s,%s,%s,%s)",
                 (chat_id, alias, e["entity_type"], json.dumps([alias], ensure_ascii=False)))
+            _index_invalidate(chat_id, "entities")
             await event.reply(f"✅ «{alias}» отцеплён от «{e['name']}» в новую сущность id {nid}. "
                               f"Факты остались на id {eid} — перепривяжи вручную при необходимости.")
     except (ValueError, IndexError):
