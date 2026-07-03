@@ -7255,13 +7255,13 @@ async def db_read(sql, params=None):
 
 _INDEX_DDL = [
     """CREATE TABLE IF NOT EXISTS idx_state (
-        chat_id BIGINT NOT NULL, stage TINYINT NOT NULL, cursor JSON NULL, stats JSON NULL,
+        chat_id BIGINT NOT NULL, stage TINYINT NOT NULL, `cursor` JSON NULL, stats JSON NULL,
         status VARCHAR(16) NOT NULL DEFAULT 'running', updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
         PRIMARY KEY (chat_id, stage)) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4""",
     """CREATE TABLE IF NOT EXISTS messages (
-        chat_id BIGINT NOT NULL, msg_id BIGINT NOT NULL, date DATETIME NULL, author_id BIGINT NULL,
+        chat_id BIGINT NOT NULL, msg_id BIGINT NOT NULL, `date` DATETIME NULL, author_id BIGINT NULL,
         reply_to_id BIGINT NULL, txt MEDIUMTEXT NULL, media_uid VARCHAR(64) NULL, media_kind TINYINT NOT NULL DEFAULT 0,
-        PRIMARY KEY (chat_id, msg_id), KEY k_date (chat_id, date)) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4""",
+        PRIMARY KEY (chat_id, msg_id), KEY k_date (chat_id, `date`)) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4""",
     """CREATE TABLE IF NOT EXISTS entities (
         id BIGINT AUTO_INCREMENT PRIMARY KEY, chat_id BIGINT NOT NULL, name VARCHAR(255) NOT NULL,
         entity_type VARCHAR(16) NOT NULL DEFAULT 'user', tg_user_id BIGINT NULL, aliases JSON NULL,
@@ -7320,7 +7320,7 @@ def _vec_unpack(blob) -> "object":
 
 # --- состояние индексации в idx_state ---
 async def _idx_get_state(chat_id: int, stage: int) -> dict:
-    rows = await db_read("SELECT cursor, stats, status FROM idx_state WHERE chat_id=%s AND stage=%s", (chat_id, stage))
+    rows = await db_read("SELECT `cursor`, stats, status FROM idx_state WHERE chat_id=%s AND stage=%s", (chat_id, stage))
     if not rows:
         return {"cursor": {}, "stats": {}, "status": None}
     r = rows[0]
@@ -7331,8 +7331,8 @@ async def _idx_get_state(chat_id: int, stage: int) -> dict:
 
 async def _idx_set_state(chat_id: int, stage: int, cursor=None, stats=None, status=None):
     await db_write(
-        """INSERT INTO idx_state (chat_id, stage, cursor, stats, status) VALUES (%s,%s,%s,%s,%s)
-           ON DUPLICATE KEY UPDATE cursor=COALESCE(VALUES(cursor),cursor),
+        """INSERT INTO idx_state (chat_id, stage, `cursor`, stats, status) VALUES (%s,%s,%s,%s,%s)
+           ON DUPLICATE KEY UPDATE `cursor`=COALESCE(VALUES(`cursor`),`cursor`),
              stats=COALESCE(VALUES(stats),stats), status=COALESCE(VALUES(status),status)""",
         (chat_id, stage, json.dumps(cursor, ensure_ascii=False) if cursor is not None else None,
          json.dumps(stats, ensure_ascii=False) if stats is not None else None, status))
@@ -7366,7 +7366,7 @@ async def _index_stage0_dump(chat_id: int, progress_cb=None):
         if not buf:
             return
         await db_write(
-            """INSERT IGNORE INTO messages (chat_id,msg_id,date,author_id,reply_to_id,txt,media_uid,media_kind)
+            """INSERT IGNORE INTO messages (chat_id,msg_id,`date`,author_id,reply_to_id,txt,media_uid,media_kind)
                VALUES (%s,%s,%s,%s,%s,%s,%s,%s)""", buf, many=True)
         done += len(buf)
         last_id = max(last_id, batch_max)
@@ -7893,7 +7893,7 @@ async def _index_stage2_graph(chat_id: int, progress_cb=None):
             await _idx_set_state(chat_id, 2, status="paused")
             return "paused"
         rows = await db_read(
-            "SELECT msg_id, date, author_id, txt, media_kind FROM messages WHERE chat_id=%s AND msg_id>%s "
+            "SELECT msg_id, `date`, author_id, txt, media_kind FROM messages WHERE chat_id=%s AND msg_id>%s "
             "ORDER BY msg_id ASC LIMIT 2000", (chat_id, cursor))
         if not rows:
             break
@@ -8413,6 +8413,11 @@ async def index_command(event):
     if reason:
         await event.reply(f"⚠️ /index недоступен: {reason}")
         return
+    try:
+        await _index_ensure_ddl()  # таблицы должны существовать до любого чтения состояния (даже preflight)
+    except Exception as e:
+        await event.reply(f"❌ Не подключиться к базе индексации: {e}")
+        return
 
     if sub in ("", "status"):
         if sub == "":
@@ -8512,6 +8517,11 @@ async def entity_show_command(event):
     if reason:
         await event.reply(f"⚠️ /entity недоступен: {reason}")
         return
+    try:
+        await _index_ensure_ddl()
+    except Exception as e:
+        await event.reply(f"❌ Не подключиться к базе индексации: {e}")
+        return
     chat_id = event.chat_id
     query = event.pattern_match.group(1).strip()
     ent = await _index_find_entity(chat_id, query)
@@ -8590,6 +8600,11 @@ async def entity_admin_command(event):
     reason = _index_available()
     if reason:
         await event.reply(f"⚠️ /entity недоступен: {reason}")
+        return
+    try:
+        await _index_ensure_ddl()
+    except Exception as e:
+        await event.reply(f"❌ Не подключиться к базе индексации: {e}")
         return
     chat_id = event.chat_id
     action = event.pattern_match.group(1).lower()
