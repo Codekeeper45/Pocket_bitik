@@ -142,6 +142,10 @@ INDEX_SCENE_HARD_GAP_SEC = 6 * 60 * 60  # даже короткую сцену �
 INDEX_STAGE2_CONCURRENCY = 6  # stage 2: сколько сцен экстрагировать параллельно (перекрыть ~34с латентность на вызов)
 INDEX_STAGE1_MICRO_TOKENS = 32_000      # stage 1: размер блока экстракции (вывод не режется — cap поднят до INDEX_EXTRACT_MAX_TOKENS)
 INDEX_EXTRACT_MAX_TOKENS = 64_000       # ПОТОЛОК ВЫВОДА экстракции: JSON + reasoning-токены (V4 Flash думает в тот же бюджет!) не режем. Провайдер принимает ≥200k
+INDEX_MODEL_MAX_OUT = {                  # per-model кламп потолка вывода (страховка от иного роутинга; текущий тянет и 200k)
+    "deepseek/deepseek-v4-flash": 16_384,
+    "deepseek/deepseek-v3.2-exp": 65_536,
+}
 INDEX_SUMMARY_MAX_TOKENS = 64_000       # ПОТОЛОК ВЫВОДА саммари (досье/роллапы): запас под reasoning, чтобы CoT не съедал бюджет до самого текста. Оплата — по факту токенов
 INDEX_STAGE1_MICRO_MESSAGES = 800
 INDEX_STAGE1_BLOCK_TOKENS = INDEX_STAGE1_MICRO_TOKENS  # legacy alias для старых комментариев/логов
@@ -7500,18 +7504,18 @@ def _index_scene_key(chat_id: int, start_msg_id: int, end_msg_id: int) -> str:
 
 
 def _index_relation_event_key(chat_id: int, scene_date, source_id: int, target_id: int,
-                              polarity: str, relation_type: str) -> str:
-    """Детерминированный, boundary- и evidence-независимый ключ события связи: дневной бакет.
-    Одна пара (source→target, polarity, тип) считается ОДНИМ событием в пределах суток → вес =
-    «в скольких разных днях проявлялась связь». Пере-обработка тех же сообщений (resume/update
-    overlap) даёт тот же день → INSERT IGNORE дедупит → вес не задваивается."""
+                              polarity: str) -> str:
+    """Детерминированный дневной ключ события связи по ПОЛЯРНОСТИ (без сырого relation_type!).
+    Одна пара (source→target, polarity) — ОДНО событие в сутки → вес = «в скольких разных днях
+    проявлялась связь этой полярности». relation_type НЕ в ключе: LLM пишет «спорит»/«ругается»
+    в один день → раньше это давало +2, теперь дедупится. Resume/update overlap → тот же день → не задваивает."""
     if scene_date is None:
         day = "0"
     elif isinstance(scene_date, str):
         day = scene_date[:10]  # 'YYYY-MM-DD…'
     else:
         day = scene_date.strftime("%Y-%m-%d")
-    raw = f"{chat_id}:{source_id}:{target_id}:{polarity}:{relation_type}:{day}"
+    raw = f"{chat_id}:{source_id}:{target_id}:{polarity}:{day}"
     return hashlib.sha1(raw.encode("utf-8")).hexdigest()
 
 
@@ -7672,9 +7676,10 @@ async def _index_extract(system: str, user: str, max_tokens: int = INDEX_EXTRACT
     for mi, model in enumerate(models):
         for attempt in range(1, INDEX_EXTRACT_RETRIES + 1):
             try:
+                mt = min(max_tokens, INDEX_MODEL_MAX_OUT.get(model, max_tokens))  # кламп под реальный лимит модели
                 resp = await asyncio.to_thread(
                     openrouter_client.chat.completions.create,
-                    model=model, max_tokens=max_tokens, temperature=0.2,
+                    model=model, max_tokens=mt, temperature=0.2,
                     response_format={"type": "json_object"},
                     messages=[{"role": "system", "content": system}, {"role": "user", "content": user}],
                     timeout=240,
@@ -7695,10 +7700,17 @@ async def _index_extract(system: str, user: str, max_tokens: int = INDEX_EXTRACT
                     return None
             except Exception as e:
                 code = getattr(e, "status_code", None) or getattr(getattr(e, "response", None), "status_code", None)
-                if code and 400 <= code < 500 and code != 429:
-                    # детерминированная ошибка запроса (не 429) — не транзиент; ретраить бессмысленно
+                if code in (401, 402):  # ключ/квота — фатально, НЕ poison: стопим стадию (иначе весь чат уйдёт в ложные skip)
+                    raise IndexTransientError(f"config {code} (ключ/квота недоступны) — стоп, не poison: {e}")
+                if code in (403, 404):  # доступ/модель-not-found — пробуем запасную; если и она недоступна → transient-стоп (не skip)
+                    log("INDEX", f"Экстракция {model}: {code} (доступ/модель) — пробую запасную")
+                    break  # got_response НЕ ставим → обе недоступны дадут transient-стоп, а не poison
+                if code in (413, 422):  # payload/param слишком большой — дробим вход (как finish=length), не skip
+                    log("INDEX", f"Экстракция {model}: {code} (payload/param) — дроблю вход")
+                    return None
+                if code and 400 <= code < 500 and code != 429:  # прочие 4xx — детерминированный poison-контент
                     got_response = True
-                    log("INDEX", f"Экстракция {model}: детерминированный {code} — не ретраю: {e}")
+                    log("INDEX", f"Экстракция {model}: детерминированный {code} — не ретраю (poison): {e}")
                     break
                 log("INDEX", f"Экстракция {model} ошибка (попытка {attempt}): {e}")
             if attempt < INDEX_EXTRACT_RETRIES:
@@ -8062,8 +8074,8 @@ async def _index_summarize_entities(chat_id: int, progress_cb=None):
                           + "\nFANON-факты:\n" + ("\n".join(f"- {c}" for c in fanon) or "(нет)"))
             if len(claims) > INDEX_SUMMARY_MAPREDUCE_MIN_CLAIMS or count_tokens(total_body) > INDEX_SUMMARY_MAPREDUCE_MIN_TOKENS:
                 await db_write("DELETE FROM entity_summary_parts WHERE chat_id=%s AND entity_id=%s", (chat_id, ent["id"]))
-                canon = await _index_summarize_claim_parts(chat_id, ent["id"], ent["name"], "canon", canon)
-                fanon = await _index_summarize_claim_parts(chat_id, ent["id"], ent["name"], "fanon", fanon)
+                canon = await _index_summarize_claim_parts(chat_id, ent["id"], ent["name"], "canon", canon, sem)
+                fanon = await _index_summarize_claim_parts(chat_id, ent["id"], ent["name"], "fanon", fanon, sem)
             body = (f"Персонаж/участник: {ent['name']}\nCANON-факты:\n" + ("\n".join(f"- {c}" for c in canon) or "(нет)")
                     + "\nFANON-факты:\n" + ("\n".join(f"- {c}" for c in fanon) or "(нет)"))
             async with sem:
@@ -8089,8 +8101,9 @@ async def _index_summarize_entities(chat_id: int, progress_cb=None):
     return "done"
 
 
-async def _index_summarize_claim_parts(chat_id: int, entity_id: int, name: str, kind: str, claims: list) -> list:
-    """Map-step для популярных сущностей: claims → compact part summaries."""
+async def _index_summarize_claim_parts(chat_id: int, entity_id: int, name: str, kind: str, claims: list, sem=None) -> list:
+    """Map-step для популярных сущностей: claims → compact part summaries. sem — общий семафор параллелизма
+    LLM (чтобы популярная сущность не устроила всплеск вызовов → 429 → Stage 1 в error)."""
     if not claims:
         return []
     out, batch, tok, part_no = [], [], 0, 0
@@ -8103,7 +8116,11 @@ async def _index_summarize_claim_parts(chat_id: int, entity_id: int, name: str, 
         canon_lines = "\n".join(f"- {c}" for c in batch) if kind == "canon" else "(нет)"
         fanon_lines = "\n".join(f"- {c}" for c in batch) if kind == "fanon" else "(нет)"
         body = f"Персонаж/участник: {name}\nCANON-факты:\n{canon_lines}\nFANON-факты:\n{fanon_lines}"
-        data = await _index_extract(_INDEX_SUMM_SYSTEM, body, max_tokens=INDEX_SUMMARY_MAX_TOKENS)
+        if sem is not None:
+            async with sem:
+                data = await _index_extract(_INDEX_SUMM_SYSTEM, body, max_tokens=INDEX_SUMMARY_MAX_TOKENS)
+        else:
+            data = await _index_extract(_INDEX_SUMM_SYSTEM, body, max_tokens=INDEX_SUMMARY_MAX_TOKENS)
         if isinstance(data, dict):
             summary = (data.get(kind) or data.get("canon") or data.get("fanon") or "").strip()
         else:
@@ -8233,12 +8250,14 @@ async def _index_apply_relations(chat_id: int, rels: list, name2id: dict, scene_
         rtype = (rel.get("type") or "связь")[:64]
         summ = (rel.get("summary") or "")[:2000]
         ev = [int(x) for x in (rel.get("evidence") or []) if str(x).isdigit()]
-        event_key = _index_relation_event_key(chat_id, scene_date, s, t, pol, rtype)
+        event_key = _index_relation_event_key(chat_id, scene_date, s, t, pol)
+        # relation_type в relation_events = pol (не сырой rtype!), чтобы UNIQUE(u_event) дедупил ПО ПОЛЯРНОСТИ:
+        # «спорит»/«ругается» в один день не задваивают вес. Настоящий rtype хранится в таблице relations.
         rowcount, _ = await db_write(
             """INSERT IGNORE INTO relation_events
                (chat_id,scene_key,source_id,target_id,relation_type,canonical_type,context_summary,evidence,scene_date)
                VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s)""",
-            (chat_id, event_key, s, t, rtype, pol, summ, json.dumps(ev, ensure_ascii=False), scene_date))
+            (chat_id, event_key, s, t, pol, pol, summ, json.dumps(ev, ensure_ascii=False), scene_date))
         if rowcount == 0:
             continue
         if pol == "neutral":
@@ -8781,10 +8800,10 @@ async def _index_summarize_texts(texts: list, title: str) -> str:
 
 async def _index_stage4_rollups(chat_id: int, progress_cb=None):
     """Строит месячные саммари из chat_chunks + общий саммари чата. Инкрементально: месяц пересобирается,
-    только если число его сцен изменилось (meta.chunk_count). Векторизует роллапы для memory_overview."""
+    только если сменилась сигнатура (count + MAX chunk id). Векторизует роллапы для memory_overview."""
     await _idx_set_state(chat_id, 4, status="running")
     months = await db_read(
-        "SELECT DATE_FORMAT(scene_date,'%%Y-%%m') ym, COUNT(*) c, MIN(scene_date) mn, MAX(scene_date) mx "
+        "SELECT DATE_FORMAT(scene_date,'%%Y-%%m') ym, COUNT(*) c, MAX(id) maxid, MIN(scene_date) mn, MAX(scene_date) mx "
         "FROM chat_chunks WHERE chat_id=%s AND scene_date IS NOT NULL GROUP BY ym ORDER BY ym", (chat_id,))
     changed = 0
     for m in months:
@@ -8792,10 +8811,13 @@ async def _index_stage4_rollups(chat_id: int, progress_cb=None):
             await _idx_set_state(chat_id, 4, status="paused")
             return "paused"
         ym = m["ym"]
+        # сигнатура месяца = count + MAX(chunk id): на update чанки удаляются+пересоздаются с новыми id →
+        # изменившийся текст сцены (даже при том же числе) даёт другой maxid → пересбор (не только по count).
+        sig = f"{int(m['c'])}:{int(m['maxid'] or 0)}"
         prev = await db_read("SELECT meta FROM time_rollups WHERE chat_id=%s AND level=1 AND bucket_key=%s", (chat_id, ym))
         if prev:
             try:
-                if int((json.loads(prev[0]["meta"]) if prev[0]["meta"] else {}).get("chunk_count", -1)) == int(m["c"]):
+                if (json.loads(prev[0]["meta"]) if prev[0]["meta"] else {}).get("sig") == sig:
                     continue  # месяц не изменился — пропускаем
             except Exception:
                 pass
@@ -8813,7 +8835,7 @@ async def _index_stage4_rollups(chat_id: int, progress_cb=None):
                VALUES (%s,1,%s,%s,%s,%s,%s,NULL)
                ON DUPLICATE KEY UPDATE period_start=VALUES(period_start), period_end=VALUES(period_end),
                  summary=VALUES(summary), meta=VALUES(meta), embedding=NULL""",
-            (chat_id, ym, m["mn"], m["mx"], summ, json.dumps({"chunk_count": int(m["c"])}, ensure_ascii=False)))
+            (chat_id, ym, m["mn"], m["mx"], summ, json.dumps({"sig": sig, "chunk_count": int(m["c"])}, ensure_ascii=False)))
         _index_invalidate(chat_id, "rollups")
         changed += 1
         await _idx_set_state(chat_id, 4, cursor={"last_month": ym}, stats={"months": len(months)})
@@ -8891,6 +8913,13 @@ async def _index_stage5_media(chat_id: int, progress_cb=None):
             await _idx_set_state(chat_id, 5, cursor={"last_chunk_id": cursor}, stats={"photos": done})
             if progress_cb:
                 await progress_cb(f"🖼 Фото: обработано {done}/~{total_ph}…")
+    # добиваем emb_image, что не получились инлайн в process_media (Stage 3 их не застал — медиа теперь после него)
+    res_img, n_img = await _index_vectorize_missing_images(chat_id, progress_cb)
+    if n_img:
+        _index_invalidate(chat_id, "media_image")
+    if res_img == "paused":
+        await _idx_set_state(chat_id, 5, status="paused")
+        return "paused"
     # эмбеддинг описаний фото (emb_text): Stage 3 их не застал (медиа теперь после него)
     res, n = await _index_vectorize_loop(chat_id, "media_assets", "msg_id", "emb_text",
                                          lambda r: (r.get("image_description") or "изображение")[:8000], progress_cb, "фото-описания")
@@ -8899,7 +8928,7 @@ async def _index_stage5_media(chat_id: int, progress_cb=None):
     if res == "paused":
         await _idx_set_state(chat_id, 5, status="paused")
         return "paused"
-    if res == "error":
+    if res == "error" or res_img == "error":
         await _idx_set_state(chat_id, 5, status="error")
         return "error"
     await _idx_set_state(chat_id, 5, status="done", stats={"photos": done})
@@ -9687,15 +9716,15 @@ async def index_retry_failed_command(event):
     await db_write(
         "UPDATE index_failed_ranges SET status='retrying' WHERE chat_id=%s AND status='skipped' AND stage>=%s",
         (chat_id, min_stage))
+    rewind = max(0, min_start - 1)
     if min_stage <= 1:
-        rewind = max(0, min_start - 1)
         await _idx_set_state(chat_id, 1, cursor={"last_msg_id": rewind}, status="running")
-        await _idx_set_state(chat_id, 2, cursor={"last_msg_id": rewind}, status="running")
-        await _idx_set_state(chat_id, 3, status="running")
-    else:
-        rewind = max(0, min_start - 1)
-        await _idx_set_state(chat_id, 2, cursor={"last_msg_id": rewind}, status="running")
-        await _idx_set_state(chat_id, 3, status="running")
+    await _idx_set_state(chat_id, 2, cursor={"last_msg_id": rewind}, status="running")
+    await _idx_set_state(chat_id, 3, status="running")
+    # переобработка сцен меняет chunks → сводки периодов (Stage 4, по сигнатуре пересоберёт затронутые месяцы)
+    # и фото-контекст (Stage 5, cursor→0 перечешет чанки, готовые фото пропустит) должны актуализироваться
+    await _idx_set_state(chat_id, 4, status="running")
+    await _idx_set_state(chat_id, 5, cursor={"last_chunk_id": 0}, status="running")
     _INDEX_CONTROL[chat_id] = "run"
     status_msg = await event.reply(f"🔁 Повторяю failed ranges со Stage {min_stage} от msg>{rewind}…")
     _INDEX_TASKS[chat_id] = asyncio.create_task(_index_pipeline(chat_id, status_msg))
