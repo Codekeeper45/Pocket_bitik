@@ -2,22 +2,33 @@ from telethon import TelegramClient, events, utils
 from telethon.errors.rpcerrorlist import MessageNotModifiedError, FloodWaitError
 from telethon.extensions import html as tl_html
 from telethon.helpers import add_surrogate
-from telethon.tl.types import MessageEntityBlockquote, MessageEntityPre, MessageMediaWebPage, InputReplyToMessage
+from telethon.tl.types import MessageEntityBlockquote, MessageEntityPre, MessageMediaWebPage, InputReplyToMessage, InputMessagesFilterPhotos
 from telethon.tl.functions.messages import SendMessageRequest
 from dotenv import load_dotenv
 from openai import OpenAI
+from urllib.parse import urlsplit, unquote
 import os
 import re
 import io
 import asyncio
 import contextvars
 import base64
+import threading
 import time
 import traceback
 import requests
 import json
 import glob
 import logging
+
+try:
+    import pymysql  # /index (GraphRAG-память, MariaDB); без пакета команда просто недоступна
+except ImportError:
+    pymysql = None
+try:
+    import numpy as _np  # /index: numpy-cosine поиск по векторам-блобам
+except ImportError:
+    _np = None
 from types import SimpleNamespace
 from logging.handlers import RotatingFileHandler
 from datetime import datetime, timedelta, timezone
@@ -66,6 +77,7 @@ sakana_api_key = os.getenv("SAKANA_API_KEY")  # Sakana AI — Fugu (оркест
 sakana_proxy = os.getenv("SAKANA_PROXY")  # необяз. прокси для Sakana (WAF режет IP датацентров; формат http(s)://[user:pass@]host:port или socks5://…)
 gloy_api_key = os.getenv("GLOY_API_KEY")  # LLM API FUN (Gloy AI) — OpenAI-совместимый, прямой Bearer
 tavily_api_key = os.getenv("TAVILY_API_KEY")  # веб-поиск/извлечение страниц для /ask (tavily.com); без ключа веб-инструменты выключены
+index_db_url = os.getenv("INDEX_DB_URL")  # MariaDB для /index (GraphRAG-память): mysql://user:pass@host:port/db (pass URL-encoded)
 llama_cloud_api_key = os.getenv("LLAMA_CLOUD_API_KEY")  # OCR фото (LlamaParse); без него фото идут через vision
 
 
@@ -107,6 +119,20 @@ GEN_CATALOG_TIMEOUT = 75    # /gen: тайм-бюджет (сек) на скач
 GEN_DESC_TIMEOUT = 150      # /gen: тайм-бюджет (сек) для режима описаний (до 300 фото; что не успело — пойдёт без описания, по кэшу /ask добирается со временем)
 GEN_BATCH_MAX = 20          # /gen -xN: максимум вариантов за команду (каждый ~40с–2мин)
 GEN_BATCH_CONCURRENCY = 2   # сколько вариантов генерим одновременно (баланс скорость/лимиты free-модели)
+
+# --- /index: GraphRAG-память по истории чата (MariaDB + numpy-вектора) ---
+INDEX_EXTRACT_MODEL = "deepseek/deepseek-v4-flash"   # экстракция досье/графа (текст): окно 1M, дёшево (OpenRouter)
+INDEX_EXTRACT_FALLBACK = "deepseek/deepseek-v3.2-exp"  # если v4-flash недоступен ключу (проверяется пробным вызовом на фазе A)
+INDEX_EMBED_TEXT_MODEL = "openai/text-embedding-3-small"   # тексты: досье, связи, сцены, описания фото ($0.02/1M, 1536d)
+INDEX_EMBED_IMAGE_MODEL = "google/gemini-embedding-2"      # картинки (сам файл) + кросс-модальный текст-запрос (GA-слаг, 3072d)
+INDEX_EMBED_DIM = 1536        # рабочая размерность (text-emb-3-small нативно 1536; gemini-emb-2 усекаем Matryoshka с 3072)
+INDEX_DUMP_BATCH = 1000       # stage 0: сообщений на пачку дампа/чекпоинт
+INDEX_SCENE_GAP_SEC = 15 * 60 # stage 2: разрыв >15 мин между сообщениями рвёт сцену
+INDEX_SCENE_TOKEN_CAP = 8000  # stage 2: мягкий потолок токенов сцены (длинная беседа рвётся принудительно)
+INDEX_SCENE_MIN_TOKENS = 1000 # stage 2: сцены короче — доклеиваем к следующей (не дробим на мелочь)
+INDEX_STAGE1_BLOCK_TOKENS = 300_000  # stage 1: размер блока «снежного кома» досье
+INDEX_MEDIA_PAUSE = (2.0, 4.0)  # stage 2: пауза между скачиваниями фото (анти-FloodWait юзербота)
+INDEX_EMBED_BATCH = 96        # stage 3: строк на батч эмбеддинга
 # OCR фото в /ask по умолчанию (cost-effective вместо vision-модели; флаг -m возвращает vision).
 # Проверено живьём: v2-поток (files → parse tier=cost_effective → poll → markdown_full), ~11с/фото,
 # русский распознаёт отлично. ВАЖНО: text_full отдаёт мусор латиницей — читать markdown_full.
@@ -6504,6 +6530,7 @@ def _help_index(active_label):
         "   `media`     🖼 vision-модели (картинки/видео-кружки) + метки [OR]/[OC]\n"
         "   `voice`     🎙 голосовые ответы: выбор голоса, флаг `-v`, эмоции\n"
         "   `gen`       🎨 генерация и редактирование изображений\n"
+        "   `index`     🗂 память по истории чата (GraphRAG): досье, граф, поиск\n"
         "   `keys`      🔑 какие API-ключи за что отвечают (что обязательно)\n"
         "   `channels`  📡 каналы, поиск, дайджест\n"
         "   `auto`      🔁 авто-ответ\n"
@@ -6768,6 +6795,26 @@ _HELP_SECTIONS = {
         "   DeepSeek сам поправит формулировки и попробует снова.\n"
         "Доступ: владелец и пользователи из `/allow`. Генерация занимает до пары минут."
     ),
+    "index": (
+        "🗂 **`/index` — память по истории чата (GraphRAG)**\n"
+        "\n"
+        "Строит из всей истории текущего чата базу знаний: досье на людей и персонажей (canon-факты\n"
+        "и fanon-мнения), граф отношений, описанные и векторизованные фото — чтобы `/ask` мог отвечать\n"
+        "на сложные вопросы «кто такой X», «из-за чего повздорили Y и Z», «скинь ту картинку со спора».\n"
+        "\n"
+        "**Команды (только владелец, работает в фоне):**\n"
+        "   `/index` — оценка: сколько сообщений/фото и примерная стоимость прохода\n"
+        "   `/index go` — запустить индексацию в фоне\n"
+        "   `/index status` — прогресс по этапам\n"
+        "   `/index pause` / `/index resume` — пауза и продолжение (состояние на чекпоинтах в БД)\n"
+        "\n"
+        "**Этапы:** 0 — дамп истории в БД · 1 — досье и алиасы · 2 — граф связей и распознавание фото ·\n"
+        "   3 — вектора для поиска. При рестарте бота индексация продолжается с последнего чекпоинта.\n"
+        "\n"
+        "⚙️ Нужны: `INDEX_DB_URL` (MariaDB/MySQL) в `.env`, пакеты `pymysql`+`numpy`, `OPENROUTER_API_KEY`.\n"
+        "🧠 Модели: DeepSeek V4 Flash (экстракция), медиа-модель `/media` (фото),\n"
+        "   text-embedding-3-small (тексты) + gemini-embedding-2 (картинки)."
+    ),
     "keys": (
         "🔑 **Какие API-ключи за что отвечают** (в файле `.env`)\n"
         "\n"
@@ -6998,7 +7045,7 @@ async def help_command(event):
         return
 
     if arg == "all":
-        order = ["ask", "model", "media", "voice", "gen", "keys", "channels", "auto", "allow", "status", "song", "help"]
+        order = ["ask", "model", "media", "voice", "gen", "index", "keys", "channels", "auto", "allow", "status", "song", "help"]
         full = "\n\n━━━━━━━━━━━━━━━━━━━━━\n\n".join(_HELP_SECTIONS[k] for k in order)
         # Telegram лимит ~4096 на сообщение — режем безопасно по разделам.
         chunk, buf = "", []
@@ -7043,6 +7090,377 @@ async def help_command(event):
     await event.edit(chunks[0])
     for extra in chunks[1:]:
         await event.respond(extra)
+
+
+# ════════════════════════════════════════════════════════════════════════
+#  /index — агентская мультимодальная GraphRAG-память по истории чата
+#  MariaDB (граф+досье+сцены+медиа) + numpy-cosine поиск. Модели: DeepSeek
+#  V4 Flash (экстракция текста), медиа-модель /media (описание фото),
+#  text-embedding-3-small (тексты), gemini-embedding-2 (картинки).
+# ════════════════════════════════════════════════════════════════════════
+
+_IDX_TL = threading.local()          # per-thread pymysql-соединение (клиенты бота sync → asyncio.to_thread)
+_INDEX_TASKS: dict = {}              # {chat_id: asyncio.Task} активных фоновых индексаций
+_INDEX_CONTROL: dict = {}           # {chat_id: "run"|"pause"} — мягкая остановка на чекпоинтах
+_INDEX_DDL_DONE = False             # DDL применяется один раз за процесс
+_INDEX_EXTRACT_OK = None            # None=не проверяли, True/False — доступна ли INDEX_EXTRACT_MODEL нашему ключу
+
+
+def _index_available() -> str:
+    """'' если /index можно запускать; иначе причина-строка (нет пакета/ключа/OpenRouter)."""
+    if pymysql is None:
+        return "нет пакета pymysql (добавь в requirements и переустанови зависимости)"
+    if _np is None:
+        return "нет пакета numpy (добавь в requirements и переустанови зависимости)"
+    if not index_db_url:
+        return "не задан INDEX_DB_URL в .env (строка подключения к MariaDB)"
+    if openrouter_client is None:
+        return "нет OPENROUTER_API_KEY (нужен для экстракции и эмбеддингов)"
+    return ""
+
+
+def _index_dsn() -> dict:
+    u = urlsplit(index_db_url)
+    return dict(host=u.hostname, port=u.port or 3306,
+                user=unquote(u.username or ""), password=unquote(u.password or ""),
+                db=(u.path or "/").lstrip("/"))
+
+
+def _index_conn():
+    """Живое соединение для ТЕКУЩЕГО потока (ping+reconnect). pymysql не потокобезопасен → thread-local."""
+    c = getattr(_IDX_TL, "conn", None)
+    if c is not None:
+        try:
+            c.ping(reconnect=True)
+            return c
+        except Exception:
+            try:
+                c.close()
+            except Exception:
+                pass
+            _IDX_TL.conn = None
+    d = _index_dsn()
+    conn = pymysql.connect(host=d["host"], port=d["port"], user=d["user"], password=d["password"],
+                           database=d["db"], charset="utf8mb4", autocommit=True, connect_timeout=15,
+                           cursorclass=pymysql.cursors.DictCursor)
+    _IDX_TL.conn = conn
+    return conn
+
+
+def _idx_run(fn):
+    for attempt in range(2):  # реконнект-ретрай при обрыве
+        conn = _index_conn()
+        try:
+            return fn(conn)
+        except (pymysql.err.OperationalError, pymysql.err.InterfaceError):
+            try:
+                conn.close()
+            except Exception:
+                pass
+            _IDX_TL.conn = None
+            if attempt == 1:
+                raise
+
+
+def _db_write(sql, params=None, many=False):
+    def _op(conn):
+        with conn.cursor() as cur:
+            if many:
+                cur.executemany(sql, params or [])
+            else:
+                cur.execute(sql, params or ())
+            return cur.rowcount, cur.lastrowid
+    return _idx_run(_op)
+
+
+def _db_read(sql, params=None):
+    def _op(conn):
+        with conn.cursor() as cur:
+            cur.execute(sql, params or ())
+            return cur.fetchall()
+    return _idx_run(_op)
+
+
+async def db_write(sql, params=None, many=False):
+    return await asyncio.to_thread(_db_write, sql, params, many)
+
+
+async def db_read(sql, params=None):
+    return await asyncio.to_thread(_db_read, sql, params)
+
+
+_INDEX_DDL = [
+    """CREATE TABLE IF NOT EXISTS idx_state (
+        chat_id BIGINT NOT NULL, stage TINYINT NOT NULL, cursor JSON NULL, stats JSON NULL,
+        status VARCHAR(16) NOT NULL DEFAULT 'running', updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+        PRIMARY KEY (chat_id, stage)) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4""",
+    """CREATE TABLE IF NOT EXISTS messages (
+        chat_id BIGINT NOT NULL, msg_id BIGINT NOT NULL, date DATETIME NULL, author_id BIGINT NULL,
+        reply_to_id BIGINT NULL, txt MEDIUMTEXT NULL, media_uid VARCHAR(64) NULL, media_kind TINYINT NOT NULL DEFAULT 0,
+        PRIMARY KEY (chat_id, msg_id), KEY k_date (chat_id, date)) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4""",
+    """CREATE TABLE IF NOT EXISTS entities (
+        id BIGINT AUTO_INCREMENT PRIMARY KEY, chat_id BIGINT NOT NULL, name VARCHAR(255) NOT NULL,
+        entity_type VARCHAR(16) NOT NULL DEFAULT 'user', tg_user_id BIGINT NULL, aliases JSON NULL,
+        canon_summary MEDIUMTEXT NULL, fanon_summary MEDIUMTEXT NULL, visual_features MEDIUMTEXT NULL,
+        embedding VARBINARY(4096) NULL, updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+        KEY k_chat (chat_id), KEY k_name (chat_id, name)) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4""",
+    """CREATE TABLE IF NOT EXISTS entity_claims (
+        id BIGINT AUTO_INCREMENT PRIMARY KEY, chat_id BIGINT NOT NULL, entity_id BIGINT NOT NULL,
+        kind VARCHAR(16) NOT NULL, claim MEDIUMTEXT NOT NULL, evidence JSON NULL,
+        first_seen DATETIME NULL, last_seen DATETIME NULL,
+        KEY k_ent (chat_id, entity_id)) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4""",
+    """CREATE TABLE IF NOT EXISTS relations (
+        id BIGINT AUTO_INCREMENT PRIMARY KEY, chat_id BIGINT NOT NULL, source_id BIGINT NOT NULL, target_id BIGINT NOT NULL,
+        relation_type VARCHAR(64) NULL, canonical_type VARCHAR(32) NULL, context_summary MEDIUMTEXT NULL,
+        weight FLOAT NOT NULL DEFAULT 1, first_seen DATETIME NULL, last_seen DATETIME NULL,
+        status VARCHAR(16) NOT NULL DEFAULT 'active', evidence JSON NULL, embedding VARBINARY(4096) NULL,
+        KEY k_chat (chat_id), KEY k_pair (chat_id, source_id, target_id)) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4""",
+    """CREATE TABLE IF NOT EXISTS media_assets (
+        chat_id BIGINT NOT NULL, msg_id BIGINT NOT NULL, file_uid VARCHAR(64) NULL, image_description MEDIUMTEXT NULL,
+        entity_ids JSON NULL, emb_text VARBINARY(4096) NULL, emb_image VARBINARY(8192) NULL,
+        PRIMARY KEY (chat_id, msg_id)) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4""",
+    """CREATE TABLE IF NOT EXISTS chat_chunks (
+        id BIGINT AUTO_INCREMENT PRIMARY KEY, chat_id BIGINT NOT NULL, start_msg_id BIGINT NULL, end_msg_id BIGINT NULL,
+        scene_date DATETIME NULL, enriched_text MEDIUMTEXT NULL, meta JSON NULL, embedding VARBINARY(4096) NULL,
+        KEY k_chat (chat_id)) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4""",
+]
+
+
+async def _index_ensure_ddl():
+    global _INDEX_DDL_DONE
+    if _INDEX_DDL_DONE:
+        return
+    for ddl in _INDEX_DDL:
+        await db_write(ddl)
+    _INDEX_DDL_DONE = True
+    log("INDEX", "DDL применён (таблицы готовы)")
+
+
+# --- вектора: float16-блобы (numpy) ---
+def _vec_pack(vec) -> bytes:
+    """list[float]/np.array → компактный float16-блоб (усечение/паддинг до INDEX_EMBED_DIM)."""
+    a = _np.asarray(vec, dtype=_np.float32)
+    if a.shape[0] >= INDEX_EMBED_DIM:
+        a = a[:INDEX_EMBED_DIM]
+    else:
+        a = _np.pad(a, (0, INDEX_EMBED_DIM - a.shape[0]))
+    n = _np.linalg.norm(a)
+    if n > 0:
+        a = a / n  # нормируем → косинус = скалярное произведение
+    return a.astype(_np.float16).tobytes()
+
+
+def _vec_unpack(blob) -> "object":
+    return _np.frombuffer(blob, dtype=_np.float16).astype(_np.float32) if blob else None
+
+
+# --- состояние индексации в idx_state ---
+async def _idx_get_state(chat_id: int, stage: int) -> dict:
+    rows = await db_read("SELECT cursor, stats, status FROM idx_state WHERE chat_id=%s AND stage=%s", (chat_id, stage))
+    if not rows:
+        return {"cursor": {}, "stats": {}, "status": None}
+    r = rows[0]
+    return {"cursor": json.loads(r["cursor"]) if r["cursor"] else {},
+            "stats": json.loads(r["stats"]) if r["stats"] else {},
+            "status": r["status"]}
+
+
+async def _idx_set_state(chat_id: int, stage: int, cursor=None, stats=None, status=None):
+    await db_write(
+        """INSERT INTO idx_state (chat_id, stage, cursor, stats, status) VALUES (%s,%s,%s,%s,%s)
+           ON DUPLICATE KEY UPDATE cursor=COALESCE(VALUES(cursor),cursor),
+             stats=COALESCE(VALUES(stats),stats), status=COALESCE(VALUES(status),status)""",
+        (chat_id, stage, json.dumps(cursor, ensure_ascii=False) if cursor is not None else None,
+         json.dumps(stats, ensure_ascii=False) if stats is not None else None, status))
+
+
+def _media_meta(m):
+    """(media_uid, media_kind) для сообщения: 1=фото, 2=картинка-документ, 3=прочий документ, 0=нет."""
+    ph = getattr(m, "photo", None)
+    if ph and not isinstance(getattr(m, "media", None), MessageMediaWebPage):
+        return (f"{getattr(ph, 'id', '')}", 1)
+    doc = getattr(m, "document", None)
+    if doc:
+        mime = (getattr(doc, "mime_type", None) or "").lower()
+        return (f"{getattr(doc, 'id', '')}", 2 if mime.startswith("image/") else 3)
+    return (None, 0)
+
+
+# --- STAGE 0: сырой дамп истории в messages ---
+async def _index_stage0_dump(chat_id: int, progress_cb=None):
+    """Выкачивает всю историю чата в messages (INSERT IGNORE), чекпоинт по max msg_id.
+    reverse=True + min_id=cursor → дозагрузка с места обрыва (resume). Медиа НЕ качаем (только uid/kind)."""
+    st = await _idx_get_state(chat_id, 0)
+    last_id = int(st["cursor"].get("last_msg_id", 0))
+    done = int(st["stats"].get("dumped", 0))
+    await _idx_set_state(chat_id, 0, status="running")
+    buf, batch_max = [], 0
+    log("INDEX", f"Stage0 дамп чата {chat_id}: продолжаю с msg_id>{last_id} (уже {done})")
+
+    async def _flush():
+        nonlocal buf, done, last_id
+        if not buf:
+            return
+        await db_write(
+            """INSERT IGNORE INTO messages (chat_id,msg_id,date,author_id,reply_to_id,txt,media_uid,media_kind)
+               VALUES (%s,%s,%s,%s,%s,%s,%s,%s)""", buf, many=True)
+        done += len(buf)
+        last_id = max(last_id, batch_max)
+        await _idx_set_state(chat_id, 0, cursor={"last_msg_id": last_id}, stats={"dumped": done})
+        if progress_cb:
+            await progress_cb(f"📥 Дамп: {done} сообщений (id≤{last_id})…")
+        buf = []
+
+    try:
+        async for m in client.iter_messages(chat_id, reverse=True, min_id=last_id):
+            if _INDEX_CONTROL.get(chat_id) == "pause":
+                await _flush()
+                await _idx_set_state(chat_id, 0, status="paused")
+                log("INDEX", f"Stage0 чата {chat_id}: пауза на id≤{last_id}")
+                return "paused"
+            uid, kind = _media_meta(m)
+            d = getattr(m, "date", None)
+            buf.append((chat_id, m.id,
+                        d.strftime("%Y-%m-%d %H:%M:%S") if d else None,
+                        getattr(m, "sender_id", None), getattr(m, "reply_to_msg_id", None),
+                        (m.raw_text or None), uid, kind))
+            batch_max = max(batch_max, m.id)
+            if len(buf) >= INDEX_DUMP_BATCH:
+                await _flush()
+        await _flush()
+    except FloodWaitError as e:
+        await _flush()
+        log("INDEX", f"Stage0 чата {chat_id}: FloodWait {e.seconds}с — пауза, дожмётся при resume")
+        await _idx_set_state(chat_id, 0, status="paused")
+        return "floodwait"
+    await _idx_set_state(chat_id, 0, status="done", stats={"dumped": done})
+    log("INDEX", f"Stage0 чата {chat_id}: готово, {done} сообщений")
+    return "done"
+
+
+# --- оркестратор пайплайна ---
+async def _index_pipeline(chat_id: int, status_msg):
+    """Прогоняет этапы по порядку, уважая паузу. Пока реализован Stage 0 (дамп);
+    этапы 1–3 (досье/граф/вектора) подключаются в следующих фазах."""
+    async def upd(text):
+        try:
+            await status_msg.edit(text)
+        except Exception:
+            pass
+    try:
+        await _index_ensure_ddl()
+        res = await _index_stage0_dump(chat_id, progress_cb=upd)
+        if res == "paused":
+            await upd("⏸ Индексация на паузе (Stage 0). `/index resume` — продолжить.")
+            return
+        if res == "floodwait":
+            await upd("⏳ Telegram притормозил выгрузку (FloodWait). `/index resume` позже — дожму остаток.")
+            return
+        st0 = await _idx_get_state(chat_id, 0)
+        n = int(st0["stats"].get("dumped", 0))
+        await upd(f"✅ Stage 0 готов: выкачано **{n}** сообщений в память.\n"
+                  f"Этапы 1–3 (досье · граф · вектора) — в следующих обновлениях бота.")
+    except Exception as e:
+        log("INDEX", f"Пайплайн чата {chat_id} упал: {e}")
+        traceback.print_exc()
+        await _idx_set_state(chat_id, 0, status="error")
+        await upd(f"❌ Индексация упала: {e}\nСостояние сохранено — `/index resume` продолжит с чекпоинта.")
+    finally:
+        _INDEX_CONTROL.pop(chat_id, None)
+        _INDEX_TASKS.pop(chat_id, None)
+
+
+async def _index_preflight(event) -> str:
+    """Оценка объёма перед запуском: сколько сообщений/фото и грубая цена/время."""
+    chat_id = event.chat_id
+    try:
+        total = (await client.get_messages(chat_id, limit=0)).total or 0
+    except Exception as e:
+        return f"⚠️ Не смог оценить объём чата: {e}"
+    try:
+        photos = (await client.get_messages(chat_id, limit=0, filter=InputMessagesFilterPhotos)).total or 0
+    except Exception:
+        photos = 0
+    st0 = await _idx_get_state(chat_id, 0)
+    dumped = int(st0["stats"].get("dumped", 0))
+    # грубая оценка: экстракция ~$0.30/1M вх.токенов·~30 токенов/сообщение; фото vision ~$0.0002; эмбеддинги копейки
+    est_tok = total * 30
+    est_cost = est_tok / 1_000_000 * 0.30 + photos * 0.0002
+    done_note = f" (уже выкачано {dumped})" if dumped else ""
+    return (f"🗂 **Индексация чата** — оценка перед запуском:\n"
+            f"• Сообщений: ~**{total}**{done_note}\n"
+            f"• Фото: ~**{photos}**\n"
+            f"• Ориентир стоимости полного прохода: **~${est_cost:.2f}** (экстракция+фото+вектора)\n"
+            f"• Время: от нескольких минут до часов (зависит от объёма и лимитов Telegram)\n\n"
+            f"Запусти: `/index go` · статус: `/index status` · пауза/продолжить: `/index pause` / `/index resume`")
+
+
+@client.on(events.NewMessage(pattern=r"^[./]index(?:\s+(go|status|pause|resume|stop))?\s*$"))
+async def index_command(event):
+    if await _slash_for_other_bot(event):
+        return
+    if not event.out:
+        return  # только владелец
+    sub = (event.pattern_match.group(1) or "").lower()
+    chat_id = event.chat_id
+    reason = _index_available()
+    if reason:
+        await event.reply(f"⚠️ /index недоступен: {reason}")
+        return
+
+    if sub in ("", "status"):
+        if sub == "":
+            await event.reply(await _index_preflight(event))
+            return
+        # status
+        running = chat_id in _INDEX_TASKS
+        parts = ["📊 **Статус индексации этого чата:**"]
+        for stg, label in ((0, "Дамп"), (1, "Досье"), (2, "Граф+медиа"), (3, "Вектора")):
+            s = await _idx_get_state(chat_id, stg)
+            if s["status"]:
+                extra = ""
+                if stg == 0 and s["stats"].get("dumped"):
+                    extra = f" · {s['stats']['dumped']} сообщ."
+                parts.append(f"• Stage {stg} {label}: {s['status']}{extra}")
+        if len(parts) == 1:
+            parts.append("• ещё не запускалась — `/index go`")
+        parts.append(f"\n{'🟢 сейчас работает в фоне' if running else '⚪️ фоновая задача не активна'}")
+        await event.reply("\n".join(parts))
+        return
+
+    if sub == "go":
+        if chat_id in _INDEX_TASKS:
+            await event.reply("🟢 Индексация этого чата уже идёт. `/index status` — прогресс.")
+            return
+        _INDEX_CONTROL[chat_id] = "run"
+        status_msg = await event.reply("🚀 Запускаю индексацию в фоне… `/index status` — прогресс.")
+        _INDEX_TASKS[chat_id] = asyncio.create_task(_index_pipeline(chat_id, status_msg))
+        return
+
+    if sub == "pause":
+        if chat_id not in _INDEX_TASKS:
+            await event.reply("⚪️ Сейчас нечего ставить на паузу (фоновая задача не активна).")
+            return
+        _INDEX_CONTROL[chat_id] = "pause"
+        await event.reply("⏸ Ставлю на паузу на ближайшем чекпоинте…")
+        return
+
+    if sub in ("resume", "stop"):
+        if sub == "stop":
+            _INDEX_CONTROL[chat_id] = "pause"
+            t = _INDEX_TASKS.get(chat_id)
+            if t:
+                await event.reply("🛑 Останавливаю на ближайшем чекпоинте (прогресс сохранён).")
+            else:
+                await event.reply("⚪️ Фоновая задача не активна.")
+            return
+        if chat_id in _INDEX_TASKS:
+            await event.reply("🟢 Уже работает.")
+            return
+        _INDEX_CONTROL[chat_id] = "run"
+        status_msg = await event.reply("▶️ Продолжаю индексацию с последнего чекпоинта…")
+        _INDEX_TASKS[chat_id] = asyncio.create_task(_index_pipeline(chat_id, status_msg))
+        return
 
 
 # --- Запуск ---
