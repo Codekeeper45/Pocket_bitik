@@ -1,0 +1,774 @@
+<title>Davinchik · INDEX — атлас памяти</title>
+<style>
+  :root{
+    /* светлая тема — прохладная бумага, не крем */
+    --ground:#e7eaf0; --panel:#f4f6fa; --panel-2:#eaedf3;
+    --ink:#161d2b; --muted:#586277; --faint:#7b859a; --line:#ccd3e0;
+    --accent:#a9740f; --accent-2:#c2913a; --cool:#3a5bc7;
+    --pos:#2c8862; --neg:#bd4a37; --neutral:#6b7488;
+    --shadow:0 1px 2px rgba(20,30,50,.08),0 8px 30px rgba(20,30,50,.06);
+    --mono:ui-monospace,"SF Mono","JetBrains Mono",Menlo,Consolas,monospace;
+    --sans:system-ui,-apple-system,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;
+    --serif:Georgia,"Iowan Old Style","Times New Roman",serif;
+  }
+  @media (prefers-color-scheme:dark){
+    :root{
+      --ground:#090e19; --panel:#0f1524; --panel-2:#141b2c;
+      --ink:#e7eaf2; --muted:#98a2b8; --faint:#6b7690; --line:#222c42;
+      --accent:#d8a24a; --accent-2:#e6bd77; --cool:#7ea2ff;
+      --pos:#5bbf8f; --neg:#e0736b; --neutral:#8892a6;
+      --shadow:0 1px 2px rgba(0,0,0,.4),0 14px 44px rgba(0,0,0,.45);
+    }
+  }
+  :root[data-theme="light"]{
+    --ground:#e7eaf0; --panel:#f4f6fa; --panel-2:#eaedf3;
+    --ink:#161d2b; --muted:#586277; --faint:#7b859a; --line:#ccd3e0;
+    --accent:#a9740f; --accent-2:#c2913a; --cool:#3a5bc7;
+    --pos:#2c8862; --neg:#bd4a37; --neutral:#6b7488;
+    --shadow:0 1px 2px rgba(20,30,50,.08),0 8px 30px rgba(20,30,50,.06);
+  }
+  :root[data-theme="dark"]{
+    --ground:#090e19; --panel:#0f1524; --panel-2:#141b2c;
+    --ink:#e7eaf2; --muted:#98a2b8; --faint:#6b7690; --line:#222c42;
+    --accent:#d8a24a; --accent-2:#e6bd77; --cool:#7ea2ff;
+    --pos:#5bbf8f; --neg:#e0736b; --neutral:#8892a6;
+    --shadow:0 1px 2px rgba(0,0,0,.4),0 14px 44px rgba(0,0,0,.45);
+  }
+
+  *{box-sizing:border-box}
+  body{margin:0}
+  .doc{
+    background:var(--ground); color:var(--ink);
+    font-family:var(--sans); line-height:1.6;
+    -webkit-font-smoothing:antialiased; font-synthesis:none;
+    overflow-x:hidden;
+  }
+  .doc ::selection{background:color-mix(in srgb,var(--accent) 34%,transparent)}
+
+  .wrap{max-width:1180px; margin:0 auto; padding:0 clamp(18px,4vw,48px)}
+  .col{max-width:68ch}
+
+  /* ─── герой ─── */
+  .hero{position:relative; min-height:92vh; display:flex; flex-direction:column; justify-content:center;
+    border-bottom:1px solid var(--line); overflow:hidden}
+  #graph{position:absolute; inset:0; width:100%; height:100%; z-index:0; opacity:.9}
+  .hero-veil{position:absolute; inset:0; z-index:1; pointer-events:none;
+    background:radial-gradient(120% 90% at 78% 18%,transparent 30%,var(--ground) 82%),
+               linear-gradient(180deg,transparent 55%,var(--ground) 100%)}
+  .hero-inner{position:relative; z-index:2; padding:64px 0}
+  .eyebrow{font-family:var(--mono); font-size:.74rem; letter-spacing:.34em; text-transform:uppercase;
+    color:var(--accent); display:flex; align-items:center; gap:14px}
+  .eyebrow::after{content:""; height:1px; flex:1; max-width:180px; background:linear-gradient(90deg,var(--accent),transparent)}
+  h1.title{font-family:var(--serif); font-weight:400; text-wrap:balance;
+    font-size:clamp(2.7rem,7vw,5.4rem); line-height:1.02; letter-spacing:-.015em;
+    margin:.32em 0 .18em}
+  h1.title em{font-style:italic; color:var(--accent)}
+  .lede{font-family:var(--serif); font-size:clamp(1.15rem,2.3vw,1.5rem); color:var(--muted);
+    max-width:30ch; line-height:1.42; margin:0}
+  .hero-stats{display:flex; flex-wrap:wrap; gap:0; margin-top:46px; border:1px solid var(--line);
+    border-radius:12px; overflow:hidden; background:color-mix(in srgb,var(--panel) 70%,transparent);
+    backdrop-filter:blur(6px); max-width:760px}
+  .hero-stats div{flex:1 1 140px; padding:18px 20px; border-right:1px solid var(--line)}
+  .hero-stats div:last-child{border-right:0}
+  .hero-stats b{font-family:var(--serif); font-size:1.9rem; font-weight:400; display:block; color:var(--ink);
+    font-variant-numeric:tabular-nums}
+  .hero-stats span{font-family:var(--mono); font-size:.68rem; letter-spacing:.14em; text-transform:uppercase; color:var(--faint)}
+
+  /* ─── раскладка тела ─── */
+  .body{display:grid; grid-template-columns:1fr; gap:0; padding:72px 0 40px}
+  @media(min-width:1000px){
+    .body{grid-template-columns:216px 1fr; gap:56px}
+  }
+  /* корешок-оглавление */
+  .spine{display:none}
+  @media(min-width:1000px){
+    .spine{display:block; align-self:start; position:sticky; top:0; padding-top:8px;
+      max-height:100vh; overflow:auto}
+  }
+  .spine h4{font-family:var(--mono); font-size:.68rem; letter-spacing:.2em; text-transform:uppercase;
+    color:var(--faint); margin:22px 0 12px; font-weight:600}
+  .spine a{display:flex; gap:10px; align-items:baseline; text-decoration:none; color:var(--muted);
+    padding:5px 0; font-size:.9rem; border-left:2px solid transparent; padding-left:12px; margin-left:-12px;
+    transition:color .18s,border-color .18s}
+  .spine a .n{font-family:var(--mono); font-size:.72rem; color:var(--faint)}
+  .spine a:hover,.spine a.on{color:var(--accent); border-color:var(--accent)}
+
+  main{min-width:0}
+  section{scroll-margin-top:24px}
+  .kicker{font-family:var(--mono); font-size:.72rem; letter-spacing:.24em; text-transform:uppercase;
+    color:var(--accent); margin:0 0 12px}
+  h2{font-family:var(--serif); font-weight:400; text-wrap:balance; letter-spacing:-.01em;
+    font-size:clamp(1.7rem,3.6vw,2.5rem); line-height:1.1; margin:0 0 .5em}
+  h3{font-family:var(--sans); font-weight:650; font-size:1.06rem; letter-spacing:-.005em; margin:2em 0 .5em; color:var(--ink)}
+  p{margin:0 0 1.05em; color:var(--ink)}
+  p.muted{color:var(--muted)}
+  a.link{color:var(--accent); text-decoration:underline; text-underline-offset:3px; text-decoration-thickness:1px}
+  strong{font-weight:650}
+  .lead-p{font-family:var(--serif); font-size:1.22rem; line-height:1.5; color:var(--muted); max-width:64ch}
+
+  .rule{height:1px; background:var(--line); border:0; margin:0}
+  .stage-block{padding:74px 0; border-top:1px solid var(--line)}
+  .stage-block:first-of-type{border-top:0}
+
+  /* заголовок пластины стадии */
+  .plate-head{display:flex; align-items:flex-start; gap:22px; margin-bottom:18px}
+  .plate-num{font-family:var(--serif); font-size:clamp(2.6rem,6vw,4rem); line-height:.8; color:var(--accent);
+    font-variant-numeric:tabular-nums; flex:none; opacity:.9}
+  .plate-num small{display:block; font-family:var(--mono); font-size:.6rem; letter-spacing:.24em;
+    text-transform:uppercase; color:var(--faint); margin-top:10px}
+  .plate-title h2{margin:0}
+  .plate-title .sub{font-family:var(--mono); font-size:.78rem; color:var(--muted); margin-top:8px; letter-spacing:.02em}
+
+  /* поток данных */
+  .flow{display:flex; flex-wrap:wrap; align-items:stretch; gap:10px; margin:26px 0; font-family:var(--mono); font-size:.8rem}
+  .flow .node{background:var(--panel); border:1px solid var(--line); border-radius:9px; padding:11px 14px;
+    display:flex; flex-direction:column; gap:3px; box-shadow:var(--shadow)}
+  .flow .node b{color:var(--ink); font-weight:600; letter-spacing:.01em}
+  .flow .node span{color:var(--faint); font-size:.68rem}
+  .flow .arr{align-self:center; color:var(--accent); font-size:1.1rem; padding:0 2px}
+
+  /* врезка "в чём гениальность" */
+  .genius{position:relative; margin:28px 0; padding:22px 24px 22px 26px; border-radius:12px;
+    background:var(--panel); border:1px solid var(--line); box-shadow:var(--shadow); overflow:hidden}
+  .genius::before{content:""; position:absolute; left:0; top:0; bottom:0; width:3px;
+    background:linear-gradient(180deg,var(--accent),color-mix(in srgb,var(--accent) 10%,transparent))}
+  .genius .tag{font-family:var(--mono); font-size:.68rem; letter-spacing:.2em; text-transform:uppercase;
+    color:var(--accent); display:block; margin-bottom:8px}
+  .genius p{margin:0; color:var(--ink)}
+  .genius p+p{margin-top:.7em}
+
+  /* блок кода/схемы */
+  pre{margin:20px 0; padding:18px 20px; background:var(--panel-2); border:1px solid var(--line);
+    border-radius:11px; overflow-x:auto; font-family:var(--mono); font-size:.79rem; line-height:1.62; color:var(--ink)}
+  pre .c{color:var(--faint)}      /* комментарий */
+  pre .k{color:var(--accent)}     /* ключевое */
+  pre .s{color:var(--cool)}       /* строка/значение */
+  code{font-family:var(--mono); font-size:.86em; background:var(--panel-2); border:1px solid var(--line);
+    padding:.08em .38em; border-radius:5px; color:var(--ink); white-space:nowrap}
+  .genius code,.flow code{background:color-mix(in srgb,var(--ground) 55%,transparent)}
+
+  /* таблицы данных */
+  .tbl-scroll{overflow-x:auto; margin:22px 0; border:1px solid var(--line); border-radius:11px}
+  table{border-collapse:collapse; width:100%; font-size:.85rem; min-width:520px}
+  th,td{text-align:left; padding:11px 15px; border-bottom:1px solid var(--line); vertical-align:top}
+  th{font-family:var(--mono); font-size:.68rem; letter-spacing:.12em; text-transform:uppercase; color:var(--faint);
+    background:var(--panel-2); font-weight:600}
+  td code{white-space:nowrap}
+  tr:last-child td{border-bottom:0}
+  td.mono{font-family:var(--mono); font-variant-numeric:tabular-nums; color:var(--muted); white-space:nowrap}
+
+  /* полярность-легенда */
+  .pol{display:inline-flex; align-items:center; gap:6px; font-family:var(--mono); font-size:.8rem}
+  .dot{width:9px; height:9px; border-radius:50%; display:inline-block}
+  .dot.pos{background:var(--pos)} .dot.neg{background:var(--neg)} .dot.neu{background:var(--neutral)}
+
+  ul.clean{list-style:none; padding:0; margin:1em 0; display:flex; flex-direction:column; gap:12px}
+  ul.clean li{padding-left:26px; position:relative; color:var(--ink)}
+  ul.clean li::before{content:"→"; position:absolute; left:0; color:var(--accent); font-family:var(--mono)}
+  ul.clean li b{color:var(--ink)}
+
+  /* карточки-сетка (модели, устойчивость) */
+  .grid{display:grid; gap:14px; margin:24px 0; grid-template-columns:repeat(auto-fit,minmax(230px,1fr))}
+  .card{background:var(--panel); border:1px solid var(--line); border-radius:12px; padding:18px 20px; box-shadow:var(--shadow)}
+  .card h4{margin:0 0 6px; font-family:var(--sans); font-weight:650; font-size:.98rem}
+  .card p{margin:0; font-size:.88rem; color:var(--muted)}
+  .card .lbl{font-family:var(--mono); font-size:.66rem; letter-spacing:.16em; text-transform:uppercase; color:var(--accent); display:block; margin-bottom:9px}
+
+  /* цитата-эпиграф */
+  .epi{font-family:var(--serif); font-style:italic; font-size:1.35rem; line-height:1.4; color:var(--muted);
+    border-left:2px solid var(--accent); padding:6px 0 6px 24px; margin:34px 0; max-width:56ch; text-wrap:balance}
+
+  footer.foot{border-top:1px solid var(--line); padding:56px 0 80px; color:var(--muted)}
+  footer.foot .wrap{display:flex; flex-wrap:wrap; gap:24px; justify-content:space-between; align-items:baseline}
+  footer.foot p{margin:0; font-size:.86rem}
+  footer.foot .sig{font-family:var(--mono); font-size:.72rem; letter-spacing:.06em; color:var(--faint)}
+
+  /* тема-переключатель */
+  .theme-btn{position:fixed; top:16px; right:16px; z-index:40; width:40px; height:40px; border-radius:50%;
+    border:1px solid var(--line); background:color-mix(in srgb,var(--panel) 80%,transparent); color:var(--ink);
+    cursor:pointer; font-size:1rem; display:grid; place-items:center; backdrop-filter:blur(8px); box-shadow:var(--shadow)}
+  .theme-btn:hover{border-color:var(--accent); color:var(--accent)}
+  :focus-visible{outline:2px solid var(--accent); outline-offset:3px; border-radius:3px}
+
+  .reveal{opacity:0; transform:translateY(16px); transition:opacity .7s ease,transform .7s cubic-bezier(.2,.7,.2,1)}
+  .reveal.in{opacity:1; transform:none}
+  @media(prefers-reduced-motion:reduce){
+    .reveal{opacity:1; transform:none; transition:none}
+  }
+</style>
+
+<div class="doc">
+  <button class="theme-btn" id="themeBtn" aria-label="Переключить тему">◐</button>
+
+  <!-- ══════════ ГЕРОЙ ══════════ -->
+  <header class="hero">
+    <canvas id="graph" aria-hidden="true"></canvas>
+    <div class="hero-veil"></div>
+    <div class="hero-inner wrap">
+      <div class="eyebrow">Davinchik · подсистема памяти</div>
+      <h1 class="title">Как чат<br>становится <em>разумом</em></h1>
+      <p class="lede">Полный разбор алгоритма <code>/index</code> — агентской мультимодальной GraphRAG-памяти.</p>
+
+      <div class="hero-stats">
+        <div><b>4</b><span>стадии конвейера</span></div>
+        <div><b>11</b><span>таблиц графа</span></div>
+        <div><b>32 805</b><span>сообщений за проход</span></div>
+        <div><b>float16</b><span>вектора-блобы</span></div>
+      </div>
+    </div>
+  </header>
+
+  <!-- ══════════ ТЕЛО ══════════ -->
+  <div class="wrap">
+    <div class="body">
+
+      <!-- корешок -->
+      <nav class="spine" aria-label="Оглавление">
+        <h4>Атлас</h4>
+        <a href="#thesis"><span class="n">·</span>Тезис</a>
+        <a href="#data"><span class="n">·</span>Архитектура данных</a>
+        <h4>Конвейер</h4>
+        <a href="#s0"><span class="n">0</span>Дамп истории</a>
+        <a href="#s1"><span class="n">1</span>Досье · снежный ком</a>
+        <a href="#s2"><span class="n">2</span>Граф · сцены · медиа</a>
+        <a href="#s3"><span class="n">3</span>Векторизация</a>
+        <h4>Извлечение</h4>
+        <a href="#search"><span class="n">·</span>Поиск</a>
+        <a href="#use"><span class="n">·</span>Как этим пользуются</a>
+        <h4>Инженерия</h4>
+        <a href="#robust"><span class="n">·</span>Устойчивость</a>
+        <a href="#ref"><span class="n">·</span>Модели и команды</a>
+      </nav>
+
+      <main>
+        <!-- ─── ТЕЗИС ─── -->
+        <section id="thesis" class="col reveal">
+          <p class="kicker">Тезис</p>
+          <h2>Сырой лог — это не память. Память нужно построить.</h2>
+          <p class="lead-p">История чата — это десятки тысяч разрозненных реплик. <code>/index</code>
+          превращает их в структуру, которую можно спросить: <em>кто это, что о нём известно,
+          кто с кем в ссоре, что было на том фото</em>. Красота в том, что вся эта работа
+          разложена на четыре независимых, возобновляемых стадии — и каждая делает ровно одно.</p>
+
+          <p>Классический RAG рубит текст на куски и ищет по косинусу. Здесь — на порядок выше:
+          строится <strong>граф знаний</strong> (сущности canon/fanon, темпоральные связи с полярностью),
+          <strong>мультимодальная память</strong> (описания и вектора фотографий), и <strong>RAG по сценам</strong> —
+          и только потом всё это индексируется векторами. Три ортогональных представления одной истории,
+          между которыми поиск свободно перемещается.</p>
+
+          <p class="epi">Гениальность конвейера не в одном трюке, а в дисциплине: состояние живёт в БД,
+          курсор двигается только после успеха, а любая авария — это пауза, а не потеря.</p>
+
+          <div class="flow" aria-label="Общий поток">
+            <div class="node"><b>Telegram</b><span>вся история</span></div>
+            <span class="arr">→</span>
+            <div class="node"><b>Stage 0</b><span>messages</span></div>
+            <span class="arr">→</span>
+            <div class="node"><b>Stage 1</b><span>entities · claims</span></div>
+            <span class="arr">→</span>
+            <div class="node"><b>Stage 2</b><span>relations · chunks · media</span></div>
+            <span class="arr">→</span>
+            <div class="node"><b>Stage 3</b><span>вектора</span></div>
+            <span class="arr">→</span>
+            <div class="node"><b>/ask · /gen</b><span>поиск</span></div>
+          </div>
+        </section>
+
+        <!-- ─── АРХИТЕКТУРА ДАННЫХ ─── -->
+        <section id="data" class="stage-block reveal">
+          <p class="kicker">Фундамент</p>
+          <h2>Одиннадцать таблиц и один изящный трюк с байтами</h2>
+          <p class="muted col">Хранилище — <strong>MariaDB 10.6</strong> (pgvector нет, нативный <code>VECTOR</code>
+          только с 11.7), поэтому вектора живут иначе — и это оказалось быстрее любого расширения.
+          Доступ к БД — потоко-локальные соединения <code>pymysql</code> через <code>asyncio.to_thread</code>
+          с авто-реконнектом, чтобы не блокировать событийный цикл юзербота.</p>
+
+          <div class="tbl-scroll">
+            <table>
+              <thead><tr><th>Таблица</th><th>Роль</th><th>Ключевое поле</th></tr></thead>
+              <tbody>
+                <tr><td><code>idx_state</code></td><td>состояние каждой стадии: курсор, статистика, статус</td><td class="mono">(chat, stage)</td></tr>
+                <tr><td><code>messages</code></td><td>сырой дамп истории (Stage 0)</td><td class="mono">(chat, msg_id)</td></tr>
+                <tr><td><code>entities</code></td><td>сущности: люди и персонажи, canon/fanon-досье</td><td class="mono">id · aliases</td></tr>
+                <tr><td><code>entity_claims</code></td><td>атомарные факты с пруфами (canon/fanon/visual)</td><td class="mono">entity_id · kind</td></tr>
+                <tr><td><code>entity_summary_parts</code></td><td>map-step для «популярных» сущностей</td><td class="mono">part_no</td></tr>
+                <tr><td><code>relations</code></td><td>граф связей: активные и закрытые рёбра</td><td class="mono">source→target</td></tr>
+                <tr><td><code>relation_events</code></td><td>дневные события связи — идемпотентный вес</td><td class="mono">scene_key</td></tr>
+                <tr><td><code>chat_chunks</code></td><td>сцены диалога (enriched_text) для RAG</td><td class="mono">start…end</td></tr>
+                <tr><td><code>media_assets</code></td><td>описания фото + два вектора (текст и картинка)</td><td class="mono">(chat, msg_id)</td></tr>
+                <tr><td><code>index_failed_ranges</code></td><td>видимые poison-диапазоны, готовые к ретраю</td><td class="mono">u_range</td></tr>
+                <tr><td><code>index_eval_runs</code></td><td>прогоны офлайн-оценки качества поиска</td><td class="mono">created_at</td></tr>
+              </tbody>
+            </table>
+          </div>
+
+          <div class="genius">
+            <span class="tag">В чём гениальность</span>
+            <p>Вектор — это не 1536 чисел в отдельной таблице, а <strong>нормированный float16-блоб</strong>
+            в <code>VARBINARY</code>. Поскольку все вектора приведены к единичной длине ещё при записи,
+            косинусное сходство вырождается в обычное скалярное произведение — а значит поиск это одно
+            умножение матрицы на вектор в numpy, прямо в RAM бота. Половинная точность режет память
+            вдвое и <em>не роняет</em> ранжирование (проверено вживую: релевантный документ остаётся #1).
+            База отдаёт байты — математику делает процесс.</p>
+          </div>
+
+          <p class="muted col">Две реальные боевые истории вписаны прямо в дизайн DDL:
+          <code>cursor</code> — зарезервированное слово MariaDB (всегда в бэктиках, иначе 1064),
+          а явный <code>NULL</code> в <code>NOT NULL</code>-колонку со <code>DEFAULT</code> всё равно падает 1048 —
+          поэтому UPSERT статуса собран так, чтобы свежая строка получала <code>'running'</code>,
+          а существующая сохраняла своё. Устойчивость здесь — не заплатка, а форма.</p>
+        </section>
+
+        <!-- ─── STAGE 0 ─── -->
+        <section id="s0" class="stage-block reveal">
+          <div class="plate-head">
+            <div class="plate-num">0<small>Stage</small></div>
+            <div class="plate-title">
+              <h2>Дамп истории</h2>
+              <div class="sub">iter_messages(reverse=True, min_id) → messages · INSERT IGNORE</div>
+            </div>
+          </div>
+
+          <p>Первая стадия скромна и оттого совершенна: выкачать всю историю чата в таблицу
+          <code>messages</code> пачками по <code>INDEX_DUMP_BATCH = 1000</code>. Но в этой скромности
+          спрятаны три решения, на которых держится вся возобновляемость конвейера.</p>
+
+          <ul class="clean">
+            <li><b>Чекпоинт по <code>max(msg_id)</code>.</b> После каждой пачки курсор двигается на максимальный
+            уже сохранённый id. Обрыв на 20-тысячном сообщении означает потерю максимум одной пачки.</li>
+            <li><b><code>reverse=True + min_id=cursor</code>.</b> Telethon отдаёт сообщения от старых к новым,
+            начиная строго после курсора — дозагрузка с места обрыва бесплатна, без перечитывания истории.</li>
+            <li><b><code>INSERT IGNORE</code>.</b> Повторно увиденное сообщение молча игнорируется по первичному ключу
+            <code>(chat, msg_id)</code>. Стадию можно запускать сколько угодно раз — результат тот же.</li>
+          </ul>
+
+          <p class="muted">Медиа на этой стадии <strong>не скачивается</strong> — сохраняются только
+          <code>media_uid</code> и <code>media_kind</code>. Байты фотографий — дорогая операция с риском
+          FloodWait, и она отложена до Stage 2, где действительно нужна. <code>FloodWaitError</code>
+          переводит стадию в <code>paused</code>, а не роняет её: <code>/index resume</code> дожмёт остаток.</p>
+
+          <div class="genius">
+            <span class="tag">В чём гениальность</span>
+            <p>Идемпотентность + курсор + мягкая пауза дают свойство, которого нет у наивного дампа:
+            стадия <strong>неубиваема</strong>. Рестарт бота, FloodWait, ручная пауза — всё это точки
+            сохранения, а не катастрофы. Конвейер начинается с фундамента, который нельзя сломать
+            наполовину.</p>
+          </div>
+        </section>
+
+        <!-- ─── STAGE 1 ─── -->
+        <section id="s1" class="stage-block reveal">
+          <div class="plate-head">
+            <div class="plate-num">1<small>Stage</small></div>
+            <div class="plate-title">
+              <h2>Досье · «снежный ком»</h2>
+              <div class="sub">micro-block → V4 Flash (JSON) → entities + claims → consolidate → summary</div>
+            </div>
+          </div>
+
+          <p>Здесь сырой текст превращается в <strong>сущности</strong> и <strong>факты</strong>.
+          Модель читает не весь чат разом, а <em>micro-block</em> до
+          <code>INDEX_STAGE1_MICRO_TOKENS = 24 000</code> токенов (или <code>800</code> сообщений).
+          И в каждый промпт подставляется <strong>реестр уже известных сущностей с их id</strong> —
+          это и есть «снежный ком»: чем дальше по истории, тем богаче контекст, и модель сама
+          связывает новое со старым.</p>
+
+          <div class="flow">
+            <div class="node"><b>micro-block</b><span>≤24k токенов</span></div>
+            <span class="arr">+</span>
+            <div class="node"><b>реестр сущностей</b><span>id · имя · алиасы</span></div>
+            <span class="arr">→</span>
+            <div class="node"><b>V4 Flash</b><span>json_object</span></div>
+            <span class="arr">→</span>
+            <div class="node"><b>UPSERT</b><span>ref/name/alias-дедуп</span></div>
+          </div>
+
+          <h3>Canon против fanon</h3>
+          <p>Каждый факт помечается видом. <strong>Canon</strong> — то, что заявлено как истина вселенной
+          («X это дракон», «Y живёт в Праге»). <strong>Fanon</strong> — отношение и оценки участников
+          («X всех бесит», «Y обожают»). Разделение фактов и мнений на уровне схемы — редкая вещь,
+          и именно оно потом позволяет собрать честное досье: «вот что о нём известно» отдельно от
+          «вот как к нему относятся».</p>
+
+          <h3>Раскрытие тождеств</h3>
+          <p>Если из беседы следует, что два имени — одна сущность (в чате раскрыли «Зая это GLM»),
+          это <strong>одна</strong> запись, оба имени уходят в <code>aliases</code>. UPSERT ищет сущность
+          тремя способами по нарастанию строгости: по <code>ref</code> из реестра, затем по точному
+          совпадению имени/алиаса, и лишь потом заводит новую. Каждые
+          <code>INDEX_CONSOLIDATE_EVERY_BLOCKS = 10</code> блоков идёт консервативная консолидация —
+          сливаются только точные дубли после нормализации имён.</p>
+
+          <div class="genius">
+            <span class="tag">В чём гениальность</span>
+            <p>«Снежный ком» решает главную боль извлечения из длинной истории — <strong>кросс-ссылки</strong>.
+            Модель, читающая блок №200, уже знает про сущность, впервые упомянутую в блоке №3, потому что
+            та лежит в реестре промпта. Дубли не плодятся, тождества раскрываются, а факты дедуплицируются
+            по нормализованному тексту с доклейкой пруфов. Идентичность строится инкрементально —
+            так, как её на самом деле узнаёт человек, читающий чат с начала.</p>
+          </div>
+
+          <h3>Синтез досье: map-reduce, когда нужно</h3>
+          <p>В финале из атомарных claim'ов синтезируются компактные <code>canon_summary</code> и
+          <code>fanon_summary</code>. Для обычной сущности — один вызов. Но если фактов больше
+          <code>80</code> или они тяжелее <code>20k</code> токенов, включается <strong>map-reduce</strong>:
+          факты бьются на части (<code>entity_summary_parts</code>), каждая сжимается отдельно, потом
+          сводится в единое досье. Популярный персонаж с сотнями упоминаний не ломает контекстное окно.</p>
+        </section>
+
+        <!-- ─── STAGE 2 ─── -->
+        <section id="s2" class="stage-block reveal">
+          <div class="plate-head">
+            <div class="plate-num">2<small>Stage</small></div>
+            <div class="plate-title">
+              <h2>Граф · сцены · медиа</h2>
+              <div class="sub">сегментация сцен → темпоральные рёбра → распознавание фото</div>
+            </div>
+          </div>
+
+          <p>Самая насыщенная стадия. Она делает три вещи сразу — и каждая заслуживает восхищения
+          по отдельности.</p>
+
+          <h3>Сегментация на сцены</h3>
+          <p>Диалог рвётся на смысловые сцены по трём правилам, работающим вместе:</p>
+          <ul class="clean">
+            <li><b>Жёсткий разрыв</b> — пауза дольше <code>INDEX_SCENE_HARD_GAP_SEC = 6 ч</code> рвёт сцену всегда.</li>
+            <li><b>Мягкий разрыв</b> — пауза дольше <code>15 мин</code>, но только если сцена уже набрала
+            минимум <code>1000</code> токенов (мелочь не дробим).</li>
+            <li><b>Потолок</b> — длинная беседа принудительно рвётся на <code>INDEX_SCENE_TOKEN_CAP = 8000</code> токенах.</li>
+          </ul>
+          <p class="muted">Открытая сцена, упёршаяся в конец окна чтения, не финализируется — она честно
+          доклеивается в следующем окне. Границы сцен получаются осмысленными, а не случайными.</p>
+
+          <h3>Темпоральный граф связей</h3>
+          <p>Вот где обычный граф знаний становится <strong>живым</strong>. Между парой сущностей держится
+          <em>одно активное сентимент-ребро</em>. Полярность связи — часть её идентичности:</p>
+          <p>
+            <span class="pol"><span class="dot pos"></span>pos</span> — тепло, союз, примирение &nbsp;·&nbsp;
+            <span class="pol"><span class="dot neg"></span>neg</span> — конфликт, ссора, вражда &nbsp;·&nbsp;
+            <span class="pol"><span class="dot neu"></span>neutral</span> — родство, роль, структурный факт
+          </p>
+          <p>Когда полярность меняется — старое ребро <strong>закрывается</strong> (<code>status='closed'</code>),
+          открывается новое. В графе остаётся история: «поссорились, потом помирились» — это два ребра
+          с датами, а не перезаписанное поле. <code>/entity show</code> показывает и активные связи,
+          и «бывших».</p>
+
+          <div class="genius">
+            <span class="tag">В чём гениальность · идемпотентный вес</span>
+            <p>Вес связи легко испортить: пере-обработай ту же сцену при <code>resume</code> — и
+            <code>weight</code> задвоится. Решение элегантно до дерзости — ключ события связи это
+            <strong>дневной бакет</strong>:</p>
+            <pre><span class="k">key</span> = sha1(<span class="s">"{chat}:{src}:{tgt}:{polarity}:{type}:{YYYY-MM-DD}"</span>)</pre>
+            <p>Одна пара в пределах суток — одно событие. <code>INSERT IGNORE</code> в <code>relation_events</code>
+            дедуплицирует по этому ключу, поэтому повторная обработка тех же сообщений <em>не двигает вес</em>.
+            А смысл веса становится честнее сырого счётчика: «в скольких <strong>разных днях</strong> проявлялась
+            связь». Смена полярности — другой ключ, значит по-прежнему регистрируется.</p>
+          </div>
+
+          <h3>Распознавание медиа</h3>
+          <p>Фотографии сцены скачиваются <strong>строго по одной</strong> — семафор
+          <code>_INDEX_MEDIA_SEM = 1</code> плюс джиттер-пауза <code>2–4 с</code> и обработка FloodWait:
+          юзербот не должен выглядеть как краулер. Каждое фото уходит в медиа-модель со справочником
+          персонажей и контекстом сцены — и та возвращает описание <em>и</em> узнанных героев
+          (кот-маскот распознан по контексту — проверено вживую). Внешность копится в
+          <code>visual_features</code> сущности, а вектор самой картинки считается <strong>здесь же</strong>,
+          пока байты в руках — чтобы Stage 3 не качал фото повторно.</p>
+
+          <div class="genius">
+            <span class="tag">В чём гениальность · выравнивание границ</span>
+            <p>При <code>/index update</code> курсор отматывается на произвольный msg_id — и наивная
+            перенарезка наплодила бы перекрывающиеся сцены. Поэтому в начале стадии курсор
+            <strong>снапается на реальную границу</strong> ранее сохранённой сцены, а «хвост» чанков
+            за ней сносится и режется заново. На обычном <code>resume</code> это чистый no-op. Ни одного
+            дубля-сцены в поиске — при нулевой цене в штатном режиме.</p>
+          </div>
+        </section>
+
+        <!-- ─── STAGE 3 ─── -->
+        <section id="s3" class="stage-block reveal">
+          <div class="plate-head">
+            <div class="plate-num">3<small>Stage</small></div>
+            <div class="plate-title">
+              <h2>Векторизация</h2>
+              <div class="sub">text-embedding-3-small (1536d) · gemini-embedding-2 (кросс-модально)</div>
+            </div>
+          </div>
+
+          <p>Финальная стадия делает граф <strong>искомым по смыслу</strong>. Досье, связи, сцены и описания
+          фото уходят в <code>text-embedding-3-small</code> (нативно 1536d). Вектора самих картинок уже
+          посчитаны в Stage 2 через <code>gemini-embedding-2</code> — и это ключ к кросс-модальному поиску:
+          картинка и текст-запрос попадают в <em>одно пространство</em>, поэтому можно искать фото словами
+          и находить похожее фото по приложенной картинке.</p>
+
+          <div class="flow">
+            <div class="node"><b>досье</b><span>entities</span></div>
+            <div class="node"><b>связи</b><span>relations</span></div>
+            <div class="node"><b>сцены</b><span>chunks</span></div>
+            <div class="node"><b>описания фото</b><span>media_text</span></div>
+            <span class="arr">→</span>
+            <div class="node"><b>emb-3-small</b><span>1536d</span></div>
+            <span class="arr">→</span>
+            <div class="node"><b>float16 blob</b><span>нормирован</span></div>
+          </div>
+
+          <p class="muted">Размерности сведены к <code>INDEX_EMBED_DIM = 1536</code>: gemini-emb-2 отдаёт
+          3072 и усекается по Matryoshka — обе модальности живут в общей рабочей размерности.</p>
+
+          <div class="genius">
+            <span class="tag">В чём гениальность</span>
+            <p>Векторизация устроена так, чтобы <strong>никогда не залипнуть</strong>. Фильтр
+            <code>embedding IS NULL</code> сам по себе служит и чекпоинтом, и очередью: обработали строку —
+            она выпала из выборки. У каждого текста есть непустой fallback, поэтому сбойная строка не
+            превращается в вечный NULL, на котором цикл крутился бы бесконечно. А <code>429/5xx</code> от
+            провайдера эмбеддингов не имеют права стать «done» — ретраи с экспоненциальной паузой держат
+            честность стадии.</p>
+          </div>
+        </section>
+
+        <!-- ─── ПОИСК ─── -->
+        <section id="search" class="stage-block reveal">
+          <p class="kicker">Извлечение</p>
+          <h2>Поиск, который масштабируется сам</h2>
+          <p class="muted col">Backend выбирается по размеру индекса — и переключается прозрачно, без
+          единой настройки со стороны пользователя.</p>
+
+          <div class="grid">
+            <div class="card">
+              <span class="lbl">до 10 000 строк</span>
+              <h4>Матрица в RAM</h4>
+              <p>Весь <em>kind</em> грузится в ndarray, ленивый кэш per (chat, kind). Поиск — одно
+              <code>mat @ qvec</code> и <code>argpartition</code>. Микросекунды.</p>
+            </div>
+            <div class="card">
+              <span class="lbl">свыше 10 000</span>
+              <h4>HNSW (если есть)</h4>
+              <p>Приближённый ANN-индекс <code>hnswlib</code> (M=16, ef=100) строится по требованию,
+              кэшируется, при сбое сборки — мягкий откат на потоковый поиск.</p>
+            </div>
+            <div class="card">
+              <span class="lbl">запасной путь</span>
+              <h4>Потоковый скан</h4>
+              <p>Top-k батчами по 5000 строк без загрузки всего индекса в память — работает при любом
+              объёме, даже когда ANN недоступен.</p>
+            </div>
+          </div>
+
+          <div class="genius">
+            <span class="tag">В чём гениальность · кэш счётчика</span>
+            <p>Выбор backend зависит от числа строк — но делать <code>COUNT(*)</code> на <em>каждый</em>
+            поисковый запрос расточительно. Поэтому счётчик кэшируется на <code>INDEX_COUNT_TTL = 60 с</code>
+            и <strong>инвалидируется на каждую запись индекса</strong>. Во время индексации он всегда свежий;
+            в burst'е поисковых запросов — берётся из кэша. Одна и та же величина обслуживает и корректность,
+            и скорость, в зависимости от того, что происходит прямо сейчас.</p>
+          </div>
+        </section>
+
+        <!-- ─── ИСПОЛЬЗОВАНИЕ ─── -->
+        <section id="use" class="stage-block reveal">
+          <p class="kicker">Плоды</p>
+          <h2>Как памятью пользуются</h2>
+          <p>Граф не самоцель — он подключён туда, где живёт бот.</p>
+
+          <ul class="clean">
+            <li><b><code>memory_search</code> в /ask.</b> Смысловой поиск по сценам, досье и связям
+            с jump-ссылками прямо на исходные сообщения.</li>
+            <li><b><code>memory_entity</code>.</b> Досье по имени или алиасу: тип, canon/fanon, топ-факты,
+            активные и закрытые связи. «Кто такой X» — и модель отвечает по графу.</li>
+            <li><b><code>memory_media</code>.</b> Находит и <em>пересылает</em> старое фото по описанию словами —
+            или по сходству с приложенной картинкой (кросс-модальный вектор).</li>
+            <li><b>Референсы для <code>/gen</code>.</b> Генератор изображений тянет из индекса релевантные
+            фото всей истории и внешность узнаваемых персонажей — «нарисуй Тостера супергероем» работает,
+            потому что бот <em>помнит</em>, как Тостер выглядит.</li>
+          </ul>
+          <p class="muted">Гейт <code>has_memory</code> проверяется одним запросом на /ask, диспетчеризация —
+          в общем tool-loop рядом с веб-поиском. Маршрутизация проверена вживую: «кто такой X» → entity,
+          «скинь картинку» → media, «2+2» → без инструмента.</p>
+        </section>
+
+        <!-- ─── УСТОЙЧИВОСТЬ ─── -->
+        <section id="robust" class="stage-block reveal">
+          <p class="kicker">Инженерия</p>
+          <h2>Разница между паузой и потерей</h2>
+          <p class="lead-p">Самое зрелое в этом конвейере — то, как он ведёт себя, когда что-то идёт не так.
+          Здесь проведена граница, которую пропускают почти все пайплайны: <strong>транзиентная авария —
+          это не то же самое, что ядовитые данные.</strong></p>
+
+          <div class="grid">
+            <div class="card">
+              <span class="lbl">транзиент</span>
+              <h4>Провайдер молчит</h4>
+              <p>Сеть, 5xx, 429, timeout — модель не ответила ни разу. Стадия встаёт в
+              <code>error</code>, курсор не двигается. <code>/index resume</code> добёрет тот же блок.
+              Ничего не дробится, ложных skip нет.</p>
+            </div>
+            <div class="card">
+              <span class="lbl">poison</span>
+              <h4>Данные ядовиты</h4>
+              <p>Модель <em>ответила</em>, но стабильно не-JSON (или детерминированный 4xx). Блок/сцена
+              рекурсивно делится пополам до минимума, минимальный виновник пишется в
+              <code>index_failed_ranges</code> и <strong>видимо</strong> пропускается.</p>
+            </div>
+          </div>
+
+          <p>Poison-диапазоны не исчезают в тишине — они видны через <code>/index failed</code> и
+          повторяемы через <code>/index retry failed</code>. Когда следующий проход перекрывает
+          диапазон, тот сам помечается <code>resolved</code>. Ошибка становится <strong>задачей в очереди</strong>,
+          а не молчаливой дырой в данных.</p>
+
+          <div class="epi">Отличить «провайдер лёг» от «эта сцена ядовита» — значит никогда не раздробить
+          здоровый блок в тысячу ложных пропусков только потому, что на минуту пропал интернет.</div>
+
+          <p class="muted col">Поверх этого — единый инвариант всех стадий: статус в <code>idx_state</code>,
+          курсор двигается только после успешного чекпоинта, пауза уважается на каждой границе, а падение
+          всего пайплайна ловится в <code>finally</code>, помечает первую незавершённую стадию
+          <code>error</code> и оставляет состояние для <code>resume</code>. Ни одна авария не отбрасывает
+          к началу.</p>
+        </section>
+
+        <!-- ─── СПРАВОЧНИК ─── -->
+        <section id="ref" class="stage-block reveal">
+          <p class="kicker">Справочник</p>
+          <h2>Модели и команды</h2>
+
+          <h3>Модели — всё через один ключ OpenRouter</h3>
+          <div class="tbl-scroll">
+            <table>
+              <thead><tr><th>Роль</th><th>Модель</th><th>Заметка</th></tr></thead>
+              <tbody>
+                <tr><td>Экстракция текста</td><td class="mono">deepseek/deepseek-v4-flash</td><td>окно 1M, JSON-mode; фолбэк v3.2-exp</td></tr>
+                <tr><td>Описание фото</td><td class="mono">/media-модель</td><td>gemini flash lite — vision у V4 Flash 404</td></tr>
+                <tr><td>Вектора текста</td><td class="mono">text-embedding-3-small</td><td>1536d, копейки за миллион</td></tr>
+                <tr><td>Вектора картинок</td><td class="mono">google/gemini-embedding-2</td><td>3072→1536, кросс-модально</td></tr>
+              </tbody>
+            </table>
+          </div>
+
+          <h3>Команды</h3>
+          <div class="tbl-scroll">
+            <table>
+              <thead><tr><th>Команда</th><th>Что делает</th></tr></thead>
+              <tbody>
+                <tr><td class="mono">/index</td><td>оценка объёма и стоимости перед запуском</td></tr>
+                <tr><td class="mono">/index go</td><td>запустить конвейер (фоновая задача per chat)</td></tr>
+                <tr><td class="mono">/index status</td><td>статус стадий, курсоры, счётчики</td></tr>
+                <tr><td class="mono">/index pause · resume</td><td>мягкая пауза на чекпоинте / продолжить</td></tr>
+                <tr><td class="mono">/index update</td><td>доиндексировать только новый хвост истории</td></tr>
+                <tr><td class="mono">/index failed · retry failed</td><td>показать / повторить poison-диапазоны</td></tr>
+                <tr><td class="mono">/entity show &lt;имя&gt;</td><td>досье: тип, canon/fanon, факты, связи</td></tr>
+                <tr><td class="mono">/entity merge · rename · alias · split</td><td>ручное редактирование графа</td></tr>
+              </tbody>
+            </table>
+          </div>
+        </section>
+      </main>
+    </div>
+  </div>
+
+  <footer class="foot">
+    <div class="wrap">
+      <p>Davinchik · подсистема <strong>/index</strong> — GraphRAG-память по истории чата.<br>
+      MariaDB · Telethon · numpy-косинус · float16-вектора.</p>
+      <p class="sig">Атлас памяти · v2-hardening</p>
+    </div>
+  </footer>
+</div>
+
+<script>
+(function(){
+  // ── тема ──
+  var root=document.documentElement, btn=document.getElementById('themeBtn');
+  function current(){
+    var t=root.getAttribute('data-theme');
+    if(t) return t;
+    return matchMedia('(prefers-color-scheme:dark)').matches?'dark':'light';
+  }
+  btn.addEventListener('click',function(){
+    var next=current()==='dark'?'light':'dark';
+    root.setAttribute('data-theme',next);
+    drawStatic&&drawStatic();
+  });
+
+  // ── scroll reveal ──
+  var io=new IntersectionObserver(function(es){
+    es.forEach(function(e){ if(e.isIntersecting){ e.target.classList.add('in'); io.unobserve(e.target);} });
+  },{threshold:.12});
+  document.querySelectorAll('.reveal').forEach(function(el){io.observe(el);});
+
+  // ── подсветка активного пункта корешка ──
+  var links=[].slice.call(document.querySelectorAll('.spine a[href^="#"]'));
+  var map={};
+  links.forEach(function(a){ var id=a.getAttribute('href').slice(1); var s=document.getElementById(id); if(s) map[id]=a; });
+  var spy=new IntersectionObserver(function(es){
+    es.forEach(function(e){
+      var a=map[e.target.id]; if(!a) return;
+      if(e.isIntersecting){ links.forEach(function(x){x.classList.remove('on');}); a.classList.add('on'); }
+    });
+  },{rootMargin:'-30% 0px -60% 0px'});
+  Object.keys(map).forEach(function(id){ spy.observe(document.getElementById(id)); });
+
+  // ── граф в герое ──
+  var cv=document.getElementById('graph'), ctx=cv.getContext('2d');
+  var reduced=matchMedia('(prefers-reduced-motion:reduce)').matches;
+  var W,H,DPR,nodes,edges,raf=null;
+  function accentColors(){
+    var cs=getComputedStyle(root);
+    return {
+      node:cs.getPropertyValue('--accent').trim()||'#d8a24a',
+      cool:cs.getPropertyValue('--cool').trim()||'#7ea2ff',
+      pos:cs.getPropertyValue('--pos').trim()||'#5bbf8f',
+      neg:cs.getPropertyValue('--neg').trim()||'#e0736b',
+      line:cs.getPropertyValue('--line').trim()||'#222c42'
+    };
+  }
+  function resize(){
+    DPR=Math.min(2,window.devicePixelRatio||1);
+    W=cv.clientWidth; H=cv.clientHeight;
+    cv.width=W*DPR; cv.height=H*DPR; ctx.setTransform(DPR,0,0,DPR,0,0);
+  }
+  function build(){
+    var n=Math.max(14,Math.min(30,Math.round(W/54)));
+    nodes=[]; edges=[];
+    for(var i=0;i<n;i++){
+      nodes.push({x:Math.random()*W,y:Math.random()*H,
+        vx:(Math.random()-.5)*.16,vy:(Math.random()-.5)*.16,
+        r:1.4+Math.random()*2.6});
+    }
+    for(var j=0;j<nodes.length;j++){
+      var links=1+((Math.random()*2)|0);
+      for(var k=0;k<links;k++){
+        var t=(Math.random()*nodes.length)|0;
+        if(t!==j) edges.push({a:j,b:t,p:Math.random()});
+      }
+    }
+  }
+  function frame(){
+    var c=accentColors();
+    ctx.clearRect(0,0,W,H);
+    // рёбра
+    for(var e=0;e<edges.length;e++){
+      var A=nodes[edges[e].a],B=nodes[edges[e].b];
+      var dx=A.x-B.x,dy=A.y-B.y,d=Math.sqrt(dx*dx+dy*dy);
+      if(d>260) continue;
+      var al=(1-d/260)*.5;
+      var col = edges[e].p<.18?c.pos : edges[e].p>.86?c.neg : c.line;
+      ctx.strokeStyle=col; ctx.globalAlpha=al; ctx.lineWidth=.8;
+      ctx.beginPath(); ctx.moveTo(A.x,A.y); ctx.lineTo(B.x,B.y); ctx.stroke();
+    }
+    ctx.globalAlpha=1;
+    // узлы
+    for(var i=0;i<nodes.length;i++){
+      var nd=nodes[i];
+      ctx.fillStyle = (i%5===0)?c.cool:c.node;
+      ctx.globalAlpha=.85;
+      ctx.beginPath(); ctx.arc(nd.x,nd.y,nd.r,0,6.2832); ctx.fill();
+      if(!reduced){ nd.x+=nd.vx; nd.y+=nd.vy;
+        if(nd.x<0||nd.x>W)nd.vx*=-1; if(nd.y<0||nd.y>H)nd.vy*=-1; }
+    }
+    ctx.globalAlpha=1;
+    if(!reduced) raf=requestAnimationFrame(frame);
+  }
+  window.drawStatic=function(){ if(reduced){ frame(); } };
+  function init(){ resize(); build(); if(raf)cancelAnimationFrame(raf); frame(); }
+  window.addEventListener('resize',function(){ resize(); build(); if(reduced)frame(); });
+  init();
+})();
+</script>
