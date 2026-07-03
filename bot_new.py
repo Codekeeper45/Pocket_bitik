@@ -161,6 +161,7 @@ INDEX_EMBED_RETRIES = 3       # embeddings: 429/5xx у провайдера не
 INDEX_MATRIX_CACHE_MAX_ROWS = 10_000  # больше ищем потоково, без полной матрицы в RAM
 INDEX_SEARCH_DB_BATCH = 5_000
 INDEX_COUNT_TTL = 60          # сек: кэш COUNT(*) для выбора backend поиска (инвалидируется на каждую запись индекса)
+INDEX_ROLLUP_TOKEN_BATCH = 24_000  # stage 4: сколько токенов сцен сжимать за один map-вызов роллап-саммари
 INDEX_SEARCH_FLOOR = 0.15     # ниже этого косинуса результат не показываем вообще
 INDEX_SEARCH_CONFIDENT = 0.28 # ниже — «слабое» совпадение: помечаем и просим модель переспросить/веб (Corrective RAG)
 INDEX_EVAL_CASES_PATH = "index_eval_cases.json"
@@ -6911,7 +6912,8 @@ _HELP_SECTIONS = {
         "   `/index eval template|run|report` — шаблон и прогон smoke-eval качества поиска\n"
         "\n"
         "**Этапы:** 0 — дамп истории в БД · 1 — досье и алиасы · 2 — граф связей и распознавание фото ·\n"
-        "   3 — вектора для поиска. При рестарте бота индексация продолжается с последнего чекпоинта.\n"
+        "   3 — вектора для поиска · 4 — сводки по месяцам (для вопросов «как менялось со временем»).\n"
+        "   При рестарте бота индексация продолжается с последнего чекпоинта.\n"
         "\n"
         "**🔎 Поиск в `/ask`:** после индексации у `/ask` в этом чате появляются инструменты памяти —\n"
         "   у владельца модель сама решает, когда лезть в базу: смысловой поиск по сценам/досье/связям, полное досье\n"
@@ -7413,6 +7415,13 @@ _INDEX_DDL = [
     """CREATE TABLE IF NOT EXISTS index_eval_runs (
         id BIGINT AUTO_INCREMENT PRIMARY KEY, chat_id BIGINT NOT NULL, created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
         cases_json JSON NULL, result_json JSON NULL, KEY k_chat (chat_id, created_at)) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4""",
+    # RAPTOR-lite: темпоральные роллап-саммари (level 1=месяц, 3=весь чат) для глобальных вопросов «как менялось»
+    """CREATE TABLE IF NOT EXISTS time_rollups (
+        id BIGINT AUTO_INCREMENT PRIMARY KEY, chat_id BIGINT NOT NULL, level TINYINT NOT NULL,
+        bucket_key VARCHAR(24) NOT NULL, period_start DATETIME NULL, period_end DATETIME NULL,
+        summary MEDIUMTEXT NULL, meta JSON NULL, embedding VARBINARY(4096) NULL,
+        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+        UNIQUE KEY u_roll (chat_id, level, bucket_key), KEY k_chat (chat_id, level)) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4""",
 ]
 
 
@@ -8690,6 +8699,115 @@ async def _index_stage3_vectors(chat_id: int, progress_cb=None):
     return "done"
 
 
+# --- STAGE 4: темпоральные роллап-саммари (RAPTOR-lite: месяц → весь чат) ---
+_INDEX_ROLLUP_SYSTEM = (
+    "Ты пишешь сжатую сводку периода жизни чата по фрагментам его диалогов/сцен (или по сводкам под-периодов). "
+    "Верни СТРОГО JSON: {\"summary\":\"<4–7 предложений: главные темы и события, общая атмосфера/настроение, кто был "
+    "активен и вокруг чего, заметные сдвиги>\"}. Только то, что есть в тексте; без выдумок. Пиши по-русски, ёмко."
+)
+
+
+async def _index_summarize_texts(texts: list, title: str) -> str:
+    """Map-reduce саммари списка текстов в одну сводку периода (для роллапов). None-safe, с фолбэком."""
+    texts = [t for t in texts if (t or "").strip()]
+    if not texts:
+        return ""
+    # map: бьём на токен-батчи, каждый сжимаем; при одном батче — сразу reduce
+    batches, cur, tok = [], [], 0
+    for t in texts:
+        ct = count_tokens(t)
+        if cur and tok + ct > INDEX_ROLLUP_TOKEN_BATCH:
+            batches.append(cur); cur, tok = [], 0
+        cur.append(t); tok += ct
+    if cur:
+        batches.append(cur)
+    parts = []
+    for b in batches:
+        body = f"Период: {title}\nФрагменты:\n" + "\n---\n".join(x[:4000] for x in b)
+        data = await _index_extract(_INDEX_ROLLUP_SYSTEM, body, max_tokens=900)
+        parts.append((data.get("summary") if isinstance(data, dict) else None) or " ".join(b)[:1200])
+    if len(parts) == 1:
+        return parts[0][:4000]
+    # reduce: сводим частичные сводки в одну
+    body = f"Период: {title}\nСводки под-отрезков:\n" + "\n---\n".join(parts)
+    data = await _index_extract(_INDEX_ROLLUP_SYSTEM, body, max_tokens=900)
+    return ((data.get("summary") if isinstance(data, dict) else None) or " ".join(parts))[:4000]
+
+
+async def _index_stage4_rollups(chat_id: int, progress_cb=None):
+    """Строит месячные саммари из chat_chunks + общий саммари чата. Инкрементально: месяц пересобирается,
+    только если число его сцен изменилось (meta.chunk_count). Векторизует роллапы для memory_overview."""
+    await _idx_set_state(chat_id, 4, status="running")
+    months = await db_read(
+        "SELECT DATE_FORMAT(scene_date,'%%Y-%%m') ym, COUNT(*) c, MIN(scene_date) mn, MAX(scene_date) mx "
+        "FROM chat_chunks WHERE chat_id=%s AND scene_date IS NOT NULL GROUP BY ym ORDER BY ym", (chat_id,))
+    changed = 0
+    for m in months:
+        if _INDEX_CONTROL.get(chat_id) == "pause":
+            await _idx_set_state(chat_id, 4, status="paused")
+            return "paused"
+        ym = m["ym"]
+        prev = await db_read("SELECT meta FROM time_rollups WHERE chat_id=%s AND level=1 AND bucket_key=%s", (chat_id, ym))
+        if prev:
+            try:
+                if int((json.loads(prev[0]["meta"]) if prev[0]["meta"] else {}).get("chunk_count", -1)) == int(m["c"]):
+                    continue  # месяц не изменился — пропускаем
+            except Exception:
+                pass
+        rows = await db_read(
+            "SELECT enriched_text FROM chat_chunks WHERE chat_id=%s AND DATE_FORMAT(scene_date,'%%Y-%%m')=%s "
+            "ORDER BY start_msg_id", (chat_id, ym))
+        try:
+            summ = await _index_summarize_texts([r["enriched_text"] for r in rows], f"месяц {ym}")
+        except IndexTransientError as e:
+            await _idx_set_state(chat_id, 4, status="error")
+            log("INDEX", f"Stage4 транзиентный сбой на {ym}: {e} — стадия в error")
+            return "error"
+        await db_write(
+            """INSERT INTO time_rollups (chat_id,level,bucket_key,period_start,period_end,summary,meta,embedding)
+               VALUES (%s,1,%s,%s,%s,%s,%s,NULL)
+               ON DUPLICATE KEY UPDATE period_start=VALUES(period_start), period_end=VALUES(period_end),
+                 summary=VALUES(summary), meta=VALUES(meta), embedding=NULL""",
+            (chat_id, ym, m["mn"], m["mx"], summ, json.dumps({"chunk_count": int(m["c"])}, ensure_ascii=False)))
+        _index_invalidate(chat_id, "rollups")
+        changed += 1
+        await _idx_set_state(chat_id, 4, cursor={"last_month": ym}, stats={"months": len(months)})
+        if progress_cb:
+            await progress_cb(f"🗓 Периоды: {ym} ({changed} обновлено)…")
+    # общий саммари чата — если месяцы менялись или его ещё нет
+    has_all = await db_read("SELECT 1 FROM time_rollups WHERE chat_id=%s AND level=3 AND bucket_key='ALL'", (chat_id,))
+    if months and (changed or not has_all):
+        msums = await db_read("SELECT summary FROM time_rollups WHERE chat_id=%s AND level=1 ORDER BY bucket_key", (chat_id,))
+        try:
+            allsum = await _index_summarize_texts([r["summary"] for r in msums], "весь чат")
+        except IndexTransientError as e:
+            await _idx_set_state(chat_id, 4, status="error")
+            log("INDEX", f"Stage4 транзиентный сбой на ALL: {e} — стадия в error")
+            return "error"
+        await db_write(
+            """INSERT INTO time_rollups (chat_id,level,bucket_key,period_start,period_end,summary,meta,embedding)
+               VALUES (%s,3,'ALL',%s,%s,%s,%s,NULL)
+               ON DUPLICATE KEY UPDATE period_start=VALUES(period_start), period_end=VALUES(period_end),
+                 summary=VALUES(summary), meta=VALUES(meta), embedding=NULL""",
+            (chat_id, months[0]["mn"], months[-1]["mx"], allsum,
+             json.dumps({"months": len(months)}, ensure_ascii=False)))
+        _index_invalidate(chat_id, "rollups")
+    # векторизуем роллапы (для memory_overview)
+    res, n = await _index_vectorize_loop(chat_id, "time_rollups", "id", "embedding",
+                                         lambda r: r.get("summary") or "период", progress_cb, "периоды")
+    if n:
+        _index_invalidate(chat_id, "rollups")
+    if res == "paused":
+        await _idx_set_state(chat_id, 4, status="paused")
+        return "paused"
+    if res == "error":
+        await _idx_set_state(chat_id, 4, status="error")
+        return "error"
+    await _idx_set_state(chat_id, 4, status="done", stats={"months": len(months)})
+    log("INDEX", f"Stage4 чата {chat_id}: готово, месяцев {len(months)} (обновлено {changed})")
+    return "done"
+
+
 # --- поиск по векторам (numpy-косинус; матрицы кэшируются per chat) ---
 _INDEX_MATRIX: dict = {}   # {(chat_id, kind): {"mat": ndarray, "ids": [...], "extra": [...], "n": int}}
 _INDEX_HNSW: dict = {}     # optional ANN cache {(chat_id, kind): {"idx": hnsw, "ids": [...], "extra": [...], "n": int}}
@@ -8700,6 +8818,7 @@ _INDEX_KINDS = {
     "chunks":      ("chat_chunks", "embedding", "id", "start_msg_id, end_msg_id, enriched_text"),
     "media_text":  ("media_assets", "emb_text", "msg_id", "msg_id, image_description, entity_ids"),
     "media_image": ("media_assets", "emb_image", "msg_id", "msg_id, image_description, entity_ids"),
+    "rollups":     ("time_rollups", "embedding", "id", "level, bucket_key, summary, period_start, period_end"),
 }
 
 
@@ -8953,6 +9072,17 @@ async def _index_tool_overview(chat_id: int, topic: str) -> str:
                          f"{h.get('relation_type') or ''}{st} — {_idx_snip(h.get('context_summary'), 160)}")
         if rbits:
             blocks.append("Связи по теме:\n" + "\n".join(rbits))
+    # 3) темпоральная динамика — сводки периодов (RAPTOR-lite): «как менялось / общая динамика»
+    tbits = []
+    for h in await _index_vector_search(chat_id, "rollups", qv, 4):
+        if h["score"] < INDEX_SEARCH_FLOOR:
+            continue
+        per = "весь период чата" if h.get("level") == 3 else f"месяц {h.get('bucket_key')}"
+        s = _idx_snip(h.get("summary"), 300)
+        if s:
+            tbits.append(f"— [{per}] {s}")
+    if tbits:
+        blocks.append("Динамика по периодам:\n" + "\n".join(tbits[:4]))
     if not blocks:
         return (f"По теме «{topic}» обобщённой памяти не нашёл. Уточни тему или возьми memory_search "
                 f"для точечного поиска по диалогам.")
@@ -9213,6 +9343,17 @@ async def _index_pipeline(chat_id: int, status_msg):
             if res3 == "error":
                 await upd("❌ Индексация остановлена на Stage 3: часть embeddings не получена. `/index resume` повторит оставшиеся строки.")
                 return
+        # Stage 4 — темпоральные роллап-саммари (месяц → весь чат), для тематических вопросов «как менялось»
+        st4 = await _idx_get_state(chat_id, 4)
+        if st4["status"] != "done":
+            await upd("✅ Вектора готовы. 🗓 Собираю сводки по месяцам (для вопросов «как менялось со временем»)…")
+            res4 = await _index_stage4_rollups(chat_id, progress_cb=upd)
+            if res4 == "paused":
+                await upd("⏸ Индексация на паузе (Stage 4 — сводки периодов). `/index resume` — продолжить.")
+                return
+            if res4 == "error":
+                await upd("❌ Индексация остановлена на Stage 4: LLM не дала сводку периода. `/index resume` повторит.")
+                return
         skipped = await _index_failed_count(chat_id, "skipped")
         skip_note = (f"\n⚠️ Пропущено poison-диапазонов: {skipped}. "
                      f"Смотри `/index failed`, повтор: `/index retry failed`.") if skipped else ""
@@ -9221,7 +9362,7 @@ async def _index_pipeline(chat_id: int, status_msg):
     except Exception as e:
         log("INDEX", f"Пайплайн чата {chat_id} упал: {e}")
         traceback.print_exc()
-        for stg in (0, 1, 2, 3):
+        for stg in (0, 1, 2, 3, 4):
             s = await _idx_get_state(chat_id, stg)
             if s["status"] != "done":
                 await _idx_set_state(chat_id, stg, status="error")
@@ -9309,12 +9450,14 @@ async def index_command(event):
         # status
         running = chat_id in _INDEX_TASKS
         parts = ["📊 **Статус индексации этого чата:**"]
-        for stg, label in ((0, "Дамп"), (1, "Досье"), (2, "Граф+медиа"), (3, "Вектора")):
+        for stg, label in ((0, "Дамп"), (1, "Досье"), (2, "Граф+медиа"), (3, "Вектора"), (4, "Сводки периодов")):
             s = await _idx_get_state(chat_id, stg)
             if s["status"]:
                 extra = ""
                 if stg == 0 and s["stats"].get("dumped"):
                     extra = f" · {s['stats']['dumped']} сообщ."
+                elif stg == 4 and s["stats"].get("months"):
+                    extra = f" · {s['stats']['months']} мес."
                 parts.append(f"• Stage {stg} {label}: {s['status']}{extra}")
         skipped = await _index_failed_count(chat_id, "skipped")
         retrying = await _index_failed_count(chat_id, "retrying")
@@ -9343,7 +9486,7 @@ async def index_command(event):
         if st0["status"] is None:
             await event.reply("📭 Чат ещё не индексировался. Запусти `/index go`.")
             return
-        for stg in (0, 1, 2, 3):
+        for stg in (0, 1, 2, 3, 4):
             s = await _idx_get_state(chat_id, stg)
             if s["status"] == "done":
                 if stg in (1, 2):
