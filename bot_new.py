@@ -139,7 +139,8 @@ INDEX_SCENE_GAP_SEC = 15 * 60 # stage 2: разрыв >15 мин между со
 INDEX_SCENE_TOKEN_CAP = 8000  # stage 2: мягкий потолок токенов сцены (длинная беседа рвётся принудительно)
 INDEX_SCENE_MIN_TOKENS = 1000 # stage 2: сцены короче — доклеиваем к следующей (не дробим на мелочь)
 INDEX_SCENE_HARD_GAP_SEC = 6 * 60 * 60  # даже короткую сцену не склеиваем через многочасовую паузу
-INDEX_STAGE1_MICRO_TOKENS = 16_000      # stage 1: micro extraction (запас под 8k-потолок вывода экстракции, иначе finish=length→дробление)
+INDEX_STAGE1_MICRO_TOKENS = 32_000      # stage 1: размер блока экстракции (вывод не режется — cap поднят до INDEX_EXTRACT_MAX_TOKENS)
+INDEX_EXTRACT_MAX_TOKENS = 24_000       # ПОТОЛОК ВЫВОДА экстракции: JSON досье/связей не должен обрезаться (finish=length). Модель тянет ≫8k
 INDEX_STAGE1_MICRO_MESSAGES = 800
 INDEX_STAGE1_BLOCK_TOKENS = INDEX_STAGE1_MICRO_TOKENS  # legacy alias для старых комментариев/логов
 INDEX_FAILED_MIN_MESSAGES = 1
@@ -7656,7 +7657,7 @@ def _json_from_llm(text: str):
     return None
 
 
-async def _index_extract(system: str, user: str, max_tokens: int = 8000):
+async def _index_extract(system: str, user: str, max_tokens: int = INDEX_EXTRACT_MAX_TOKENS):
     """Экстракция через INDEX_EXTRACT_MODEL (V4 Flash) с JSON-mode; фолбэк на запасную.
     Возвращает dict при успехе; None — если провайдер ОТВЕТИЛ, но контент не парсится как JSON
     (детерминированный «poison» — можно дробить/скипать). Если провайдер ни разу не ответил
