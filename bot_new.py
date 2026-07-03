@@ -7762,11 +7762,13 @@ async def _index_process_media(chat_id: int, photo_msgs: list, scene_text: str, 
                     "INSERT INTO entity_claims (chat_id,entity_id,kind,claim,evidence) VALUES (%s,%s,'visual',%s,%s)",
                     (chat_id, eid, app, json.dumps([msg.id], ensure_ascii=False)))
         uid, _ = _media_meta(msg)
+        # вектор САМОЙ картинки (gemini-embedding-2) считаем здесь, пока байты в руках — иначе Stage 3 качал бы фото повторно
+        emb_img = await _index_embed_image(raw)
         await db_write(
-            """INSERT INTO media_assets (chat_id,msg_id,file_uid,image_description,entity_ids)
-               VALUES (%s,%s,%s,%s,%s) ON DUPLICATE KEY UPDATE image_description=VALUES(image_description),
-               entity_ids=VALUES(entity_ids), file_uid=VALUES(file_uid)""",
-            (chat_id, msg.id, uid, desc, json.dumps(ent_ids, ensure_ascii=False)))
+            """INSERT INTO media_assets (chat_id,msg_id,file_uid,image_description,entity_ids,emb_image)
+               VALUES (%s,%s,%s,%s,%s,%s) ON DUPLICATE KEY UPDATE image_description=VALUES(image_description),
+               entity_ids=VALUES(entity_ids), file_uid=VALUES(file_uid), emb_image=VALUES(emb_image)""",
+            (chat_id, msg.id, uid, desc, json.dumps(ent_ids, ensure_ascii=False), emb_img))
         done += 1
     return done
 
@@ -7855,6 +7857,176 @@ async def _index_stage2_graph(chat_id: int, progress_cb=None):
     return "done"
 
 
+# --- эмбеддинги (OpenRouter /embeddings) ---
+def _sync_embed_texts(texts: list) -> list:
+    resp = requests.post(f"{OPENROUTER_BASE_URL}/embeddings",
+                         headers={"Authorization": f"Bearer {openrouter_api_key}"},
+                         json={"model": INDEX_EMBED_TEXT_MODEL, "input": texts}, timeout=180)
+    resp.raise_for_status()
+    out = [None] * len(texts)
+    for d in resp.json().get("data", []):
+        i = d.get("index", 0)
+        if 0 <= i < len(texts):
+            out[i] = d.get("embedding")
+    return out
+
+
+def _sync_embed_image(raw: bytes) -> list:
+    b64 = base64.b64encode(raw).decode("utf-8")
+    resp = requests.post(f"{OPENROUTER_BASE_URL}/embeddings",
+                         headers={"Authorization": f"Bearer {openrouter_api_key}"},
+                         json={"model": INDEX_EMBED_IMAGE_MODEL, "encoding_format": "float",
+                               "input": [{"content": [{"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{b64}"}}]}]},
+                         timeout=120)
+    resp.raise_for_status()
+    return resp.json()["data"][0]["embedding"]
+
+
+async def _index_embed_texts(texts: list) -> list:
+    """Список текстов → список float16-блобов (None на неудачных)."""
+    if not texts:
+        return []
+    try:
+        vecs = await asyncio.to_thread(_sync_embed_texts, texts)
+    except Exception as e:
+        log("INDEX", f"Эмбеддинг текстов не удался: {e}")
+        return [None] * len(texts)
+    return [_vec_pack(v) if v else None for v in vecs]
+
+
+async def _index_embed_image(raw: bytes):
+    try:
+        return _vec_pack(await asyncio.to_thread(_sync_embed_image, raw))
+    except Exception as e:
+        log("INDEX", f"Эмбеддинг картинки не удался: {e}")
+        return None
+
+
+async def _index_embed_query(text: str, image_space: bool = False):
+    """Текст запроса → нормированный np-вектор в нужном пространстве (text-emb-3-small или gemini-emb-2)."""
+    model = INDEX_EMBED_IMAGE_MODEL if image_space else INDEX_EMBED_TEXT_MODEL
+
+    def _op():
+        resp = requests.post(f"{OPENROUTER_BASE_URL}/embeddings",
+                             headers={"Authorization": f"Bearer {openrouter_api_key}"},
+                             json={"model": model, "input": [text]}, timeout=60)
+        resp.raise_for_status()
+        return resp.json()["data"][0]["embedding"]
+    try:
+        v = await asyncio.to_thread(_op)
+        return _vec_unpack(_vec_pack(v))  # та же нормировка/усечение, что у хранимых
+    except Exception as e:
+        log("INDEX", f"Эмбеддинг запроса не удался: {e}")
+        return None
+
+
+# --- STAGE 3: векторизация текстов (картинки уже векторизованы в Stage 2) ---
+async def _index_vectorize_loop(chat_id, table, key_col, emb_col, textfn, progress_cb, label):
+    """Батчами эмбеддит строки с пустым emb_col. Курсор по key_col в пределах прохода → нет вечного цикла
+    на сбойных строках; NULL-фильтр = чекпоинт (повтор/resume пропускает уже готовые)."""
+    cur, done = 0, 0
+    while True:
+        if _INDEX_CONTROL.get(chat_id) == "pause":
+            return "paused", done
+        rows = await db_read(
+            f"SELECT * FROM {table} WHERE chat_id=%s AND {emb_col} IS NULL AND {key_col}>%s ORDER BY {key_col} LIMIT %s",
+            (chat_id, cur, INDEX_EMBED_BATCH))
+        if not rows:
+            break
+        cur = rows[-1][key_col]
+        blobs = await _index_embed_texts([textfn(r) for r in rows])
+        for r, blob in zip(rows, blobs):
+            if blob is not None:
+                await db_write(f"UPDATE {table} SET {emb_col}=%s WHERE chat_id=%s AND {key_col}=%s",
+                               (blob, chat_id, r[key_col]))
+                done += 1
+        if progress_cb:
+            await progress_cb(f"🔢 Вектора {label}: {done}…")
+    return "done", done
+
+
+async def _index_stage3_vectors(chat_id: int, progress_cb=None):
+    """Векторизует досье, связи, сцены и описания фото (text-embedding-3-small). Картинки (emb_image) —
+    уже в Stage 2. Каждый текст непустой (fallback-заглушки), чтобы не плодить вечные NULL."""
+    await _idx_set_state(chat_id, 3, status="running")
+
+    def _ent_text(r):
+        al = json.loads(r["aliases"]) if r["aliases"] else []
+        return " | ".join(x for x in [r["name"], ", ".join(al), r.get("canon_summary") or "",
+                                      r.get("fanon_summary") or "", r.get("visual_features") or ""] if x).strip() or r["name"]
+
+    targets = [
+        ("entities", "id", "embedding", _ent_text, "досье"),
+        ("relations", "id", "embedding", lambda r: (r.get("context_summary") or r.get("relation_type") or "связь"), "связи"),
+        ("chat_chunks", "id", "embedding", lambda r: (r.get("enriched_text") or "сцена")[:8000], "сцены"),
+        ("media_assets", "msg_id", "emb_text", lambda r: (r.get("image_description") or "изображение")[:8000], "фото"),
+    ]
+    for table, key_col, emb_col, textfn, label in targets:
+        res, n = await _index_vectorize_loop(chat_id, table, key_col, emb_col, textfn, progress_cb, label)
+        if res == "paused":
+            return "paused"
+        log("INDEX", f"Stage3 {label}: {n} векторов")
+    await _idx_set_state(chat_id, 3, status="done")
+    log("INDEX", f"Stage3 чата {chat_id}: готово")
+    return "done"
+
+
+# --- поиск по векторам (numpy-косинус; матрицы кэшируются per chat) ---
+_INDEX_MATRIX: dict = {}   # {(chat_id, kind): {"mat": ndarray, "ids": [...], "extra": [...], "n": int}}
+# kind → (table, emb_col, key_col, доп.поля-для-сниппета)
+_INDEX_KINDS = {
+    "entities":    ("entities", "embedding", "id", "name, entity_type, canon_summary, fanon_summary"),
+    "relations":   ("relations", "embedding", "id", "source_id, target_id, relation_type, context_summary, status"),
+    "chunks":      ("chat_chunks", "embedding", "id", "start_msg_id, end_msg_id, enriched_text"),
+    "media_text":  ("media_assets", "emb_text", "msg_id", "msg_id, image_description, entity_ids"),
+    "media_image": ("media_assets", "emb_image", "msg_id", "msg_id, image_description, entity_ids"),
+}
+
+
+async def _index_load_matrix(chat_id: int, kind: str) -> dict:
+    """Матрица векторов kind для чата с ленивым кэшем и досинхронизацией по числу строк."""
+    table, emb_col, key_col, extra = _INDEX_KINDS[kind]
+    ck = (chat_id, kind)
+    n_now = (await db_read(f"SELECT COUNT(*) c FROM {table} WHERE chat_id=%s AND {emb_col} IS NOT NULL", (chat_id,)))[0]["c"]
+    cached = _INDEX_MATRIX.get(ck)
+    if cached and cached["n"] == n_now:
+        return cached
+    rows = await db_read(
+        f"SELECT {key_col} AS _k, {emb_col} AS _emb, {extra} FROM {table} WHERE chat_id=%s AND {emb_col} IS NOT NULL ORDER BY {key_col}",
+        (chat_id,))
+    if rows:
+        mat = _np.vstack([_np.frombuffer(r["_emb"], dtype=_np.float16).astype(_np.float32) for r in rows])
+    else:
+        mat = _np.zeros((0, INDEX_EMBED_DIM), dtype=_np.float32)
+    obj = {"mat": mat, "ids": [r["_k"] for r in rows],
+           "extra": [{k: v for k, v in r.items() if k not in ("_emb", "_k")} for r in rows], "n": n_now}
+    _INDEX_MATRIX[ck] = obj
+    return obj
+
+
+def _index_topk(mat, qvec, k: int) -> list:
+    """[(row_index, score)] топ-k по косинусу (векторы нормированы → скалярное произведение)."""
+    if qvec is None or getattr(mat, "shape", (0,))[0] == 0:
+        return []
+    sims = mat @ qvec
+    k = min(k, sims.shape[0])
+    idx = _np.argpartition(-sims, k - 1)[:k] if k < sims.shape[0] else _np.arange(sims.shape[0])
+    idx = idx[_np.argsort(-sims[idx])]
+    return [(int(i), float(sims[i])) for i in idx]
+
+
+async def _index_vector_search(chat_id: int, kind: str, qvec, top_n: int = 8) -> list:
+    """Топ-N совпадений: [{score, key, ...доп.поля}]."""
+    m = await _index_load_matrix(chat_id, kind)
+    hits = _index_topk(m["mat"], qvec, top_n)
+    out = []
+    for ri, score in hits:
+        item = {"score": round(score, 4), "key": m["ids"][ri]}
+        item.update(m["extra"][ri])
+        out.append(item)
+    return out
+
+
 # --- оркестратор пайплайна ---
 async def _index_pipeline(chat_id: int, status_msg):
     """Прогоняет этапы по порядку, уважая паузу. Пока реализован Stage 0 (дамп);
@@ -7897,8 +8069,16 @@ async def _index_pipeline(chat_id: int, status_msg):
                 return
         nrel = (await db_read("SELECT COUNT(*) c FROM relations WHERE chat_id=%s AND status='active'", (chat_id,)))[0]["c"]
         nmedia = (await db_read("SELECT COUNT(*) c FROM media_assets WHERE chat_id=%s", (chat_id,)))[0]["c"]
-        await upd(f"✅ Готово: {n} сообщений · {cnt} сущностей · **{nrel}** активных связей · **{nmedia}** описанных фото.\n"
-                  f"Смотри: `/entity show <имя>`. Этап 3 (вектора для поиска) — в следующем обновлении.")
+        # Stage 3 — векторизация
+        st3 = await _idx_get_state(chat_id, 3)
+        if st3["status"] != "done":
+            await upd(f"✅ Граф: {nrel} связей, {nmedia} фото. 🔢 Векторизую для поиска…")
+            res3 = await _index_stage3_vectors(chat_id, progress_cb=upd)
+            if res3 == "paused":
+                await upd("⏸ Индексация на паузе (Stage 3 — вектора). `/index resume` — продолжить.")
+                return
+        await upd(f"🎉 Индексация завершена: {n} сообщений · {cnt} сущностей · {nrel} связей · {nmedia} фото.\n"
+                  f"Досье: `/entity show <имя>`. Поиск в `/ask` подключается в следующем обновлении.")
     except Exception as e:
         log("INDEX", f"Пайплайн чата {chat_id} упал: {e}")
         traceback.print_exc()
