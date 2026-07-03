@@ -3292,7 +3292,13 @@ async def ask_agentic(context: str, question: str, must_search: bool = False, ca
     has_channels = len(channels) > 0
     has_web = bool(tavily_api_key)        # веб-инструменты Tavily (web_search/web_extract/web_crawl/web_map)
     has_reply = chat_id is not None and bool(msg_by_id)  # адресный реплай по #id истории
-    has_tools = has_channels or has_web or has_reply
+    has_memory = False                    # GraphRAG-память /index (memory_search/entity/media) — если чат проиндексирован
+    if chat_id is not None and not _index_available():
+        try:
+            has_memory = (await db_read("SELECT COUNT(*) c FROM entities WHERE chat_id=%s", (chat_id,)))[0]["c"] > 0
+        except Exception as e:
+            log("ASK", f"Проверка памяти /index не удалась: {e}")
+    has_tools = has_channels or has_web or has_reply or has_memory
 
     now_str = datetime.now(MSK).strftime("%d.%m.%Y %H:%M")
 
@@ -3318,6 +3324,13 @@ async def ask_agentic(context: str, question: str, must_search: bool = False, ca
                           "если же ответ общий или адресат один — хватает обычного текста. Можно подсветить фрагмент: "
                           "в поле quote передай дословную подстроку этого сообщения (удобно для длинных). После реплаев, "
                           "как правило, стоит дать и общий итоговый ответ обычным текстом. Что выбрать — на твоё усмотрение.")
+    if has_memory:
+        system_prompt += ("\n\nУ этого чата есть ПРОИНДЕКСИРОВАННАЯ ПАМЯТЬ (команда /index) — база по всей истории: "
+                          "memory_search (смысловой поиск по сценам-диалогам, досье и связям), memory_entity (полное "
+                          "досье персонажа/участника по имени или прозвищу — canon-факты, мнение чата, связи), "
+                          "memory_media (найти и переслать в чат фото из истории по описанию). Используй их для вопросов "
+                          "про историю чата, лор, персонажей, прошлые споры и события, про которых нет в текущем контексте, "
+                          "и когда просят найти/скинуть старое фото. Имена и прозвища разрешаются автоматически.")
     if must_search and (has_channels or has_web):
         force_name = "telegram_search" if has_channels else "web_search"
         system_prompt += f"\n\nОБЯЗАТЕЛЬНО используй {force_name} хотя бы один раз перед тем как ответить."
@@ -3344,13 +3357,14 @@ async def ask_agentic(context: str, question: str, must_search: bool = False, ca
     force_tool = must_search and (has_channels or has_web)  # принудительный поиск только для search-инструментов
     force_tool_name = "telegram_search" if has_channels else "web_search"
     tools_list = (([TELEGRAM_SEARCH_TOOL] if has_channels else []) + (WEB_TOOLS if has_web else [])
-                  + ([REPLY_TOOL] if has_reply else []))
+                  + ([REPLY_TOOL] if has_reply else []) + (INDEX_MEMORY_TOOLS if has_memory else []))
     reply_sent = [0]  # счётчик отправленных реплаев (анти-спам, лимит REPLY_MAX)
-    sstats = {"iters": 0, "calls": 0, "posts": 0, "web": 0, "replies": 0}  # сводка (-c)
+    sstats = {"iters": 0, "calls": 0, "posts": 0, "web": 0, "replies": 0, "memory": 0}  # сводка (-c)
 
     def _log_search_summary():
         if sstats["iters"]:
-            log("ASK", f"Поиск: {sstats['iters']} итер., {sstats['calls']} запросов к каналам, найдено {sstats['posts']} постов, веб-вызовов {sstats['web']}")
+            log("ASK", f"Поиск: {sstats['iters']} итер., {sstats['calls']} запросов к каналам, найдено {sstats['posts']} постов, "
+                       f"веб-вызовов {sstats['web']}, память /index {sstats['memory']}")
 
     for iteration in range(max_iterations):
         log("ASK", f"Agentic итерация {iteration + 1}/{max_iterations}")
@@ -3494,6 +3508,23 @@ async def ask_agentic(context: str, question: str, must_search: bool = False, ca
             if tname == "reply_to_messages":
                 res = await _run_reply_tool(args, chat_id, msg_by_id, reply_sent)
                 sstats["replies"] = reply_sent[0]
+                messages.append({"role": "tool", "tool_call_id": tool_call.id, "content": res})
+                continue
+
+            # — GraphRAG-память /index —
+            if tname in ("memory_search", "memory_entity", "memory_media"):
+                sstats["memory"] = sstats.get("memory", 0) + 1
+                if tname == "memory_search":
+                    res = await _index_tool_search(chat_id, args.get("query", ""), args.get("kind", "all"))
+                elif tname == "memory_entity":
+                    res = await _index_tool_entity(chat_id, args.get("name", ""))
+                else:
+                    try:
+                        cnt = int(args.get("count", 1) or 1)
+                    except (ValueError, TypeError):
+                        cnt = 1
+                    res = await _index_tool_media(chat_id, args.get("query", ""), cnt)
+                log("ASK", f"Память /index {tname}: {_idx_snip(args.get('query') or args.get('name'), 80)} → {len(res)} симв")
                 messages.append({"role": "tool", "tool_call_id": tool_call.id, "content": res})
                 continue
 
@@ -6808,9 +6839,20 @@ _HELP_SECTIONS = {
         "   `/index go` — запустить индексацию в фоне\n"
         "   `/index status` — прогресс по этапам\n"
         "   `/index pause` / `/index resume` — пауза и продолжение (состояние на чекпоинтах в БД)\n"
+        "   `/index update` — догнать новые сообщения после прошлой индексации\n"
         "\n"
         "**Этапы:** 0 — дамп истории в БД · 1 — досье и алиасы · 2 — граф связей и распознавание фото ·\n"
         "   3 — вектора для поиска. При рестарте бота индексация продолжается с последнего чекпоинта.\n"
+        "\n"
+        "**🔎 Поиск в `/ask`:** после индексации у `/ask` в этом чате появляются инструменты памяти —\n"
+        "   модель сама решает, когда лезть в базу: смысловой поиск по сценам/досье/связям, полное досье\n"
+        "   персонажа по имени, и поиск+пересылка старого фото по описанию. Спрашивай обычным `/ask`:\n"
+        "   «кто такой Тостер?», «из-за чего спорили Дима и Олег?», «скинь ту картинку со спора про меч».\n"
+        "\n"
+        "**📇 Досье и правка графа:**\n"
+        "   `/entity show <имя|алиас>` — карточка: canon-факты, мнение чата, связи (со ссылками на сообщения)\n"
+        "   `/entity merge <id1> <id2>` — слить две сущности (id2 → id1)\n"
+        "   `/entity rename <id> <имя>` · `/entity alias <id> <алиас>` · `/entity split <id> <алиас>`\n"
         "\n"
         "⚙️ Нужны: `INDEX_DB_URL` (MariaDB/MySQL) в `.env`, пакеты `pymysql`+`numpy`, `OPENROUTER_API_KEY`.\n"
         "🧠 Модели: DeepSeek V4 Flash (экстракция), медиа-модель `/media` (фото),\n"
@@ -8027,6 +8069,135 @@ async def _index_vector_search(chat_id: int, kind: str, qvec, top_n: int = 8) ->
     return out
 
 
+# --- инструменты памяти для /ask (агентный цикл) ---
+INDEX_MEMORY_TOOLS = [
+    {"type": "function", "function": {
+        "name": "memory_search",
+        "description": "Ищет в проиндексированной памяти чата (её строит команда /index): сцены-диалоги из прошлого, "
+                       "досье персонажей и участников, связи между ними. Используй для вопросов про историю чата, "
+                       "лор, персонажей, прошлые события и споры, которых нет в текущем контексте переписки.",
+        "parameters": {"type": "object", "properties": {
+            "query": {"type": "string", "description": "Что ищем, своими словами (смысловой поиск)."},
+            "kind": {"type": "string", "enum": ["all", "scenes", "dossiers", "relations"],
+                     "description": "Где искать: scenes — диалоги, dossiers — досье, relations — связи, all — везде (по умолчанию)."}},
+            "required": ["query"]}}},
+    {"type": "function", "function": {
+        "name": "memory_entity",
+        "description": "Полное досье сущности (участник или вымышленный персонаж) по имени или алиасу: canon-факты "
+                       "(что считается правдой), fanon (мнение чата) и связи с другими. Используй для вопросов "
+                       "«кто такой X», «какие у X отношения с Y».",
+        "parameters": {"type": "object", "properties": {
+            "name": {"type": "string", "description": "Имя или прозвище персонажа/участника."}}, "required": ["name"]}}},
+    {"type": "function", "function": {
+        "name": "memory_media",
+        "description": "Находит и ПЕРЕСЫЛАЕТ в чат фото из истории по текстовому описанию (напр. «та картинка со спора "
+                       "про меч», «арт с Заей»). Используй, когда просят скинуть/найти картинку/фото/арт из прошлого.",
+        "parameters": {"type": "object", "properties": {
+            "query": {"type": "string", "description": "Описание искомого фото своими словами."},
+            "count": {"type": "integer", "description": "Сколько фото переслать, 1–3 (по умолчанию 1)."}}, "required": ["query"]}}},
+]
+
+
+def _idx_snip(text, n=180):
+    return re.sub(r"\s+", " ", (text or "")).strip()[:n]
+
+
+async def _index_chat_entity(chat_id):
+    try:
+        return await client.get_entity(chat_id)
+    except Exception:
+        return None
+
+
+async def _index_tool_search(chat_id: int, query: str, kind: str = "all") -> str:
+    if not (query or "").strip():
+        return "Пустой запрос."
+    qv = await _index_embed_query(query)
+    if qv is None:
+        return "Не удалось векторизовать запрос."
+    ent = await _index_chat_entity(chat_id)
+    kinds = {"scenes": ["chunks"], "dossiers": ["entities"], "relations": ["relations"]}.get(kind, ["chunks", "entities", "relations"])
+    out = []
+    for k in kinds:
+        for h in await _index_vector_search(chat_id, k, qv, 5):
+            if h["score"] < 0.15:
+                continue
+            if k == "chunks":
+                link = (f" {build_msg_link(ent, h['start_msg_id'])}" if ent and h.get("start_msg_id") else "")
+                out.append(f"• [сцена {h['score']}] {_idx_snip(h.get('enriched_text'), 220)}{link}")
+            elif k == "entities":
+                out.append(f"• [досье {h['score']}] {h['name']} ({h['entity_type']}): {_idx_snip(h.get('canon_summary'), 160)}")
+            elif k == "relations":
+                nm = await db_read("SELECT id, name FROM entities WHERE id IN (%s,%s)", (h["source_id"], h["target_id"]))
+                n = {r["id"]: r["name"] for r in nm}
+                st = "" if h.get("status") == "active" else " (в прошлом)"
+                out.append(f"• [связь {h['score']}] {n.get(h['source_id'], '?')} → {n.get(h['target_id'], '?')}: "
+                           f"{h.get('relation_type') or ''}{st} — {_idx_snip(h.get('context_summary'), 140)}")
+    return "\n".join(out) if out else "Ничего похожего в памяти не нашёл."
+
+
+async def _index_entity_report(chat_id: int, ent: dict) -> str:
+    """Текстовое досье сущности для модели (факты + связи с именами)."""
+    aliases = json.loads(ent["aliases"]) if ent["aliases"] else []
+    parts = [f"{ent['name']} ({'персонаж' if ent['entity_type'] == 'character' else 'участник'})"]
+    if [a for a in aliases if a != ent["name"]]:
+        parts.append("Алиасы: " + ", ".join(a for a in aliases if a != ent["name"]))
+    if (ent.get("canon_summary") or "").strip():
+        parts.append("Canon: " + ent["canon_summary"].strip())
+    if (ent.get("fanon_summary") or "").strip():
+        parts.append("Мнение чата (fanon): " + ent["fanon_summary"].strip())
+    if (ent.get("visual_features") or "").strip():
+        parts.append("Внешность: " + ent["visual_features"].strip())
+    claims = await db_read("SELECT kind, claim FROM entity_claims WHERE chat_id=%s AND entity_id=%s ORDER BY id",
+                           (chat_id, ent["id"]))
+    for kind, title in (("canon", "Факты"), ("fanon", "Мнения")):
+        ck = [c["claim"] for c in claims if c["kind"] == kind][:8]
+        if ck:
+            parts.append(f"{title}: " + "; ".join(ck))
+    rels = await db_read(
+        "SELECT source_id, target_id, relation_type, canonical_type, status FROM relations "
+        "WHERE chat_id=%s AND (source_id=%s OR target_id=%s) ORDER BY status, weight DESC LIMIT 20",
+        (chat_id, ent["id"], ent["id"]))
+    if rels:
+        need = {r["source_id"] for r in rels} | {r["target_id"] for r in rels}
+        nm = await db_read("SELECT id, name FROM entities WHERE id IN (%s)" % ",".join(str(int(i)) for i in need))
+        n = {r["id"]: r["name"] for r in nm}
+        cur = [f"{n.get(r['target_id'] if r['source_id'] == ent['id'] else r['source_id'], '?')} ({r['relation_type']})"
+               for r in rels if r["status"] == "active"]
+        past = [f"{n.get(r['target_id'] if r['source_id'] == ent['id'] else r['source_id'], '?')} ({r['relation_type']}, в прошлом)"
+                for r in rels if r["status"] != "active"]
+        if cur:
+            parts.append("Связи сейчас: " + ", ".join(cur[:12]))
+        if past:
+            parts.append("Бывшие связи: " + ", ".join(past[:8]))
+    return "\n".join(parts)
+
+
+async def _index_tool_entity(chat_id: int, name: str) -> str:
+    ent = await _index_find_entity(chat_id, name)
+    if not ent:
+        return f"Сущность «{name}» в памяти чата не найдена."
+    return await _index_entity_report(chat_id, ent)
+
+
+async def _index_tool_media(chat_id: int, query: str, count: int = 1) -> str:
+    if not (query or "").strip():
+        return "Пустой запрос."
+    qv = await _index_embed_query(query)
+    if qv is None:
+        return "Не удалось векторизовать запрос."
+    count = max(1, min(3, count))
+    hits = [h for h in await _index_vector_search(chat_id, "media_text", qv, 5) if h["score"] >= 0.15][:count]
+    if not hits:
+        return "Подходящих фото в памяти не нашёл."
+    msg_ids = [h["msg_id"] for h in hits]
+    try:
+        await client.forward_messages(chat_id, msg_ids, chat_id)
+    except Exception as e:
+        return f"Нашёл фото (msg {msg_ids}), но не смог переслать: {e}"
+    return "Переслал в чат: " + "; ".join(_idx_snip(h.get("image_description"), 90) for h in hits)
+
+
 # --- оркестратор пайплайна ---
 async def _index_pipeline(chat_id: int, status_msg):
     """Прогоняет этапы по порядку, уважая паузу. Пока реализован Stage 0 (дамп);
@@ -8114,7 +8285,7 @@ async def _index_preflight(event) -> str:
             f"Запусти: `/index go` · статус: `/index status` · пауза/продолжить: `/index pause` / `/index resume`")
 
 
-@client.on(events.NewMessage(pattern=r"^[./]index(?:\s+(go|status|pause|resume|stop))?\s*$"))
+@client.on(events.NewMessage(pattern=r"^[./]index(?:\s+(go|status|pause|resume|stop|update))?\s*$"))
 async def index_command(event):
     if await _slash_for_other_bot(event):
         return
@@ -8153,6 +8324,23 @@ async def index_command(event):
             return
         _INDEX_CONTROL[chat_id] = "run"
         status_msg = await event.reply("🚀 Запускаю индексацию в фоне… `/index status` — прогресс.")
+        _INDEX_TASKS[chat_id] = asyncio.create_task(_index_pipeline(chat_id, status_msg))
+        return
+
+    if sub == "update":  # догнать новые сообщения: снимаем «done» со стадий (курсоры остаются) и прогоняем пайплайн
+        if chat_id in _INDEX_TASKS:
+            await event.reply("🟢 Индексация уже идёт — дождись её, потом `/index update`.")
+            return
+        st0 = await _idx_get_state(chat_id, 0)
+        if st0["status"] is None:
+            await event.reply("📭 Чат ещё не индексировался. Запусти `/index go`.")
+            return
+        for stg in (0, 1, 2, 3):
+            s = await _idx_get_state(chat_id, stg)
+            if s["status"] == "done":
+                await _idx_set_state(chat_id, stg, status="running")  # курсоры/NULL-фильтры пропустят готовое, обработают новое
+        _INDEX_CONTROL[chat_id] = "run"
+        status_msg = await event.reply("🔄 Догоняю новые сообщения (досье · граф · вектора)…")
         _INDEX_TASKS[chat_id] = asyncio.create_task(_index_pipeline(chat_id, status_msg))
         return
 
@@ -8274,6 +8462,88 @@ async def entity_show_command(event):
     n_claims = len(claims)
     parts.append(f"\n_id {ent['id']} · фактов: {n_claims} · связей: {len(rels)}_")
     await send_long(chat_id, "\n".join(parts), parse_mode="md", reply_to=event.id)
+
+
+@client.on(events.NewMessage(pattern=r"^[./]entity\s+(merge|rename|alias|split)\s+(.+)$"))
+async def entity_admin_command(event):
+    """Правка графа: merge <id1> <id2> · rename <id> <новое имя> · alias <id> <алиас> · split <id> <алиас>."""
+    if await _slash_for_other_bot(event):
+        return
+    if not event.out:
+        return
+    reason = _index_available()
+    if reason:
+        await event.reply(f"⚠️ /entity недоступен: {reason}")
+        return
+    chat_id = event.chat_id
+    action = event.pattern_match.group(1).lower()
+    rest = event.pattern_match.group(2).strip()
+
+    async def _get(eid):
+        r = await db_read("SELECT * FROM entities WHERE chat_id=%s AND id=%s", (chat_id, int(eid)))
+        return r[0] if r else None
+
+    try:
+        if action == "merge":  # merge <id1> <id2> — id2 вливается в id1, id2 удаляется
+            a, b = (int(x) for x in rest.split()[:2])
+            e1, e2 = await _get(a), await _get(b)
+            if not e1 or not e2:
+                await event.reply("❌ Один из id не найден. `/entity merge <id1> <id2>`")
+                return
+            al1 = json.loads(e1["aliases"]) if e1["aliases"] else []
+            al2 = json.loads(e2["aliases"]) if e2["aliases"] else []
+            merged = list(dict.fromkeys(al1 + al2 + [e1["name"], e2["name"]]))
+            await db_write("UPDATE entities SET aliases=%s WHERE id=%s", (json.dumps(merged, ensure_ascii=False), a))
+            await db_write("UPDATE entity_claims SET entity_id=%s WHERE chat_id=%s AND entity_id=%s", (a, chat_id, b))
+            await db_write("UPDATE relations SET source_id=%s WHERE chat_id=%s AND source_id=%s", (a, chat_id, b))
+            await db_write("UPDATE relations SET target_id=%s WHERE chat_id=%s AND target_id=%s", (a, chat_id, b))
+            await db_write("DELETE FROM entities WHERE chat_id=%s AND id=%s", (chat_id, b))
+            await db_write("UPDATE entities SET embedding=NULL WHERE id=%s", (a,))  # пересоберётся на /index update
+            _INDEX_MATRIX.pop((chat_id, "entities"), None)
+            await event.reply(f"✅ «{e2['name']}» (id {b}) влит в «{e1['name']}» (id {a}). "
+                              f"Векторы досье обновятся на `/index update`.")
+        elif action == "rename":  # rename <id> <новое имя>
+            parts = rest.split(maxsplit=1)
+            eid, newname = int(parts[0]), parts[1].strip()
+            e = await _get(eid)
+            if not e:
+                await event.reply("❌ id не найден.")
+                return
+            al = json.loads(e["aliases"]) if e["aliases"] else []
+            if newname not in al:
+                al.append(newname)
+            await db_write("UPDATE entities SET name=%s, aliases=%s, embedding=NULL WHERE id=%s",
+                           (newname, json.dumps(al, ensure_ascii=False), eid))
+            _INDEX_MATRIX.pop((chat_id, "entities"), None)
+            await event.reply(f"✅ id {eid} переименован в «{newname}».")
+        elif action == "alias":  # alias <id> <алиас>
+            parts = rest.split(maxsplit=1)
+            eid, alias = int(parts[0]), parts[1].strip()
+            e = await _get(eid)
+            if not e:
+                await event.reply("❌ id не найден.")
+                return
+            al = json.loads(e["aliases"]) if e["aliases"] else []
+            if alias not in al:
+                al.append(alias)
+            await db_write("UPDATE entities SET aliases=%s WHERE id=%s", (json.dumps(al, ensure_ascii=False), eid))
+            await event.reply(f"✅ «{alias}» добавлен алиасом к «{e['name']}» (id {eid}).")
+        elif action == "split":  # split <id> <алиас> — отцепляет алиас в НОВУЮ пустую сущность
+            parts = rest.split(maxsplit=1)
+            eid, alias = int(parts[0]), parts[1].strip()
+            e = await _get(eid)
+            if not e:
+                await event.reply("❌ id не найден.")
+                return
+            al = [a for a in (json.loads(e["aliases"]) if e["aliases"] else []) if a.lower() != alias.lower()]
+            await db_write("UPDATE entities SET aliases=%s WHERE id=%s", (json.dumps(al, ensure_ascii=False), eid))
+            _, nid = await db_write(
+                "INSERT INTO entities (chat_id,name,entity_type,aliases) VALUES (%s,%s,%s,%s)",
+                (chat_id, alias, e["entity_type"], json.dumps([alias], ensure_ascii=False)))
+            await event.reply(f"✅ «{alias}» отцеплён от «{e['name']}» в новую сущность id {nid}. "
+                              f"Факты остались на id {eid} — перепривяжи вручную при необходимости.")
+    except (ValueError, IndexError):
+        await event.reply("❌ Формат: `/entity merge <id1> <id2>` · `rename <id> <имя>` · `alias <id> <алиас>` · `split <id> <алиас>`")
 
 
 # --- Запуск ---
