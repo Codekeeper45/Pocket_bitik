@@ -134,6 +134,7 @@ INDEX_SCENE_MIN_TOKENS = 1000 # stage 2: сцены короче — докле�
 INDEX_STAGE1_BLOCK_TOKENS = 300_000  # stage 1: размер блока «снежного кома» досье
 INDEX_MEDIA_PAUSE = (2.0, 4.0)  # stage 2: пауза между скачиваниями фото (анти-FloodWait юзербота)
 INDEX_EMBED_BATCH = 96        # stage 3: строк на батч эмбеддинга
+GEN_INDEX_REF_MAX = 8         # /gen: сколько фото-референсов подтягивать из индекс-памяти (смысловой поиск по всей истории)
 # OCR фото в /ask по умолчанию (cost-effective вместо vision-модели; флаг -m возвращает vision).
 # Проверено живьём: v2-поток (files → parse tier=cost_effective → poll → markdown_full), ~11с/фото,
 # русский распознаёт отлично. ВАЖНО: text_full отдаёт мусор латиницей — читать markdown_full.
@@ -2390,7 +2391,9 @@ async def _build_gen_prompt(user_prompt: str, context_text: str = None, image_de
             cat_lines = []
             for it in cat_used:
                 head = f"#{it['idx']}"
-                if it.get("from_owner"):
+                if it.get("from_index"):
+                    head += " [из памяти чата — релевантно запросу]"
+                elif it.get("from_owner"):
                     head += " [фото запросившего/прошлая генерация]"
                 cap = (it.get("caption") or "").strip()
                 if cap:
@@ -3523,7 +3526,9 @@ async def ask_agentic(context: str, question: str, must_search: bool = False, ca
                         cnt = int(args.get("count", 1) or 1)
                     except (ValueError, TypeError):
                         cnt = 1
-                    res = await _index_tool_media(chat_id, args.get("query", ""), cnt)
+                    q_img = images[0]["bytes"] if images else None  # приложенная картинка → визуальный поиск
+                    res = await _index_tool_media(chat_id, args.get("query", ""), cnt,
+                                                  visual=bool(args.get("visual")), query_image=q_img)
                 log("ASK", f"Память /index {tname}: {_idx_snip(args.get('query') or args.get('name'), 80)} → {len(res)} симв")
                 messages.append({"role": "tool", "tool_call_id": tool_call.id, "content": res})
                 continue
@@ -5249,9 +5254,10 @@ async def gen_command(event):
             if not reply_with_photo or improve or creative:
                 context_text = (reply_msg.raw_text or "").strip()[:4000]
 
-        # ── каталог фото из истории чата: по умолчанию для /gen N ИИ сам выберет из них референсы ──
+        # ── каталог фото-референсов: недавние N сообщений + смысловой поиск по индекс-памяти (вся история) ──
         catalog = []
-        if n > 0 and not noimg and not raw:
+        build_cat = (not noimg and not raw)
+        if build_cat:
             want_vision = active_model_supports_vision()
             if want_vision is None:  # кастомная OR-модель без флага — спросим вживую
                 try:
@@ -5260,9 +5266,24 @@ async def gen_command(event):
                 except Exception:
                     want_vision = False
             want_vision = bool(want_vision) and not force_desc  # -m → принудительно режим описаний
-            cand_limit = GEN_CTX_IMG_MAX if want_vision else GEN_CTX_IMG_MAX_DESC  # прямой режим ≤20, описания — большой пул
-            cat_timeout = GEN_CATALOG_TIMEOUT if want_vision else GEN_DESC_TIMEOUT
-            catalog = await _gen_history_catalog(ordered, want_vision, limit=cand_limit, timeout=cat_timeout, progress_cb=set_status)
+            if n > 0:  # недавние фото из окна N
+                cand_limit = GEN_CTX_IMG_MAX if want_vision else GEN_CTX_IMG_MAX_DESC  # прямой режим ≤20, описания — большой пул
+                cat_timeout = GEN_CATALOG_TIMEOUT if want_vision else GEN_DESC_TIMEOUT
+                catalog = await _gen_history_catalog(ordered, want_vision, limit=cand_limit, timeout=cat_timeout, progress_cb=set_status)
+            # индекс-память: релевантные всему запросу фото и досье персонажей (внешность) — из ВСЕЙ истории, не только N
+            if await _index_chat_indexed(event.chat_id):
+                await set_status("🧠 Ищу референсы и контекст в памяти чата…")
+                idx_items, idx_ctx = await _gen_index_candidates(event.chat_id, user_prompt)
+                if idx_items:
+                    seen_mids = {it["mid"] for it in catalog}
+                    for it in idx_items:
+                        if it["mid"] not in seen_mids:  # дедуп с недавним каталогом
+                            catalog.append(it)
+                            seen_mids.add(it["mid"])
+                if idx_ctx:  # внешность релевантных персонажей → в контекст промптера
+                    context_text = (context_text + "\n\n" + idx_ctx) if context_text else idx_ctx
+            for i, it in enumerate(catalog, 1):  # сквозная нумерация после слияния источников
+                it["idx"] = i
 
         # ── анти-повтор: подписи прошлых генераций (💡 идея / 🎨 промпт, шлёт сам юзербот → m.out) лежат в логе
         # как обычные сообщения — модель охотно берёт оттуда готовую идею и повторяет уже сделанное. Собираем их
@@ -8017,7 +8038,7 @@ async def _index_stage3_vectors(chat_id: int, progress_cb=None):
 _INDEX_MATRIX: dict = {}   # {(chat_id, kind): {"mat": ndarray, "ids": [...], "extra": [...], "n": int}}
 # kind → (table, emb_col, key_col, доп.поля-для-сниппета)
 _INDEX_KINDS = {
-    "entities":    ("entities", "embedding", "id", "name, entity_type, canon_summary, fanon_summary"),
+    "entities":    ("entities", "embedding", "id", "name, entity_type, canon_summary, fanon_summary, visual_features"),
     "relations":   ("relations", "embedding", "id", "source_id, target_id, relation_type, context_summary, status"),
     "chunks":      ("chat_chunks", "embedding", "id", "start_msg_id, end_msg_id, enriched_text"),
     "media_text":  ("media_assets", "emb_text", "msg_id", "msg_id, image_description, entity_ids"),
@@ -8090,11 +8111,14 @@ INDEX_MEMORY_TOOLS = [
             "name": {"type": "string", "description": "Имя или прозвище персонажа/участника."}}, "required": ["name"]}}},
     {"type": "function", "function": {
         "name": "memory_media",
-        "description": "Находит и ПЕРЕСЫЛАЕТ в чат фото из истории по текстовому описанию (напр. «та картинка со спора "
-                       "про меч», «арт с Заей»). Используй, когда просят скинуть/найти картинку/фото/арт из прошлого.",
+        "description": "Находит и ПЕРЕСЫЛАЕТ в чат фото из истории. Два режима: по текстовому описанию (напр. «та "
+                       "картинка со спора про меч», «арт с Заей»), либо ПО ВИЗУАЛЬНОМУ СХОДСТВУ с приложенной "
+                       "картинкой (visual=true — «найди похожие арты на это фото», работает если к запросу приложено "
+                       "изображение). Используй, когда просят скинуть/найти картинку/фото/арт из прошлого или похожие на данную.",
         "parameters": {"type": "object", "properties": {
-            "query": {"type": "string", "description": "Описание искомого фото своими словами."},
-            "count": {"type": "integer", "description": "Сколько фото переслать, 1–3 (по умолчанию 1)."}}, "required": ["query"]}}},
+            "query": {"type": "string", "description": "Описание искомого фото своими словами (для текстового поиска)."},
+            "visual": {"type": "boolean", "description": "true — искать по СХОДСТВУ с приложенной к запросу картинкой, а не по тексту."},
+            "count": {"type": "integer", "description": "Сколько фото переслать, 1–3 (по умолчанию 1)."}}, "required": []}}},
 ]
 
 
@@ -8180,14 +8204,21 @@ async def _index_tool_entity(chat_id: int, name: str) -> str:
     return await _index_entity_report(chat_id, ent)
 
 
-async def _index_tool_media(chat_id: int, query: str, count: int = 1) -> str:
-    if not (query or "").strip():
-        return "Пустой запрос."
-    qv = await _index_embed_query(query)
+async def _index_tool_media(chat_id: int, query: str, count: int = 1, visual: bool = False, query_image: bytes = None) -> str:
+    """Поиск фото по описанию (текст → emb_text) или ПО КАРТИНКЕ (visual=true, приложенное/реплай-фото →
+    emb_image, «найди похожие арты»). Найденное пересылается в чат."""
+    count = max(1, min(3, count))
+    if visual and query_image:
+        qv = await _index_embed_query_image(query_image)
+        space = "media_image"
+    else:
+        if not (query or "").strip():
+            return "Пустой запрос."
+        qv = await _index_embed_query(query)
+        space = "media_text"
     if qv is None:
         return "Не удалось векторизовать запрос."
-    count = max(1, min(3, count))
-    hits = [h for h in await _index_vector_search(chat_id, "media_text", qv, 5) if h["score"] >= 0.15][:count]
+    hits = [h for h in await _index_vector_search(chat_id, space, qv, 6) if h["score"] >= 0.15][:count]
     if not hits:
         return "Подходящих фото в памяти не нашёл."
     msg_ids = [h["msg_id"] for h in hits]
@@ -8196,6 +8227,91 @@ async def _index_tool_media(chat_id: int, query: str, count: int = 1) -> str:
     except Exception as e:
         return f"Нашёл фото (msg {msg_ids}), но не смог переслать: {e}"
     return "Переслал в чат: " + "; ".join(_idx_snip(h.get("image_description"), 90) for h in hits)
+
+
+async def _index_embed_query_image(raw: bytes):
+    """Картинка запроса → нормированный np-вектор в пространстве картинок (gemini-embedding-2)."""
+    try:
+        return _vec_unpack(await asyncio.to_thread(_sync_embed_image, raw))
+    except Exception as e:
+        log("INDEX", f"Эмбеддинг картинки-запроса не удался: {e}")
+        return None
+
+
+async def _index_media_count(chat_id: int) -> int:
+    """Сколько фото в памяти чата пригодны для поиска (emb_text проставлен). 0 → чат не индексирован."""
+    if _index_available():
+        return 0
+    try:
+        return (await db_read("SELECT COUNT(*) c FROM media_assets WHERE chat_id=%s AND emb_text IS NOT NULL", (chat_id,)))[0]["c"]
+    except Exception:
+        return 0
+
+
+async def _index_chat_indexed(chat_id: int) -> bool:
+    """True, если у чата есть проиндексированные сущности (для подтягивания досье/референсов в /gen и /ask)."""
+    if _index_available():
+        return False
+    try:
+        return (await db_read("SELECT COUNT(*) c FROM entities WHERE chat_id=%s", (chat_id,)))[0]["c"] > 0
+    except Exception:
+        return False
+
+
+async def _gen_index_candidates(chat_id: int, prompt: str, limit: int = GEN_INDEX_REF_MAX) -> tuple:
+    """Для /gen: смысловой поиск референсов и контекста по ВСЕЙ проиндексированной истории (не только N последних).
+    Возвращает (catalog_items, context_text): фото-кандидаты в формате каталога /gen + текст-контекст из досье
+    (внешность релевантных персонажей — ключ к узнаваемым референсам)."""
+    if not chat_id or _index_available() or not (prompt or "").strip():
+        return [], None
+    qv = await _index_embed_query(prompt)
+    if qv is None:
+        return [], None
+    # релевантные фото по описаниям (по всей истории)
+    media_hits = [h for h in await _index_vector_search(chat_id, "media_text", qv, limit * 2) if h["score"] >= 0.2][:limit]
+    # релевантные персонажи → их внешность в контекст промптера
+    ent_hits = [h for h in await _index_vector_search(chat_id, "entities", qv, 5) if h["score"] >= 0.25]
+    ctx_lines = []
+    for h in ent_hits:
+        vf = (h.get("visual_features") or "").strip()
+        cs = (h.get("canon_summary") or "").strip()
+        desc = vf or cs
+        if desc:
+            ctx_lines.append(f"- {h['name']}: {_idx_snip(desc, 200)}")
+    ctx = ("Из памяти чата — релевантные персонажи (можно опереться на их облик для узнаваемых референсов):\n"
+           + "\n".join(ctx_lines)) if ctx_lines else None
+
+    items = []
+    if media_hits:
+        mids = [h["msg_id"] for h in media_hits]
+        desc_by_mid = {h["msg_id"]: (h.get("image_description") or "") for h in media_hits}
+        try:
+            msgs = []
+            for i in range(0, len(mids), 100):
+                msgs += await client.get_messages(chat_id, ids=mids[i:i + 100])
+        except Exception as e:
+            log("GEN", f"Индекс-референсы: get_messages не удался: {e}")
+            msgs = []
+
+        async def _dl(m):
+            if not (m and getattr(m, "photo", None)):
+                return None
+            try:
+                raw = await m.download_media(bytes)
+            except Exception:
+                return None
+            if not raw:
+                return None
+            return {"idx": 0, "mid": m.id, "bytes": raw, "thumb": await _downscale_img(raw),
+                    "caption": (m.raw_text or "").strip(), "desc": desc_by_mid.get(m.id) or None,
+                    "from_owner": bool(getattr(m, "out", False)), "from_index": True}
+        try:
+            res = await asyncio.wait_for(asyncio.gather(*[_dl(m) for m in msgs]), timeout=GEN_CATALOG_TIMEOUT)
+            items = [it for it in res if it]
+        except asyncio.TimeoutError:
+            log("GEN", "Индекс-референсы: скачивание превысило тайм-бюджет")
+    log("GEN", f"Индекс-референсы: {len(items)} фото + {len(ctx_lines)} досье из памяти по запросу «{_idx_snip(prompt, 50)}»")
+    return items, ctx
 
 
 # --- оркестратор пайплайна ---
