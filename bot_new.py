@@ -3359,8 +3359,11 @@ async def ask_agentic(context: str, question: str, must_search: bool = False, ca
                           "как правило, стоит дать и общий итоговый ответ обычным текстом. Что выбрать — на твоё усмотрение.")
     if has_memory:
         system_prompt += ("\n\nУ этого чата есть ПРОИНДЕКСИРОВАННАЯ ПАМЯТЬ (команда /index) — база по всей истории: "
-                          "memory_search (смысловой поиск по сценам-диалогам, досье и связям), memory_entity (полное "
-                          "досье персонажа/участника по имени или прозвищу — canon-факты, мнение чата, связи), "
+                          "memory_search (смысловой поиск по сценам-диалогам, досье и связям — для ТОЧЕЧНЫХ фактов и "
+                          "конкретных реплик), memory_overview (высокоуровневое обобщение по теме для ГЛОБАЛЬНЫХ/"
+                          "ТЕМАТИЧЕСКИХ вопросов — атмосфера, общее отношение к кому-то, динамика — из сжатых досье и "
+                          "связей, без сырых диалогов), memory_entity (полное досье персонажа/участника по имени или "
+                          "прозвищу — canon-факты, мнение чата, связи), "
                           "memory_media (найти и переслать в чат фото из истории по описанию). Используй их для вопросов "
                           "про историю чата, лор, персонажей, прошлые споры и события, про которых нет в текущем контексте, "
                           "и когда просят найти/скинуть старое фото. Имена и прозвища разрешаются автоматически. "
@@ -3555,10 +3558,12 @@ async def ask_agentic(context: str, question: str, must_search: bool = False, ca
                 continue
 
             # — GraphRAG-память /index —
-            if tname in ("memory_search", "memory_entity", "memory_media"):
+            if tname in ("memory_search", "memory_entity", "memory_media", "memory_overview"):
                 sstats["memory"] = sstats.get("memory", 0) + 1
                 if tname == "memory_search":
                     res = await _index_tool_search(chat_id, args.get("query", ""), args.get("kind", "all"))
+                elif tname == "memory_overview":
+                    res = await _index_tool_overview(chat_id, args.get("topic", ""))
                 elif tname == "memory_entity":
                     res = await _index_tool_entity(chat_id, args.get("name", ""))
                 else:
@@ -3569,7 +3574,7 @@ async def ask_agentic(context: str, question: str, must_search: bool = False, ca
                     q_img = images[0]["bytes"] if images else None  # приложенная картинка → визуальный поиск
                     res = await _index_tool_media(chat_id, args.get("query", ""), cnt,
                                                   visual=bool(args.get("visual")), query_image=q_img)
-                log("ASK", f"Память /index {tname}: {_idx_snip(args.get('query') or args.get('name'), 80)} → {len(res)} симв")
+                log("ASK", f"Память /index {tname}: {_idx_snip(args.get('query') or args.get('topic') or args.get('name'), 80)} → {len(res)} симв")
                 messages.append({"role": "tool", "tool_call_id": tool_call.id, "content": res})
                 continue
 
@@ -8838,6 +8843,16 @@ INDEX_MEMORY_TOOLS = [
                      "description": "Где искать: scenes — диалоги, dossiers — досье, relations — связи, all — везде (по умолчанию)."}},
             "required": ["query"]}}},
     {"type": "function", "function": {
+        "name": "memory_overview",
+        "description": "Высокоуровневое ОБОБЩЕНИЕ по памяти чата для ТЕМАТИЧЕСКИХ и ГЛОБАЛЬНЫХ вопросов — «какая обычно "
+                       "атмосфера», «как в чате относятся к X», «кто главные фигуры вокруг темы Y», «общая динамика/"
+                       "настроения». Отвечает по СЖАТЫМ досье и ОБОБЩЁННЫМ связям (без сырых диалогов) — экономит контекст "
+                       "и даёт картину целиком. Для точечных фактов, конкретных реплик и «что именно сказали» — бери "
+                       "memory_search, а не это.",
+        "parameters": {"type": "object", "properties": {
+            "topic": {"type": "string", "description": "Тема или аспект для обобщения, своими словами."}},
+            "required": ["topic"]}}},
+    {"type": "function", "function": {
         "name": "memory_entity",
         "description": "Полное досье сущности (участник или вымышленный персонаж) по имени или алиасу: canon-факты "
                        "(что считается правдой), fanon (мнение чата) и связи с другими. Используй для вопросов "
@@ -8904,6 +8919,45 @@ async def _index_tool_search(chat_id: int, query: str, kind: str = "all") -> str
         out.append(f"⚠️ Совпадения слабые (макс score {best:.2f}) — возможно, точного ответа в памяти нет. "
                    f"Если это не то, переспроси другими словами или проверь web_search; не выдавай догадку за факт.")
     return "\n".join(out)
+
+
+async def _index_tool_overview(chat_id: int, topic: str) -> str:
+    """LightRAG high-level: тематическое обобщение ТОЛЬКО из саммари (сжатые досье + обобщённые связи, без сырых сцен).
+    Роутер = выбор модели между этим (тематика/картина в целом) и memory_search (точечные факты/реплики)."""
+    if not (topic or "").strip():
+        return "Пустая тема."
+    qv = await _index_embed_query(topic)
+    if qv is None:
+        return "Не удалось векторизовать запрос."
+    blocks = []
+    # 1) причастные лица/персонажи — по сжатым досье
+    ebits = []
+    for h in await _index_vector_search(chat_id, "entities", qv, 8):
+        if h["score"] < INDEX_SEARCH_FLOOR:
+            continue
+        s = _idx_snip(h.get("canon_summary") or h.get("fanon_summary") or "", 220)
+        if s:
+            ebits.append(f"— {h['name']} ({'персонаж' if h.get('entity_type') == 'character' else 'участник'}): {s}")
+    if ebits:
+        blocks.append("Причастные (сжатые досье):\n" + "\n".join(ebits[:6]))
+    # 2) обобщённые связи по теме
+    rels = [h for h in await _index_vector_search(chat_id, "relations", qv, 8) if h["score"] >= INDEX_SEARCH_FLOOR]
+    if rels:
+        need = {h["source_id"] for h in rels} | {h["target_id"] for h in rels}
+        nm = await db_read("SELECT id, name FROM entities WHERE id IN (%s)" % ",".join(str(int(i)) for i in need))
+        n2 = {r["id"]: r["name"] for r in nm}
+        rbits = []
+        for h in rels[:6]:
+            st = "" if h.get("status") == "active" else " (в прошлом)"
+            rbits.append(f"— {n2.get(h['source_id'], '?')} ↔ {n2.get(h['target_id'], '?')}: "
+                         f"{h.get('relation_type') or ''}{st} — {_idx_snip(h.get('context_summary'), 160)}")
+        if rbits:
+            blocks.append("Связи по теме:\n" + "\n".join(rbits))
+    if not blocks:
+        return (f"По теме «{topic}» обобщённой памяти не нашёл. Уточни тему или возьми memory_search "
+                f"для точечного поиска по диалогам.")
+    return ("Высокоуровневое обобщение по памяти чата (по досье и связям, без сырых диалогов — "
+            "картина в целом, не дословные цитаты):\n\n" + "\n\n".join(blocks))
 
 
 async def _index_entity_report(chat_id: int, ent: dict) -> str:
