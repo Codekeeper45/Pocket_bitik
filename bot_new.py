@@ -9486,11 +9486,18 @@ async def _index_tool_media(chat_id: int, query: str, count: int = 1, visual: bo
         space = "media_text"
     if qv is None:
         return "Не удалось векторизовать запрос."
-    all_hits = await _index_vector_search(chat_id, space, qv, 6)
+    all_hits = await _index_vector_search(chat_id, space, qv, INDEX_RERANK_POOL)
     best = max((h["score"] for h in all_hits), default=0.0)
-    hits = [h for h in all_hits if h["score"] >= INDEX_SEARCH_FLOOR][:count]
+    hits = None
+    if not visual and all_hits:  # текстовый поиск фото — реранкуем описания по запросу (визуальный image→image оставляем на косинусе)
+        order = await _index_rerank(query, [h.get("image_description") or "изображение" for h in all_hits], top_n=count)
+        if order is not None:
+            best = order[0][1] if order else 0.0
+            hits = [all_hits[i] for i, rel in order if 0 <= i < len(all_hits) and rel >= INDEX_RERANK_MIN][:count]
+    if hits is None:  # визуальный режим или фолбэк без rerank — косинус
+        hits = [h for h in all_hits if h["score"] >= INDEX_SEARCH_FLOOR][:count]
     if not hits:
-        note = f" (лучшее score {best:.2f})" if best else ""
+        note = f" (лучшее {best:.2f})" if best else ""
         return f"Подходящих фото в памяти не нашёл{note}. Опиши искомое иначе — что на фото, кто, какое событие."
     msg_ids = [h["msg_id"] for h in hits]
     try:
