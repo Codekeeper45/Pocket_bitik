@@ -140,7 +140,8 @@ INDEX_SCENE_TOKEN_CAP = 8000  # stage 2: мягкий потолок токен�
 INDEX_SCENE_MIN_TOKENS = 1000 # stage 2: сцены короче — доклеиваем к следующей (не дробим на мелочь)
 INDEX_SCENE_HARD_GAP_SEC = 6 * 60 * 60  # даже короткую сцену не склеиваем через многочасовую паузу
 INDEX_STAGE1_MICRO_TOKENS = 32_000      # stage 1: размер блока экстракции (вывод не режется — cap поднят до INDEX_EXTRACT_MAX_TOKENS)
-INDEX_EXTRACT_MAX_TOKENS = 24_000       # ПОТОЛОК ВЫВОДА экстракции: JSON досье/связей не должен обрезаться (finish=length). Модель тянет ≫8k
+INDEX_EXTRACT_MAX_TOKENS = 64_000       # ПОТОЛОК ВЫВОДА экстракции: JSON + reasoning-токены (V4 Flash думает в тот же бюджет!) не режем. Провайдер принимает ≥200k
+INDEX_SUMMARY_MAX_TOKENS = 64_000       # ПОТОЛОК ВЫВОДА саммари (досье/роллапы): запас под reasoning, чтобы CoT не съедал бюджет до самого текста. Оплата — по факту токенов
 INDEX_STAGE1_MICRO_MESSAGES = 800
 INDEX_STAGE1_BLOCK_TOKENS = INDEX_STAGE1_MICRO_TOKENS  # legacy alias для старых комментариев/логов
 INDEX_FAILED_MIN_MESSAGES = 1
@@ -8063,7 +8064,7 @@ async def _index_summarize_entities(chat_id: int, progress_cb=None):
             body = (f"Персонаж/участник: {ent['name']}\nCANON-факты:\n" + ("\n".join(f"- {c}" for c in canon) or "(нет)")
                     + "\nFANON-факты:\n" + ("\n".join(f"- {c}" for c in fanon) or "(нет)"))
             async with sem:
-                data = await _index_extract(_INDEX_SUMM_SYSTEM, body, max_tokens=1200)
+                data = await _index_extract(_INDEX_SUMM_SYSTEM, body, max_tokens=INDEX_SUMMARY_MAX_TOKENS)
             if isinstance(data, dict):
                 csum, fsum = (data.get("canon") or "").strip(), (data.get("fanon") or "").strip()
             else:  # фолбэк — просто склейка фактов
@@ -8099,7 +8100,7 @@ async def _index_summarize_claim_parts(chat_id: int, entity_id: int, name: str, 
         canon_lines = "\n".join(f"- {c}" for c in batch) if kind == "canon" else "(нет)"
         fanon_lines = "\n".join(f"- {c}" for c in batch) if kind == "fanon" else "(нет)"
         body = f"Персонаж/участник: {name}\nCANON-факты:\n{canon_lines}\nFANON-факты:\n{fanon_lines}"
-        data = await _index_extract(_INDEX_SUMM_SYSTEM, body, max_tokens=900)
+        data = await _index_extract(_INDEX_SUMM_SYSTEM, body, max_tokens=INDEX_SUMMARY_MAX_TOKENS)
         if isinstance(data, dict):
             summary = (data.get(kind) or data.get("canon") or data.get("fanon") or "").strip()
         else:
@@ -8307,7 +8308,7 @@ async def _index_process_media(chat_id: int, image_msgs: list, scene_text: str, 
             b64 = base64.b64encode(raw).decode("utf-8")
             user = (f"Справочник персонажей:\n{registry[:4000]}\n\nКонтекст сцены:\n{scene_text[:2500]}")
             resp = await asyncio.to_thread(
-                mclient.chat.completions.create, model=model, max_tokens=1500, timeout=90,
+                mclient.chat.completions.create, model=model, max_tokens=3000, timeout=90,
                 messages=[{"role": "user", "content": [
                     {"type": "text", "text": _INDEX_MEDIA_SYSTEM + "\n\n" + user},
                     {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{b64}", "detail": "high"}}]}])
@@ -8725,13 +8726,13 @@ async def _index_summarize_texts(texts: list, title: str) -> str:
     parts = []
     for b in batches:
         body = f"Период: {title}\nФрагменты:\n" + "\n---\n".join(x[:4000] for x in b)
-        data = await _index_extract(_INDEX_ROLLUP_SYSTEM, body, max_tokens=900)
+        data = await _index_extract(_INDEX_ROLLUP_SYSTEM, body, max_tokens=INDEX_SUMMARY_MAX_TOKENS)
         parts.append((data.get("summary") if isinstance(data, dict) else None) or " ".join(b)[:1200])
     if len(parts) == 1:
         return parts[0][:4000]
     # reduce: сводим частичные сводки в одну
     body = f"Период: {title}\nСводки под-отрезков:\n" + "\n---\n".join(parts)
-    data = await _index_extract(_INDEX_ROLLUP_SYSTEM, body, max_tokens=900)
+    data = await _index_extract(_INDEX_ROLLUP_SYSTEM, body, max_tokens=INDEX_SUMMARY_MAX_TOKENS)
     return ((data.get("summary") if isinstance(data, dict) else None) or " ".join(parts))[:4000]
 
 
