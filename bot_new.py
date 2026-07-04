@@ -136,12 +136,16 @@ GEN_INDEX_VISUAL_POOL = 16  # /gen: сколько индекс-кандидат
 # --- /index: GraphRAG-память по истории чата (MariaDB + numpy-вектора) ---
 INDEX_EXTRACT_MODEL = "deepseek-v4-flash"   # экстракция досье/графа через официальный DeepSeek API: 1M context, большой output
 INDEX_EXTRACT_FALLBACK = "deepseek-v4-pro"  # запасной официальный DeepSeek, дороже; используем только если Flash недоступен/сыпется
-INDEX_EMBED_TEXT_MODEL = "openai/text-embedding-3-small"   # тексты: досье, связи, сцены, описания фото ($0.02/1M, 1536d)
+INDEX_EMBED_TEXT_MODEL = "qwen/qwen3-embedding-8b"   # тексты: досье, связи, сцены, описания фото. SOTA MTEB, дешевле, 32k контекст, MRL 32–4096 (OpenRouter /embeddings)
 INDEX_EMBED_IMAGE_MODEL = "google/gemini-embedding-2"      # картинки (сам файл) + кросс-модальный текст-запрос (GA-слаг, 3072d)
-INDEX_EMBED_DIM = 1536        # рабочая размерность (text-emb-3-small нативно 1536; gemini-emb-2 усекаем Matryoshka с 3072)
-INDEX_DUMP_BATCH = 1000       # stage 0: сообщений на пачку дампа/чекпоинт
+INDEX_EMBED_TEXT_DIM = 2048   # рабочая размерность ТЕКСТА (qwen3 MRL; 2048 сильнее text-emb-3-small@1536, при половине RAM/латентности от 4096)
+INDEX_EMBED_IMAGE_DIM = 1536  # рабочая размерность КАРТИНОК (gemini-emb-2, усекаем Matryoshka с 3072) — НЕ меняем при смене текстового эмбеддера
+INDEX_EMBED_DIM = INDEX_EMBED_TEXT_DIM  # легаси-алиас: дефолтная размерность = текстовая (текст-путей большинство)
+INDEX_DUMP_BATCH = 5000       # stage 0: сообщений на пачку дампа/чекпоинт (подняли 1000→5000: быстрее Stage 0, ценой чуть большего переделывания после краша)
 INDEX_SCENE_GAP_SEC = 15 * 60 # stage 2: разрыв >15 мин между сообщениями рвёт сцену
-INDEX_SCENE_TOKEN_CAP = 8000  # stage 2: мягкий потолок токенов сцены (длинная беседа рвётся принудительно)
+INDEX_SCENE_TOKEN_CAP = 20000 # stage 2: мягкий потолок токенов сцены. Подняли 8000→20000: раньше 8k был из-за окна text-emb-3-small;
+#   qwen3 держит 32k, поэтому 15-мин всплеск беседы эмбеддится ЦЕЛИКОМ одним чанком (поиск богаче). 15-мин разрыв (GAP) остаётся
+#   реальной границей сцены; кап — лишь предохранитель от монстр-сцен (запас под summary-обёртку до 32k). Размен: связи чуть шумнее.
 INDEX_SCENE_MIN_TOKENS = 1000 # stage 2: сцены короче — доклеиваем к следующей (не дробим на мелочь)
 INDEX_SCENE_HARD_GAP_SEC = 6 * 60 * 60  # даже короткую сцену не склеиваем через многочасовую паузу
 INDEX_STAGE2_CONCURRENCY = 6  # stage 2: сколько сцен экстрагировать параллельно (перекрыть ~34с латентность на вызов)
@@ -166,8 +170,8 @@ INDEX_STAGE1_BLOCK_TOKENS = INDEX_STAGE1_MICRO_TOKENS  # legacy alias для с�
 INDEX_FAILED_MIN_MESSAGES = 1
 INDEX_UPDATE_OVERLAP_MESSAGES = 300
 INDEX_UPDATE_OVERLAP_HOURS = 24
-INDEX_SUMMARY_CLAIM_BATCH = 80
-INDEX_SUMMARY_TOKEN_BATCH = 8_000
+INDEX_SUMMARY_CLAIM_BATCH = 160     # synthesis досье: клеймов на map-вызов (80→160: меньше вызовов на популярную сущность)
+INDEX_SUMMARY_TOKEN_BATCH = 16_000  # synthesis досье: токенов на map-чанк (8k→16k: меньше чанков)
 INDEX_SUMMARY_MAPREDUCE_MIN_CLAIMS = 80
 INDEX_SUMMARY_MAPREDUCE_MIN_TOKENS = 20_000
 INDEX_CONSOLIDATE_EVERY_BLOCKS = 10
@@ -189,21 +193,21 @@ INDEX_GALLERY_GROW_MIN = 0.60   # gallery 5c: image→image порог рост�
 INDEX_GALLERY_GROW_ROUNDS = 2   # gallery 5c: раундов verified growth (описание→подтверждение→новые якоря)
 INDEX_GALLERY_MAX_PER_ENTITY = 30  # gallery: кап фото в галерее сущности за прогон
 INDEX_GALLERY_SCENE_CAP = 12    # gallery 5b: кап фото-кандидатов из сцен с упоминанием сущности (recall-приор)
-INDEX_EMBED_BATCH = 96        # stage 3: строк на батч эмбеддинга
+INDEX_EMBED_BATCH = 192       # stage 3: строк на батч эмбеддинга (96→192: qwen окно больше; INDEX_EMBED_MAX_CHARS сам дробит по символам)
 INDEX_EMBED_MAX_CHARS = 200_000  # stage 3: потолок символов на ОДИН запрос эмбеддинга — провайдер режет
 #                                  запрос на 300k токенов; 96 плотных сцен ×8000 симв. это превышают,
 #                                  а OpenRouter отдаёт отказ как HTTP 200 с error-телом (молчаливая потеря)
 INDEX_EXTRACT_RETRIES = 3     # LLM/JSON extractor: не двигаем чекпоинт после временного сбоя
 INDEX_EMBED_RETRIES = 3       # embeddings: 429/5xx у провайдера не должны превращаться в "done"
 INDEX_MATRIX_CACHE_MAX_ROWS = 10_000  # больше ищем потоково, без полной матрицы в RAM
-INDEX_SEARCH_DB_BATCH = 5_000
+INDEX_SEARCH_DB_BATCH = 10_000  # потоковый векторный поиск: строк на выборку (5k→10k: быстрее стриминг, чуть больше транзиентной RAM)
 INDEX_COUNT_TTL = 60          # сек: кэш COUNT(*) для выбора backend поиска (инвалидируется на каждую запись индекса)
-INDEX_ROLLUP_TOKEN_BATCH = 24_000  # stage 4: сколько токенов сцен сжимать за один map-вызов роллап-саммари
+INDEX_ROLLUP_TOKEN_BATCH = 48_000  # stage 4: сколько токенов сцен сжимать за один map-вызов роллап-саммари (24k→48k: меньше вызовов Stage 4)
 INDEX_SEARCH_FLOOR = 0.15     # ниже этого косинуса результат не показываем вообще
 INDEX_SEARCH_CONFIDENT = 0.28 # ниже — «слабое» совпадение: помечаем и просим модель переспросить/веб (Corrective RAG)
 INDEX_RERANK_MODEL = "cohere/rerank-4-pro"  # OpenRouter /rerank (rerank-v4.0-pro): переупорядочивает кандидатов по ИСТИННОЙ релевантности (мультиязычный, проверено на русском)
-INDEX_RERANK_POOL = 8         # кандидатов на kind достаём вектором ПОД rerank (шире финальной выдачи)
-INDEX_RERANK_TOPN = 12        # финальная выдача после rerank
+INDEX_RERANK_POOL = 24        # кандидатов на kind достаём вектором ПОД rerank (8→24: шире воронка → лучше полнота /ask)
+INDEX_RERANK_TOPN = 20        # финальная выдача после rerank (12→20: больше памяти доходит до ответа)
 INDEX_RERANK_MIN = 0.08       # rel-score ниже — не показываем (у v4-pro мусор ~0.12, точный ~0.9)
 INDEX_RERANK_CONFIDENT = 0.35 # ниже — «слабое» совпадение (Corrective-гейт по rerank-score)
 INDEX_EVAL_CASES_PATH = "index_eval_cases.json"
@@ -7104,6 +7108,8 @@ _HELP_SECTIONS = {
         "   `/index label <текст>` — задать этому чату короткую подпись для `/index all` (пусто — показать, `-` — сбросить)\n"
         "   `/index pause` / `/index resume` — пауза и продолжение (состояние на чекпоинтах в БД)\n"
         "   `/index update` — догнать новые сообщения после прошлой индексации\n"
+        "   `/index reindex [vectors|scenes]` — пересборка под новый эмбеддер/крупные сцены: `vectors` (дефолт) — переэмбеддинг\n"
+        "      всех текстов без LLM; `scenes` — пересобрать сцены(20k)+связи заново (досье Stage 1 сохранены, медиа не пере-vision)\n"
         "   `/index recategorize` — обогатить связи: категории (романтика/дружба/семья/вражда/…), денойз со-присутствия,\n"
         "      добить пустые досье (нужны уже построенные связи — Stage 2). Идемпотентна, резюмится сама.\n"
         "   `/index failed` — показать poison-диапазоны, которые были честно пропущены после дробления\n"
@@ -7133,7 +7139,7 @@ _HELP_SECTIONS = {
         "⚙️ Нужны: `INDEX_DB_URL` (MariaDB/MySQL), `DEEPSEEK_API_KEY` для экстракции,\n"
         "   `OPENROUTER_API_KEY` для embeddings, пакеты `pymysql`+`numpy`.\n"
         "🧠 Модели: официальный DeepSeek V4 Flash (экстракция), медиа-модель `/media` (фото),\n"
-        "   text-embedding-3-small (тексты) + gemini-embedding-2 (картинки)."
+        "   qwen3-embedding-8b (тексты, 2048d) + gemini-embedding-2 (картинки)."
     ),
     "keys": (
         "🔑 **Какие API-ключи за что отвечают** (в файле `.env`)\n"
@@ -7145,7 +7151,7 @@ _HELP_SECTIONS = {
         "**НЕОБЯЗАТЕЛЬНЫЕ** (без них бот НЕ падает — просто часть функций выключена):\n"
         "   `OPENROUTER_API_KEY` — даёт:\n"
         "      • распознавание картинок/кружков в `/ask` (vision-модели `[OR]`);\n"
-        "      • embeddings для `/index` (text-embedding-3-small + gemini-embedding-2);\n"
+        "      • embeddings для `/index` (qwen3-embedding-8b + gemini-embedding-2);\n"
         "      • возможность ставить любую модель OpenRouter для ответов (`/model vendor/model`).\n"
         "   `OPENCODE_API_KEY` — даёт vision-модели `[OC]` (Kimi / GLM / Qwen / MiMo) в `/model media`.\n"
         "   `MODELGATE_API_KEY` — даёт модели **Claude** (Opus / Sonnet / Haiku) для ответов\n"
@@ -7417,7 +7423,7 @@ async def help_command(event):
 #  /index — агентская мультимодальная GraphRAG-память по истории чата
 #  MariaDB (граф+досье+сцены+медиа) + numpy-cosine поиск. Модели: DeepSeek
 #  V4 Flash (экстракция текста), медиа-модель /media (описание фото),
-#  text-embedding-3-small (тексты), gemini-embedding-2 (картинки).
+#  qwen3-embedding-8b (тексты, 2048d), gemini-embedding-2 (картинки).
 # ════════════════════════════════════════════════════════════════════════
 
 _IDX_TL = threading.local()          # per-thread pymysql-соединение (клиенты бота sync → asyncio.to_thread)
@@ -7661,13 +7667,14 @@ async def _index_ensure_ddl():
 
 
 # --- вектора: float16-блобы (numpy) ---
-def _vec_pack(vec) -> bytes:
-    """list[float]/np.array → компактный float16-блоб (усечение/паддинг до INDEX_EMBED_DIM)."""
+def _vec_pack(vec, dim: int = INDEX_EMBED_TEXT_DIM) -> bytes:
+    """list[float]/np.array → компактный float16-блоб (усечение/паддинг до dim, нормировка).
+    dim задаётся вызывающим: текстовые вектора — INDEX_EMBED_TEXT_DIM, картиночные — INDEX_EMBED_IMAGE_DIM."""
     a = _np.asarray(vec, dtype=_np.float32)
-    if a.shape[0] >= INDEX_EMBED_DIM:
-        a = a[:INDEX_EMBED_DIM]
+    if a.shape[0] >= dim:
+        a = a[:dim]
     else:
-        a = _np.pad(a, (0, INDEX_EMBED_DIM - a.shape[0]))
+        a = _np.pad(a, (0, dim - a.shape[0]))
     n = _np.linalg.norm(a)
     if n > 0:
         a = a / n  # нормируем → косинус = скалярное произведение
@@ -7676,6 +7683,25 @@ def _vec_pack(vec) -> bytes:
 
 def _vec_unpack(blob) -> "object":
     return _np.frombuffer(blob, dtype=_np.float16).astype(_np.float32) if blob else None
+
+
+def _index_kind_dim(kind: str) -> int:
+    """Размерность вектора вида: media_image — картиночная (gemini), остальные (entities/relations/chunks/media_text/rollups) — текстовая (qwen)."""
+    return INDEX_EMBED_IMAGE_DIM if kind == "media_image" else INDEX_EMBED_TEXT_DIM
+
+
+def _index_fresh_vec_rows(chat_id: int, kind: str, rows: list) -> list:
+    """Оставляет строки с вектором ТЕКУЩЕЙ размерности вида (len блоба = dim*2 байт, float16).
+    Вектора старой размерности (до `/index reindex`, напр. 1536 после смены эмбеддера) отбрасываем —
+    иначе np.vstack/косинус падают на смешении длин. Диагностику логируем один раз на (chat, kind)."""
+    want = _index_kind_dim(kind) * 2
+    fresh = [r for r in rows if r.get("_emb") is not None and len(r["_emb"]) == want]
+    if len(fresh) < len(rows):
+        wk = (chat_id, kind)
+        if wk not in _INDEX_DIM_WARN:
+            _INDEX_DIM_WARN.add(wk)
+            log("INDEX", f"Поиск {kind} чата {chat_id}: {len(rows) - len(fresh)} векторов старой размерности пропущено — нужен `/index reindex`")
+    return fresh
 
 
 # --- состояние индексации в idx_state ---
@@ -8915,7 +8941,8 @@ def _sync_embed_texts(texts: list) -> list:
         try:
             resp = requests.post(f"{OPENROUTER_BASE_URL}/embeddings",
                                  headers={"Authorization": f"Bearer {openrouter_api_key}"},
-                                 json={"model": INDEX_EMBED_TEXT_MODEL, "input": texts}, timeout=180)
+                                 json={"model": INDEX_EMBED_TEXT_MODEL, "input": texts,
+                                       "dimensions": INDEX_EMBED_TEXT_DIM}, timeout=180)  # qwen3 MRL → сразу нужная размерность
             resp.raise_for_status()
             j = resp.json()
             # OpenRouter заворачивает отказ апстрима (400 too-large / 5xx) в HTTP 200 с error-телом —
@@ -9015,25 +9042,29 @@ async def _index_rerank(query: str, docs: list, top_n=None):
 
 async def _index_embed_image(raw: bytes):
     try:
-        return _vec_pack(await asyncio.to_thread(_sync_embed_image, raw))
+        return _vec_pack(await asyncio.to_thread(_sync_embed_image, raw), INDEX_EMBED_IMAGE_DIM)
     except Exception as e:
         log("INDEX", f"Эмбеддинг картинки не удался: {e}")
         return None
 
 
 async def _index_embed_query(text: str, image_space: bool = False):
-    """Текст запроса → нормированный np-вектор в нужном пространстве (text-emb-3-small или gemini-emb-2)."""
+    """Текст запроса → нормированный np-вектор в нужном пространстве (qwen3 текст или gemini картинки)."""
     model = INDEX_EMBED_IMAGE_MODEL if image_space else INDEX_EMBED_TEXT_MODEL
+    dim = INDEX_EMBED_IMAGE_DIM if image_space else INDEX_EMBED_TEXT_DIM
 
     def _op():
+        body = {"model": model, "input": [text]}
+        if not image_space:
+            body["dimensions"] = INDEX_EMBED_TEXT_DIM  # qwen3 MRL → сразу нужная размерность
         resp = requests.post(f"{OPENROUTER_BASE_URL}/embeddings",
                              headers={"Authorization": f"Bearer {openrouter_api_key}"},
-                             json={"model": model, "input": [text]}, timeout=60)
+                             json=body, timeout=60)
         resp.raise_for_status()
         return resp.json()["data"][0]["embedding"]
     try:
         v = await asyncio.to_thread(_op)
-        return _vec_unpack(_vec_pack(v))  # та же нормировка/усечение, что у хранимых
+        return _vec_unpack(_vec_pack(v, dim))  # та же нормировка/усечение, что у хранимых
     except Exception as e:
         log("INDEX", f"Эмбеддинг запроса не удался: {e}")
         return None
@@ -9115,7 +9146,7 @@ async def _index_vectorize_missing_images(chat_id: int, progress_cb=None):
 
 
 async def _index_stage3_vectors(chat_id: int, progress_cb=None):
-    """Векторизует досье, связи, сцены и описания фото (text-embedding-3-small). Картинки (emb_image) —
+    """Векторизует досье, связи, сцены и описания фото (qwen3-embedding-8b). Картинки (emb_image) —
     уже в Stage 2. Каждый текст непустой (fallback-заглушки), чтобы не плодить вечные NULL."""
     await _idx_set_state(chat_id, 3, status="running")
     ent_rows = await db_read("SELECT id, name, aliases FROM entities WHERE chat_id=%s", (chat_id,))
@@ -9654,18 +9685,24 @@ async def _index_load_matrix(chat_id: int, kind: str) -> dict:
     rows = await db_read(
         f"SELECT {key_col} AS _k, {emb_col} AS _emb FROM {table} WHERE chat_id=%s AND {emb_col} IS NOT NULL ORDER BY {key_col}",
         (chat_id,))
+    rows = _index_fresh_vec_rows(chat_id, kind, rows)  # игнорим вектора старой размерности до reindex (иначе vstack падает на смешении длин)
     if rows:
         mat = _np.vstack([_np.frombuffer(r["_emb"], dtype=_np.float16).astype(_np.float32) for r in rows])
     else:
-        mat = _np.zeros((0, INDEX_EMBED_DIM), dtype=_np.float32)
+        mat = _np.zeros((0, _index_kind_dim(kind)), dtype=_np.float32)
     obj = {"mat": mat, "ids": [r["_k"] for r in rows], "n": n_now}
     _INDEX_MATRIX[ck] = obj
     return obj
 
 
+_INDEX_DIM_WARN = set()  # (chat_id, kind) где уже предупредили о старой размерности — лог один раз
+
+
 def _index_topk(mat, qvec, k: int) -> list:
     """[(row_index, score)] топ-k по косинусу (векторы нормированы → скалярное произведение)."""
     if qvec is None or getattr(mat, "shape", (0,))[0] == 0:
+        return []
+    if mat.shape[1] != qvec.shape[0]:  # старые вектора иной размерности (до /index reindex) — не роняем поиск
         return []
     sims = mat @ qvec
     k = min(k, sims.shape[0])
@@ -9712,8 +9749,11 @@ async def _index_load_hnsw(chat_id: int, kind: str, n_now: int = None):
         rows = await db_read(
             f"SELECT {key_col} AS _k, {emb_col} AS _emb FROM {table} WHERE chat_id=%s AND {emb_col} IS NOT NULL ORDER BY {key_col}",
             (chat_id,))
+        rows = _index_fresh_vec_rows(chat_id, kind, rows)  # только вектора текущей размерности (иначе add_items падает)
+        if not rows:
+            return None
         mat = _np.vstack([_np.frombuffer(r["_emb"], dtype=_np.float16).astype(_np.float32) for r in rows])
-        idx = _hnswlib.Index(space="cosine", dim=INDEX_EMBED_DIM)
+        idx = _hnswlib.Index(space="cosine", dim=_index_kind_dim(kind))
         idx.init_index(max_elements=len(rows), ef_construction=100, M=16)
         idx.add_items(mat, _np.arange(len(rows)))
         idx.set_ef(min(100, max(10, len(rows))))
@@ -9755,6 +9795,9 @@ async def _index_vector_search_stream(chat_id: int, kind: str, qvec, top_n: int 
         if not rows:
             break
         cur = rows[-1]["_k"]
+        rows = _index_fresh_vec_rows(chat_id, kind, rows)  # только текущая размерность (иначе vstack/косинус падают до reindex)
+        if not rows:
+            continue
         mat = _np.vstack([_np.frombuffer(r["_emb"], dtype=_np.float16).astype(_np.float32) for r in rows])
         sims = mat @ qvec
         for i, score in enumerate(sims):
@@ -10674,7 +10717,7 @@ async def _index_embed_query_image(raw: bytes):
     """Картинка запроса → нормированный np-вектор в пространстве картинок (gemini-embedding-2)."""
     try:
         v = await asyncio.to_thread(_sync_embed_image, raw)
-        return _vec_unpack(_vec_pack(v))
+        return _vec_unpack(_vec_pack(v, INDEX_EMBED_IMAGE_DIM))
     except Exception as e:
         log("INDEX", f"Эмбеддинг картинки-запроса не удался: {e}")
         return None
@@ -11467,6 +11510,59 @@ async def index_label_command(event):
     await _index_set_meta(chat_id, label=label)
     _INDEX_TITLE_CACHE.pop(chat_id, None)
     await event.reply(f"🏷 Готово: этот чат в `/index all` теперь «**{label}**» `{chat_id}`.")
+
+
+@client.on(events.NewMessage(pattern=r"^[./]index\s+reindex(?:\s+(vectors|scenes))?\s*$"))
+async def index_reindex_command(event):
+    """Пересборка индекса под новый эмбеддер / крупные сцены. Резюмируется watchdog’ом (стадии в running → пайплайн).
+    `vectors` (дефолт) — переэмбеддинг ВСЕХ текстовых векторов без LLM (Stage 3 + роллапы Stage 4-инкрементально).
+    `scenes` — пересборка сцен(20k)+связей(inline-категории)+эмбеддинга (Stage 2→4); досье Stage 1 сохранены,
+    медиа-описания переиспользуются (vision не гоняется заново)."""
+    if await _slash_for_other_bot(event) or not event.out:
+        return
+    reason = _index_available()
+    if reason:
+        await event.reply(f"⚠️ /index reindex недоступен: {reason}")
+        return
+    try:
+        await _index_ensure_ddl()
+    except Exception as e:
+        await event.reply(f"❌ Не подключиться к базе индексации: {e}")
+        return
+    chat_id = event.chat_id
+    mode = (event.pattern_match.group(1) or "vectors").lower()
+    if chat_id in _INDEX_TASKS:
+        await event.reply("🟢 Индексация/maintenance уже идёт — дождись или `/index stop`.")
+        return
+    # reindex — только для ПОЛНОСТЬЮ проиндексированного чата: иначе пайплайн доработает незавершённые
+    # Stage 2/5 с LLM/vision (режим «без LLM» сломался бы), а полу-готовый чат нельзя корректно пересобрать.
+    not_done = [stg for stg in (0, 1, 2, 3, 4, 5) if (await _idx_get_state(chat_id, stg))["status"] != "done"]
+    if not_done:
+        await event.reply(f"📭 Чат ещё не полностью проиндексирован (не готовы стадии {not_done}). "
+                          f"Доведи индексацию (`/index go` / `/index status`) — reindex для завершённых чатов.")
+        return
+    # Краш-безопасный порядок: сперва помечаем стадии running (намерение), потом мутируем, потом пайплайн.
+    # Умер посреди — watchdog возобновит running-стадии; повтор `/index reindex` идемпотентен (NULL-фильтр).
+    if mode == "scenes":
+        await _idx_set_state(chat_id, 2, cursor={"last_msg_id": 0}, stats={}, status="running")
+    await _idx_set_state(chat_id, 3, status="running")
+    await _idx_set_state(chat_id, 4, status="running")  # Stage 4 инкрементален: сцены не менялись (vectors) → без LLM, только переэмбеддинг роллапов
+    # текстовые вектора пресервных строк зануляем В ОБОИХ режимах — иначе старая размерность (1536) останется и выпадет из поиска
+    for tbl, col in (("entities", "embedding"), ("media_assets", "emb_text"), ("time_rollups", "embedding")):
+        await db_write(f"UPDATE {tbl} SET {col}=NULL WHERE chat_id=%s", (chat_id,))
+    if mode == "vectors":
+        await db_write("UPDATE chat_chunks SET embedding=NULL WHERE chat_id=%s", (chat_id,))
+        await db_write("UPDATE relations SET embedding=NULL WHERE chat_id=%s", (chat_id,))
+        note = "переэмбеддинг всех текстовых векторов в пространство qwen3 (без LLM)"
+    else:  # scenes: сцены и связи пересоздаются заново (с новыми 2048-векторами)
+        await db_write("DELETE FROM chat_chunks WHERE chat_id=%s", (chat_id,))
+        await db_write("DELETE FROM relations WHERE chat_id=%s", (chat_id,))
+        await db_write("DELETE FROM relation_events WHERE chat_id=%s", (chat_id,))  # дедуп-ключи веса связей — иначе пересбор поедет криво
+        note = "пересборка сцен (20k) + связи заново (inline-категории) + переэмбеддинг всех текстов; досье Stage 1 и медиа-описания сохранены"
+    _index_invalidate(chat_id, "entities", "relations", "chunks", "media_text", "media_image", "rollups")
+    _INDEX_CONTROL[chat_id] = "run"
+    status_msg = await event.reply(f"♻️ Reindex ({mode}): {note}.\nПрогресс — `/index status`, стоп — `/index stop`, резюм — авто.")
+    _INDEX_TASKS[chat_id] = asyncio.create_task(_index_pipeline(chat_id, status_msg))
 
 
 @client.on(events.NewMessage(pattern=r"^[./]index(?:\s+(go|status|st|s|pause|p|resume|res|r|stop|update|up|u))?(?:\s+(gallery|g|text|t|full|f))?\s*$"))
