@@ -9425,6 +9425,16 @@ async def _index_stage5_gallery(chat_id: int, progress_cb=None):
     log("INDEX", f"Gallery 5b: {len({m for d in cand.values() for m in d})} фото-кандидатов на {len(cand)} сущностей")
 
     # --- 5c: verified growth (описание = верификация членства в галерее) ---
+    async def _media_rows_chunked(mids, cols, extra=""):
+        """SELECT по msg_id IN (...) чанками ≤1000 — не раздуваем placeholder-лист на больших чатах."""
+        out = []
+        for i in range(0, len(mids), 1000):
+            part = mids[i:i + 1000]
+            ph = ",".join(["%s"] * len(part))
+            out += await db_read(f"SELECT {cols} FROM media_assets WHERE chat_id=%s AND msg_id IN ({ph}) {extra}",
+                                 tuple([chat_id] + part))
+        return out
+
     galleries = {eid: set() for eid in cand}
     for rnd in range(INDEX_GALLERY_GROW_ROUNDS + 1):
         if _INDEX_CONTROL.get(chat_id) == "pause":
@@ -9433,10 +9443,8 @@ async def _index_stage5_gallery(chat_id: int, progress_cb=None):
         all_mids = sorted({m for eid, d in cand.items() for m in d if len(galleries[eid]) < INDEX_GALLERY_MAX_PER_ENTITY})
         if not all_mids:
             break
-        ph = ",".join(["%s"] * len(all_mids))
-        have = {r["msg_id"] for r in await db_read(
-            f"SELECT msg_id FROM media_assets WHERE chat_id=%s AND msg_id IN ({ph}) "
-            f"AND image_description IS NOT NULL AND image_description<>''", tuple([chat_id] + all_mids))}
+        have = {r["msg_id"] for r in await _media_rows_chunked(
+            all_mids, "msg_id", "AND image_description IS NOT NULL AND image_description<>''")}
         undesc = [m for m in all_mids if m not in have]
         if undesc:
             sbm = {}  # mid → кого на нём ищем (для головы справочника)
@@ -9449,9 +9457,7 @@ async def _index_stage5_gallery(chat_id: int, progress_cb=None):
             if _INDEX_CONTROL.get(chat_id) == "pause":
                 await _idx_set_state(chat_id, 5, status="paused")
                 return "paused"
-        rows = await db_read(
-            f"SELECT msg_id, entity_ids, emb_image FROM media_assets WHERE chat_id=%s AND msg_id IN ({ph})",
-            tuple([chat_id] + all_mids))
+        rows = await _media_rows_chunked(all_mids, "msg_id, entity_ids, emb_image")
         by_mid = {r["msg_id"]: r for r in rows}
         new_conf = {}  # eid → [подтверждённые mid этого раунда]
         for eid, d in cand.items():
@@ -9475,6 +9481,11 @@ async def _index_stage5_gallery(chat_id: int, progress_cb=None):
                 if blob:
                     _add(eid, await _index_vector_search(chat_id, "media_image", _vec_unpack(blob), INDEX_GALLERY_POOL),
                          INDEX_GALLERY_GROW_MIN)
+            # ре-трим: рост может добавить до 5×POOL новых кандидатов на сущность — режем обратно до POOL
+            # лучших НЕподтверждённых (подтверждённые уже в galleries), иначе IN(...) и vision-бюджет пухнут
+            if len(cand.get(eid, {})) > INDEX_GALLERY_POOL:
+                fresh = {m: s for m, s in cand[eid].items() if m not in galleries[eid]}
+                cand[eid] = dict(sorted(fresh.items(), key=lambda kv: -kv[1])[:INDEX_GALLERY_POOL])
 
     # --- финал: emb_text ТОЛЬКО описанным (иначе заглушки «изображение» замусорят текстовый поиск) ---
     res, n = await _index_vectorize_loop(chat_id, "media_assets", "msg_id", "emb_text",
@@ -10533,11 +10544,14 @@ async def _gen_index_candidates(chat_id: int, prompt: str, limit: int = GEN_INDE
             if junk:
                 items = [it for it in items if it not in junk]
                 log("GEN", f"Индекс-референсы: исключено {len(junk)} скриншотов/мемов")
-            if any(it.get("visual_desc") for it in items):
-                before = len(items)
-                items = [it for it in items if it.get("visual_desc") or (it.get("caption") or "").strip()]
-                if before != len(items):
-                    log("GEN", f"Индекс-референсы: исключено {before - len(items)} фото без visual-desc")
+            before = len(items)
+            # безусловно: без свежего visual-desc, без stage5-описания (index_desc — тоже vision-продукт)
+            # и без подписи реранкеру нечего оценивать — кандидат остаётся чистым вектор-шумом (gallery-фото
+            # только с эмбеддингом при упавшем vision раньше просачивались с пустым visual=)
+            items = [it for it in items if it.get("visual_desc") or (it.get("index_desc") or "").strip()
+                     or (it.get("caption") or "").strip()]
+            if before != len(items):
+                log("GEN", f"Индекс-референсы: исключено {before - len(items)} фото без каких-либо описаний")
             items = await _gen_rerank_index_items(prompt, items, limit)
     log("GEN", f"Индекс-референсы: {len(items)} фото + {len(ctx_lines)} досье из памяти по запросу «{_idx_snip(prompt, 50)}»")
     return items, ctx
@@ -10732,6 +10746,10 @@ async def index_command(event):
         # status
         running = chat_id in _INDEX_TASKS
         mode = await _index_get_mode(chat_id)
+        meta = await _idx_get_state(chat_id, INDEX_META_STAGE)
+        if not (meta["stats"] or {}).get("mode"):  # меты нет: не запускался → покажем реальный дефолт go, был до режимов → легаси
+            st0m = await _idx_get_state(chat_id, 0)
+            mode = f"{INDEX_MODE_DEFAULT} (дефолт)" if st0m["status"] is None else f"{mode} (легаси)"
         parts = [f"📊 **Статус индексации этого чата** (режим: {mode}):"]
         for stg, label in ((0, "Дамп"), (1, "Досье"), (2, "Граф связей"), (3, "Вектора"),
                            (4, "Сводки периодов"), (5, "Фото")):
@@ -11287,20 +11305,10 @@ async def entity_admin_command(event):
             if not e1 or not e2:
                 await event.reply("❌ Один из id не найден. `/entity merge <id1> <id2>`")
                 return
-            al1 = json.loads(e1["aliases"]) if e1["aliases"] else []
-            al2 = json.loads(e2["aliases"]) if e2["aliases"] else []
-            merged = list(dict.fromkeys(al1 + al2 + [e1["name"], e2["name"]]))
-            await db_transaction([
-                ("UPDATE entities SET aliases=%s, canon_summary=NULL, fanon_summary=NULL, embedding=NULL WHERE chat_id=%s AND id=%s",
-                 (json.dumps(merged, ensure_ascii=False), chat_id, a)),
-                ("UPDATE entity_claims SET entity_id=%s WHERE chat_id=%s AND entity_id=%s", (a, chat_id, b)),
-                ("UPDATE relations SET source_id=%s, embedding=NULL WHERE chat_id=%s AND source_id=%s", (a, chat_id, b)),
-                ("UPDATE relations SET target_id=%s, embedding=NULL WHERE chat_id=%s AND target_id=%s", (a, chat_id, b)),
-                ("DELETE FROM relations WHERE chat_id=%s AND source_id=target_id", (chat_id,)),
-                ("DELETE FROM entities WHERE chat_id=%s AND id=%s", (chat_id, b)),
-            ])
-            await _index_media_relink_entity(chat_id, a, b)  # галерея влитой сущности переезжает
-            _index_invalidate(chat_id, "entities", "relations")
+            # единый хелпер (не дублируем транзакцию): он же переносит relation_events (иначе дневные
+            # dedup-ключи остаются на drop_id и /index update задваивает веса), чистит summary_parts,
+            # self-loop'ы и переезжает галерею media_assets.entity_ids
+            await _index_merge_entity_ids(chat_id, a, b)
             await event.reply(f"✅ «{e2['name']}» (id {b}) влит в «{e1['name']}» (id {a}). "
                               f"Векторы досье обновятся на `/index update`.")
         elif action == "rename":  # rename <id> <новое имя>
