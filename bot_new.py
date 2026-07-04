@@ -118,8 +118,9 @@ OPENROUTER_AUDIO_FALLBACK = "mistralai/voxtral-mini-transcribe"  # запасн�
 OPENROUTER_IMAGE_MODEL = "openai/gpt-image-2"  # /gen: text→image и image→image (OpenAI GPT Image 2, платная)
 OPENROUTER_IMAGE_FALLBACK = "google/gemini-3.1-flash-image"  # запасная при сбое/перегрузке основной (4K не умеет → авто-даунгрейд до 2K)
 GEN_IMAGE_MAX_INPUT = 3_000_000  # лимит входного запроса ~4.5 МБ; base64 ×1.33 → входное фото до ~3 МБ
-GEN_CTX_IMG_MAX = 20        # /gen: макс. фото-кандидатов когда vision-модель смотрит их НАПРЯМУЮ (прямой режим)
-GEN_CTX_IMG_MAX_DESC = 300  # /gen: макс. фото-кандидатов в режиме ОПИСАНИЙ (текстовая модель или флаг -m) — описания компактны, ИИ выбирает из большого пула
+GEN_CTX_IMG_MAX = 16        # /gen: суммарный потолок каталога (свежие+индекс) для vision-промптера; он же describe-пул свежих
+GEN_CTX_IMG_MAX_DESC = 32   # /gen: суммарный потолок каталога для desc-режима (текст-модель/-m) — режем шум большого окна (было 300)
+GEN_MEDIA_DL_TIMEOUT = 15   # /gen: таймаут на скачивание ОДНОГО фото-кандидата — зависшее фото не морозит весь пул
 GEN_CTX_REF_MAX = 16        # потолок референсов в генератор: GPT Image 2 принимает до 16 картинок на вход (офиц. OpenAI API)
 GEN_CTX_THUMB_PX = 768      # /gen: сторона уменьшенной копии фото-кандидата для ПРОМПТЕРА (vision-вход/описание) — иначе 20 полных фото бьют лимит запроса (Alibaba ~28МБ)
 GEN_CTX_REF_SIDE = 1536     # /gen: качественный resize выбранных refs для ГЕНЕРАТОРА (лица/арты узнаются лучше, чем с 768px thumb)
@@ -2341,6 +2342,10 @@ _IMAGE_GEN_WITH_REFS_SYSTEM = (
     "идея пользователя: следуй замыслу и доводи его, не подменяя и не сужая.\n"
     "Референсы выбирай по номерам и в промпте явно говори, что с ними делать (взять персонажа/лицо, перенять стиль, "
     "использовать как фон, объединить).\n"
+    "ДВЕ ГРУППЫ кандидатов: «свежие» — то, о чём сейчас идёт беседа (контекст): для запросов вроде «нарисуй нас / "
+    "это / как на фото выше» опирайся на них. «Релевантные из всей истории» — семантически похожее на запрос из "
+    "прошлого: для «достань конкретного персонажа/арт/объект из истории». Свежесть и смысловая близость — разные "
+    "сигналы; выбирай ту группу, что реально отвечает запросу, а не просто визуально яркое.\n"
     "ОТБОР (качество важнее количества): каждый референс должен работать на идею — конкретный персонаж/лицо, "
     "узнаваемый стиль, ключевой объект или фон, — а не быть «просто похожим» или случайным. Выбирай придирчиво: "
     "обычно хватает до 5 референсов (исключение — несколько РАЗНЫХ персонажей, тогда по фото на каждого). "
@@ -2504,11 +2509,20 @@ async def _build_gen_prompt(user_prompt: str, context_text: str = None, image_de
             parts.append(f"Описание референсных изображений (поданы модели на вход):\n{image_desc}")
         if cat_used:
             if want_vision:
-                parts.append("Доступные изображения из чата идут ниже парами: строка REF #N сразу перед соответствующей картинкой. "
-                             "Выбирай REFS только по этим номерам.")
+                parts.append("Доступные изображения из чата идут ниже двумя группами, парами «REF #N + картинка»: "
+                             "сначала свежие (о чём сейчас беседа — контекст), затем релевантные из всей истории "
+                             "(семантический поиск по запросу). Выбирай REFS только по этим номерам.")
             else:
-                cat_lines = [_gen_catalog_ref_label(it, include_missing_desc=True) for it in cat_used]
-                parts.append("Доступные изображения из чата (можно выбрать как референсы по номерам):\n" + "\n".join(cat_lines))
+                _recent = [it for it in cat_used if not it.get("from_index")]
+                _idx = [it for it in cat_used if it.get("from_index")]
+                _blocks = []
+                if _recent:
+                    _blocks.append("Свежие фото (о чём сейчас беседа — контекст):\n"
+                                   + "\n".join(_gen_catalog_ref_label(it, include_missing_desc=True) for it in _recent))
+                if _idx:
+                    _blocks.append("Релевантные фото из всей истории (семантический поиск по запросу):\n"
+                                   + "\n".join(_gen_catalog_ref_label(it, include_missing_desc=True) for it in _idx))
+                parts.append("Доступные изображения из чата (выбирай референсы по номерам #N):\n\n" + "\n\n".join(_blocks))
         if past_gens:  # прошлые генерации из лога чата (их идеи/промпты модель видит в контексте) — анти-повтор
             joined = "\n".join(f"- {p}" for p in past_gens)
             parts.append("УЖЕ СГЕНЕРИРОВАНО РАНЕЕ в этом чате (идеи прошлых генераций):\n" + joined +
@@ -2527,7 +2541,13 @@ async def _build_gen_prompt(user_prompt: str, context_text: str = None, image_de
         text_block = "\n\n".join(parts)
         if want_vision and cat_used:  # уменьшенные копии — активной модели НАПРЯМУЮ (thumb, не оригинал → лимит размера запроса)
             uc = [{"type": "text", "text": text_block}]
-            for it in cat_used:
+            prev_group = None
+            for it in cat_used:  # cat_used идёт «свежие → индекс» (непрерывными группами) — вставляем заголовок на границе
+                group = "index" if it.get("from_index") else "recent"
+                if group != prev_group:
+                    uc.append({"type": "text", "text": ("— Свежие фото (контекст беседы) —" if group == "recent"
+                                                        else "— Релевантные фото из всей истории (семантический поиск) —")})
+                    prev_group = group
                 uc.append({"type": "text", "text": _gen_catalog_ref_label(it, include_missing_desc=False)})
                 b64 = base64.b64encode(it.get("thumb") or it["bytes"]).decode("utf-8")
                 uc.append({"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{b64}", "detail": "low"}})
@@ -5040,7 +5060,10 @@ async def _gen_history_catalog(ordered, want_vision: bool, limit: int = GEN_CTX_
 
     async def _dl(m):
         try:
-            raw = await m.download_media(bytes)
+            raw = await asyncio.wait_for(m.download_media(bytes), timeout=GEN_MEDIA_DL_TIMEOUT)
+        except asyncio.TimeoutError:
+            log("GEN", f"Каталог: фото id={getattr(m, 'id', '?')} скачивалось дольше {GEN_MEDIA_DL_TIMEOUT}с — пропускаю")
+            return None
         except Exception as e:
             log("GEN", f"Каталог: фото id={getattr(m, 'id', '?')} не скачалось: {e}")
             return None
@@ -5422,21 +5445,23 @@ async def gen_command(event):
                     want_vision = False
             want_vision = bool(want_vision) and not force_desc  # -m → принудительно режим описаний
             if n > 0:  # недавние фото из окна N
-                cand_limit = GEN_CTX_IMG_MAX if want_vision else GEN_CTX_IMG_MAX_DESC  # прямой режим ≤20, описания — большой пул
+                cand_limit = GEN_CTX_IMG_MAX if want_vision else GEN_CTX_IMG_MAX_DESC  # describe-пул свежих = кап (newest-хвост)
                 cat_timeout = GEN_CATALOG_TIMEOUT if want_vision else GEN_DESC_TIMEOUT
                 catalog = await _gen_history_catalog(ordered, want_vision, limit=cand_limit, timeout=cat_timeout, progress_cb=set_status)
             # индекс-память: релевантные всему запросу фото и досье персонажей (внешность) — из ВСЕЙ истории, не только N
+            idx_items = []
             if _index_memory_allowed(is_owner) and await _index_chat_indexed(event.chat_id):
                 await set_status("🧠 Ищу референсы и контекст в памяти чата…")
-                idx_items, idx_ctx = await _gen_index_candidates(event.chat_id, user_prompt)
-                if idx_items:
-                    seen_mids = {it["mid"] for it in catalog}
-                    for it in idx_items:
-                        if it["mid"] not in seen_mids:  # дедуп с недавним каталогом
-                            catalog.append(it)
-                            seen_mids.add(it["mid"])
+                recent_mids = {it["mid"] for it in catalog if it.get("mid")}  # ② индекс не качает уже показанные свежие
+                idx_items, idx_ctx = await _gen_index_candidates(event.chat_id, user_prompt, exclude_mids=recent_mids)
                 if idx_ctx:  # внешность релевантных персонажей → в контекст промптера
                     context_text = (context_text + "\n\n" + idx_ctx) if context_text else idx_ctx
+            # B: суммарный кап каталога — индекс (релевантное золото, ≤GEN_INDEX_REF_MAX) держим весь, свежие
+            # обрезаем до newest-хвоста на остаток; total ≤ cap. Старое-но-релевантное покрыто индекс-путём.
+            cap = GEN_CTX_IMG_MAX if want_vision else GEN_CTX_IMG_MAX_DESC
+            recent_slots = max(0, cap - len(idx_items))
+            recent_keep = catalog[-recent_slots:] if recent_slots else []
+            catalog = (recent_keep + idx_items)[:cap]  # свежие (контекст) первыми, релевантные из истории — после
             for i, it in enumerate(catalog, 1):  # сквозная нумерация после слияния источников
                 it["idx"] = i
 
@@ -9592,8 +9617,9 @@ def _index_norm_score(score) -> float:
         return 0.0
 
 
-async def _index_media_hybrid_hits(chat_id: int, query: str, count: int, for_gen: bool = False) -> list:
-    """Union media_text(text space) + media_image(image space from text query), deduped by msg_id."""
+async def _index_media_hybrid_hits(chat_id: int, query: str, count: int, for_gen: bool = False, qv_text=None) -> list:
+    """Union media_text(text space) + media_image(image space from text query), deduped by msg_id.
+    qv_text — уже посчитанный text-эмбеддинг запроса (переиспользуем, чтобы не эмбедить одно и то же дважды)."""
     query = (query or "").strip()
     if not query:
         return []
@@ -9623,7 +9649,7 @@ async def _index_media_hybrid_hits(chat_id: int, query: str, count: int, for_gen
             item[f"{'text' if flag == 'text_hit' else 'image'}_score"] = raw_score
             item["score"] = max(item["score"], _index_norm_score(raw_score))
 
-    qv_text = await _index_embed_query(query)
+    qv_text = qv_text if qv_text is not None else await _index_embed_query(query)
     await _merge("media_text", qv_text, "text_hit")
     qv_image = await _index_embed_query(query, image_space=True)
     await _merge("media_image", qv_image, "image_hit")
@@ -10091,19 +10117,24 @@ async def _gen_rerank_index_items(prompt: str, items: list, limit: int) -> list:
     return items[:limit]
 
 
-async def _gen_index_candidates(chat_id: int, prompt: str, limit: int = GEN_INDEX_REF_MAX) -> tuple:
+async def _gen_index_candidates(chat_id: int, prompt: str, limit: int = GEN_INDEX_REF_MAX, exclude_mids=None) -> tuple:
     """Для /gen: смысловой поиск референсов и контекста по ВСЕЙ проиндексированной истории (не только N последних).
     Возвращает (catalog_items, context_text): фото-кандидаты в формате каталога /gen + текст-контекст из досье
-    (внешность релевантных персонажей — ключ к узнаваемым референсам)."""
+    (внешность релевантных персонажей — ключ к узнаваемым референсам).
+    exclude_mids — msg_id уже показанных свежих фото: их пропускаем ДО скачивания (нет двойной загрузки, чистое
+    разделение «свежее = контекст / индекс = релевантное из старого»)."""
     if not chat_id or _index_available() or not (prompt or "").strip():
         return [], None
     search_ready, _search_note = await _index_memory_ready(chat_id, "memory_search")
     if not search_ready:
         return [], None
+    exclude_mids = set(exclude_mids or ())
     qv = await _index_embed_query(prompt)
     media_ready, _media_note = await _index_memory_ready(chat_id, "memory_media")
     # media_text — лорное/контекстное описание, media_image — визуальное пространство gemini-embedding-2.
-    media_hits = await _index_media_hybrid_hits(chat_id, prompt, GEN_INDEX_POOL, for_gen=True) if media_ready else []
+    media_hits = await _index_media_hybrid_hits(chat_id, prompt, GEN_INDEX_POOL, for_gen=True, qv_text=qv) if media_ready else []
+    if exclude_mids:
+        media_hits = [h for h in media_hits if h.get("msg_id") not in exclude_mids]
     # релевантные персонажи → их внешность в контекст промптера
     ent_hits = [h for h in await _index_vector_search(chat_id, "entities", qv, 5) if h["score"] >= 0.25] if qv is not None else []
     ctx_lines = []
@@ -10138,7 +10169,10 @@ async def _gen_index_candidates(chat_id: int, prompt: str, limit: int = GEN_INDE
             if not _index_is_image_msg(m):
                 return None
             try:
-                raw = await m.download_media(bytes)
+                raw = await asyncio.wait_for(m.download_media(bytes), timeout=GEN_MEDIA_DL_TIMEOUT)
+            except asyncio.TimeoutError:
+                log("GEN", f"Индекс-референсы: фото id={getattr(m, 'id', '?')} скачивалось дольше {GEN_MEDIA_DL_TIMEOUT}с — пропускаю")
+                return None
             except Exception:
                 return None
             if not raw:
