@@ -7097,6 +7097,7 @@ _HELP_SECTIONS = {
         "   `/index status` — прогресс по этапам этого чата (стадия · % прохода · сколько сущностей/связей)\n"
         "   `/index all` — обзор ВСЕХ индексируемых чатов сразу: где каждый (стадия, %, сущности/связи, жив ли фон)\n"
         "   `/index all live` — то же, но **само-обновляется** в одном сообщении, пока идёт работа (авто-стоп при завершении)\n"
+        "   `/index label <текст>` — задать этому чату короткую подпись для `/index all` (пусто — показать, `-` — сбросить)\n"
         "   `/index pause` / `/index resume` — пауза и продолжение (состояние на чекпоинтах в БД)\n"
         "   `/index update` — догнать новые сообщения после прошлой индексации\n"
         "   `/index recategorize` — обогатить связи: категории (романтика/дружба/семья/вражда/…), денойз со-присутствия,\n"
@@ -7708,8 +7709,23 @@ async def _index_get_mode(chat_id: int) -> str:
     return mode if mode in ("gallery", "text", "full") else "full"
 
 
+async def _index_set_meta(chat_id: int, **updates):
+    """Мердж-запись в мета-строку (stage 9): читаем текущие stats, обновляем ключи, пишем назад.
+    Нужно, чтобы mode и label (и прочая мета) не затирали друг друга — _idx_set_state пишет stats ЦЕЛИКОМ."""
+    st = await _idx_get_state(chat_id, INDEX_META_STAGE)
+    meta = dict(st["stats"] or {})
+    meta.update(updates)
+    await _idx_set_state(chat_id, INDEX_META_STAGE, stats=meta, status="done")
+
+
 async def _index_set_mode(chat_id: int, mode: str):
-    await _idx_set_state(chat_id, INDEX_META_STAGE, stats={"mode": mode}, status="done")
+    await _index_set_meta(chat_id, mode=mode)
+
+
+async def _index_get_label(chat_id: int) -> str:
+    """Ручная подпись чата (`/index label`), если задана."""
+    st = await _idx_get_state(chat_id, INDEX_META_STAGE)
+    return ((st["stats"] or {}).get("label") or "").strip()
 
 
 def _index_scene_key(chat_id: int, start_msg_id: int, end_msg_id: int) -> str:
@@ -11269,15 +11285,20 @@ _INDEX_TITLE_CACHE: dict = {}
 
 
 async def _index_chat_title(chat_id: int) -> str:
-    """Best-effort название чата для обзора (кэш на процесс; фолбэк — сам id)."""
+    """Название чата для обзора: ручная подпись `/index label` > имя из Telegram > сам id. Кэш на процесс."""
     if chat_id in _INDEX_TITLE_CACHE:
         return _INDEX_TITLE_CACHE[chat_id]
-    title = str(chat_id)
+    title = ""
     try:
-        ent = await client.get_entity(chat_id)
-        title = utils.get_display_name(ent) or str(chat_id)
+        title = await _index_get_label(chat_id)
     except Exception:
-        pass
+        title = ""
+    if not title:
+        try:
+            ent = await client.get_entity(chat_id)
+            title = utils.get_display_name(ent) or str(chat_id)
+        except Exception:
+            title = str(chat_id)
     _INDEX_TITLE_CACHE[chat_id] = title
     return title
 
@@ -11399,6 +11420,49 @@ async def index_all_command(event):
             raise
 
     _INDEX_ALL_LIVE_TASK = asyncio.create_task(_live_loop(status))
+
+
+@client.on(events.NewMessage(pattern=r"^[./]index\s+label\b\s*(.*)$"))
+async def index_label_command(event):
+    """Ручная подпись текущего чата для `/index all` (если имя из Telegram не читается или хочется короче).
+    `/index label Настолки` — задать · `/index label` — показать · `/index label -` — сбросить."""
+    if await _slash_for_other_bot(event) or not event.out:
+        return
+    reason = _index_available()
+    if reason:
+        await event.reply(f"⚠️ /index недоступен: {reason}")
+        return
+    try:
+        await _index_ensure_ddl()
+    except Exception as e:
+        await event.reply(f"❌ Не подключиться к базе индексации: {e}")
+        return
+    chat_id = event.chat_id
+    text = (event.pattern_match.group(1) or "").strip()
+    if not text:
+        cur = await _index_get_label(chat_id)
+        if cur:
+            await event.reply(f"🏷 Подпись этого чата: «**{cur}**». `/index label -` — сбросить.")
+        else:
+            auto = ""
+            try:
+                ent = await client.get_entity(chat_id)
+                auto = utils.get_display_name(ent) or ""
+            except Exception:
+                pass
+            shown = f"«{auto}»" if auto else f"`{chat_id}`"
+            await event.reply(f"🏷 Своей подписи нет — в `/index all` показывается {shown}.\n"
+                              f"`/index label <текст>` — задать свою короткую подпись.")
+        return
+    if text in ("-", "—", "clear", "сброс", "reset"):
+        await _index_set_meta(chat_id, label="")
+        _INDEX_TITLE_CACHE.pop(chat_id, None)
+        await event.reply("🏷 Подпись сброшена — в `/index all` вернётся имя из Telegram.")
+        return
+    label = text[:40]
+    await _index_set_meta(chat_id, label=label)
+    _INDEX_TITLE_CACHE.pop(chat_id, None)
+    await event.reply(f"🏷 Готово: этот чат в `/index all` теперь «**{label}**» `{chat_id}`.")
 
 
 @client.on(events.NewMessage(pattern=r"^[./]index(?:\s+(go|status|st|s|pause|p|resume|res|r|stop|update|up|u))?(?:\s+(gallery|g|text|t|full|f))?\s*$"))
