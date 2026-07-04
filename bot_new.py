@@ -7094,7 +7094,8 @@ _HELP_SECTIONS = {
         "        с досье → у сущностей появляются галереи (`/entity gallery <имя>`); быстрее и сильно дешевле full\n"
         "      • **text** — только текст, медиа не трогаем (максимальная скорость)\n"
         "      • **full** — полное vision-описание каждого фото (медленно, дорого, максимум медиа-памяти)\n"
-        "   `/index status` — прогресс по этапам (и режим)\n"
+        "   `/index status` — прогресс по этапам этого чата (стадия · % прохода · сколько сущностей/связей)\n"
+        "   `/index all` — обзор ВСЕХ индексируемых чатов сразу: где каждый (стадия, %, сущности/связи, жив ли фон)\n"
         "   `/index pause` / `/index resume` — пауза и продолжение (состояние на чекпоинтах в БД)\n"
         "   `/index update` — догнать новые сообщения после прошлой индексации\n"
         "   `/index recategorize` — обогатить связи: категории (романтика/дружба/семья/вражда/…), денойз со-присутствия,\n"
@@ -7103,7 +7104,7 @@ _HELP_SECTIONS = {
         "   `/index retry failed [1|2]` — переиндексировать пропущенные блоки/сцены точечно\n"
         "   `/index eval template|run|report` — шаблон и прогон smoke-eval качества поиска\n"
         "   ⚡️ **Короткие алиасы:** `/index g`/`t`/`f` = go в режиме · `st`/`s` = status · `p` = pause ·\n"
-        "      `r`/`res` = resume · `u`/`up` = update · `rc`/`recat` = recategorize. Полные слова тоже работают.\n"
+        "      `r`/`res` = resume · `u`/`up` = update · `rc`/`recat` = recategorize · `all` = обзор всех. Полные слова тоже работают.\n"
         "\n"
         "**Этапы:** 0 — дамп истории в БД · 1 — досье и алиасы · 2 — граф связей · 3 — вектора для поиска ·\n"
         "   4 — сводки по месяцам («как менялось со временем») · 5 — фото (последней, не блокирует поиск).\n"
@@ -11233,6 +11234,112 @@ async def index_recategorize_command(event):
     _index_start_recategorize(chat_id, status_msg=status_msg)
 
 
+# --- Мониторинг индексации: % прохода стадии + глобальный обзор всех чатов ---
+def _index_human_num(n) -> str:
+    n = int(n or 0)
+    if n >= 1_000_000:
+        return f"{n / 1_000_000:.1f}M"
+    if n >= 10_000:
+        return f"{n // 1000}k"
+    if n >= 1_000:
+        return f"{n / 1000:.1f}k"
+    return str(n)
+
+
+async def _index_stage_pct(chat_id: int, cursor) -> str:
+    """Грубый % прохода стадии по курсору (Stage 1/2: cursor.last_msg_id растёт по возрастанию msg_id).
+    Возвращает ' · ~52% (196k/375k)' или '' если посчитать нельзя."""
+    try:
+        last = int((cursor or {}).get("last_msg_id", 0))
+        if last <= 0:
+            return ""
+        d = await db_read("SELECT COUNT(*) c FROM messages WHERE chat_id=%s AND msg_id<=%s", (chat_id, last))
+        t = await db_read("SELECT COUNT(*) c FROM messages WHERE chat_id=%s", (chat_id,))
+        done = int(d[0]["c"]); total = int(t[0]["c"])
+        if total <= 0:
+            return ""
+        pct = min(100, round(done * 100 / total))
+        return f" · ~{pct}% ({_index_human_num(done)}/{_index_human_num(total)})"
+    except Exception:
+        return ""
+
+
+_INDEX_TITLE_CACHE: dict = {}
+
+
+async def _index_chat_title(chat_id: int) -> str:
+    """Best-effort название чата для обзора (кэш на процесс; фолбэк — сам id)."""
+    if chat_id in _INDEX_TITLE_CACHE:
+        return _INDEX_TITLE_CACHE[chat_id]
+    title = str(chat_id)
+    try:
+        ent = await client.get_entity(chat_id)
+        title = utils.get_display_name(ent) or str(chat_id)
+    except Exception:
+        pass
+    _INDEX_TITLE_CACHE[chat_id] = title
+    return title
+
+
+async def _index_relcounts(chat_id: int) -> tuple:
+    """(всего связей, из них категоризировано)."""
+    r = await db_read("SELECT COUNT(*) c, SUM(rel_category IS NOT NULL) cat FROM relations WHERE chat_id=%s", (chat_id,))
+    return int(r[0]["c"] or 0), int(r[0]["cat"] or 0)
+
+
+@client.on(events.NewMessage(pattern=r"^[./]index\s+all\s*$"))
+async def index_all_command(event):
+    """Глобальный обзор: на каком месте КАЖДЫЙ индексируемый чат (стадия · % · сущности/связи · жив ли фон)."""
+    if await _slash_for_other_bot(event) or not event.out:
+        return
+    reason = _index_available()
+    if reason:
+        await event.reply(f"⚠️ /index недоступен: {reason}")
+        return
+    try:
+        await _index_ensure_ddl()
+    except Exception as e:
+        await event.reply(f"❌ Не подключиться к базе индексации: {e}")
+        return
+    rows = await db_read("SELECT DISTINCT chat_id FROM idx_state ORDER BY chat_id")
+    if not rows:
+        await event.reply("📭 Пока ни один чат не индексировался. Запусти `/index go` в нужном чате.")
+        return
+    STAGE_LABELS = {0: "Дамп", 1: "Досье", 2: "Граф", 3: "Вектора", 4: "Сводки", 5: "Фото"}
+    lines = [f"🗂 **Все индексации** ({len(rows)} чат.):"]
+    active = 0
+    for r in rows:
+        cid = int(r["chat_id"])
+        ec = (await db_read("SELECT COUNT(*) c FROM entities WHERE chat_id=%s", (cid,)))[0]["c"]
+        rels, cat = await _index_relcounts(cid)
+        live = cid in _INDEX_TASKS
+        if live:
+            active += 1
+        # позиция = первая пайплайн-стадия 0..5, которая не done
+        pos_stage, pos_status, pos_state = "done", "done", None
+        for stg in (0, 1, 2, 3, 4, 5):
+            s = await _idx_get_state(cid, stg)
+            if s["status"] is None:
+                pos_stage, pos_status, pos_state = stg, "ожидает", s
+                break
+            if s["status"] != "done":
+                pos_stage, pos_status, pos_state = stg, s["status"], s
+                break
+        if pos_stage == "done":
+            posrep = "✅ готово"
+        else:
+            pct = await _index_stage_pct(cid, pos_state["cursor"]) if pos_stage in (1, 2) and pos_status == "running" else ""
+            posrep = f"Stage {pos_stage} {STAGE_LABELS[pos_stage]} {pos_status}{pct}"
+        catrep = ""
+        if rels:
+            catrep = f" · {rels} связей" + (f" ⚠️{cat}/{rels} cat (`/index rc`)" if cat < rels else " ✓cat")
+        title = _idx_snip(await _index_chat_title(cid), 30)
+        lines.append(f"• **{title}** `{cid}`{' 🟢' if live else ''}\n  {posrep} · {ec} сущ{catrep}")
+    lines.append(f"\n{'🟢' if active else '⚪️'} активных фоновых задач: **{active}**"
+                 f"{' (остальные подхватит watchdog)' if not active else ''}")
+    await send_long(event.chat_id, "\n".join(lines), parse_mode="md", reply_to=event.id)
+
+
 @client.on(events.NewMessage(pattern=r"^[./]index(?:\s+(go|status|st|s|pause|p|resume|res|r|stop|update|up|u))?(?:\s+(gallery|g|text|t|full|f))?\s*$"))
 async def index_command(event):
     if await _slash_for_other_bot(event):
@@ -11278,6 +11385,18 @@ async def index_command(event):
                 extra = ""
                 if stg == 0 and s["stats"].get("dumped"):
                     extra = f" · {s['stats']['dumped']} сообщ."
+                    if s["status"] == "running":
+                        extra += await _index_stage_pct(chat_id, s["cursor"])
+                elif stg == 1:
+                    ec = (await db_read("SELECT COUNT(*) c FROM entities WHERE chat_id=%s", (chat_id,)))[0]["c"]
+                    extra = f" · {ec} сущностей"
+                    if s["status"] == "running":
+                        extra += await _index_stage_pct(chat_id, s["cursor"])
+                elif stg == 2:
+                    rn, cn = await _index_relcounts(chat_id)
+                    extra = (f" · {rn} связей" + (f" · ⚠️ {cn}/{rn} категоризир." if rn and cn < rn else (" ✓cat" if rn else ""))) if rn else ""
+                    if s["status"] == "running":
+                        extra += await _index_stage_pct(chat_id, s["cursor"])
                 elif stg == 4 and s["stats"].get("months"):
                     extra = f" · {s['stats']['months']} мес."
                 elif stg == 5 and s["stats"].get("photos"):
