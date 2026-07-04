@@ -7031,6 +7031,7 @@ _HELP_SECTIONS = {
         "   Гостям из `/allow` память не выдаётся, если явно не включить `INDEX_MEMORY_FOR_GUESTS=1`.\n"
         "\n"
         "**📇 Досье и правка графа:**\n"
+        "   `/entity list` — реестр всех сущностей (тип, число фактов, привязка к tg); фильтр `users`/`chars`, страница числом\n"
         "   `/entity show <имя|алиас>` — карточка: canon-факты, мнение чата, связи (со ссылками на сообщения)\n"
         "   `/entity merge <id1> <id2>` — слить две сущности (id2 → id1)\n"
         "   `/entity rename <id> <имя>` · `/entity alias <id> <алиас>` · `/entity split <id> <алиас>`\n"
@@ -10767,6 +10768,65 @@ async def entity_relink_command(event):
     tail = (f" Осталось {total - linked} (модель переименовала в непохожее имя — при желании поправь `/entity`)."
             if total - linked else "")
     await event.reply(f"🔗 Привязка участников: **{linked}** из {total} несопоставленных получили tg_user_id.{tail}")
+
+
+@client.on(events.NewMessage(pattern=r"^[./]entity\s+list\b\s*(.*)$"))
+async def entity_list_command(event):
+    """Реестр всех сущностей чата: имя, тип, число фактов, привязка к tg, срез canon-саммари.
+    `/entity list` · фильтр `users`/`chars` · страница числом (напр. `/entity list users 2`)."""
+    if await _slash_for_other_bot(event):
+        return
+    if not event.out:
+        return
+    reason = _index_available()
+    if reason:
+        await event.reply(f"⚠️ /entity недоступен: {reason}")
+        return
+    try:
+        await _index_ensure_ddl()
+    except Exception as e:
+        await event.reply(f"❌ Не подключиться к базе индексации: {e}")
+        return
+    chat_id = event.chat_id
+    etype, page = None, 1
+    for a in (event.pattern_match.group(1) or "").split():
+        al = a.lower()
+        if al in ("users", "user", "участники", "u"):
+            etype = "user"
+        elif al in ("chars", "char", "персонажи", "c"):
+            etype = "character"
+        elif al.isdigit():
+            page = max(1, int(al))
+    where = "WHERE e.chat_id=%s" + (" AND e.entity_type=%s" if etype else "")
+    params = [chat_id] + ([etype] if etype else [])
+    rows = await db_read(
+        f"""SELECT e.id, e.name, e.entity_type, e.tg_user_id, e.canon_summary, COUNT(cl.id) AS facts
+            FROM entities e LEFT JOIN entity_claims cl ON cl.chat_id=e.chat_id AND cl.entity_id=e.id
+            {where} GROUP BY e.id ORDER BY facts DESC, e.name""", tuple(params))
+    if not rows:
+        await event.reply("📭 В памяти этого чата пока нет сущностей. Запусти `/index go`.")
+        return
+    PAGE = 40
+    total = len(rows)
+    pages = (total + PAGE - 1) // PAGE
+    page = min(page, pages)
+    chunk = rows[(page - 1) * PAGE: page * PAGE]
+    users = sum(1 for r in rows if r["entity_type"] == "user")
+    linked = sum(1 for r in rows if r["tg_user_id"])
+    flt = {"user": "участники", "character": "персонажи"}.get(etype, "все")
+    head = (f"🗂 Сущности чата ({flt}): {total} · 👤 {users} · 🎭 {total - users} · 🔗 привязано {linked}"
+            f"  ·  стр. {page}/{pages}\n")
+    lines = []
+    for r in chunk:
+        tg = "🔗" if r["tg_user_id"] else "  "
+        te = "🎭" if r["entity_type"] == "character" else "👤"
+        snip = _idx_snip(r.get("canon_summary"), 70)
+        lines.append(f"{tg}{te} #{r['id']} {r['name']} · {r['facts']}ф" + (f" — {snip}" if snip else ""))
+    foot = "\n\n📖 Подробнее: /entity show <имя>"
+    if page < pages:
+        nxt = "/entity list" + ({"user": " users", "character": " chars"}.get(etype, "")) + f" {page + 1}"
+        foot += f"\n➡️ Следующая страница: {nxt}"
+    await send_long(chat_id, head + "\n".join(lines) + foot, parse_mode=None, reply_to=event.id)
 
 
 @client.on(events.NewMessage(pattern=r"^[./]entity\s+(merge|rename|alias|split)\s+(.+)$"))
