@@ -7106,17 +7106,14 @@ _HELP_SECTIONS = {
         "   `/index all` — обзор ВСЕХ индексируемых чатов сразу: где каждый (стадия, %, сущности/связи, жив ли фон)\n"
         "   `/index all live` — то же, но **само-обновляется** в одном сообщении, пока идёт работа (авто-стоп при завершении)\n"
         "   `/index label <текст>` — задать этому чату короткую подпись для `/index all` (пусто — показать, `-` — сбросить)\n"
-        "   `/index pause` / `/index resume` — пауза и продолжение (состояние на чекпоинтах в БД)\n"
-        "   `/index update` — догнать новые сообщения после прошлой индексации\n"
+        "   `/index stop` — мягко остановить/пауза на ближайшем чекпоинте (прогресс сохранён). Продолжить — `/index go`\n"
+        "   `/index update` — догнать новые сообщения + повторить пропущенные poison-диапазоны + добить пустые досье\n"
         "   `/index reindex [vectors|scenes]` — пересборка под новый эмбеддер/крупные сцены: `vectors` (дефолт) — переэмбеддинг\n"
         "      всех текстов без LLM; `scenes` — пересобрать сцены(20k)+связи заново (досье Stage 1 сохранены, медиа не пере-vision)\n"
-        "   `/index recategorize` — обогатить связи: категории (романтика/дружба/семья/вражда/…), денойз со-присутствия,\n"
-        "      добить пустые досье (нужны уже построенные связи — Stage 2). Идемпотентна, резюмится сама.\n"
-        "   `/index failed` — показать poison-диапазоны, которые были честно пропущены после дробления\n"
-        "   `/index retry failed [1|2]` — переиндексировать пропущенные блоки/сцены точечно\n"
+        "   `/index failed` — показать poison-диапазоны, честно пропущенные после дробления (повтор — `/index update`)\n"
         "   `/index eval template|run|report` — шаблон и прогон smoke-eval качества поиска\n"
-        "   ⚡️ **Короткие алиасы:** `/index g`/`t`/`f` = go в режиме · `st`/`s` = status · `p` = pause ·\n"
-        "      `r`/`res` = resume · `u`/`up` = update · `rc`/`recat` = recategorize · `all` = обзор всех. Полные слова тоже работают.\n"
+        "   ⚡️ **Короткие алиасы:** `/index g`/`t`/`f` = go в режиме · `st`/`s` = status · `p` = stop · `u`/`up` = update · `all` = обзор всех.\n"
+        "      Полные слова тоже работают. (Категории связей ставятся автоматически при индексации; `pause`/`resume`/`recategorize`/`retry` слиты в `stop`/`go`/`update`.)\n"
         "\n"
         "**Этапы:** 0 — дамп истории в БД · 1 — досье и алиасы · 2 — граф связей · 3 — вектора для поиска ·\n"
         "   4 — сводки по месяцам («как менялось со временем») · 5 — фото (последней, не блокирует поиск).\n"
@@ -7436,7 +7433,7 @@ _INDEX_COUNTS: dict = {}            # {(chat_id, kind): (count, monotonic_ts)} �
 
 class IndexTransientError(Exception):
     """Провайдер экстракции недоступен (сеть/5xx/timeout) — авария, а не poison-контент.
-    Стадия должна встать в error и дождаться /index resume, НЕ дробить блок в ложные skip."""
+    Стадия должна встать в error и дождаться /index go, НЕ дробить блок в ложные skip."""
 
 
 def _index_available() -> str:
@@ -7728,7 +7725,7 @@ async def _idx_set_state(chat_id: int, stage: int, cursor=None, stats=None, stat
 INDEX_META_STAGE = 9  # выделенная строка idx_state под мета (режим): stage 0–5 пишут свои stats ЦЕЛИКОМ,
 #                       и mode в них затёрся бы первым же чекпоинтом; стадию 9 пайплайн не трогает,
 #                       status='done' не подхватывается boot-резюмом
-INDEX_RECATEGORIZE_STAGE = 8  # maintenance: /index recategorize; не часть основного pipeline 0–5
+INDEX_RECATEGORIZE_STAGE = 8  # maintenance stage-8 (команда /index recategorize убрана в Фазе 5; машинерия для доигрывания старых состояний)
 
 
 async def _index_get_mode(chat_id: int) -> str:
@@ -8318,7 +8315,7 @@ async def _index_stage1_dossiers(chat_id: int, progress_cb=None):
             touched, skipped = await _index_stage1_extract_rows(chat_id, block_rows, amap, name2author)
         except IndexTransientError as e:  # авария провайдера — не двигаем курсор, встаём в error
             await _idx_set_state(chat_id, 1, status="error")
-            log("INDEX", f"Stage1 транзиентный сбой на блоке до {last}: {e} — стадия в error, /index resume добёрет")
+            log("INDEX", f"Stage1 транзиентный сбой на блоке до {last}: {e} — стадия в error, /index go добёрет")
             return "error"
         cursor = last
         blocks_done += 1
@@ -8338,7 +8335,7 @@ async def _index_stage1_dossiers(chat_id: int, progress_cb=None):
         sum_res = await _index_summarize_entities(chat_id, progress_cb)
     except IndexTransientError as e:  # провайдер недоступен на саммари — не закрываем стадию
         await _idx_set_state(chat_id, 1, status="error")
-        log("INDEX", f"Stage1 саммари: транзиентный сбой ({e}) — стадия в error, /index resume добёрет")
+        log("INDEX", f"Stage1 саммари: транзиентный сбой ({e}) — стадия в error, /index go добёрет")
         return "error"
     if sum_res == "paused":
         await _idx_set_state(chat_id, 1, status="paused")
@@ -8879,7 +8876,7 @@ async def _index_stage2_graph(chat_id: int, progress_cb=None):
         if progress_cb and last_ok is not None:
             await progress_cb(f"🕸 Граф: {scenes_done} сцен (до id {last_ok})…")
         batch = []
-        if stopped:  # сцена не извлеклась даже после ретрая → встаём в error (чекпоинт на last_ok, /index resume добёрет без дыр)
+        if stopped:  # сцена не извлеклась даже после ретрая → встаём в error (чекпоинт на last_ok, /index go добёрет без дыр)
             raise IndexTransientError("Stage2: сцена не извлеклась даже после точечного ретрая — провайдер сыпется")
 
     while True:
@@ -10109,7 +10106,7 @@ async def _index_tool_connections(chat_id: int, entity: str = None, category: st
              LIMIT %s""",
         tuple(params + [limit]))
     uncat = 0
-    if category:  # категории могли быть ещё не вычислены (/index recategorize) → не выдаём ложное «нет романтики»
+    if category:  # категории могли быть ещё не вычислены (старый чат до inline-категорий; чинит /index reindex scenes) → не выдаём ложное «нет романтики»
         uscope, uparams = ["chat_id=%s", "rel_category IS NULL"], [chat_id]
         if focus:
             uscope.append("(source_id=%s OR target_id=%s)")
@@ -10126,7 +10123,7 @@ async def _index_tool_connections(chat_id: int, entity: str = None, category: st
         base = "Связей по фильтрам не найдено" + (": " + ", ".join(filters) if filters else ".")
         if uncat:  # НЕ «нет романтики», а «категории ещё не размечены»
             base += (f"\n⚠️ У {uncat} связей категория ещё НЕ вычислена — по категории «{category}» ответ неполон. "
-                     f"Запусти `/index recategorize`, либо посмотри связи без фильтра категории.")
+                     f"Запусти `/index reindex scenes` (пересоберёт связи с категориями), либо смотри связи без фильтра категории.")
         return base
 
     for r in rows:
@@ -10145,7 +10142,7 @@ async def _index_tool_connections(chat_id: int, entity: str = None, category: st
     if polarity:
         head.append(f"Полярность: {polarity}.")
     if category and uncat:  # частичная категоризация — честно предупреждаем о неполноте
-        head.append(f"⚠️ ещё {uncat} связей без категории (`/index recategorize` уточнит).")
+        head.append(f"⚠️ ещё {uncat} связей без категории (`/index reindex scenes` уточнит).")
     lines = [" ".join(head)]
     for cat in sorted(grouped, key=_index_rel_category_sort_key):
         items = grouped[cat]
@@ -10909,10 +10906,10 @@ async def _index_pipeline(chat_id: int, status_msg):
         if st0["status"] != "done":
             res = await _index_stage0_dump(chat_id, progress_cb=upd)
             if res == "paused":
-                await upd("⏸ Индексация на паузе (Stage 0 — дамп). `/index resume` — продолжить.")
+                await upd("⏸ Индексация на паузе (Stage 0 — дамп). `/index go` — продолжить.")
                 return
             if res == "floodwait":
-                await upd("⏳ Telegram притормозил выгрузку (FloodWait). `/index resume` позже — дожму остаток.")
+                await upd("⏳ Telegram притормозил выгрузку (FloodWait). `/index go` позже — дожму остаток.")
                 return
         st0 = await _idx_get_state(chat_id, 0)
         n = int(st0["stats"].get("dumped", 0))
@@ -10922,10 +10919,10 @@ async def _index_pipeline(chat_id: int, status_msg):
             await upd(f"✅ Дамп: {n} сообщений. 🧠 Строю досье (может занять долго)…")
             res1 = await _index_stage1_dossiers(chat_id, progress_cb=upd)
             if res1 == "paused":
-                await upd("⏸ Индексация на паузе (Stage 1 — досье). `/index resume` — продолжить.")
+                await upd("⏸ Индексация на паузе (Stage 1 — досье). `/index go` — продолжить.")
                 return
             if res1 == "error":
-                await upd("❌ Индексация остановлена на Stage 1: LLM не вернула валидный JSON. `/index resume` попробует тот же блок ещё раз.")
+                await upd("❌ Индексация остановлена на Stage 1: LLM не вернула валидный JSON. `/index go` попробует тот же блок ещё раз.")
                 return
         cnt = (await db_read("SELECT COUNT(*) c FROM entities WHERE chat_id=%s", (chat_id,)))[0]["c"]
         # Stage 2 — граф связей + медиа
@@ -10934,10 +10931,10 @@ async def _index_pipeline(chat_id: int, status_msg):
             await upd(f"✅ Досье: {cnt} сущностей. 🕸 Строю граф связей и разбираю фото (долго — фото по одному)…")
             res2 = await _index_stage2_graph(chat_id, progress_cb=upd)
             if res2 == "paused":
-                await upd("⏸ Индексация на паузе (Stage 2 — граф). `/index resume` — продолжить.")
+                await upd("⏸ Индексация на паузе (Stage 2 — граф). `/index go` — продолжить.")
                 return
             if res2 == "error":
-                await upd("❌ Индексация остановлена на Stage 2: LLM не вернула валидные связи. `/index resume` попробует сцену ещё раз.")
+                await upd("❌ Индексация остановлена на Stage 2: LLM не вернула валидные связи. `/index go` попробует сцену ещё раз.")
                 return
         nrel = (await db_read("SELECT COUNT(*) c FROM relations WHERE chat_id=%s AND status='active'", (chat_id,)))[0]["c"]
         nmedia = (await db_read("SELECT COUNT(*) c FROM media_assets WHERE chat_id=%s", (chat_id,)))[0]["c"]
@@ -10947,10 +10944,10 @@ async def _index_pipeline(chat_id: int, status_msg):
             await upd(f"✅ Граф: {nrel} связей, {nmedia} фото. 🔢 Векторизую для поиска…")
             res3 = await _index_stage3_vectors(chat_id, progress_cb=upd)
             if res3 == "paused":
-                await upd("⏸ Индексация на паузе (Stage 3 — вектора). `/index resume` — продолжить.")
+                await upd("⏸ Индексация на паузе (Stage 3 — вектора). `/index go` — продолжить.")
                 return
             if res3 == "error":
-                await upd("❌ Индексация остановлена на Stage 3: часть embeddings не получена. `/index resume` повторит оставшиеся строки.")
+                await upd("❌ Индексация остановлена на Stage 3: часть embeddings не получена. `/index go` повторит оставшиеся строки.")
                 return
         # Stage 4 — темпоральные роллап-саммари (месяц → весь чат), для тематических вопросов «как менялось»
         st4 = await _idx_get_state(chat_id, 4)
@@ -10958,10 +10955,10 @@ async def _index_pipeline(chat_id: int, status_msg):
             await upd("✅ Вектора готовы. 🗓 Собираю сводки по месяцам (для вопросов «как менялось со временем»)…")
             res4 = await _index_stage4_rollups(chat_id, progress_cb=upd)
             if res4 == "paused":
-                await upd("⏸ Индексация на паузе (Stage 4 — сводки периодов). `/index resume` — продолжить.")
+                await upd("⏸ Индексация на паузе (Stage 4 — сводки периодов). `/index go` — продолжить.")
                 return
             if res4 == "error":
-                await upd("❌ Индексация остановлена на Stage 4: LLM не дала сводку периода. `/index resume` повторит.")
+                await upd("❌ Индексация остановлена на Stage 4: LLM не дала сводку периода. `/index go` повторит.")
                 return
         # Stage 5 — фото (последней; текстовый граф уже готов и ищется, фото доливаются в фоне).
         # Режим: text — медиа не трогаем; gallery — вектора всех + описание только совпавших с досье; full — описываем всё.
@@ -10980,14 +10977,14 @@ async def _index_pipeline(chat_id: int, status_msg):
                     await upd("✅ Граф, вектора и сводки готовы — поиск по тексту уже работает. 🖼 Дообрабатываю фото (долго, по одному)…")
                     res5 = await _index_stage5_media(chat_id, progress_cb=upd)
                 if res5 == "paused":
-                    await upd("⏸ Индексация на паузе (Stage 5 — фото). `/index resume` — продолжить. Текстовый поиск уже работает.")
+                    await upd("⏸ Индексация на паузе (Stage 5 — фото). `/index go` — продолжить. Текстовый поиск уже работает.")
                     return
                 if res5 == "error":
-                    await upd("⚠️ Часть фото не векторизовалась (Stage 5). `/index resume` дожмёт. Текстовый поиск уже работает.")
+                    await upd("⚠️ Часть фото не векторизовалась (Stage 5). `/index go` дожмёт. Текстовый поиск уже работает.")
                     return
         skipped = await _index_failed_count(chat_id, "skipped")
         skip_note = (f"\n⚠️ Пропущено poison-диапазонов: {skipped}. "
-                     f"Смотри `/index failed`, повтор: `/index retry failed`.") if skipped else ""
+                     f"Смотри `/index failed`, повтор пропущенных — `/index update`.") if skipped else ""
         nmedia = (await db_read("SELECT COUNT(*) c FROM media_assets WHERE chat_id=%s", (chat_id,)))[0]["c"]
         await upd(f"🎉 Индексация завершена: {n} сообщений · {cnt} сущностей · {nrel} связей · {nmedia} фото."
                   f"{skip_note}\nДосье: `/entity show <имя>`. Поиск в `/ask` уже подключён для владельца.")
@@ -10999,7 +10996,7 @@ async def _index_pipeline(chat_id: int, status_msg):
             if s["status"] != "done":
                 await _idx_set_state(chat_id, stg, status="error")
                 break
-        await upd(f"❌ Индексация упала: {e}\nСостояние сохранено — `/index resume` продолжит с чекпоинта.")
+        await upd(f"❌ Индексация упала: {e}\nСостояние сохранено — `/index go` продолжит с чекпоинта.")
     finally:
         _INDEX_CONTROL.pop(chat_id, None)
         _INDEX_TASKS.pop(chat_id, None)
@@ -11027,9 +11024,9 @@ async def _index_preflight(event) -> str:
             f"• Фото: ~**{photos}**\n"
             f"• Ориентир стоимости полного прохода: **~${est_cost:.2f}** (экстракция+фото+вектора)\n"
             f"• Время: от нескольких минут до часов (зависит от объёма и лимитов Telegram)\n\n"
-            f"Запусти: `/index go` · статус: `/index status` · пауза/продолжить: `/index pause` / `/index resume`\n"
+            f"Запусти: `/index go` · статус: `/index status` · стоп: `/index stop` (продолжить — снова `/index go`)\n"
             f"⚡️ Короче: `/index g` = go gallery · `/index t` / `/index f` = text/full · "
-            f"`/index st` статус · `/index u` update · `/index rc` recategorize")
+            f"`/index st` статус · `/index u` update · `/index all` обзор всех")
 
 
 async def _index_update_rewind_cursor(chat_id: int) -> int:
@@ -11258,7 +11255,7 @@ def _index_start_recategorize(chat_id: int, status_msg=None):
         try:
             stats = await _index_recategorize_run(chat_id, progress_cb=upd)
             if _INDEX_CONTROL.get(chat_id) == "pause":
-                await upd("⏸ Recategorize на паузе. Повторный `/index recategorize` продолжит с чекпоинта.")
+                await upd("⏸ Recategorize на паузе. watchdog продолжит с чекпоинта.")
                 return
             await upd("✅ Recategorize готов: "
                       f"denoise group {stats.get('denoised', 0)} · "
@@ -11269,7 +11266,7 @@ def _index_start_recategorize(chat_id: int, status_msg=None):
             await _idx_set_state(chat_id, INDEX_RECATEGORIZE_STAGE, status="error")
             log("INDEX", f"Recategorize чата {chat_id} упал: {e}")
             traceback.print_exc()
-            await upd(f"❌ Recategorize упал: {e}. Повторный `/index recategorize` продолжит с чекпоинта.")
+            await upd(f"❌ Recategorize упал: {e}. watchdog продолжит с чекпоинта.")
         finally:
             _INDEX_CONTROL.pop(chat_id, None)
             _INDEX_TASKS.pop(chat_id, None)
@@ -11277,25 +11274,9 @@ def _index_start_recategorize(chat_id: int, status_msg=None):
     _INDEX_TASKS[chat_id] = asyncio.create_task(runner())
 
 
-@client.on(events.NewMessage(pattern=r"^[./]index\s+(?:recategorize|recat|rc)\s*$"))
-async def index_recategorize_command(event):
-    if await _slash_for_other_bot(event) or not event.out:
-        return
-    chat_id = event.chat_id
-    reason = _index_available()
-    if reason:
-        await event.reply(f"⚠️ /index recategorize недоступен: {reason}")
-        return
-    try:
-        await _index_ensure_ddl()
-    except Exception as e:
-        await event.reply(f"❌ Не подключиться к базе индексации: {e}")
-        return
-    if chat_id in _INDEX_TASKS:
-        await event.reply("🟢 Индексация/maintenance уже идёт — дождись завершения или `/index stop`.")
-        return
-    status_msg = await event.reply("🏷 Запускаю recategorize связей в фоне… `/index stop` — мягко остановить.")
-    _index_start_recategorize(chat_id, status_msg=status_msg)
+# Команда `/index recategorize` убрана (Фаза 5): категории связей теперь ставятся INLINE при индексации/`reindex`.
+# Машинерия (_index_start_recategorize / _index_recategorize_run / watchdog stage-8) СОХРАНЕНА — доигрывает
+# старые незавершённые stage-8 состояния при резюме; новые чаты её не создают.
 
 
 # --- Мониторинг индексации: % прохода стадии + глобальный обзор всех чатов ---
@@ -11388,7 +11369,7 @@ async def _index_all_report(header_suffix: str = "") -> tuple:
             posrep = f"Stage {pos_stage} {STAGE_LABELS[pos_stage]} {pos_status}{pct}"
         catrep = ""
         if rels:
-            catrep = f" · {rels} связей" + (f" ⚠️{cat}/{rels} cat (`/index rc`)" if cat < rels else " ✓cat")
+            catrep = f" · {rels} связей" + (f" ⚠️{cat}/{rels} cat (`/index reindex scenes`)" if cat < rels else " ✓cat")
         title = _idx_snip(await _index_chat_title(cid), 30)
         lines.append(f"• **{title}** `{cid}`{' 🟢' if live else ''}\n  {posrep} · {ec} сущ{catrep}")
     lines.append(f"\n{'🟢' if active else '⚪️'} активных фоновых задач: **{active}**"
@@ -11565,16 +11546,16 @@ async def index_reindex_command(event):
     _INDEX_TASKS[chat_id] = asyncio.create_task(_index_pipeline(chat_id, status_msg))
 
 
-@client.on(events.NewMessage(pattern=r"^[./]index(?:\s+(go|status|st|s|pause|p|resume|res|r|stop|update|up|u))?(?:\s+(gallery|g|text|t|full|f))?\s*$"))
+@client.on(events.NewMessage(pattern=r"^[./]index(?:\s+(go|status|st|s|stop|p|update|up|u))?(?:\s+(gallery|g|text|t|full|f))?\s*$"))
 async def index_command(event):
     if await _slash_for_other_bot(event):
         return
     if not event.out:
         return  # только владелец
-    # короткие алиасы: st/s=status · p=pause · r/res=resume · u/up=update · режимы g/t/f.
-    # `/index g|t|f` без под-команды = go в этом режиме (быстрый старт).
+    # короткие алиасы: st/s=status · p=stop · u/up=update · режимы g/t/f. `/index g|t|f` = go в этом режиме.
+    # pause слит в stop; resume слит в go (go = старт ИЛИ продолжение с чекпоинта).
     raw_sub = (event.pattern_match.group(1) or "").lower()
-    sub = {"s": "status", "st": "status", "p": "pause", "r": "resume", "res": "resume",
+    sub = {"s": "status", "st": "status", "p": "stop",
            "u": "update", "up": "update"}.get(raw_sub, raw_sub)
     raw_mode = (event.pattern_match.group(2) or "").lower()
     req_mode = {"g": "gallery", "t": "text", "f": "full"}.get(raw_mode, raw_mode)
@@ -11647,19 +11628,27 @@ async def index_command(event):
         await event.reply("\n".join(parts))
         return
 
-    if sub == "go":
+    if sub == "go":  # старт ИЛИ продолжение с чекпоинта (resume влит сюда; watchdog и так резюмит)
         if chat_id in _INDEX_TASKS:
             await event.reply("🟢 Индексация этого чата уже идёт. `/index status` — прогресс.")
             return
-        mode = req_mode or INDEX_MODE_DEFAULT
-        await _index_set_mode(chat_id, mode)
+        st0 = await _idx_get_state(chat_id, 0)
+        fresh = st0["status"] is None
+        if req_mode:
+            await _index_set_mode(chat_id, req_mode)
+        elif fresh:
+            await _index_set_mode(chat_id, INDEX_MODE_DEFAULT)
+        mode = await _index_get_mode(chat_id)
         _INDEX_CONTROL[chat_id] = "run"
-        mode_label = {"gallery": "🖼 галерея досье", "text": "📝 только текст", "full": "🔬 полное медиа"}[mode]
-        status_msg = await event.reply(f"🚀 Запускаю индексацию в фоне (режим: {mode_label})… `/index status` — прогресс.")
+        if fresh:
+            mode_label = {"gallery": "🖼 галерея досье", "text": "📝 только текст", "full": "🔬 полное медиа"}[mode]
+            status_msg = await event.reply(f"🚀 Запускаю индексацию в фоне (режим: {mode_label})… `/index status` — прогресс.")
+        else:
+            status_msg = await event.reply("▶️ Продолжаю индексацию с последнего чекпоинта… `/index status` — прогресс.")
         _INDEX_TASKS[chat_id] = asyncio.create_task(_index_pipeline(chat_id, status_msg))
         return
 
-    if sub == "update":  # догнать новые сообщения: снимаем «done» со стадий (курсоры остаются) и прогоняем пайплайн
+    if sub == "update":  # догнать новые сообщения + повтор пропущенных (retry failed влит сюда); курсоры откатываем на overlap
         if chat_id in _INDEX_TASKS:
             await event.reply("🟢 Индексация уже идёт — дождись её, потом `/index update`.")
             return
@@ -11667,42 +11656,39 @@ async def index_command(event):
         if st0["status"] is None:
             await event.reply("📭 Чат ещё не индексировался. Запусти `/index go`.")
             return
+        # заодно повторяем ВСЕ пропущенные poison-диапазоны (влитый retry failed). Берём ИСТИННЫЙ MIN(start_msg_id)
+        # по всем skipped (не сэмпл 500!) — иначе строки за пределами сэмпла ушли бы в retrying и зависли навсегда.
+        frow = await db_read(
+            "SELECT MIN(start_msg_id) ms, COUNT(*) c FROM index_failed_ranges WHERE chat_id=%s AND status='skipped'", (chat_id,))
+        min_failed, n_failed = frow[0]["ms"], int(frow[0]["c"] or 0)
+        rewind_failed = None
+        if min_failed is not None:
+            await db_write("UPDATE index_failed_ranges SET status='retrying' WHERE chat_id=%s AND status='skipped'", (chat_id,))
+            rewind_failed = max(0, int(min_failed) - 1)
         for stg in (0, 1, 2, 3, 4, 5):
             s = await _idx_get_state(chat_id, stg)
             if s["status"] == "done":
                 if stg in (1, 2):
                     rewind = await _index_update_rewind_cursor(chat_id)
+                    if rewind_failed is not None:
+                        rewind = min(rewind, rewind_failed)  # захватить и failed-диапазоны, если они раньше overlap-окна
                     await _idx_set_state(chat_id, stg, cursor={"last_msg_id": rewind}, status="running")
+                elif stg == 5 and rewind_failed is not None:
+                    await _idx_set_state(chat_id, stg, cursor={"last_chunk_id": 0}, status="running")  # перечесать чанки для реассоциации фото (как делал retry failed)
                 else:
                     await _idx_set_state(chat_id, stg, status="running")
         _INDEX_CONTROL[chat_id] = "run"
-        status_msg = await event.reply("🔄 Догоняю новые сообщения (досье · граф · вектора)…")
+        note = f" + повтор {n_failed} пропущенных" if rewind_failed is not None else ""
+        status_msg = await event.reply(f"🔄 Догоняю новые сообщения (досье · граф · вектора){note}… `/index status` — прогресс.")
         _INDEX_TASKS[chat_id] = asyncio.create_task(_index_pipeline(chat_id, status_msg))
         return
 
-    if sub == "pause":
-        if chat_id not in _INDEX_TASKS:
-            await event.reply("⚪️ Сейчас нечего ставить на паузу (фоновая задача не активна).")
-            return
+    if sub == "stop":  # мягкая остановка/пауза на чекпоинте (pause слит сюда); продолжить — `/index go`
         _INDEX_CONTROL[chat_id] = "pause"
-        await event.reply("⏸ Ставлю на паузу на ближайшем чекпоинте…")
-        return
-
-    if sub in ("resume", "stop"):
-        if sub == "stop":
-            _INDEX_CONTROL[chat_id] = "pause"
-            t = _INDEX_TASKS.get(chat_id)
-            if t:
-                await event.reply("🛑 Останавливаю на ближайшем чекпоинте (прогресс сохранён).")
-            else:
-                await event.reply("⚪️ Фоновая задача не активна.")
-            return
-        if chat_id in _INDEX_TASKS:
-            await event.reply("🟢 Уже работает.")
-            return
-        _INDEX_CONTROL[chat_id] = "run"
-        status_msg = await event.reply("▶️ Продолжаю индексацию с последнего чекпоинта…")
-        _INDEX_TASKS[chat_id] = asyncio.create_task(_index_pipeline(chat_id, status_msg))
+        if _INDEX_TASKS.get(chat_id):
+            await event.reply("🛑 Останавливаю на ближайшем чекпоинте (прогресс сохранён). Продолжить — `/index go`.")
+        else:
+            await event.reply("⚪️ Фоновая задача не активна.")
         return
 
 
@@ -11725,47 +11711,10 @@ async def index_failed_command(event):
     for r in rows:
         lines.append(f"• Stage {r['stage']} {r['unit_type']} {r['start_msg_id']}..{r['end_msg_id']} "
                      f"attempts={r['attempts']} — {_idx_snip(r.get('reason'), 120)}")
-    lines.append("\nПовтор: `/index retry failed` или `/index retry failed 1|2`.")
+    lines.append("\nПовтор пропущенных влит в `/index update` (он их подхватывает автоматически).")
     await send_long(chat_id, "\n".join(lines), parse_mode="md", reply_to=event.id)
 
-
-@client.on(events.NewMessage(pattern=r"^[./]index\s+retry\s+failed(?:\s+([12]))?\s*$"))
-async def index_retry_failed_command(event):
-    if await _slash_for_other_bot(event) or not event.out:
-        return
-    reason = _index_available()
-    if reason:
-        await event.reply(f"⚠️ /index недоступен: {reason}")
-        return
-    await _index_ensure_ddl()
-    chat_id = event.chat_id
-    if chat_id in _INDEX_TASKS:
-        await event.reply("🟢 Индексация уже идёт — дождись завершения.")
-        return
-    stage_arg = event.pattern_match.group(1)
-    rows = await _index_failed_rows(chat_id, int(stage_arg) if stage_arg else None, "skipped", 500)
-    if not rows:
-        await event.reply("✅ Skipped failed ranges для повтора нет.")
-        return
-    min_stage = min(int(r["stage"]) for r in rows)
-    min_start = min(int(r["start_msg_id"]) for r in rows)
-    if stage_arg:
-        min_stage = int(stage_arg)
-    await db_write(
-        "UPDATE index_failed_ranges SET status='retrying' WHERE chat_id=%s AND status='skipped' AND stage>=%s",
-        (chat_id, min_stage))
-    rewind = max(0, min_start - 1)
-    if min_stage <= 1:
-        await _idx_set_state(chat_id, 1, cursor={"last_msg_id": rewind}, status="running")
-    await _idx_set_state(chat_id, 2, cursor={"last_msg_id": rewind}, status="running")
-    await _idx_set_state(chat_id, 3, status="running")
-    # переобработка сцен меняет chunks → сводки периодов (Stage 4, по сигнатуре пересоберёт затронутые месяцы)
-    # и фото-контекст (Stage 5, cursor→0 перечешет чанки, готовые фото пропустит) должны актуализироваться
-    await _idx_set_state(chat_id, 4, status="running")
-    await _idx_set_state(chat_id, 5, cursor={"last_chunk_id": 0}, status="running")
-    _INDEX_CONTROL[chat_id] = "run"
-    status_msg = await event.reply(f"🔁 Повторяю failed ranges со Stage {min_stage} от msg>{rewind}…")
-    _INDEX_TASKS[chat_id] = asyncio.create_task(_index_pipeline(chat_id, status_msg))
+# Команда `/index update` убрана (Фаза 5): повтор skipped/retrying-диапазонов теперь делает `/index update`.
 
 
 _INDEX_EVAL_TEMPLATE = [
