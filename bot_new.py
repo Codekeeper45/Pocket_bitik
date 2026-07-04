@@ -7096,6 +7096,7 @@ _HELP_SECTIONS = {
         "      • **full** — полное vision-описание каждого фото (медленно, дорого, максимум медиа-памяти)\n"
         "   `/index status` — прогресс по этапам этого чата (стадия · % прохода · сколько сущностей/связей)\n"
         "   `/index all` — обзор ВСЕХ индексируемых чатов сразу: где каждый (стадия, %, сущности/связи, жив ли фон)\n"
+        "   `/index all live` — то же, но **само-обновляется** в одном сообщении, пока идёт работа (авто-стоп при завершении)\n"
         "   `/index pause` / `/index resume` — пауза и продолжение (состояние на чекпоинтах в БД)\n"
         "   `/index update` — догнать новые сообщения после прошлой индексации\n"
         "   `/index recategorize` — обогатить связи: категории (романтика/дружба/семья/вражда/…), денойз со-присутствия,\n"
@@ -11287,26 +11288,13 @@ async def _index_relcounts(chat_id: int) -> tuple:
     return int(r[0]["c"] or 0), int(r[0]["cat"] or 0)
 
 
-@client.on(events.NewMessage(pattern=r"^[./]index\s+all\s*$"))
-async def index_all_command(event):
-    """Глобальный обзор: на каком месте КАЖДЫЙ индексируемый чат (стадия · % · сущности/связи · жив ли фон)."""
-    if await _slash_for_other_bot(event) or not event.out:
-        return
-    reason = _index_available()
-    if reason:
-        await event.reply(f"⚠️ /index недоступен: {reason}")
-        return
-    try:
-        await _index_ensure_ddl()
-    except Exception as e:
-        await event.reply(f"❌ Не подключиться к базе индексации: {e}")
-        return
+async def _index_all_report(header_suffix: str = "") -> tuple:
+    """Строит текст глобального обзора всех индексаций. Возвращает (текст, число_активных_фоновых)."""
     rows = await db_read("SELECT DISTINCT chat_id FROM idx_state ORDER BY chat_id")
     if not rows:
-        await event.reply("📭 Пока ни один чат не индексировался. Запусти `/index go` в нужном чате.")
-        return
+        return ("📭 Пока ни один чат не индексировался. Запусти `/index go` в нужном чате.", 0)
     STAGE_LABELS = {0: "Дамп", 1: "Досье", 2: "Граф", 3: "Вектора", 4: "Сводки", 5: "Фото"}
-    lines = [f"🗂 **Все индексации** ({len(rows)} чат.):"]
+    lines = [f"🗂 **Все индексации** ({len(rows)} чат.){header_suffix}:"]
     active = 0
     for r in rows:
         cid = int(r["chat_id"])
@@ -11337,7 +11325,80 @@ async def index_all_command(event):
         lines.append(f"• **{title}** `{cid}`{' 🟢' if live else ''}\n  {posrep} · {ec} сущ{catrep}")
     lines.append(f"\n{'🟢' if active else '⚪️'} активных фоновых задач: **{active}**"
                  f"{' (остальные подхватит watchdog)' if not active else ''}")
-    await send_long(event.chat_id, "\n".join(lines), parse_mode="md", reply_to=event.id)
+    return ("\n".join(lines), active)
+
+
+INDEX_ALL_LIVE_INTERVAL = 15    # сек между авто-обновлениями /index all live
+INDEX_ALL_LIVE_MAX_TICKS = 160  # 15с*160 ≈ 40 мин, потом само-стоп (перезапусти командой)
+_INDEX_ALL_LIVE_TASK = None     # одна живая петля на процесс (повторный /index all live отменяет прежнюю)
+_INDEX_ALL_SPINNER = "◐◓◑◒"
+
+
+@client.on(events.NewMessage(pattern=r"^[./]index\s+all(?:\s+(live|l))?\s*$"))
+async def index_all_command(event):
+    """Глобальный обзор всех индексаций. `/index all` — снимок; `/index all live` — живое авто-обновление
+    того же сообщения (пока есть активные фоновые задачи, до ~40 мин)."""
+    global _INDEX_ALL_LIVE_TASK
+    if await _slash_for_other_bot(event) or not event.out:
+        return
+    reason = _index_available()
+    if reason:
+        await event.reply(f"⚠️ /index недоступен: {reason}")
+        return
+    try:
+        await _index_ensure_ddl()
+    except Exception as e:
+        await event.reply(f"❌ Не подключиться к базе индексации: {e}")
+        return
+    is_live = bool(event.pattern_match.group(1))
+    text, active = await _index_all_report()
+    if not is_live:
+        await send_long(event.chat_id, text, parse_mode="md", reply_to=event.id)
+        return
+    # live-режим: правим ОДНО сообщение, пока идёт работа
+    status = await event.reply(text + f"\n\n🔄 живое обновление каждые {INDEX_ALL_LIVE_INTERVAL}с…", parse_mode="md")
+    if active == 0:
+        await status.edit(text + "\n\n⚪️ активных задач нет — обновлять нечего. `/index all live`, когда запустишь.",
+                          parse_mode="md")
+        return
+    if _INDEX_ALL_LIVE_TASK and not _INDEX_ALL_LIVE_TASK.done():
+        _INDEX_ALL_LIVE_TASK.cancel()  # прежняя петля больше не нужна — обновляем новое сообщение
+
+    async def _live_loop(msg):
+        last = None
+        try:
+            for tick in range(INDEX_ALL_LIVE_MAX_TICKS):
+                await asyncio.sleep(INDEX_ALL_LIVE_INTERVAL)
+                try:
+                    rep, act = await _index_all_report()
+                except Exception:
+                    continue  # транзиентный сбой БД — просто ждём следующий тик
+                if act == 0:
+                    try:
+                        await msg.edit(rep + "\n\n✅ все фоновые задачи завершились. `/index all live` — снова.",
+                                       parse_mode="md")
+                    except Exception:
+                        pass
+                    return
+                spin = _INDEX_ALL_SPINNER[tick % len(_INDEX_ALL_SPINNER)]
+                body = rep + f"\n\n{spin} живое обновление каждые {INDEX_ALL_LIVE_INTERVAL}с (авто-стоп при завершении)"
+                if body != last:
+                    try:
+                        await msg.edit(body, parse_mode="md")
+                        last = body
+                    except Exception as e:
+                        if "not modified" not in str(e).lower():
+                            return  # флуд-лимит/сообщение удалено и т.п. — тихо выходим
+            try:
+                rep, _ = await _index_all_report()
+                await msg.edit(rep + "\n\n⏹ авто-обновление остановлено (40 мин). `/index all live` — заново.",
+                               parse_mode="md")
+            except Exception:
+                pass
+        except asyncio.CancelledError:
+            raise
+
+    _INDEX_ALL_LIVE_TASK = asyncio.create_task(_live_loop(status))
 
 
 @client.on(events.NewMessage(pattern=r"^[./]index(?:\s+(go|status|st|s|pause|p|resume|res|r|stop|update|up|u))?(?:\s+(gallery|g|text|t|full|f))?\s*$"))
