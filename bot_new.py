@@ -11165,7 +11165,6 @@ async def _index_recategorize_run(chat_id: int, progress_cb=None) -> dict:
     return stats
 
 
-@client.on(events.NewMessage(pattern=r"^[./]index\s+recategorize\s*$"))
 def _index_start_recategorize(chat_id: int, status_msg=None):
     """Ставит recategorize-задачу в фон. Переиспользуется командой И watchdog-авторезюмом
     (status_msg=None → прогресс молча в лог). Идемпотентна: recategorize сам резюмится по чекпоинту."""
@@ -11202,6 +11201,7 @@ def _index_start_recategorize(chat_id: int, status_msg=None):
     _INDEX_TASKS[chat_id] = asyncio.create_task(runner())
 
 
+@client.on(events.NewMessage(pattern=r"^[./]index\s+recategorize\s*$"))
 async def index_recategorize_command(event):
     if await _slash_for_other_bot(event) or not event.out:
         return
