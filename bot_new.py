@@ -7917,12 +7917,14 @@ async def _index_extract(system: str, user: str, max_tokens: int = INDEX_EXTRACT
                     _INDEX_EXTRACT_OK = True
                     return data
                 fin = resp.choices[0].finish_reason
-                log("INDEX", f"Экстракция {provider}/{model}: не распарсил JSON (finish={fin}, попытка {attempt})")
                 if fin == "length":
-                    # ответ обрезан по потолку токенов — повтор того же запроса даст ту же обрезку,
-                    # смена модели тоже (блок/сцена слишком «плотные»). Детерминированно, но НЕ poison:
-                    # возвращаем None сразу → caller дробит единицу пополам (меньше вход → влезет вывод).
+                    # НЕ сбой провайдера: модель ОТВЕТИЛА, но блок слишком плотный — вывод упёрся в потолок max_tokens.
+                    # Повтор/смена модели дадут ту же обрезку (детерминированно, но НЕ poison): возвращаем None →
+                    # caller штатно делит вход пополам (меньше вход → вывод влезет). Это само-лечение, не ошибка.
+                    log("INDEX", f"Экстракция {provider}/{model}: блок плотный, вывод упёрся в {mt // 1000}k ток. "
+                                 f"→ дроблю вход пополам (штатное само-дробление, не сбой)")
                     return None
+                log("INDEX", f"Экстракция {provider}/{model}: ответ не распарсился как JSON (finish={fin}, попытка {attempt})")
             except Exception as e:
                 code = getattr(e, "status_code", None) or getattr(getattr(e, "response", None), "status_code", None)
                 if code in (401, 402):  # ключ/квота — фатально, НЕ poison: стопим стадию (иначе весь чат уйдёт в ложные skip)
@@ -10953,7 +10955,9 @@ async def _index_preflight(event) -> str:
             f"• Фото: ~**{photos}**\n"
             f"• Ориентир стоимости полного прохода: **~${est_cost:.2f}** (экстракция+фото+вектора)\n"
             f"• Время: от нескольких минут до часов (зависит от объёма и лимитов Telegram)\n\n"
-            f"Запусти: `/index go` · статус: `/index status` · пауза/продолжить: `/index pause` / `/index resume`")
+            f"Запусти: `/index go` · статус: `/index status` · пауза/продолжить: `/index pause` / `/index resume`\n"
+            f"⚡️ Короче: `/index g` = go gallery · `/index t` / `/index f` = text/full · "
+            f"`/index st` статус · `/index u` update · `/index rc` recategorize")
 
 
 async def _index_update_rewind_cursor(chat_id: int) -> int:
@@ -11201,7 +11205,7 @@ def _index_start_recategorize(chat_id: int, status_msg=None):
     _INDEX_TASKS[chat_id] = asyncio.create_task(runner())
 
 
-@client.on(events.NewMessage(pattern=r"^[./]index\s+recategorize\s*$"))
+@client.on(events.NewMessage(pattern=r"^[./]index\s+(?:recategorize|recat|rc)\s*$"))
 async def index_recategorize_command(event):
     if await _slash_for_other_bot(event) or not event.out:
         return
@@ -11222,13 +11226,21 @@ async def index_recategorize_command(event):
     _index_start_recategorize(chat_id, status_msg=status_msg)
 
 
-@client.on(events.NewMessage(pattern=r"^[./]index(?:\s+(go|status|pause|resume|stop|update))?(?:\s+(gallery|text|full))?\s*$"))
+@client.on(events.NewMessage(pattern=r"^[./]index(?:\s+(go|status|st|s|pause|p|resume|res|r|stop|update|up|u))?(?:\s+(gallery|g|text|t|full|f))?\s*$"))
 async def index_command(event):
     if await _slash_for_other_bot(event):
         return
     if not event.out:
         return  # только владелец
-    sub = (event.pattern_match.group(1) or "").lower()
+    # короткие алиасы: st/s=status · p=pause · r/res=resume · u/up=update · режимы g/t/f.
+    # `/index g|t|f` без под-команды = go в этом режиме (быстрый старт).
+    raw_sub = (event.pattern_match.group(1) or "").lower()
+    sub = {"s": "status", "st": "status", "p": "pause", "r": "resume", "res": "resume",
+           "u": "update", "up": "update"}.get(raw_sub, raw_sub)
+    raw_mode = (event.pattern_match.group(2) or "").lower()
+    req_mode = {"g": "gallery", "t": "text", "f": "full"}.get(raw_mode, raw_mode)
+    if sub == "" and req_mode:
+        sub = "go"
     chat_id = event.chat_id
     reason = _index_available()
     if reason:
@@ -11288,7 +11300,7 @@ async def index_command(event):
         if chat_id in _INDEX_TASKS:
             await event.reply("🟢 Индексация этого чата уже идёт. `/index status` — прогресс.")
             return
-        mode = (event.pattern_match.group(2) or "").lower() or INDEX_MODE_DEFAULT
+        mode = req_mode or INDEX_MODE_DEFAULT
         await _index_set_mode(chat_id, mode)
         _INDEX_CONTROL[chat_id] = "run"
         mode_label = {"gallery": "🖼 галерея досье", "text": "📝 только текст", "full": "🔬 полное медиа"}[mode]
