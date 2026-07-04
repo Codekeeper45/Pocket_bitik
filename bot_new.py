@@ -9257,7 +9257,7 @@ async def _index_stage5_media(chat_id: int, progress_cb=None):
 
 async def _index_describe_msg_ids(chat_id: int, msg_ids, seekers_by_mid: dict = None, progress_cb=None):
     """Описывает КОНКРЕТНЫЕ фото (gallery-режим): группирует их по сценам → сценовый контекст + справочник →
-    _index_process_media. seekers_by_mid {mid: [(имя, тег)]} — кого мы ИЩЕМ на этих фото: их имена идут
+    _index_process_media. seekers_by_mid {mid: [(имя, тег, внешность)]} — кого мы ИЩЕМ на этих фото: их имена идут
     В НАЧАЛО справочника (process_media режет его [:4000] — в конце их бы отрезало, и модель не смогла бы
     назвать сущность → подтверждение не сработало бы). Уже описанные скипаются внутри (describe-once)."""
     msg_ids = sorted({int(m) for m in (msg_ids or [])})
@@ -9283,12 +9283,15 @@ async def _index_describe_msg_ids(chat_id: int, msg_ids, seekers_by_mid: dict = 
         registry, name2id = await _index_relation_registry(chat_id, scene_text or None)
         seekers = []  # union искомых по фото этой группы, с сохранением порядка
         for mid in mids:
-            for nm, tag in (seekers_by_mid or {}).get(mid, []):
-                if nm and (nm, tag) not in seekers:
-                    seekers.append((nm, tag))
+            for sk in (seekers_by_mid or {}).get(mid, []):
+                if sk and sk[0] and sk not in seekers:
+                    seekers.append(sk)
         if seekers:  # В НАЧАЛО (см. докстринг); кап — не выжимаем сценовый справочник целиком
-            head = "\n".join(f"{nm} — {tag}" for nm, tag in seekers[:40])
-            registry = "Проверь в первую очередь, есть ли на фото:\n" + head + "\n\n" + registry
+            head = "\n".join(f"{nm} — {tag}" + (f"; внешность: {vf}" if vf else "")
+                             for nm, tag, vf in seekers[:25])
+            registry = ("Проверь в первую очередь, есть ли на фото эти сущности. Указывай сущность в characters "
+                        "ТОЛЬКО если она реально ВИДНА на изображении и облик согласуется с её описанием внешности; "
+                        "упоминание в тексте сцены — НЕ основание:\n" + head + "\n\n" + registry)
         try:
             image_msgs = []
             for i in range(0, len(mids), 100):
@@ -9329,10 +9332,16 @@ async def _index_stage5_gallery(chat_id: int, progress_cb=None):
             break
         ids = [r["msg_id"] for r in rows]
         cur_mid = ids[-1]
-        try:
-            msgs = await client.get_messages(chat_id, ids=ids)
-        except Exception as e:
-            log("INDEX", f"Gallery 5a: get_messages не удался: {e}")
+        msgs = None
+        for attempt in (1, 2):  # один ретрай — не теряем батч на секундном блипе Telegram
+            try:
+                msgs = await client.get_messages(chat_id, ids=ids)
+                break
+            except Exception as e:
+                log("INDEX", f"Gallery 5a: get_messages не удался (попытка {attempt}): {e}")
+                await asyncio.sleep(2)
+        if msgs is None:
+            emb_fail += len(ids)  # батч пропущен — строки остались без emb_image, добьёт resume/update
             continue
         for m in (msgs or []):
             if not _index_is_image_msg(m):
@@ -9352,8 +9361,15 @@ async def _index_stage5_gallery(chat_id: int, progress_cb=None):
             await progress_cb(f"🖼 Галерея: вектора фото {emb_new}/~{total_ph}…")
     if emb_new:
         _index_invalidate(chat_id, "media_image")
+    if emb_fail and not emb_new and emb_fail >= min(10, max(1, total_ph)):
+        # ноль успехов при заметном числе неудач = системный сбой (embeddings/Telegram лежит) — не строим
+        # галереи на пустом media_image; error → авто-резюм на рестарте повторит. Порог отсекает ловушку
+        # «резюм с парой битых файлов» (иначе вечный error блокировал бы memory_media)
+        log("INDEX", f"Gallery 5a: системный сбой — 0 успехов при {emb_fail} неудачах")
+        await _idx_set_state(chat_id, 5, stats={"emb_failed": emb_fail}, status="error")
+        return "error"
     if emb_fail:
-        log("INDEX", f"Gallery 5a: {emb_fail} фото без вектора — доберутся на следующем прогоне/update")
+        log("INDEX", f"Gallery 5a: {emb_fail} фото без вектора (в т.ч. битые/недоступные) — добьёт `/index update`")
 
     # --- 5b: сиды кандидатов (вектора + SQL, без vision) ---
     if progress_cb:
@@ -9419,7 +9435,10 @@ async def _index_stage5_gallery(chat_id: int, progress_cb=None):
                     d.setdefault(mid, 0.0)
         if cand.get(eid):
             cand[eid] = dict(sorted(cand[eid].items(), key=lambda kv: -kv[1])[:INDEX_GALLERY_POOL])
-            ent_tag[eid] = (e["name"], "персонаж" if e["entity_type"] == "character" else "участник")
+            # внешность идёт в справочник верификации — иначе модель подтверждала бы по имени/контексту,
+            # а не по облику (ядро качества галереи: косинус предлагает, vision сверяет С ВНЕШНОСТЬЮ)
+            ent_tag[eid] = (e["name"], "персонаж" if e["entity_type"] == "character" else "участник",
+                            _idx_snip(vtxt, 90))
         elif eid in cand:
             cand.pop(eid, None)
     log("INDEX", f"Gallery 5b: {len({m for d in cand.values() for m in d})} фото-кандидатов на {len(cand)} сущностей")
@@ -9504,8 +9523,12 @@ async def _index_stage5_gallery(chat_id: int, progress_cb=None):
         "SELECT COUNT(*) c FROM media_assets WHERE chat_id=%s AND image_description IS NOT NULL AND image_description<>''",
         (chat_id,)))[0]["c"]
     n_gal = sum(1 for s in galleries.values() if s)
-    await _idx_set_state(chat_id, 5, status="done", stats={"photos": n_desc, "galleries": n_gal, "embedded": emb_new})
-    log("INDEX", f"Stage5-gallery чата {chat_id}: готово — вектора +{emb_new}, описано всего {n_desc}, галерей {n_gal}")
+    st5_stats = {"photos": n_desc, "galleries": n_gal, "embedded": emb_new}
+    if emb_fail:
+        st5_stats["emb_failed"] = emb_fail
+    await _idx_set_state(chat_id, 5, status="done", stats=st5_stats)
+    log("INDEX", f"Stage5-gallery чата {chat_id}: готово — вектора +{emb_new}, описано всего {n_desc}, галерей {n_gal}"
+                 + (f", без вектора {emb_fail}" if emb_fail else ""))
     return "done"
 
 
@@ -10762,6 +10785,10 @@ async def index_command(event):
                     extra = f" · {s['stats']['months']} мес."
                 elif stg == 5 and s["stats"].get("photos"):
                     extra = f" · {s['stats']['photos']} фото"
+                    if s["stats"].get("galleries"):
+                        extra += f" · галерей {s['stats']['galleries']}"
+                    if s["stats"].get("emb_failed"):
+                        extra += f" · без вектора {s['stats']['emb_failed']}"
                 parts.append(f"• Stage {stg} {label}: {s['status']}{extra}")
         skipped = await _index_failed_count(chat_id, "skipped")
         retrying = await _index_failed_count(chat_id, "retrying")
