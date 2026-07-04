@@ -2369,11 +2369,11 @@ _IMAGE_GEN_WITH_REFS_SYSTEM = (
     "конкретного номера (напр. 'use the face and appearance from image #3'): это для узнаваемости, не выдумывай "
     "внешность реального человека. То же с НЕлюдьми-персонажами (аниме-герой, маскот, питомец, существо из чата): "
     "если запрос про такого персонажа и его облик есть на фото — бери это фото референсом облика.\n"
-    "СВЕЖЕСТЬ: фото с пометкой [фото запросившего/прошлая генерация] — это картинки самого пользователя и уже "
-    "сделанные ранее генерации. НЕ копируй с них стиль и композицию и не делай вариации прошлых генераций — держи "
-    "результат свежим, не повторяй уже сделанное в чате. Брать их в референсы стоит ТОЛЬКО если без них никак "
-    "(нужно лицо конкретного человека, и оно есть лишь там). По возможности опирайся на органичные фото других "
-    "участников.\n"
+    "СВЕЖЕСТЬ: твои прошлые генерации ЗАПРЕЩЕНЫ как референсы — их нет среди кандидатов, а если похожая "
+    "AI-картинка всё же встретилась, не бери её и не делай вариаций уже сделанного. Фото с пометкой "
+    "[фото запросившего/прошлая генерация] — картинки самого пользователя: не копируй с них стиль и композицию, "
+    "бери в референсы ТОЛЬКО если без них никак (нужно лицо конкретного человека, и оно есть лишь там). "
+    "По возможности опирайся на органичные фото других участников.\n"
     "Если подходящих фото нет — оставь список референсов пустым.\n"
     "Ответь СТРОГО в формате (четыре строки, без лишнего текста):\n"
     "IDEA: <одна фраза на русском — суть изображения>\n"
@@ -5016,6 +5016,15 @@ async def _gen_collect_input_images(event, reply_msg, extra_msgs=None):
     return out, skipped
 
 
+def _gen_is_own_generation(m) -> bool:
+    """Своя прошлая генерация /gen: исходящее (юзербот шлёт от владельца) с подписью 💡/🎨.
+    Такие фото ЗАПРЕЩЕНЫ как референсы (и их промпты не показываем модели) — иначе бот
+    зацикливается на вариациях самого себя вместо свежих образов."""
+    if not getattr(m, "out", False):
+        return False
+    return (getattr(m, "raw_text", None) or "").lstrip().startswith(("💡", "🎨"))
+
+
 async def _gen_history_catalog(ordered, want_vision: bool, limit: int = GEN_CTX_IMG_MAX, timeout: float = GEN_CATALOG_TIMEOUT, progress_cb=None) -> list:
     """Каталог фото из истории чата для /gen: новейшие ≤limit фото из ordered (дедуп по file-id).
     Для каждого: оригинал `bytes` (уйдёт В ГЕНЕРАТОР как референс) + уменьшенная копия `thumb`
@@ -5044,6 +5053,7 @@ async def _gen_history_catalog(ordered, want_vision: bool, limit: int = GEN_CTX_
             lines.append(f"{side} {who}: {_preview(t, 140)}")
         return " | ".join(lines)
 
+    n_own_gen = 0
     for m in ordered:  # ordered — хронологический
         if getattr(m, "action", None):
             n_preview += 1
@@ -5057,13 +5067,16 @@ async def _gen_history_catalog(ordered, want_vision: bool, limit: int = GEN_CTX_
         if isinstance(getattr(m, "media", None), MessageMediaWebPage):
             n_preview += 1
             continue
+        if _gen_is_own_generation(m):  # свои прошлые генерации — ЖЁСТКИЙ бан из кандидатов
+            n_own_gen += 1
+            continue
         k = _media_key(m)
         if k in seen:
             continue
         seen.add(k)
         photos.append(m)
-    if n_preview:
-        log("GEN", f"Каталог: отсеяно {n_preview} превью ссылок/сервисных фото")
+    if n_preview or n_own_gen:
+        log("GEN", f"Каталог: отсеяно {n_preview} превью/сервисных + {n_own_gen} своих прошлых генераций")
     photos = photos[-limit:]  # хвост = самые свежие
     if not photos:
         return []
@@ -5437,7 +5450,10 @@ async def gen_command(event):
             ordered = list(reversed(msgs[:n]))
             if include_ids or exclude_ids:
                 log("GEN", f"Контекст после фильтра: {len(ordered)} сообщ. (вкл={len(include_ids)} искл={len(exclude_ids)})")
-            context_text, _, _, _ = await assemble_context(ordered, True)  # text-only: медиа не разбираем
+            # свои 💡/🎨-подписи (полные промпты прошлых генераций) в контекст НЕ показываем — модель их
+            # охотно копирует; анти-повтор идёт отдельным явным списком past_gens (только идеи, с запретом)
+            ctx_msgs = [m for m in ordered if not _gen_is_own_generation(m)]
+            context_text, _, _, _ = await assemble_context(ctx_msgs, True)  # text-only: медиа не разбираем
         elif reply_msg is not None and (reply_msg.raw_text or "").strip():
             # Reply на сообщение С ФОТО: без флагов DeepSeek не вмешивается (промпт дословный, фото на вход);
             # с -i/-c — берёт текст/подпись реплая в контекст. Reply на чистый текст — как раньше.
@@ -10475,7 +10491,7 @@ async def _gen_index_candidates(chat_id: int, prompt: str, limit: int = GEN_INDE
             msgs = []
 
         async def _dl(m):
-            if not _index_is_image_msg(m):
+            if not _index_is_image_msg(m) or _gen_is_own_generation(m):  # свои генерации — бан и из индекс-рефов
                 return None
             try:
                 raw = await asyncio.wait_for(m.download_media(bytes), timeout=GEN_MEDIA_DL_TIMEOUT)
