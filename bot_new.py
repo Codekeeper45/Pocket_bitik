@@ -149,9 +149,11 @@ INDEX_SCENE_TOKEN_CAP = 20000 # stage 2: мягкий потолок токен�
 INDEX_SCENE_MIN_TOKENS = 1000 # stage 2: сцены короче — доклеиваем к следующей (не дробим на мелочь)
 INDEX_SCENE_HARD_GAP_SEC = 6 * 60 * 60  # даже короткую сцену не склеиваем через многочасовую паузу
 INDEX_STAGE2_CONCURRENCY = 6  # stage 2: сколько сцен экстрагировать параллельно (перекрыть ~34с латентность на вызов)
-INDEX_STAGE1_MICRO_TOKENS = 64_000      # stage 1: размер блока экстракции. Подняли 32k→64k: Stage 1 строго ПОСЛЕДОВАТЕЛЕН
-#   (снежный ком — каждый блок видит реестр прошлых), поэтому скорость = число блоков. Крупнее блок → меньше блоков → быстрее.
-#   Безопасно с тех пор, как output-cap = 384k и timeout = 480с (раньше 32k держали малым, чтобы вывод не упирался в 64k → finish=length).
+INDEX_STAGE1_MICRO_TOKENS = 300_000    # stage 1: размер блока экстракции. 300k (DeepSeek V4 = 1M контекст). Stage 1 строго ПОСЛЕДОВАТЕЛЕН
+#   (снежный ком), скорость = число блоков → крупнее блок = меньше блоков = быстрее. Цель — ОБОБЩЁННЫЕ досье (генерализация),
+#   поэтому потеря части гранулярных фактов на больших блоках приемлема. Страховка: таймаут на большом блоке → авто-дробление
+#   (IndexTimeoutError → _index_stage1_extract_rows), маленький таймаутит → транзиент (не скип). Плотность claims меряем A/B после рестарта.
+INDEX_STAGE1_TIMEOUT_SPLIT_MIN = 200    # stage 1: блок крупнее (в сообщениях) — таймаут дробит; мельче — таймаут = транзиент (сеть), не скипаем
 INDEX_EXTRACT_MAX_TOKENS = 384_000      # ПОТОЛОК ВЫВОДА = максимум модели (official DeepSeek V4 = 384k) → фактически БЕЗ лимита:
 #   модель сама останавливается на finish=stop, бесконечно писать не может. Платим только за реально сгенерированные токены,
 #   поэтому высокий потолок бесплатен — он лишь убирает искусственную обрезку (раньше 64k → finish=length → дробление блока).
@@ -163,9 +165,8 @@ INDEX_MODEL_MAX_OUT = {                  # per-model кламп потолка �
     "deepseek/deepseek-v4-pro": 384_000,
 }
 INDEX_SUMMARY_MAX_TOKENS = 64_000       # ПОТОЛОК ВЫВОДА саммари (досье/роллапы): запас под reasoning, чтобы CoT не съедал бюджет до самого текста. Оплата — по факту токенов
-INDEX_STAGE1_MICRO_MESSAGES = 2400      # верхняя граница сообщений в блоке. Была 800 → для чатов с короткими сообщениями
-#   именно ЭТОТ лимит упирался раньше токенов (800 коротких ≈ 20k ток < 64k) → блоки недозаполнены → лишние
-#   последовательные вызовы. Подняли до 2400, чтобы блок набирался до токен-бюджета, а не до счётчика сообщений.
+INDEX_STAGE1_MICRO_MESSAGES = 6000      # верхняя граница сообщений в блоке (потолок выборки из БД). Подняли до 6000, чтобы блок
+#   набирался до ТОКЕН-бюджета (300k ≈ 4400 сообщ при ~68 ток/сообщ), а не упирался в счётчик сообщений раньше времени.
 INDEX_STAGE1_BLOCK_TOKENS = INDEX_STAGE1_MICRO_TOKENS  # legacy alias для старых комментариев/логов
 INDEX_FAILED_MIN_MESSAGES = 1
 INDEX_UPDATE_OVERLAP_MESSAGES = 300
@@ -7436,6 +7437,12 @@ class IndexTransientError(Exception):
     Стадия должна встать в error и дождаться /index go, НЕ дробить блок в ложные skip."""
 
 
+class IndexTimeoutError(IndexTransientError):
+    """Экстракция упёрлась в таймаут — вероятно блок слишком большой/медленный. Caller решает:
+    большой блок → дробить пополам (страховка больших блоков), маленький → пробросить как транзиент (не скипать данные).
+    Наследует IndexTransientError → по умолчанию (если никто не ловит спец-обработкой) ведёт себя безопасно."""
+
+
 def _index_available() -> str:
     """'' если /index можно запускать; иначе причина-строка (нет пакета/ключа/OpenRouter)."""
     if pymysql is None:
@@ -7949,7 +7956,7 @@ async def _index_extract(system: str, user: str, max_tokens: int = INDEX_EXTRACT
                     "temperature": 0.2,
                     "response_format": {"type": "json_object"},
                     "messages": [{"role": "system", "content": system}, {"role": "user", "content": user}],
-                    "timeout": 480,  # потолок вывода снят (384k) → даём большому легитимному JSON время дописаться, а не рубим по таймауту
+                    "timeout": 600,  # запас под большой prefill (до 300k вход) + вывод; таймаут → IndexTimeoutError → дробление большого блока (страховка)
                 }
                 if provider == "deepseek":
                     # Официальный DeepSeek: extraction должен возвращать JSON, поэтому thinking выключаем
@@ -7959,7 +7966,10 @@ async def _index_extract(system: str, user: str, max_tokens: int = INDEX_EXTRACT
                     # OpenRouter принимает reasoning как провайдерский параметр в теле запроса.
                     kwargs["extra_body"] = {"reasoning": {"enabled": False}}
                 resp = await asyncio.to_thread(
-                    llm_client.chat.completions.create,
+                    # max_retries=0: гасим ВНУТРЕННИЕ ретраи SDK (дефолт 2) — иначе таймаут большого блока крутится
+                    # ~3×600с внутри клиента ДО того как всплывёт IndexTimeoutError и сработает дробление. Ретраи — наш
+                    # уровень (INDEX_EXTRACT_RETRIES, только для НЕ-таймаутов). with_options не трогает /ask (свой клиент).
+                    llm_client.with_options(max_retries=0).chat.completions.create,
                     **kwargs,
                 )
                 got_response = True
@@ -7979,6 +7989,11 @@ async def _index_extract(system: str, user: str, max_tokens: int = INDEX_EXTRACT
                 log("INDEX", f"Экстракция {provider}/{model}: ответ не распарсился как JSON (finish={fin}, попытка {attempt})")
             except Exception as e:
                 code = getattr(e, "status_code", None) or getattr(getattr(e, "response", None), "status_code", None)
+                _elow = str(e).lower()
+                if code is None and ("timeout" in _elow or "timed out" in _elow or type(e).__name__ in ("APITimeoutError", "ReadTimeout", "Timeout", "TimeoutError", "ConnectTimeout", "ReadTimeoutError")):
+                    # таймаут (вероятно блок слишком большой/медленный) → сигналим наверх спец-исключением: caller решит
+                    # дробить (большой блок) или пробросить как транзиент (маленький). Ретраить тот же большой блок = жечь минуты.
+                    raise IndexTimeoutError(f"{provider}/{model}: таймаут экстракции")
                 if code in (401, 402):  # ключ/квота — фатально, НЕ poison: стопим стадию (иначе весь чат уйдёт в ложные skip)
                     raise IndexTransientError(f"{provider}/{model}: config {code} (ключ/квота недоступны) — стоп, не poison: {e}")
                 if code in (403, 404):  # доступ/модель-not-found — пробуем запасную; если и она недоступна → transient-стоп (не skip)
@@ -8259,7 +8274,14 @@ async def _index_stage1_extract_rows(chat_id: int, rows: list, amap: dict, name2
     start, end = rows[0]["msg_id"], rows[-1]["msg_id"]
     registry, _ = await _index_load_registry(chat_id)
     user = f"РЕЕСТР (известные сущности):\n{registry}\n\nНОВЫЙ БЛОК:\n" + _index_rows_to_text(rows, amap)
-    data = await _index_extract(_INDEX_STAGE1_SYSTEM, user)
+    try:
+        data = await _index_extract(_INDEX_STAGE1_SYSTEM, user)
+    except IndexTimeoutError:
+        if len(rows) > INDEX_STAGE1_TIMEOUT_SPLIT_MIN:  # большой блок не уложился в таймаут → страховка: дробим пополам (как finish=length)
+            log("INDEX", f"Stage1: таймаут на блоке {start}..{end} ({len(rows)} сообщ) → дроблю пополам")
+            data = None
+        else:
+            raise  # маленький блок таймаутит — это не размер, а транзиент (сеть): пробрасываем, НЕ скипаем реальные сообщения
     if data and isinstance(data.get("entities"), list):
         touched = await _index_apply_entities(chat_id, data["entities"], name2author)
         return touched, 0
