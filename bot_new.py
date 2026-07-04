@@ -7879,10 +7879,15 @@ async def _index_extract(system: str, user: str, max_tokens: int = INDEX_EXTRACT
     if deepseek_client is not None:
         routes.append(("deepseek", deepseek_client, INDEX_EXTRACT_MODEL))
         routes.append(("deepseek", deepseek_client, INDEX_EXTRACT_FALLBACK))
-    if openrouter_client is not None:  # аварийный путь: lower output cap, но лучше чем полный простой
-        routes.append(("openrouter", openrouter_client, "deepseek/deepseek-v4-flash"))
+    # аварийный путь: pro-слаг (потолок вывода 384k). НЕ flash-слаг — у OpenRouter flash режет вывод на 16k,
+    # плотный блок досье в него не влезает → обрыв JSON (finish=length). primary/fallback — официальный flash/pro.
+    if openrouter_client is not None:
+        routes.append(("openrouter", openrouter_client, "deepseek/deepseek-v4-pro"))
     got_response = False  # был ли хоть один валидный ответ провайдера (пусть и не-JSON)
     for ri, (provider, llm_client, model) in enumerate(routes):
+        if provider == "openrouter" and ri > 0:  # дошли до аварийного резерва → официальный не сработал: видно СРАЗУ, не по крупицам
+            log("INDEX", f"⚠️ Экстракция: официальный DeepSeek не сработал на этом блоке → аварийный OpenRouter {model} "
+                         f"(проверь квоту/доступ/нагрузку официального; резерв тоже платный)")
         for attempt in range(1, INDEX_EXTRACT_RETRIES + 1):
             try:
                 mt = min(max_tokens, INDEX_MODEL_MAX_OUT.get(model, max_tokens))  # кламп под реальный лимит модели
