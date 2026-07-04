@@ -196,10 +196,23 @@ INDEX_SEARCH_FLOOR = 0.15     # ниже этого косинуса резул�
 INDEX_SEARCH_CONFIDENT = 0.28 # ниже — «слабое» совпадение: помечаем и просим модель переспросить/веб (Corrective RAG)
 INDEX_RERANK_MODEL = "cohere/rerank-4-pro"  # OpenRouter /rerank (rerank-v4.0-pro): переупорядочивает кандидатов по ИСТИННОЙ релевантности (мультиязычный, проверено на русском)
 INDEX_RERANK_POOL = 8         # кандидатов на kind достаём вектором ПОД rerank (шире финальной выдачи)
-INDEX_RERANK_TOPN = 8         # финальная выдача после rerank
+INDEX_RERANK_TOPN = 12        # финальная выдача после rerank
 INDEX_RERANK_MIN = 0.08       # rel-score ниже — не показываем (у v4-pro мусор ~0.12, точный ~0.9)
 INDEX_RERANK_CONFIDENT = 0.35 # ниже — «слабое» совпадение (Corrective-гейт по rerank-score)
 INDEX_EVAL_CASES_PATH = "index_eval_cases.json"
+INDEX_REL_CATEGORIES = ("romantic", "friend", "family", "rival", "professional", "mentor", "acquaintance", "group")
+INDEX_REL_CATEGORY_SET = set(INDEX_REL_CATEGORIES)
+INDEX_REL_CATEGORY_ORDER = {cat: i for i, cat in enumerate(INDEX_REL_CATEGORIES)}
+INDEX_REL_CATEGORY_LABELS = {
+    "romantic": ("❤️", "романтические"),
+    "friend": ("👥", "друзья"),
+    "family": ("👪", "семья"),
+    "rival": ("⚔️", "соперники/конфликты"),
+    "professional": ("💼", "профессиональные"),
+    "mentor": ("🎓", "наставничество"),
+    "acquaintance": ("▫️", "знакомые/нейтральные"),
+    "group": ("◦", "прочие контакты"),
+}
 GEN_INDEX_REF_MAX = 8         # /gen: сколько фото-референсов подтягивать из индекс-памяти (смысловой поиск по всей истории)
 # OCR фото в /ask по умолчанию (cost-effective вместо vision-модели; флаг -m возвращает vision).
 # Проверено живьём: v2-поток (files → parse tier=cost_effective → poll → markdown_full), ~11с/фото,
@@ -3475,10 +3488,15 @@ async def ask_agentic(context: str, question: str, must_search: bool = False, ca
         system_prompt += ("\n\nУ этого чата есть ПРОИНДЕКСИРОВАННАЯ ПАМЯТЬ (команда /index) — база по всей истории. "
                           f"Доступные сейчас tools: {available}. Недоступные из-за частичной индексации: {unavailable}. "
                           "memory_search ищет сцены-диалоги, досье и связи для точечных фактов/реплик; "
+                          "memory_connections обходит граф связей SQL-запросом и даёт обзор отношений по сущности "
+                          "или категории; "
                           "memory_entity даёт полное досье сущности; memory_overview даёт высокоуровневую картину по "
                           "сжатым периодам/досье/связям; memory_media находит и пересылает фото из истории. "
                           "Используй доступные tools для вопросов про историю чата, лор, персонажей, прошлые споры и "
                           "события, а также старые фото. Имена и прозвища разрешаются автоматически. "
+                          "Для вопросов «кто с кем встречается», «кто дружит», «кто во вражде», «связи X», "
+                          "«пары в чате» сначала вызывай memory_connections (category=romantic/friend/rival или entity), "
+                          "а не перебирай варианты через memory_search. "
                           "Если memory_search вернул слабые/пустые совпадения (помечено ⚠️) — не выдавай догадку за факт: "
                           "переспроси другими словами (конкретнее имена/событие) один раз или, для внешних тем, используй веб. "
                           "Иногда к вопросу приложена справка о спрашивающем из памяти — учитывай её, только если релевантно.")
@@ -3673,13 +3691,15 @@ async def ask_agentic(context: str, question: str, must_search: bool = False, ca
                 continue
 
             # — GraphRAG-память /index —
-            if tname in ("memory_search", "memory_entity", "memory_media", "memory_overview"):
+            if tname in ("memory_search", "memory_connections", "memory_entity", "memory_media", "memory_overview"):
                 sstats["memory"] = sstats.get("memory", 0) + 1
                 ready, note = await _index_memory_ready(chat_id, tname)
                 if not ready:
                     res = note
                 elif tname == "memory_search":
                     res = await _index_tool_search(chat_id, args.get("query", ""), args.get("kind", "all"))
+                elif tname == "memory_connections":
+                    res = await _index_tool_connections(chat_id, args.get("entity"), args.get("category"), args.get("polarity"))
                 elif tname == "memory_overview":
                     res = await _index_tool_overview(chat_id, args.get("topic", ""))
                 elif tname == "memory_entity":
@@ -3692,7 +3712,7 @@ async def ask_agentic(context: str, question: str, must_search: bool = False, ca
                     q_img = images[0]["bytes"] if images else None  # приложенная картинка → визуальный поиск
                     res = await _index_tool_media(chat_id, args.get("query", ""), cnt,
                                                   visual=bool(args.get("visual")), query_image=q_img)
-                log("ASK", f"Память /index {tname}: {_idx_snip(args.get('query') or args.get('topic') or args.get('name'), 80)} → {len(res)} симв")
+                log("ASK", f"Память /index {tname}: {_idx_snip(args.get('query') or args.get('topic') or args.get('name') or args.get('entity') or args.get('category'), 80)} → {len(res)} симв")
                 messages.append({"role": "tool", "tool_call_id": tool_call.id, "content": res})
                 continue
 
@@ -7552,7 +7572,7 @@ _INDEX_DDL = [
         KEY k_ent (chat_id, entity_id)) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4""",
     """CREATE TABLE IF NOT EXISTS relations (
         id BIGINT AUTO_INCREMENT PRIMARY KEY, chat_id BIGINT NOT NULL, source_id BIGINT NOT NULL, target_id BIGINT NOT NULL,
-        relation_type VARCHAR(64) NULL, canonical_type VARCHAR(32) NULL, context_summary MEDIUMTEXT NULL,
+        relation_type VARCHAR(64) NULL, canonical_type VARCHAR(32) NULL, rel_category VARCHAR(24) NULL, context_summary MEDIUMTEXT NULL,
         weight FLOAT NOT NULL DEFAULT 1, first_seen DATETIME NULL, last_seen DATETIME NULL,
         status VARCHAR(16) NOT NULL DEFAULT 'active', evidence JSON NULL, embedding VARBINARY(4096) NULL,
         KEY k_chat (chat_id), KEY k_pair (chat_id, source_id, target_id)) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4""",
@@ -7605,6 +7625,7 @@ _INDEX_MIGRATIONS = [
     "ALTER TABLE chat_chunks ADD UNIQUE KEY u_scene (chat_id, start_msg_id, end_msg_id)",
     "ALTER TABLE chat_chunks ADD KEY k_scene_range (chat_id, start_msg_id, end_msg_id)",
     "ALTER TABLE media_assets ADD COLUMN visual_description MEDIUMTEXT NULL",
+    "ALTER TABLE relations ADD COLUMN rel_category VARCHAR(24) NULL",
 ]
 
 
@@ -7667,6 +7688,7 @@ async def _idx_set_state(chat_id: int, stage: int, cursor=None, stats=None, stat
 INDEX_META_STAGE = 9  # выделенная строка idx_state под мета (режим): stage 0–5 пишут свои stats ЦЕЛИКОМ,
 #                       и mode в них затёрся бы первым же чекпоинтом; стадию 9 пайплайн не трогает,
 #                       status='done' не подхватывается boot-резюмом
+INDEX_RECATEGORIZE_STAGE = 8  # maintenance: /index recategorize; не часть основного pipeline 0–5
 
 
 async def _index_get_mode(chat_id: int) -> str:
@@ -8273,11 +8295,19 @@ _INDEX_SUMM_SYSTEM = (
 )
 
 
-async def _index_summarize_entities(chat_id: int, progress_cb=None):
+async def _index_summarize_entities(chat_id: int, progress_cb=None, entity_ids: list = None):
     """Из claim'ов синтезирует entities.canon_summary/fanon_summary. Чекпоинт по entity id."""
+    xwhere, params = "", [chat_id]
+    if entity_ids:
+        ids = [int(x) for x in entity_ids if x]
+        if not ids:
+            return "done"
+        xwhere = " AND id IN (" + ",".join(["%s"] * len(ids)) + ")"
+        params.extend(ids)
     ents = await db_read(
-        "SELECT id, name FROM entities WHERE chat_id=%s AND (canon_summary IS NULL OR fanon_summary IS NULL) ORDER BY id",
-        (chat_id,))
+        "SELECT id, name FROM entities WHERE chat_id=%s AND (canon_summary IS NULL OR fanon_summary IS NULL)"
+        + xwhere + " ORDER BY id",
+        tuple(params))
     sem = asyncio.Semaphore(4)
     total = len(ents)
     done = 0
@@ -8371,13 +8401,21 @@ _INDEX_MEDIA_SEM = asyncio.Semaphore(1)  # скачиваем фото стро�
 _INDEX_REL_SYSTEM = (
     "Ты — аналитик связей в чате. Дан СПРАВОЧНИК сущностей (имена и алиасы) и одна СЦЕНА диалога в формате "
     "[msg_id] Автор: текст. Верни СТРОГО JSON (без пояснений):\n"
-    '{"relations":[{"source":"<имя из справочника>","target":"<имя из справочника>",'
+    '{"scene_summary":"<1-2 фразы: о чём сцена>",'
+    '"relations":[{"source":"<имя из справочника>","target":"<имя из справочника>",'
     ' "type":"<тип связи по-русски: глагол/отношение>","polarity":"pos|neg|neutral",'
+    ' "category":"romantic|friend|family|rival|professional|mentor|acquaintance|group",'
     ' "summary":"<суть связи или конфликта в этой сцене>","evidence":[<msg_id>]}]}\n'
     "Только связи, ЯВНО проявленные в этой сцене (кто с кем взаимодействует, что заявлено об отношениях). "
     "source и target — строго имена ИЗ СПРАВОЧНИКА; если участник связи не из справочника — пропусти связь. "
     "polarity: pos (тепло/союз/симпатия/примирение), neg (конфликт/вражда/насмешка/ссора), "
-    "neutral (родство/роль/структурный факт без оценки). evidence — msg_id из сцены."
+    "neutral (родство/роль/структурный факт без оценки). Категории: romantic — романтика/пара/флирт/краш; "
+    "friend — дружба/союз/тёплое регулярное общение; family — родство/семейные роли; rival — конфликт/вражда/"
+    "травля/соревнование; professional — рабочая/деловая/организационная роль; mentor — наставник/учитель/"
+    "старший направляет младшего; acquaintance — знакомство или слабый нейтральный контакт; group — совместное "
+    "присутствие/общий чат/сомнительная связь без адресного взаимодействия. Чистое со-присутствие в общем чате "
+    "(оба просто писали, без адресного взаимодействия) — НЕ связь; если сомневаешься, ставь category=group. "
+    "evidence — msg_id из сцены."
 )
 
 _INDEX_MEDIA_SYSTEM = (
@@ -8468,6 +8506,7 @@ async def _index_apply_relations(chat_id: int, rels: list, name2id: dict, scene_
         pol = str(rel.get("polarity", "neutral")).lower()
         if pol not in ("pos", "neg", "neutral"):
             pol = "neutral"
+        cat = _index_rel_category(rel.get("category"), pol)
         rtype = (rel.get("type") or "связь")[:64]
         summ = (rel.get("summary") or "")[:2000]
         ev = [int(x) for x in (rel.get("evidence") or []) if str(x).isdigit()]
@@ -8493,22 +8532,23 @@ async def _index_apply_relations(chat_id: int, rels: list, name2id: dict, scene_
             if pol != "neutral" and row["canonical_type"] != pol:  # полярность сменилась → закрываем старое ребро
                 await db_write("UPDATE relations SET status='closed' WHERE chat_id=%s AND id=%s", (chat_id, row["id"]))
                 await db_write(
-                    """INSERT INTO relations (chat_id,source_id,target_id,relation_type,canonical_type,context_summary,
-                       weight,first_seen,last_seen,status,evidence) VALUES (%s,%s,%s,%s,%s,%s,1,%s,%s,'active',%s)""",
-                    (chat_id, s, t, rtype, pol, summ, scene_date, scene_date, json.dumps(ev, ensure_ascii=False)))
+                    """INSERT INTO relations (chat_id,source_id,target_id,relation_type,canonical_type,rel_category,context_summary,
+                       weight,first_seen,last_seen,status,evidence) VALUES (%s,%s,%s,%s,%s,%s,%s,1,%s,%s,'active',%s)""",
+                    (chat_id, s, t, rtype, pol, cat, summ, scene_date, scene_date, json.dumps(ev, ensure_ascii=False)))
                 _index_invalidate(chat_id, "relations")
             else:  # то же ребро — усиливаем, обновляем summary/last_seen, доклеиваем evidence
                 old_ev = json.loads(row["evidence"]) if row["evidence"] else []
                 new_ev = list(dict.fromkeys(old_ev + ev))[:50]
                 await db_write(
-                    "UPDATE relations SET weight=weight+1, last_seen=%s, relation_type=%s, context_summary=%s, evidence=%s, embedding=NULL WHERE chat_id=%s AND id=%s",
-                    (scene_date, rtype, summ, json.dumps(new_ev, ensure_ascii=False), chat_id, row["id"]))
+                    """UPDATE relations SET weight=weight+1, last_seen=%s, relation_type=%s, rel_category=%s,
+                       context_summary=%s, evidence=%s, embedding=NULL WHERE chat_id=%s AND id=%s""",
+                    (scene_date, rtype, cat, summ, json.dumps(new_ev, ensure_ascii=False), chat_id, row["id"]))
                 _index_invalidate(chat_id, "relations")
         else:
             await db_write(
-                """INSERT INTO relations (chat_id,source_id,target_id,relation_type,canonical_type,context_summary,
-                   weight,first_seen,last_seen,status,evidence) VALUES (%s,%s,%s,%s,%s,%s,1,%s,%s,'active',%s)""",
-                (chat_id, s, t, rtype, pol, summ, scene_date, scene_date, json.dumps(ev, ensure_ascii=False)))
+                """INSERT INTO relations (chat_id,source_id,target_id,relation_type,canonical_type,rel_category,context_summary,
+                   weight,first_seen,last_seen,status,evidence) VALUES (%s,%s,%s,%s,%s,%s,%s,1,%s,%s,'active',%s)""",
+                (chat_id, s, t, rtype, pol, cat, summ, scene_date, scene_date, json.dumps(ev, ensure_ascii=False)))
         applied += 1
     return applied, touched
 
@@ -8654,18 +8694,22 @@ async def _index_stage2_graph(chat_id: int, progress_cb=None):
 
     scene, scene_tok, prev_date = [], 0, None
 
-    async def _write_chunk(sc, scene_text, rels_applied, touched, media_done, failed=False):
+    async def _write_chunk(sc, scene_text, rels_applied, touched, media_done, failed=False, scene_summary=None):
         nonlocal scenes_done
         if not sc:
             return
         s_date = sc[-1]["date"]
         ent_ids = sorted(touched)
         meta = {"entities": ent_ids[:60], "relations": rels_applied, "photos": media_done, "failed": bool(failed)}
+        if (scene_summary or "").strip():
+            meta["summary"] = _idx_snip(scene_summary, 600)
         enriched = scene_text
         if ent_ids:
             names = await db_read("SELECT name FROM entities WHERE id IN (%s)" %
                                   ",".join(str(int(i)) for i in ent_ids[:30]))
             enriched += "\n[Участники сцены: " + ", ".join(n["name"] for n in names) + "]"
+        if not (enriched or "").strip():
+            return
         rowcount, _ = await db_write(
             """INSERT INTO chat_chunks (chat_id,start_msg_id,end_msg_id,scene_date,enriched_text,meta)
                VALUES (%s,%s,%s,%s,%s,%s)
@@ -8686,6 +8730,7 @@ async def _index_stage2_graph(chat_id: int, progress_cb=None):
         registry, name2id = await _index_relation_registry(chat_id, scene_text)
         rels_applied, touched = 0, set()
         failed = False
+        scene_summary = None
         if scene_text.strip():
             data = await _index_extract(_INDEX_REL_SYSTEM + "\n\nСПРАВОЧНИК:\n" + registry, "СЦЕНА:\n" + scene_text)
             if data is None or not isinstance(data.get("relations"), list):
@@ -8701,9 +8746,10 @@ async def _index_stage2_graph(chat_id: int, progress_cb=None):
                     {"depth": depth, "text_preview": scene_text[:500]})
                 log("INDEX", f"Stage2 poison scene skipped: {sc[0]['msg_id']}..{sc[-1]['msg_id']}")
             else:
+                scene_summary = data.get("scene_summary")
                 rels_applied, touched = await _index_apply_relations(chat_id, data["relations"], name2id, s_date)
         # медиа НЕ качаем в Stage 2 (это блокировало граф на часы) — фото обрабатывает отдельная Stage 5
-        await _write_chunk(sc, scene_text, rels_applied, touched, 0, failed=failed)
+        await _write_chunk(sc, scene_text, rels_applied, touched, 0, failed=failed, scene_summary=scene_summary)
 
     # --- параллельная экстракция: завершённые сцены копятся в batch → экстрагируются concurrently → применяются по очереди ---
     batch = []
@@ -8726,9 +8772,11 @@ async def _index_stage2_graph(chat_id: int, progress_cb=None):
             await _finalize(sc)  # редкий poison-путь: пере-извлечёт и раздробит/запишет failed
             return
         rels_applied, touched = 0, set()
+        scene_summary = None
         if data and isinstance(data.get("relations"), list):
+            scene_summary = data.get("scene_summary")
             rels_applied, touched = await _index_apply_relations(chat_id, data["relations"], name2id, s_date)
-        await _write_chunk(sc, scene_text, rels_applied, touched, 0, failed=False)
+        await _write_chunk(sc, scene_text, rels_applied, touched, 0, failed=False, scene_summary=scene_summary)
 
     async def _flush_batch():
         """Экстрагирует batch параллельно, применяет по очереди, чекпоинтит по сцене. Устойчив к транзиентам:
@@ -9045,7 +9093,7 @@ async def _index_stage3_vectors(chat_id: int, progress_cb=None):
     targets = [
         ("entities", "id", "embedding", _ent_text, "досье", ""),
         ("relations", "id", "embedding", lambda r: _index_relation_embedding_text(r, rel_entities), "связи", ""),
-        ("chat_chunks", "id", "embedding", lambda r: (r.get("enriched_text") or "сцена")[:8000], "сцены", ""),
+        ("chat_chunks", "id", "embedding", _index_chunk_embedding_text, "сцены", ""),
         # только описанные: в gallery-режиме у большинства фото есть emb_image, но нет описания —
         # без гейта они получили бы одинаковые вектора «изображение» и замусорили текстовый поиск фото
         ("media_assets", "msg_id", "emb_text", lambda r: (r.get("image_description") or "изображение")[:8000], "фото",
@@ -9538,8 +9586,8 @@ _INDEX_HNSW: dict = {}     # optional ANN cache {(chat_id, kind): {"idx": hnsw, 
 # kind → (table, emb_col, key_col, доп.поля-для-сниппета)
 _INDEX_KINDS = {
     "entities":    ("entities", "embedding", "id", "name, entity_type, canon_summary, fanon_summary, visual_features"),
-    "relations":   ("relations", "embedding", "id", "source_id, target_id, relation_type, canonical_type, context_summary, status, weight, first_seen, last_seen, evidence"),
-    "chunks":      ("chat_chunks", "embedding", "id", "start_msg_id, end_msg_id, enriched_text"),
+    "relations":   ("relations", "embedding", "id", "source_id, target_id, relation_type, canonical_type, rel_category, context_summary, status, weight, first_seen, last_seen, evidence"),
+    "chunks":      ("chat_chunks", "embedding", "id", "start_msg_id, end_msg_id, enriched_text, meta"),
     "media_text":  ("media_assets", "emb_text", "msg_id", "msg_id, image_description, visual_description, entity_ids"),
     "media_image": ("media_assets", "emb_image", "msg_id", "msg_id, image_description, visual_description, entity_ids"),
     "rollups":     ("time_rollups", "embedding", "id", "level, bucket_key, summary, period_start, period_end"),
@@ -9703,6 +9751,17 @@ INDEX_MEMORY_TOOLS = [
                      "description": "Где искать: scenes — диалоги, dossiers — досье, relations — связи, all — везде (по умолчанию)."}},
             "required": ["query"]}}},
     {"type": "function", "function": {
+        "name": "memory_connections",
+        "description": "Структурный обход графа связей без векторного поиска. Используй для вопросов «кто с кем "
+                       "встречается/дружит/враждует», «связи X», «пары в чате», когда нужен обзор отношений, "
+                       "а не поиск реплик.",
+        "parameters": {"type": "object", "properties": {
+            "entity": {"type": "string", "description": "Имя/алиас сущности; если задано — вернуть все её связи по категориям."},
+            "category": {"type": "string", "enum": list(INDEX_REL_CATEGORIES),
+                         "description": "Фильтр категории: romantic, friend, family, rival, professional, mentor, acquaintance, group."},
+            "polarity": {"type": "string", "enum": ["pos", "neg", "neutral"],
+                         "description": "Опциональный фильтр старой полярности."}}, "required": []}}},
+    {"type": "function", "function": {
         "name": "memory_overview",
         "description": "Высокоуровневое ОБОБЩЕНИЕ по памяти чата для ТЕМАТИЧЕСКИХ и ГЛОБАЛЬНЫХ вопросов — «какая обычно "
                        "атмосфера», «как в чате относятся к X», «кто главные фигуры вокруг темы Y», «общая динамика/"
@@ -9734,6 +9793,32 @@ INDEX_MEMORY_TOOLS = [
 
 def _idx_snip(text, n=180):
     return re.sub(r"\s+", " ", (text or "")).strip()[:n]
+
+
+def _index_chunk_meta(row: dict) -> dict:
+    meta = row.get("meta") if isinstance(row, dict) else None
+    if isinstance(meta, dict):
+        return meta
+    if not meta:
+        return {}
+    try:
+        data = json.loads(meta)
+        return data if isinstance(data, dict) else {}
+    except Exception:
+        return {}
+
+
+def _index_chunk_summary(row: dict) -> str:
+    meta = _index_chunk_meta(row)
+    return (meta.get("summary") or meta.get("scene_summary") or "").strip()
+
+
+def _index_chunk_embedding_text(row: dict) -> str:
+    summary = _index_chunk_summary(row)
+    text = (row.get("enriched_text") or "").strip()
+    if summary:
+        return (summary + "\n\n" + text[:8000]).strip()[:8000]
+    return (text or "сцена")[:8000]
 
 
 def _index_json_list(value) -> list:
@@ -9785,6 +9870,28 @@ def _index_date_short(value) -> str:
     return str(value)[:10]
 
 
+def _index_rel_category_fallback(polarity: str) -> str:
+    pol = (polarity or "").strip().lower()
+    if pol == "neg":
+        return "rival"
+    if pol == "pos":
+        return "friend"
+    return "acquaintance"
+
+
+def _index_rel_category(value, polarity: str = None) -> str:
+    cat = (value or "").strip().lower()
+    return cat if cat in INDEX_REL_CATEGORY_SET else _index_rel_category_fallback(polarity)
+
+
+def _index_rel_category_label(category: str) -> tuple:
+    return INDEX_REL_CATEGORY_LABELS.get(_index_rel_category(category), INDEX_REL_CATEGORY_LABELS["acquaintance"])
+
+
+def _index_rel_category_sort_key(category: str) -> int:
+    return INDEX_REL_CATEGORY_ORDER.get(_index_rel_category(category), INDEX_REL_CATEGORY_ORDER["acquaintance"])
+
+
 async def _index_entity_name_map(chat_id: int, ids: set) -> dict:
     ids = {int(x) for x in ids if x}
     if not ids:
@@ -9812,6 +9919,7 @@ def _index_relation_embedding_text(row: dict, entities: dict = None) -> str:
         f"target: {_names(tgt) or row.get('target_id')}",
         f"relation_type: {row.get('relation_type') or 'связь'}",
         f"canonical_type: {row.get('canonical_type') or ''}",
+        f"rel_category: {_index_rel_category(row.get('rel_category'), row.get('canonical_type'))}",
         f"status: {row.get('status') or 'active'}",
         f"weight: {row.get('weight') or ''}",
         f"evidence_msg_ids: {', '.join(str(x) for x in ev)}" if ev else "",
@@ -9832,13 +9940,15 @@ async def _index_relation_names(chat_id: int, rels: list) -> dict:
 def _index_relation_doc(hit: dict, names: dict) -> str:
     a, b = names.get(hit.get("source_id"), "?"), names.get(hit.get("target_id"), "?")
     status = hit.get("status") or "active"
+    cat = _index_rel_category(hit.get("rel_category"), hit.get("canonical_type"))
     return (f"{a} -> {b}: {hit.get('relation_type') or 'связь'} "
-            f"({hit.get('canonical_type') or '?'}, {status}, weight={hit.get('weight') or 1}) — "
+            f"({cat}/{hit.get('canonical_type') or '?'}, {status}, weight={hit.get('weight') or 1}) — "
             f"{_idx_snip(hit.get('context_summary'), 500)}")
 
 
 def _index_relation_line(hit: dict, names: dict, chat_ent=None, rel_score=None) -> str:
     a, b = names.get(hit.get("source_id"), "?"), names.get(hit.get("target_id"), "?")
+    cat = _index_rel_category(hit.get("rel_category"), hit.get("canonical_type"))
     st = "" if hit.get("status") == "active" else " (в прошлом)"
     weight = hit.get("weight")
     dates = ""
@@ -9849,12 +9959,133 @@ def _index_relation_line(hit: dict, names: dict, chat_ent=None, rel_score=None) 
     score = f" [rel {rel_score:.2f}]" if rel_score is not None else ""
     tail = "; " + ev if ev else ""
     return (f"• [связь] {a} -> {b}: {hit.get('relation_type') or 'связь'}"
-            f"/{hit.get('canonical_type') or '?'}{st} — {_idx_snip(hit.get('context_summary'), 180)} "
+            f"/{cat}/{hit.get('canonical_type') or '?'}{st} — {_idx_snip(hit.get('context_summary'), 180)} "
             f"(вес {weight or 1}{dates}{tail}){score}")
+
+
+def _index_rel_category_sql() -> str:
+    valid = ",".join("'" + c + "'" for c in INDEX_REL_CATEGORIES)
+    return (f"(CASE WHEN rel_category IN ({valid}) THEN rel_category "
+            "WHEN canonical_type='neg' THEN 'rival' "
+            "WHEN canonical_type='pos' THEN 'friend' "
+            "ELSE 'acquaintance' END)")
+
+
+def _index_connection_line(row: dict, names: dict, chat_ent=None, focus_id=None) -> str:
+    sid, tid = row.get("source_id"), row.get("target_id")
+    a, b = names.get(sid, "?"), names.get(tid, "?")
+    if focus_id:
+        other = names.get(tid if sid == focus_id else sid, "?")
+        arrow = "→" if sid == focus_id else "←"
+        prefix = f"{arrow} {other}"
+    else:
+        prefix = f"{a} ↔ {b}"
+    status = "сейчас" if row.get("status") == "active" else "в прошлом"
+    dates = ""
+    first, last = _index_date_short(row.get("first_seen")), _index_date_short(row.get("last_seen"))
+    if first or last:
+        dates = f"; {first or '?'}..{last or '?'}"
+    ev = _index_msg_refs(chat_ent, row.get("evidence"), limit=3)
+    ev = f"; {ev}" if ev else ""
+    cat = _index_rel_category(row.get("_category") or row.get("rel_category"), row.get("canonical_type"))
+    return (f"• {prefix}: {row.get('relation_type') or 'связь'}/{cat}/{row.get('canonical_type') or '?'} "
+            f"({status}, вес {row.get('weight') or 1}{dates}{ev}) — {_idx_snip(row.get('context_summary'), 220)}")
+
+
+async def _index_tool_connections(chat_id: int, entity: str = None, category: str = None, polarity: str = None) -> str:
+    ready, note = await _index_memory_ready(chat_id, "memory_connections")
+    if not ready:
+        return note
+    entity = (entity or "").strip()
+    category = (category or "").strip().lower()
+    polarity = (polarity or "").strip().lower()
+    if category and category not in INDEX_REL_CATEGORY_SET:
+        return "Неверная category. Допустимо: " + ", ".join(INDEX_REL_CATEGORIES)
+    if polarity and polarity not in ("pos", "neg", "neutral"):
+        return "Неверная polarity. Допустимо: pos, neg, neutral."
+
+    focus = await _index_find_entity(chat_id, entity) if entity else None
+    if entity and not focus:
+        return f"Сущность «{entity}» в памяти чата не найдена."
+
+    cat_expr = _index_rel_category_sql()
+    where = ["chat_id=%s"]
+    params = [chat_id]
+    if focus:
+        where.append("(source_id=%s OR target_id=%s)")
+        params.extend([focus["id"], focus["id"]])
+    if category:
+        where.append(f"{cat_expr}=%s")
+        params.append(category)
+    if polarity:
+        where.append("canonical_type=%s")
+        params.append(polarity)
+    limit = 120 if focus else 60
+    rows = await db_read(
+        f"""SELECT id AS `key`, source_id, target_id, relation_type, canonical_type, rel_category,
+                  {cat_expr} AS rel_category_norm, context_summary, status, weight, first_seen, last_seen, evidence
+             FROM relations
+             WHERE {' AND '.join(where)}
+             ORDER BY status='active' DESC, rel_category_norm='group' ASC, weight DESC, last_seen DESC, id DESC
+             LIMIT %s""",
+        tuple(params + [limit]))
+    uncat = 0
+    if category:  # категории могли быть ещё не вычислены (/index recategorize) → не выдаём ложное «нет романтики»
+        uscope, uparams = ["chat_id=%s", "rel_category IS NULL"], [chat_id]
+        if focus:
+            uscope.append("(source_id=%s OR target_id=%s)")
+            uparams.extend([focus["id"], focus["id"]])
+        uncat = (await db_read(f"SELECT COUNT(*) c FROM relations WHERE {' AND '.join(uscope)}", tuple(uparams)))[0]["c"]
+    if not rows:
+        filters = []
+        if entity:
+            filters.append(f"entity={entity}")
+        if category:
+            filters.append(f"category={category}")
+        if polarity:
+            filters.append(f"polarity={polarity}")
+        base = "Связей по фильтрам не найдено" + (": " + ", ".join(filters) if filters else ".")
+        if uncat:  # НЕ «нет романтики», а «категории ещё не размечены»
+            base += (f"\n⚠️ У {uncat} связей категория ещё НЕ вычислена — по категории «{category}» ответ неполон. "
+                     f"Запусти `/index recategorize`, либо посмотри связи без фильтра категории.")
+        return base
+
+    for r in rows:
+        r["_category"] = _index_rel_category(r.get("rel_category_norm") or r.get("rel_category"), r.get("canonical_type"))
+    chat_ent = await _index_chat_entity(chat_id)
+    names = await _index_relation_names(chat_id, rows)
+    grouped = {}
+    for r in rows:
+        grouped.setdefault(r["_category"], []).append(r)
+
+    head = ["Структурный обход графа связей (SQL по relations, без векторного поиска)."]
+    if focus:
+        head.append(f"Сущность: {focus['name']}.")
+    if category:
+        head.append(f"Категория: {category}.")
+    if polarity:
+        head.append(f"Полярность: {polarity}.")
+    if category and uncat:  # частичная категоризация — честно предупреждаем о неполноте
+        head.append(f"⚠️ ещё {uncat} связей без категории (`/index recategorize` уточнит).")
+    lines = [" ".join(head)]
+    for cat in sorted(grouped, key=_index_rel_category_sort_key):
+        items = grouped[cat]
+        emoji, title = _index_rel_category_label(cat)
+        if cat == "group" and not category:
+            lines.append(f"\n{emoji} {title}/group: {len(items)} слабых или co-presence-контактов; детали скрыты. "
+                         "Запроси category=group, если они нужны явно.")
+            continue
+        lines.append(f"\n{emoji} {title}/{cat}:")
+        for r in items[:25]:
+            lines.append(_index_connection_line(r, names, chat_ent=chat_ent, focus_id=focus["id"] if focus else None))
+        if len(items) > 25:
+            lines.append(f"• … ещё {len(items) - 25}")
+    return "\n".join(lines)
 
 
 _INDEX_TOOL_STAGE = {
     "memory_search": 3,
+    "memory_connections": 3,
     "memory_entity": 3,
     "memory_overview": 4,
     "memory_media": 5,
@@ -9943,23 +10174,24 @@ async def _index_relation_direct_hits(chat_id: int, query: str) -> list:
     ids = [int(e["id"]) for e in ents if e.get("id")]
     if not ids:
         return []
+    cat_expr = _index_rel_category_sql()
     if len(ids) >= 2:
         ph = ",".join(["%s"] * len(ids))
         rows = await db_read(
-            f"""SELECT id AS `key`, source_id, target_id, relation_type, canonical_type, context_summary,
+            f"""SELECT id AS `key`, source_id, target_id, relation_type, canonical_type, rel_category, context_summary,
                       status, weight, first_seen, last_seen, evidence
                 FROM relations
                 WHERE chat_id=%s AND source_id IN ({ph}) AND target_id IN ({ph})
-                ORDER BY status='active' DESC, weight DESC, last_seen DESC LIMIT 12""",
+                ORDER BY status='active' DESC, {cat_expr}='group' ASC, weight DESC, last_seen DESC LIMIT 12""",
             tuple([chat_id] + ids + ids))
     else:
         eid = ids[0]
         rows = await db_read(
-            """SELECT id AS `key`, source_id, target_id, relation_type, canonical_type, context_summary,
+            f"""SELECT id AS `key`, source_id, target_id, relation_type, canonical_type, rel_category, context_summary,
                       status, weight, first_seen, last_seen, evidence
                FROM relations
                WHERE chat_id=%s AND (source_id=%s OR target_id=%s)
-               ORDER BY status='active' DESC, weight DESC, last_seen DESC LIMIT 12""",
+               ORDER BY status='active' DESC, {cat_expr}='group' ASC, weight DESC, last_seen DESC LIMIT 12""",
             (chat_id, eid, eid))
     out = []
     for r in rows:
@@ -10151,8 +10383,10 @@ async def _index_tool_search(chat_id: int, query: str, kind: str = "all") -> str
             seen.add(sk)
             if k == "chunks":
                 link = (f" {build_msg_link(ent, h['start_msg_id'])}" if ent and h.get("start_msg_id") else "")
-                doc = _idx_snip(h.get("enriched_text"), 600)
-                line = f"• [сцена] {_idx_snip(h.get('enriched_text'), 220)}{link}"
+                summary = _index_chunk_summary(h)
+                scene_text = summary or h.get("enriched_text")
+                doc = _idx_snip((summary + "\n" + (h.get("enriched_text") or "")) if summary else scene_text, 600)
+                line = f"• [сцена] {_idx_snip(scene_text, 220)}{link}"
             elif k == "entities":
                 doc = f"{h['name']}: {_idx_snip(h.get('canon_summary') or h.get('fanon_summary'), 500)}"
                 line = f"• [досье] {h['name']} ({h['entity_type']}): {_idx_snip(h.get('canon_summary'), 160)}"
@@ -10224,8 +10458,9 @@ async def _index_tool_overview(chat_id: int, topic: str) -> str:
         rbits = []
         for h in rels[:6]:
             st = "" if h.get("status") == "active" else " (в прошлом)"
+            cat = _index_rel_category(h.get("rel_category"), h.get("canonical_type"))
             rbits.append(f"— {n2.get(h['source_id'], '?')} ↔ {n2.get(h['target_id'], '?')}: "
-                         f"{h.get('relation_type') or ''}{st} — {_idx_snip(h.get('context_summary'), 160)}")
+                         f"{h.get('relation_type') or ''}/{cat}{st} — {_idx_snip(h.get('context_summary'), 160)}")
         if rbits:
             blocks.append("Связи по теме:\n" + "\n".join(rbits))
     # 3) темпоральная динамика — сводки периодов (RAPTOR-lite): «как менялось / общая динамика»
@@ -10270,30 +10505,28 @@ async def _index_entity_report(chat_id: int, ent: dict) -> str:
                 bits.append(c["claim"] + (f" ({ev})" if ev else ""))
             parts.append(f"{title}: " + "; ".join(bits))
     rels = await db_read(
-        "SELECT source_id, target_id, relation_type, canonical_type, context_summary, weight, first_seen, last_seen, status, evidence FROM relations "
+        "SELECT source_id, target_id, relation_type, canonical_type, rel_category, context_summary, weight, first_seen, last_seen, status, evidence FROM relations "
         "WHERE chat_id=%s AND (source_id=%s OR target_id=%s) ORDER BY status, weight DESC LIMIT 20",
         (chat_id, ent["id"], ent["id"]))
     if rels:
         need = {r["source_id"] for r in rels} | {r["target_id"] for r in rels}
         nm = await db_read("SELECT id, name FROM entities WHERE id IN (%s)" % ",".join(str(int(i)) for i in need))
         n = {r["id"]: r["name"] for r in nm}
-        def _rel_bit(r):
-            other = n.get(r["target_id"] if r["source_id"] == ent["id"] else r["source_id"], "?")
-            dates = ""
-            first, last = _index_date_short(r.get("first_seen")), _index_date_short(r.get("last_seen"))
-            if first or last:
-                dates = f"; {first or '?'}..{last or '?'}"
-            ev = _index_msg_refs(chat_ent, r.get("evidence"), limit=3)
-            ev = f"; {ev}" if ev else ""
-            return (f"{other} ({r.get('relation_type') or 'связь'}/{r.get('canonical_type') or '?'}, "
-                    f"вес {r.get('weight') or 1}{dates}{ev}) — {_idx_snip(r.get('context_summary'), 180)}")
-
-        cur = [_rel_bit(r) for r in rels if r["status"] == "active"]
-        past = [_rel_bit(r) + " [в прошлом]" for r in rels if r["status"] != "active"]
-        if cur:
-            parts.append("Связи сейчас:\n" + "\n".join("• " + x for x in cur[:12]))
-        if past:
-            parts.append("Бывшие связи:\n" + "\n".join("• " + x for x in past[:8]))
+        grouped = {}
+        for r in rels:
+            cat = _index_rel_category(r.get("rel_category"), r.get("canonical_type"))
+            grouped.setdefault(cat, []).append(r)
+        rel_parts = []
+        for cat in sorted(grouped, key=_index_rel_category_sort_key):
+            items = grouped[cat]
+            emoji, title = _index_rel_category_label(cat)
+            if cat == "group":
+                rel_parts.append(f"{emoji} {title}/group: {len(items)} слабых или общих контактов")
+                continue
+            rel_parts.append(f"{emoji} {title}/{cat}:")
+            rel_parts.extend(_index_connection_line(r, n, chat_ent=chat_ent, focus_id=ent["id"]) for r in items[:8])
+        if rel_parts:
+            parts.append("Связи по категориям:\n" + "\n".join(rel_parts))
     return "\n".join(parts)
 
 
@@ -10327,13 +10560,14 @@ async def _index_asker_brief(chat_id: int, tg_id: int) -> str:
     if (e.get("visual_features") or "").strip():
         bits.append("Внешность: " + _idx_snip(e["visual_features"], 160))
     rels = await db_read(
-        "SELECT source_id, target_id, relation_type FROM relations WHERE chat_id=%s AND status='active' "
+        "SELECT source_id, target_id, relation_type, canonical_type, rel_category FROM relations WHERE chat_id=%s AND status='active' "
         "AND (source_id=%s OR target_id=%s) ORDER BY weight DESC LIMIT 5", (chat_id, e["id"], e["id"]))
     if rels:
         need = {r["source_id"] for r in rels} | {r["target_id"] for r in rels}
         nm = await db_read("SELECT id, name FROM entities WHERE id IN (%s)" % ",".join(str(int(i)) for i in need))
         n2 = {r["id"]: r["name"] for r in nm}
-        pairs = [f"{n2.get(r['target_id'] if r['source_id'] == e['id'] else r['source_id'], '?')} ({r['relation_type']})"
+        pairs = [f"{n2.get(r['target_id'] if r['source_id'] == e['id'] else r['source_id'], '?')} "
+                 f"({r['relation_type']}/{_index_rel_category(r.get('rel_category'), r.get('canonical_type'))})"
                  for r in rels]
         if pairs:
             bits.append("Связи: " + ", ".join(pairs))
@@ -10744,6 +10978,237 @@ async def _index_update_rewind_cursor(chat_id: int) -> int:
     return max(0, min(candidates) - 1)
 
 
+_INDEX_REL_RECATEGORIZE_SYSTEM = (
+    "Ты категоризируешь уже извлечённые связи графа чата. Верни СТРОГО JSON без пояснений: "
+    '{"categories":[{"id":123,"category":"romantic|friend|family|rival|professional|mentor|acquaintance|group"}]}. '
+    "Категории: romantic — романтика/пара/флирт/краш; friend — дружба/союз/тёплое регулярное общение; "
+    "family — родство/семейные роли; rival — конфликт/вражда/травля/соревнование; professional — рабочая/"
+    "деловая/организационная роль; mentor — наставник/учитель/старший направляет младшего; acquaintance — "
+    "знакомство или слабый нейтральный контакт; group — совместное присутствие/общий чат/сомнительная связь "
+    "без адресного взаимодействия. Если данных мало, выбери самый осторожный вариант; чистое co-presence = group."
+)
+
+
+def _index_recategorize_category_map(data: dict, rows: list) -> dict:
+    raw = data.get("categories") if isinstance(data, dict) else None
+    if raw is None and isinstance(data, dict):
+        raw = data.get("relations") or data.get("result")
+    out = {}
+    if isinstance(raw, dict):
+        for k, v in raw.items():
+            try:
+                out[int(k)] = str(v).strip().lower()
+            except Exception:
+                continue
+    elif isinstance(raw, list):
+        for item in raw:
+            if not isinstance(item, dict):
+                continue
+            try:
+                rid = int(item.get("id"))
+            except Exception:
+                continue
+            out[rid] = str(item.get("category") or "").strip().lower()
+    elif isinstance(data, dict):
+        ids = {int(r["id"]) for r in rows}
+        for k, v in data.items():
+            try:
+                rid = int(k)
+            except Exception:
+                continue
+            if rid in ids:
+                out[rid] = str(v).strip().lower()
+    return out
+
+
+async def _index_recategorize_batch(rows: list) -> dict:
+    lines = []
+    for r in rows:
+        lines.append(
+            f"id={r['id']} | source={r.get('source_name') or '?'} | target={r.get('target_name') or '?'} | "
+            f"type={r.get('relation_type') or ''} | polarity={r.get('canonical_type') or ''} | "
+            f"context={_idx_snip(r.get('context_summary'), 500)}"
+        )
+    data = await _index_extract(_INDEX_REL_RECATEGORIZE_SYSTEM, "Связи:\n" + "\n".join(lines), max_tokens=4000)
+    if not isinstance(data, dict):
+        return {}
+    return _index_recategorize_category_map(data, rows)
+
+
+async def _index_recategorize_denoise(chat_id: int) -> int:
+    ctx_likes = [
+        "%общем чате%", "%общий чат%", "%также присутств%", "%присутствует в чате%",
+        "%оба писали%", "%в том же чате%", "%участвует в общем%",
+    ]
+    type_likes = ["%общ%", "%чат%", "%присутств%", "%участв%", "%контакт%", "%связь%", "%пересека%"]
+    ctx_sql = " OR ".join(["LOWER(COALESCE(context_summary,'')) LIKE %s"] * len(ctx_likes))
+    type_sql = " OR ".join(["LOWER(COALESCE(relation_type,'')) LIKE %s"] * len(type_likes))
+    rowcount, _ = await db_write(
+        f"""UPDATE relations SET rel_category='group', embedding=NULL
+            WHERE chat_id=%s AND rel_category IS NULL
+              AND ({ctx_sql}) AND (relation_type IS NULL OR relation_type='' OR {type_sql})""",
+        tuple([chat_id] + ctx_likes + type_likes))
+    if rowcount:
+        _index_invalidate(chat_id, "relations")
+    return int(rowcount or 0)
+
+
+async def _index_recategorize_fill_summaries(chat_id: int, progress_cb=None) -> int:
+    rows = await db_read(
+        """SELECT e.id
+             FROM entities e
+             JOIN (
+                SELECT entity_id, COUNT(*) c FROM entity_claims WHERE chat_id=%s GROUP BY entity_id
+             ) cl ON cl.entity_id=e.id
+             WHERE e.chat_id=%s AND cl.c>=3 AND (e.canon_summary IS NULL OR TRIM(e.canon_summary)='')
+             ORDER BY e.id""",
+        (chat_id, chat_id))
+    ids = [int(r["id"]) for r in rows]
+    if not ids:
+        return 0
+    ph = ",".join(["%s"] * len(ids))
+    await db_write(
+        f"UPDATE entities SET canon_summary=NULL, fanon_summary=NULL, embedding=NULL WHERE chat_id=%s AND id IN ({ph})",
+        tuple([chat_id] + ids))
+    res = await _index_summarize_entities(chat_id, progress_cb=progress_cb, entity_ids=ids)
+    if res == "paused":
+        return -1
+    _index_invalidate(chat_id, "entities")
+    return len(ids)
+
+
+async def _index_recategorize_run(chat_id: int, progress_cb=None) -> dict:
+    st = await _idx_get_state(chat_id, INDEX_RECATEGORIZE_STAGE)
+    resume = st["status"] in ("running", "paused", "error")
+    cursor = int((st["cursor"] or {}).get("last_relation_id", 0)) if resume else 0
+    phase = (st["cursor"] or {}).get("phase") if resume else None
+    phase = phase or "relations"
+    stats = dict(st["stats"] or {}) if resume else {}
+    for key in ("denoised", "categorized", "summarized", "deleted_chunks"):
+        stats.setdefault(key, 0)
+    await _idx_set_state(chat_id, INDEX_RECATEGORIZE_STAGE,
+                         cursor={"phase": phase, "last_relation_id": cursor}, stats=stats, status="running")
+
+    if phase == "relations":
+        if progress_cb:
+            await progress_cb("🧹 Recategorize: denoise явных co-presence-связей…")
+        stats["denoised"] += await _index_recategorize_denoise(chat_id)
+        await _idx_set_state(chat_id, INDEX_RECATEGORIZE_STAGE,
+                             cursor={"phase": "relations", "last_relation_id": cursor}, stats=stats, status="running")
+        while True:
+            if _INDEX_CONTROL.get(chat_id) == "pause":
+                await _idx_set_state(chat_id, INDEX_RECATEGORIZE_STAGE,
+                                     cursor={"phase": "relations", "last_relation_id": cursor}, stats=stats, status="paused")
+                return stats
+            rows = await db_read(
+                """SELECT r.id, r.relation_type, r.canonical_type, r.context_summary,
+                          s.name AS source_name, t.name AS target_name
+                     FROM relations r
+                     JOIN entities s ON s.chat_id=r.chat_id AND s.id=r.source_id
+                     JOIN entities t ON t.chat_id=r.chat_id AND t.id=r.target_id
+                     WHERE r.chat_id=%s AND r.rel_category IS NULL AND r.id>%s
+                     ORDER BY r.id LIMIT 40""",
+                (chat_id, cursor))
+            if not rows:
+                break
+            cat_map = await _index_recategorize_batch(rows)
+            updates = []
+            for r in rows:
+                cat = _index_rel_category(cat_map.get(int(r["id"])), r.get("canonical_type"))
+                updates.append((cat, chat_id, int(r["id"])))
+            await db_write("UPDATE relations SET rel_category=%s, embedding=NULL WHERE chat_id=%s AND id=%s",
+                           updates, many=True)
+            cursor = int(rows[-1]["id"])
+            stats["categorized"] += len(rows)
+            _index_invalidate(chat_id, "relations")
+            await _idx_set_state(chat_id, INDEX_RECATEGORIZE_STAGE,
+                                 cursor={"phase": "relations", "last_relation_id": cursor}, stats=stats, status="running")
+            if progress_cb:
+                await progress_cb(f"🏷 Recategorize: размечено {stats['categorized']} связей (до id {cursor})…")
+        phase = "summaries"
+        await _idx_set_state(chat_id, INDEX_RECATEGORIZE_STAGE,
+                             cursor={"phase": phase, "last_relation_id": cursor}, stats=stats, status="running")
+
+    if phase == "summaries":
+        if _INDEX_CONTROL.get(chat_id) == "pause":
+            await _idx_set_state(chat_id, INDEX_RECATEGORIZE_STAGE,
+                                 cursor={"phase": "summaries", "last_relation_id": cursor}, stats=stats, status="paused")
+            return stats
+        if progress_cb:
+            await progress_cb("📝 Recategorize: добиваю пустые canon-досье с достаточным числом claims…")
+        summarized = await _index_recategorize_fill_summaries(chat_id, progress_cb=progress_cb)
+        if summarized < 0:
+            await _idx_set_state(chat_id, INDEX_RECATEGORIZE_STAGE,
+                                 cursor={"phase": "summaries", "last_relation_id": cursor}, stats=stats, status="paused")
+            return stats
+        stats["summarized"] += summarized
+        phase = "cleanup"
+        await _idx_set_state(chat_id, INDEX_RECATEGORIZE_STAGE,
+                             cursor={"phase": phase, "last_relation_id": cursor}, stats=stats, status="running")
+
+    if phase == "cleanup":
+        if progress_cb:
+            await progress_cb("🧽 Recategorize: удаляю пустые сцены из chat_chunks…")
+        deleted, _ = await db_write(
+            "DELETE FROM chat_chunks WHERE chat_id=%s AND (enriched_text IS NULL OR TRIM(enriched_text)='')",
+            (chat_id,))
+        stats["deleted_chunks"] += int(deleted or 0)
+        if deleted:
+            _index_invalidate(chat_id, "chunks")
+        await _idx_set_state(chat_id, INDEX_RECATEGORIZE_STAGE,
+                             cursor={"phase": "done", "last_relation_id": cursor}, stats=stats, status="done")
+    return stats
+
+
+@client.on(events.NewMessage(pattern=r"^[./]index\s+recategorize\s*$"))
+async def index_recategorize_command(event):
+    if await _slash_for_other_bot(event) or not event.out:
+        return
+    chat_id = event.chat_id
+    reason = _index_available()
+    if reason:
+        await event.reply(f"⚠️ /index recategorize недоступен: {reason}")
+        return
+    try:
+        await _index_ensure_ddl()
+    except Exception as e:
+        await event.reply(f"❌ Не подключиться к базе индексации: {e}")
+        return
+    if chat_id in _INDEX_TASKS:
+        await event.reply("🟢 Индексация/maintenance уже идёт — дождись завершения или `/index stop`.")
+        return
+    _INDEX_CONTROL[chat_id] = "run"
+    status_msg = await event.reply("🏷 Запускаю recategorize связей в фоне… `/index stop` — мягко остановить.")
+
+    async def upd(text):
+        try:
+            await status_msg.edit(text)
+        except Exception:
+            pass
+
+    async def runner():
+        try:
+            stats = await _index_recategorize_run(chat_id, progress_cb=upd)
+            if _INDEX_CONTROL.get(chat_id) == "pause":
+                await upd("⏸ Recategorize на паузе. Повторный `/index recategorize` продолжит с чекпоинта.")
+                return
+            await upd("✅ Recategorize готов: "
+                      f"denoise group {stats.get('denoised', 0)} · "
+                      f"размечено {stats.get('categorized', 0)} · "
+                      f"досье добито {stats.get('summarized', 0)} · "
+                      f"пустых сцен удалено {stats.get('deleted_chunks', 0)}.")
+        except Exception as e:
+            await _idx_set_state(chat_id, INDEX_RECATEGORIZE_STAGE, status="error")
+            log("INDEX", f"Recategorize чата {chat_id} упал: {e}")
+            traceback.print_exc()
+            await upd(f"❌ Recategorize упал: {e}. Повторный `/index recategorize` продолжит с чекпоинта.")
+        finally:
+            _INDEX_CONTROL.pop(chat_id, None)
+            _INDEX_TASKS.pop(chat_id, None)
+
+    _INDEX_TASKS[chat_id] = asyncio.create_task(runner())
+
+
 @client.on(events.NewMessage(pattern=r"^[./]index(?:\s+(go|status|pause|resume|stop|update))?(?:\s+(gallery|text|full))?\s*$"))
 async def index_command(event):
     if await _slash_for_other_bot(event):
@@ -10794,6 +11259,12 @@ async def index_command(event):
         retrying = await _index_failed_count(chat_id, "retrying")
         if skipped or retrying:
             parts.append(f"• Failed ranges: skipped {skipped} · retrying {retrying} (`/index failed`)")
+        rec = await _idx_get_state(chat_id, INDEX_RECATEGORIZE_STAGE)
+        if rec["status"]:
+            rs = rec["stats"] or {}
+            extra = (f" · denoise {rs.get('denoised', 0)} · cat {rs.get('categorized', 0)}"
+                     f" · summaries {rs.get('summarized', 0)} · empty chunks {rs.get('deleted_chunks', 0)}")
+            parts.append(f"• Stage {INDEX_RECATEGORIZE_STAGE} Recategorize: {rec['status']}{extra}")
         if len(parts) == 1:
             parts.append("• ещё не запускалась — `/index go`")
         parts.append(f"\n{'🟢 сейчас работает в фоне' if running else '⚪️ фоновая задача не активна'}")
@@ -11101,28 +11572,35 @@ async def entity_show_command(event):
     # связи из графа (активные и закрытые) — Stage 2
     id2name = {}
     rels = await db_read(
-        """SELECT source_id, target_id, relation_type, canonical_type, context_summary, status, weight
+        """SELECT source_id, target_id, relation_type, canonical_type, rel_category, context_summary,
+                  status, weight, first_seen, last_seen, evidence
            FROM relations WHERE chat_id=%s AND (source_id=%s OR target_id=%s) ORDER BY status, weight DESC LIMIT 20""",
         (chat_id, ent["id"], ent["id"]))
     if rels:
         need = {r["source_id"] for r in rels} | {r["target_id"] for r in rels}
         nm = await db_read("SELECT id, name FROM entities WHERE id IN (%s)" % ",".join(str(int(i)) for i in need))
         id2name = {r["id"]: r["name"] for r in nm}
-        pol_emoji = {"pos": "💚", "neg": "💢", "neutral": "▫️"}
-        active = [r for r in rels if r["status"] == "active"]
-        closed = [r for r in rels if r["status"] != "active"]
-        if active:
-            parts.append("\n🔗 **Связи:**")
-            for r in active[:10]:
+        grouped = {}
+        for r in rels:
+            grouped.setdefault(_index_rel_category(r.get("rel_category"), r.get("canonical_type")), []).append(r)
+        parts.append("\n🔗 **Связи по категориям:**")
+        for cat in sorted(grouped, key=_index_rel_category_sort_key):
+            items = grouped[cat]
+            emoji, title = _index_rel_category_label(cat)
+            if cat == "group":
+                parts.append(f"{emoji} _прочие контакты/group:_ {len(items)} слабых или co-presence-связей")
+                continue
+            parts.append(f"{emoji} **{title.capitalize()}:**")
+            for r in items[:8]:
                 other = id2name.get(r["target_id"] if r["source_id"] == ent["id"] else r["source_id"], "?")
                 arrow = "→" if r["source_id"] == ent["id"] else "←"
-                parts.append(f"{pol_emoji.get(r['canonical_type'], '▫️')} {arrow} **{other}** — {r['relation_type']} "
-                             f"(×{int(r['weight'])})")
-        if closed:
-            parts.append("\n🕯 _Бывшие связи (изменились со временем):_")
-            for r in closed[:5]:
-                other = id2name.get(r["target_id"] if r["source_id"] == ent["id"] else r["source_id"], "?")
-                parts.append(f"• {other} — {r['relation_type']} (было)")
+                past = " · было" if r["status"] != "active" else ""
+                ev = _index_msg_refs(chat_ent, r.get("evidence"), limit=1)
+                link = ""
+                if "links=" in ev:
+                    link = " [↗](" + ev.split("links=", 1)[1].split(",", 1)[0] + ")"
+                parts.append(f"• {arrow} **{other}** — {r.get('relation_type') or 'связь'} "
+                             f"(×{int(r.get('weight') or 1)}{past}) — {_idx_snip(r.get('context_summary'), 140)}{link}")
     n_claims = len(claims)
     try:  # галерея: фото, где сущность подтверждена медиа-моделью (entity_ids)
         n_gal = (await db_read(
@@ -11400,7 +11878,7 @@ async def _index_boot_resume():
         return
     try:
         await _index_ensure_ddl()
-        rows = await db_read("SELECT DISTINCT chat_id FROM idx_state WHERE status IN ('running','error')")
+        rows = await db_read("SELECT DISTINCT chat_id FROM idx_state WHERE stage IN (0,1,2,3,4,5) AND status IN ('running','error')")
     except Exception as e:
         log("INDEX", f"Автовозобновление: состояние недоступно ({e})")
         return
