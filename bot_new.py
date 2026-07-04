@@ -169,6 +169,9 @@ INDEX_REGISTRY_FALLBACK_LIMIT = 300
 INDEX_MEDIA_PAUSE = (2.0, 4.0)  # stage 5: пауза между скачиваниями фото (анти-FloodWait юзербота)
 INDEX_MEDIA_DL_TIMEOUT = 60     # stage 5: таймаут на одно скачивание фото — зависшая картинка не морозит стадию
 INDEX_EMBED_BATCH = 96        # stage 3: строк на батч эмбеддинга
+INDEX_EMBED_MAX_CHARS = 200_000  # stage 3: потолок символов на ОДИН запрос эмбеддинга — провайдер режет
+#                                  запрос на 300k токенов; 96 плотных сцен ×8000 симв. это превышают,
+#                                  а OpenRouter отдаёт отказ как HTTP 200 с error-телом (молчаливая потеря)
 INDEX_EXTRACT_RETRIES = 3     # LLM/JSON extractor: не двигаем чекпоинт после временного сбоя
 INDEX_EMBED_RETRIES = 3       # embeddings: 429/5xx у провайдера не должны превращаться в "done"
 INDEX_MATRIX_CACHE_MAX_ROWS = 10_000  # больше ищем потоково, без полной матрицы в RAM
@@ -8715,23 +8718,26 @@ async def _index_stage2_graph(chat_id: int, progress_cb=None):
 
 # --- эмбеддинги (OpenRouter /embeddings) ---
 def _sync_embed_texts(texts: list) -> list:
-    last_err = None
+    j = None
     for attempt in range(1, INDEX_EMBED_RETRIES + 1):
         try:
             resp = requests.post(f"{OPENROUTER_BASE_URL}/embeddings",
                                  headers={"Authorization": f"Bearer {openrouter_api_key}"},
                                  json={"model": INDEX_EMBED_TEXT_MODEL, "input": texts}, timeout=180)
             resp.raise_for_status()
+            j = resp.json()
+            # OpenRouter заворачивает отказ апстрима (400 too-large / 5xx) в HTTP 200 с error-телом —
+            # raise_for_status его не ловит. Без этой проверки data пуст → все None → молча теряем вектора.
+            if isinstance(j, dict) and j.get("error"):
+                raise RuntimeError(f"200-wrapped provider error: {str(j.get('error'))[:200]}")
             break
-        except Exception as e:
-            last_err = e
+        except Exception:
+            j = None
             if attempt == INDEX_EMBED_RETRIES:
                 raise
             time.sleep(min(30, 2 ** attempt) + random.random())
-    if last_err and "resp" not in locals():
-        raise last_err
     out = [None] * len(texts)
-    for d in resp.json().get("data", []):
+    for d in (j or {}).get("data", []):
         i = d.get("index", 0)
         if 0 <= i < len(texts):
             out[i] = d.get("embedding")
@@ -8761,15 +8767,33 @@ def _sync_embed_image(raw: bytes) -> list:
 
 
 async def _index_embed_texts(texts: list) -> list:
-    """Список текстов → список float16-блобов (None на неудачных)."""
+    """Список текстов → список float16-блобов (None на неудачных), 1:1 по длине.
+    Режем на под-батчи по бюджету символов INDEX_EMBED_MAX_CHARS: провайдер отклоняет запрос
+    свыше 300k токенов, а INDEX_EMBED_BATCH плотных сцен это превышает. Сбой одного под-батча
+    даёт None только для его строк — остальные векторизуются (Stage 3 дозакроет на resume)."""
     if not texts:
         return []
-    try:
-        vecs = await asyncio.to_thread(_sync_embed_texts, texts)
-    except Exception as e:
-        log("INDEX", f"Эмбеддинг текстов не удался: {e}")
-        return [None] * len(texts)
-    return [_vec_pack(v) if v else None for v in vecs]
+
+    async def _emb(batch):
+        if not batch:
+            return []
+        try:
+            vecs = await asyncio.to_thread(_sync_embed_texts, batch)
+        except Exception as e:
+            log("INDEX", f"Эмбеддинг текстов не удался ({len(batch)} шт.): {e}")
+            return [None] * len(batch)
+        return [_vec_pack(v) if v else None for v in vecs]
+
+    out, sub, sub_len = [], [], 0
+    for t in texts:
+        tl = len(t or "")
+        if sub and sub_len + tl > INDEX_EMBED_MAX_CHARS:
+            out.extend(await _emb(sub))
+            sub, sub_len = [], 0
+        sub.append(t)
+        sub_len += tl
+    out.extend(await _emb(sub))
+    return out
 
 
 def _sync_rerank(query: str, docs: list, top_n=None):
