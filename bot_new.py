@@ -22,6 +22,7 @@ import json
 import glob
 import logging
 import hashlib
+import bisect
 
 try:
     import pymysql  # /index (GraphRAG-память, MariaDB); без пакета команда просто недоступна
@@ -168,7 +169,19 @@ INDEX_REGISTRY_SEMANTIC_LIMIT = 50
 INDEX_REGISTRY_NEIGHBOR_LIMIT = 100
 INDEX_REGISTRY_FALLBACK_LIMIT = 300
 INDEX_MEDIA_PAUSE = (2.0, 4.0)  # stage 5: пауза между скачиваниями фото (анти-FloodWait юзербота)
+INDEX_MEDIA_PAUSE_THUMB = (0.8, 1.6)  # gallery 5a: thumbnail-запросы легче — пауза короче (осторожно, семафор тот же)
 INDEX_MEDIA_DL_TIMEOUT = 60     # stage 5: таймаут на одно скачивание фото — зависшая картинка не морозит стадию
+INDEX_MODE_DEFAULT = "gallery"  # /index go без аргумента; для чатов, начатых до режимов, легаси-дефолт full
+INDEX_GALLERY_POOL = 40         # gallery 5b: кандидатов на сущность из одного сид-источника
+# Пороги откалиброваны на живых emb_image (2745 фото, 2026-07-04): text→image свои 0.50–0.56 / медиана шума 0.36;
+# image→image свои 0.63–0.85, но чужие визуально-похожие тоже 0.66+ → косинус только СОРТИРУЕТ кандидатов,
+# членство в галерее решает vision-подтверждение (verified growth)
+INDEX_GALLERY_SEED_MIN = 0.55   # gallery: image→image порог сид-совпадения (аватарка → фото чата)
+INDEX_GALLERY_TEXT_MIN = 0.45   # gallery: text→image порог (канон-описание внешности → фото) — в зазоре шум/сигнал
+INDEX_GALLERY_GROW_MIN = 0.60   # gallery 5c: image→image порог роста от подтверждённых якорей (строже сида)
+INDEX_GALLERY_GROW_ROUNDS = 2   # gallery 5c: раундов verified growth (описание→подтверждение→новые якоря)
+INDEX_GALLERY_MAX_PER_ENTITY = 30  # gallery: кап фото в галерее сущности за прогон
+INDEX_GALLERY_SCENE_CAP = 12    # gallery 5b: кап фото-кандидатов из сцен с упоминанием сущности (recall-приор)
 INDEX_EMBED_BATCH = 96        # stage 3: строк на батч эмбеддинга
 INDEX_EMBED_MAX_CHARS = 200_000  # stage 3: потолок символов на ОДИН запрос эмбеддинга — провайдер режет
 #                                  запрос на 300k токенов; 96 плотных сцен ×8000 симв. это превышают,
@@ -7037,8 +7050,12 @@ _HELP_SECTIONS = {
         "\n"
         "**Команды (только владелец, работает в фоне):**\n"
         "   `/index` — оценка: сколько сообщений/фото и примерная стоимость прохода\n"
-        "   `/index go` — запустить индексацию в фоне\n"
-        "   `/index status` — прогресс по этапам\n"
+        "   `/index go [gallery|text|full]` — запустить индексацию в фоне. Режимы:\n"
+        "      • **gallery** (дефолт) — вектора ВСЕХ фото (дёшево, thumbnail) + vision-описание только совпавших\n"
+        "        с досье → у сущностей появляются галереи (`/entity gallery <имя>`); быстрее и сильно дешевле full\n"
+        "      • **text** — только текст, медиа не трогаем (максимальная скорость)\n"
+        "      • **full** — полное vision-описание каждого фото (медленно, дорого, максимум медиа-памяти)\n"
+        "   `/index status` — прогресс по этапам (и режим)\n"
         "   `/index pause` / `/index resume` — пауза и продолжение (состояние на чекпоинтах в БД)\n"
         "   `/index update` — догнать новые сообщения после прошлой индексации\n"
         "   `/index failed` — показать poison-диапазоны, которые были честно пропущены после дробления\n"
@@ -7058,6 +7075,7 @@ _HELP_SECTIONS = {
         "**📇 Досье и правка графа:**\n"
         "   `/entity list` — реестр всех сущностей (тип, число фактов, привязка к tg); фильтр `users`/`chars`, страница числом\n"
         "   `/entity show <имя|алиас>` — карточка: canon-факты, мнение чата, связи (со ссылками на сообщения)\n"
+        "   `/entity gallery <имя|алиас>` — переслать фото из галереи сущности (собирается в режимах gallery/full)\n"
         "   `/entity merge <id1> <id2>` — слить две сущности (id2 → id1)\n"
         "   `/entity rename <id> <имя>` · `/entity alias <id> <алиас>` · `/entity split <id> <алиас>`\n"
         "   `/entity relink` — привязать несопоставленных участников к их Telegram-id (по author_id)\n"
@@ -7630,6 +7648,23 @@ async def _idx_set_state(chat_id: int, stage: int, cursor=None, stats=None, stat
          json.dumps(stats, ensure_ascii=False) if stats is not None else None, status, status))
 
 
+INDEX_META_STAGE = 9  # выделенная строка idx_state под мета (режим): stage 0–5 пишут свои stats ЦЕЛИКОМ,
+#                       и mode в них затёрся бы первым же чекпоинтом; стадию 9 пайплайн не трогает,
+#                       status='done' не подхватывается boot-резюмом
+
+
+async def _index_get_mode(chat_id: int) -> str:
+    """Режим индексации чата (gallery|text|full) из мета-строки. Нет записи → full:
+    легаси-чаты, начатые до режимов, ведут себя как раньше (полное описание фото)."""
+    st = await _idx_get_state(chat_id, INDEX_META_STAGE)
+    mode = (st["stats"] or {}).get("mode")
+    return mode if mode in ("gallery", "text", "full") else "full"
+
+
+async def _index_set_mode(chat_id: int, mode: str):
+    await _idx_set_state(chat_id, INDEX_META_STAGE, stats={"mode": mode}, status="done")
+
+
 def _index_scene_key(chat_id: int, start_msg_id: int, end_msg_id: int) -> str:
     raw = f"{chat_id}:{start_msg_id}:{end_msg_id}".encode("utf-8")
     return hashlib.sha1(raw).hexdigest()
@@ -8047,6 +8082,21 @@ async def _index_apply_entities(chat_id: int, ents: list, name2author: dict):
     return touched
 
 
+async def _index_media_relink_entity(chat_id: int, keep_id: int, drop_id: int):
+    """При merge сущностей переписывает media_assets.entity_ids (drop→keep) — иначе галерея влитой теряется."""
+    try:
+        rows = await db_read(
+            "SELECT msg_id, entity_ids FROM media_assets WHERE chat_id=%s AND JSON_CONTAINS(entity_ids, %s)",
+            (chat_id, str(int(drop_id))))
+        for r in rows:
+            ids = [int(x) for x in _index_json_list(r.get("entity_ids")) if str(x).lstrip("-").isdigit()]
+            new_ids = list(dict.fromkeys(keep_id if x == drop_id else x for x in ids))
+            await db_write("UPDATE media_assets SET entity_ids=%s WHERE chat_id=%s AND msg_id=%s",
+                           (json.dumps(new_ids, ensure_ascii=False), chat_id, r["msg_id"]))
+    except Exception as e:
+        log("INDEX", f"media_assets relink {drop_id}→{keep_id} не удался: {e}")
+
+
 async def _index_merge_entity_ids(chat_id: int, keep_id: int, drop_id: int):
     if keep_id == drop_id:
         return
@@ -8073,6 +8123,7 @@ async def _index_merge_entity_ids(chat_id: int, keep_id: int, drop_id: int):
         ("DELETE FROM entity_summary_parts WHERE chat_id=%s AND entity_id IN (%s,%s)", (chat_id, keep_id, drop_id)),
         ("DELETE FROM entities WHERE chat_id=%s AND id=%s", (chat_id, drop_id)),
     ])
+    await _index_media_relink_entity(chat_id, keep_id, drop_id)
     _index_invalidate(chat_id, "entities", "relations")
 
 
@@ -8446,14 +8497,21 @@ async def _index_apply_relations(chat_id: int, rels: list, name2id: dict, scene_
     return applied, touched
 
 
-async def _index_download_media(msg):
+async def _index_download_media(msg, thumb: bool = False):
     """Скачивает фото сообщения по одному с паузой, таймаутом и обработкой FloodWait (анти-бан юзербота).
+    thumb=True — лёгкий thumbnail Telegram (для эмбеддингов gallery-режима; пауза короче, запрос легче);
+    если thumbnail у сообщения нет (часть image-документов) — фолбэк на полный размер.
     Семафор держим ТОЛЬКО на само скачивание — во время FloodWait-сна он отпущен (иначе один чат морозил бы медиа другого)."""
     for attempt in range(3):
         try:
             async with _INDEX_MEDIA_SEM:
-                raw = await asyncio.wait_for(msg.download_media(bytes), timeout=INDEX_MEDIA_DL_TIMEOUT)
-            await asyncio.sleep(random.uniform(*INDEX_MEDIA_PAUSE))
+                if thumb:
+                    raw = await asyncio.wait_for(msg.download_media(bytes, thumb=-1), timeout=INDEX_MEDIA_DL_TIMEOUT)
+                    if not raw:  # у документа нет thumbs → полный размер
+                        raw = await asyncio.wait_for(msg.download_media(bytes), timeout=INDEX_MEDIA_DL_TIMEOUT)
+                else:
+                    raw = await asyncio.wait_for(msg.download_media(bytes), timeout=INDEX_MEDIA_DL_TIMEOUT)
+            await asyncio.sleep(random.uniform(*(INDEX_MEDIA_PAUSE_THUMB if thumb else INDEX_MEDIA_PAUSE)))
             return raw
         except FloodWaitError as e:  # семафор уже отпущен (вышли из with на исключении) → спим, не блокируя других
             log("INDEX", f"Медиа: FloodWait {e.seconds}с — жду (семафор отпущен)")
@@ -8520,13 +8578,14 @@ async def _index_process_media(chat_id: int, image_msgs: list, scene_text: str, 
             eid = name2id.get(str(c.get("name", "")).lower().strip())
             if not eid:
                 continue
-            ent_ids.append(eid)
+            if eid not in ent_ids:
+                ent_ids.append(eid)
             app = (c.get("appearance") or "").strip()
             if app:  # копим внешность у сущности (капом), + visual-claim с пруфом
                 rows = await db_read("SELECT visual_features FROM entities WHERE id=%s", (eid,))
-                old = (rows[0]["visual_features"] or "") if rows else ""
-                if app.lower() not in old.lower():
-                    newvf = (old + " · " + app).strip(" ·")[:2000]
+                old_vf = (rows[0]["visual_features"] or "") if rows else ""  # НЕ «old»: снаружи old = строка media_assets!
+                if app.lower() not in old_vf.lower():
+                    newvf = (old_vf + " · " + app).strip(" ·")[:2000]
                     await db_write("UPDATE entities SET visual_features=%s, embedding=NULL WHERE chat_id=%s AND id=%s",
                                    (newvf, chat_id, eid))
                     _index_invalidate(chat_id, "entities")
@@ -8881,15 +8940,17 @@ async def _index_embed_query(text: str, image_space: bool = False):
 
 
 # --- STAGE 3: векторизация текстов (картинки уже векторизованы в Stage 2) ---
-async def _index_vectorize_loop(chat_id, table, key_col, emb_col, textfn, progress_cb, label):
+async def _index_vectorize_loop(chat_id, table, key_col, emb_col, textfn, progress_cb, label, extra_where: str = ""):
     """Батчами эмбеддит строки с пустым emb_col. Курсор по key_col в пределах прохода → нет вечного цикла
-    на сбойных строках; NULL-фильтр = чекпоинт (повтор/resume пропускает уже готовые)."""
+    на сбойных строках; NULL-фильтр = чекпоинт (повтор/resume пропускает уже готовые).
+    extra_where — доп. SQL-условие (напр. «только описанные фото» в gallery: без него неописанные
+    строки получили бы одинаковые вектора заглушки «изображение» и замусорили media_text)."""
     cur, done, failed = 0, 0, 0
     while True:
         if _INDEX_CONTROL.get(chat_id) == "pause":
             return "paused", done
         rows = await db_read(
-            f"SELECT * FROM {table} WHERE chat_id=%s AND {emb_col} IS NULL AND {key_col}>%s ORDER BY {key_col} LIMIT %s",
+            f"SELECT * FROM {table} WHERE chat_id=%s AND {emb_col} IS NULL {extra_where} AND {key_col}>%s ORDER BY {key_col} LIMIT %s",
             (chat_id, cur, INDEX_EMBED_BATCH))
         if not rows:
             break
@@ -8966,10 +9027,13 @@ async def _index_stage3_vectors(chat_id: int, progress_cb=None):
                                       r.get("fanon_summary") or "", r.get("visual_features") or ""] if x).strip() or r["name"]
 
     targets = [
-        ("entities", "id", "embedding", _ent_text, "досье"),
-        ("relations", "id", "embedding", lambda r: _index_relation_embedding_text(r, rel_entities), "связи"),
-        ("chat_chunks", "id", "embedding", lambda r: (r.get("enriched_text") or "сцена")[:8000], "сцены"),
-        ("media_assets", "msg_id", "emb_text", lambda r: (r.get("image_description") or "изображение")[:8000], "фото"),
+        ("entities", "id", "embedding", _ent_text, "досье", ""),
+        ("relations", "id", "embedding", lambda r: _index_relation_embedding_text(r, rel_entities), "связи", ""),
+        ("chat_chunks", "id", "embedding", lambda r: (r.get("enriched_text") or "сцена")[:8000], "сцены", ""),
+        # только описанные: в gallery-режиме у большинства фото есть emb_image, но нет описания —
+        # без гейта они получили бы одинаковые вектора «изображение» и замусорили текстовый поиск фото
+        ("media_assets", "msg_id", "emb_text", lambda r: (r.get("image_description") or "изображение")[:8000], "фото",
+         "AND image_description IS NOT NULL AND image_description<>''"),
     ]
     matrix_kind = {
         ("entities", "embedding"): "entities",
@@ -8977,8 +9041,8 @@ async def _index_stage3_vectors(chat_id: int, progress_cb=None):
         ("chat_chunks", "embedding"): "chunks",
         ("media_assets", "emb_text"): "media_text",
     }
-    for table, key_col, emb_col, textfn, label in targets:
-        res, n = await _index_vectorize_loop(chat_id, table, key_col, emb_col, textfn, progress_cb, label)
+    for table, key_col, emb_col, textfn, label, xwhere in targets:
+        res, n = await _index_vectorize_loop(chat_id, table, key_col, emb_col, textfn, progress_cb, label, extra_where=xwhere)
         kind = matrix_kind.get((table, emb_col))
         if n and kind:
             _index_invalidate(chat_id, kind)
@@ -9157,9 +9221,11 @@ async def _index_stage5_media(chat_id: int, progress_cb=None):
     if res_img == "paused":
         await _idx_set_state(chat_id, 5, status="paused")
         return "paused"
-    # эмбеддинг описаний фото (emb_text): Stage 3 их не застал (медиа теперь после него)
+    # эмбеддинг описаний фото (emb_text): Stage 3 их не застал (медиа теперь после него).
+    # Гейт «только описанные» — чтобы 5a-строки gallery-прошлого (emb_image без описания) не получали вектора-заглушки
     res, n = await _index_vectorize_loop(chat_id, "media_assets", "msg_id", "emb_text",
-                                         lambda r: (r.get("image_description") or "изображение")[:8000], progress_cb, "фото-описания")
+                                         lambda r: (r.get("image_description") or "изображение")[:8000], progress_cb, "фото-описания",
+                                         extra_where="AND image_description IS NOT NULL AND image_description<>''")
     if n:
         _index_invalidate(chat_id, "media_text")
     if res == "paused":
@@ -9170,6 +9236,249 @@ async def _index_stage5_media(chat_id: int, progress_cb=None):
         return "error"
     await _idx_set_state(chat_id, 5, status="done", stats={"photos": done})
     log("INDEX", f"Stage5 чата {chat_id}: готово, фото {done}")
+    return "done"
+
+
+async def _index_describe_msg_ids(chat_id: int, msg_ids, seekers_by_mid: dict = None, progress_cb=None):
+    """Описывает КОНКРЕТНЫЕ фото (gallery-режим): группирует их по сценам → сценовый контекст + справочник →
+    _index_process_media. seekers_by_mid {mid: [(имя, тег)]} — кого мы ИЩЕМ на этих фото: их имена идут
+    В НАЧАЛО справочника (process_media режет его [:4000] — в конце их бы отрезало, и модель не смогла бы
+    назвать сущность → подтверждение не сработало бы). Уже описанные скипаются внутри (describe-once)."""
+    msg_ids = sorted({int(m) for m in (msg_ids or [])})
+    if not msg_ids:
+        return 0
+    chunks = await db_read(
+        "SELECT id, start_msg_id, end_msg_id, enriched_text FROM chat_chunks "
+        "WHERE chat_id=%s AND end_msg_id>=%s AND start_msg_id<=%s ORDER BY start_msg_id",
+        (chat_id, msg_ids[0], msg_ids[-1]))
+    starts = [int(c["start_msg_id"] or 0) for c in chunks]
+    groups = {}  # индекс сцены (или -1 = вне сцен) → [msg_id]
+    for mid in msg_ids:
+        pos = bisect.bisect_right(starts, mid) - 1
+        if pos >= 0 and int(chunks[pos]["end_msg_id"] or 0) >= mid:
+            groups.setdefault(pos, []).append(mid)
+        else:
+            groups.setdefault(-1, []).append(mid)
+    done, total = 0, len(msg_ids)
+    for pos, mids in groups.items():
+        if _INDEX_CONTROL.get(chat_id) == "pause":
+            return done
+        scene_text = (chunks[pos]["enriched_text"] or "") if pos >= 0 else ""
+        registry, name2id = await _index_relation_registry(chat_id, scene_text or None)
+        seekers = []  # union искомых по фото этой группы, с сохранением порядка
+        for mid in mids:
+            for nm, tag in (seekers_by_mid or {}).get(mid, []):
+                if nm and (nm, tag) not in seekers:
+                    seekers.append((nm, tag))
+        if seekers:  # В НАЧАЛО (см. докстринг); кап — не выжимаем сценовый справочник целиком
+            head = "\n".join(f"{nm} — {tag}" for nm, tag in seekers[:40])
+            registry = "Проверь в первую очередь, есть ли на фото:\n" + head + "\n\n" + registry
+        try:
+            image_msgs = []
+            for i in range(0, len(mids), 100):
+                msgs = await client.get_messages(chat_id, ids=mids[i:i + 100])
+                image_msgs += [m for m in msgs if _index_is_image_msg(m)]
+            done += await _index_process_media(chat_id, image_msgs, scene_text, registry, name2id)
+        except Exception as e:
+            log("INDEX", f"Gallery: описание пачки фото не удалось: {e}")
+        if progress_cb:
+            await progress_cb(f"🖼 Галерея: описано {done}/{total} кандидатов…")
+    return done
+
+
+async def _index_stage5_gallery(chat_id: int, progress_cb=None):
+    """Gallery-режим Stage 5: (5a) дёшево эмбеддит ВСЕ картинки (thumbnail, gemini-embedding-2, БЕЗ vision) →
+    (5b) сиды кандидатов на сущность: аватарка (image→image) / текст-канон внешности (text→image) /
+    со-встречаемость в сценах (cold-start) → (5c) verified growth: кандидаты описываются медиа-моделью
+    (describe-once: одно описание линкует всех найденных), подтверждённые фото (сущность реально распознана
+    по canon-справочнику — арты «недалеко от канона» проходят, чужое нет) идут в галерею и становятся
+    image-якорями для добора похожих. Resume: 5a — NULL-фильтр, 5b/5c переигрываются дёшево (скип описанных)."""
+    await _idx_set_state(chat_id, 5, status="running")
+    total_ph = (await db_read("SELECT COUNT(*) c FROM messages WHERE chat_id=%s AND media_kind IN (1,2)", (chat_id,)))[0]["c"]
+    log("INDEX", f"Stage5-gallery чата {chat_id}: фото ~{total_ph}")
+
+    # --- 5a: эмбеддинг всех фото (thumbnail, без vision) ---
+    cur_mid, emb_new, emb_fail = 0, 0, 0
+    while True:
+        if _INDEX_CONTROL.get(chat_id) == "pause":
+            await _idx_set_state(chat_id, 5, status="paused")
+            return "paused"
+        rows = await db_read(
+            """SELECT m.msg_id FROM messages m
+               LEFT JOIN media_assets a ON a.chat_id=m.chat_id AND a.msg_id=m.msg_id
+               WHERE m.chat_id=%s AND m.media_kind IN (1,2) AND m.msg_id>%s AND a.emb_image IS NULL
+               ORDER BY m.msg_id LIMIT 50""",
+            (chat_id, cur_mid))
+        if not rows:
+            break
+        ids = [r["msg_id"] for r in rows]
+        cur_mid = ids[-1]
+        try:
+            msgs = await client.get_messages(chat_id, ids=ids)
+        except Exception as e:
+            log("INDEX", f"Gallery 5a: get_messages не удался: {e}")
+            continue
+        for m in (msgs or []):
+            if not _index_is_image_msg(m):
+                continue
+            raw = await _index_download_media(m, thumb=True)
+            blob = await _index_embed_image(raw) if raw else None
+            if blob is None:
+                emb_fail += 1
+                continue
+            uid, _ = _media_meta(m)
+            await db_write(
+                """INSERT INTO media_assets (chat_id,msg_id,file_uid,emb_image) VALUES (%s,%s,%s,%s)
+                   ON DUPLICATE KEY UPDATE emb_image=VALUES(emb_image), file_uid=VALUES(file_uid)""",
+                (chat_id, m.id, uid, blob))
+            emb_new += 1
+        if progress_cb and emb_new:
+            await progress_cb(f"🖼 Галерея: вектора фото {emb_new}/~{total_ph}…")
+    if emb_new:
+        _index_invalidate(chat_id, "media_image")
+    if emb_fail:
+        log("INDEX", f"Gallery 5a: {emb_fail} фото без вектора — доберутся на следующем прогоне/update")
+
+    # --- 5b: сиды кандидатов (вектора + SQL, без vision) ---
+    if progress_cb:
+        await progress_cb("🖼 Галерея: ищу кандидатов по аватаркам и канон-описаниям…")
+    ents = await db_read(
+        "SELECT id, name, entity_type, tg_user_id, visual_features, canon_summary FROM entities WHERE chat_id=%s",
+        (chat_id,))
+    cand = {}      # eid → {mid: score}
+    ent_tag = {}   # eid → (имя, тег) для «кого ищем на фото» в справочнике описания
+
+    def _add(eid, hits, floor):
+        got = 0
+        for h in hits:
+            sc = float(h.get("score") or 0.0)
+            if sc < floor:
+                continue
+            mid = h.get("msg_id") or h.get("key")
+            if mid is None:
+                continue
+            d = cand.setdefault(eid, {})
+            if sc > d.get(mid, -1.0):
+                d[mid] = sc
+            got += 1
+        return got
+
+    for e in ents:
+        if _INDEX_CONTROL.get(chat_id) == "pause":
+            await _idx_set_state(chat_id, 5, status="paused")
+            return "paused"
+        eid, got = e["id"], 0
+        if e.get("tg_user_id"):  # 1) аватарка привязанного участника — сильнейший image→image сид
+            try:
+                pf = await client.download_profile_photo(int(e["tg_user_id"]), file=bytes)
+                ablob = await _index_embed_image(pf) if pf else None
+                if ablob is not None:
+                    got += _add(eid, await _index_vector_search(chat_id, "media_image", _vec_unpack(ablob), INDEX_GALLERY_POOL),
+                                INDEX_GALLERY_SEED_MIN)
+            except Exception as ex:
+                log("INDEX", f"Gallery 5b: аватарка «{e['name']}» не взялась: {ex}")
+        # 2) текст-канон внешности (главный сид персонажей) — text→image, порог выше (кросс-модальность грубее)
+        vtxt = (e.get("visual_features") or "").strip() or (e.get("canon_summary") or "").strip()[:600]
+        if vtxt:
+            qv = await _index_embed_query(vtxt[:2000], image_space=True)
+            if qv is not None:
+                got += _add(eid, await _index_vector_search(chat_id, "media_image", qv, INDEX_GALLERY_POOL),
+                            INDEX_GALLERY_TEXT_MIN)
+        if not got:  # 3) cold-start: фото из сцен, где сущность упоминается (кап, скор 0 — чисто кандидаты на проверку)
+            nm = (e["name"] or "").strip()
+            if nm and not _INDEX_USERID_RE.match(nm):
+                like = "%" + nm.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_") + "%"
+                mids = []
+                for r in await db_read(
+                        "SELECT start_msg_id, end_msg_id FROM chat_chunks WHERE chat_id=%s AND enriched_text LIKE %s LIMIT 20",
+                        (chat_id, like)):
+                    for p in await db_read(
+                            "SELECT msg_id FROM messages WHERE chat_id=%s AND msg_id BETWEEN %s AND %s AND media_kind IN (1,2) LIMIT 5",
+                            (chat_id, r["start_msg_id"], r["end_msg_id"])):
+                        mids.append(p["msg_id"])
+                    if len(mids) >= INDEX_GALLERY_SCENE_CAP:
+                        break
+                d = cand.setdefault(eid, {})
+                for mid in mids[:INDEX_GALLERY_SCENE_CAP]:
+                    d.setdefault(mid, 0.0)
+        if cand.get(eid):
+            cand[eid] = dict(sorted(cand[eid].items(), key=lambda kv: -kv[1])[:INDEX_GALLERY_POOL])
+            ent_tag[eid] = (e["name"], "персонаж" if e["entity_type"] == "character" else "участник")
+        elif eid in cand:
+            cand.pop(eid, None)
+    log("INDEX", f"Gallery 5b: {len({m for d in cand.values() for m in d})} фото-кандидатов на {len(cand)} сущностей")
+
+    # --- 5c: verified growth (описание = верификация членства в галерее) ---
+    galleries = {eid: set() for eid in cand}
+    for rnd in range(INDEX_GALLERY_GROW_ROUNDS + 1):
+        if _INDEX_CONTROL.get(chat_id) == "pause":
+            await _idx_set_state(chat_id, 5, status="paused")
+            return "paused"
+        all_mids = sorted({m for eid, d in cand.items() for m in d if len(galleries[eid]) < INDEX_GALLERY_MAX_PER_ENTITY})
+        if not all_mids:
+            break
+        ph = ",".join(["%s"] * len(all_mids))
+        have = {r["msg_id"] for r in await db_read(
+            f"SELECT msg_id FROM media_assets WHERE chat_id=%s AND msg_id IN ({ph}) "
+            f"AND image_description IS NOT NULL AND image_description<>''", tuple([chat_id] + all_mids))}
+        undesc = [m for m in all_mids if m not in have]
+        if undesc:
+            sbm = {}  # mid → кого на нём ищем (для головы справочника)
+            for eid, d in cand.items():
+                for mid in d:
+                    if mid in have or eid not in ent_tag:
+                        continue
+                    sbm.setdefault(mid, []).append(ent_tag[eid])
+            await _index_describe_msg_ids(chat_id, undesc, seekers_by_mid=sbm, progress_cb=progress_cb)
+            if _INDEX_CONTROL.get(chat_id) == "pause":
+                await _idx_set_state(chat_id, 5, status="paused")
+                return "paused"
+        rows = await db_read(
+            f"SELECT msg_id, entity_ids, emb_image FROM media_assets WHERE chat_id=%s AND msg_id IN ({ph})",
+            tuple([chat_id] + all_mids))
+        by_mid = {r["msg_id"]: r for r in rows}
+        new_conf = {}  # eid → [подтверждённые mid этого раунда]
+        for eid, d in cand.items():
+            for mid in d:
+                r = by_mid.get(mid)
+                if not r or mid in galleries[eid] or len(galleries[eid]) >= INDEX_GALLERY_MAX_PER_ENTITY:
+                    continue
+                linked = {int(x) for x in _index_json_list(r.get("entity_ids")) if str(x).lstrip("-").isdigit()}
+                if eid in linked:
+                    galleries[eid].add(mid)
+                    new_conf.setdefault(eid, []).append(mid)
+        n_new = sum(len(v) for v in new_conf.values())
+        log("INDEX", f"Gallery 5c раунд {rnd}: подтверждено +{n_new} фото")
+        if rnd >= INDEX_GALLERY_GROW_ROUNDS or not n_new:
+            break
+        for eid, mids in new_conf.items():  # рост: подтверждённые фото → image-якоря → добор похожих
+            if len(galleries[eid]) >= INDEX_GALLERY_MAX_PER_ENTITY:
+                continue
+            for mid in mids[:5]:
+                blob = (by_mid.get(mid) or {}).get("emb_image")
+                if blob:
+                    _add(eid, await _index_vector_search(chat_id, "media_image", _vec_unpack(blob), INDEX_GALLERY_POOL),
+                         INDEX_GALLERY_GROW_MIN)
+
+    # --- финал: emb_text ТОЛЬКО описанным (иначе заглушки «изображение» замусорят текстовый поиск) ---
+    res, n = await _index_vectorize_loop(chat_id, "media_assets", "msg_id", "emb_text",
+                                         lambda r: (r.get("image_description") or "изображение")[:8000],
+                                         progress_cb, "фото-описания",
+                                         extra_where="AND image_description IS NOT NULL AND image_description<>''")
+    if n:
+        _index_invalidate(chat_id, "media_text")
+    if res == "paused":
+        await _idx_set_state(chat_id, 5, status="paused")
+        return "paused"
+    if res == "error":
+        await _idx_set_state(chat_id, 5, status="error")
+        return "error"
+    n_desc = (await db_read(
+        "SELECT COUNT(*) c FROM media_assets WHERE chat_id=%s AND image_description IS NOT NULL AND image_description<>''",
+        (chat_id,)))[0]["c"]
+    n_gal = sum(1 for s in galleries.values() if s)
+    await _idx_set_state(chat_id, 5, status="done", stats={"photos": n_desc, "galleries": n_gal, "embedded": emb_new})
+    log("INDEX", f"Stage5-gallery чата {chat_id}: готово — вектора +{emb_new}, описано всего {n_desc}, галерей {n_gal}")
     return "done"
 
 
@@ -10288,17 +10597,28 @@ async def _index_pipeline(chat_id: int, status_msg):
             if res4 == "error":
                 await upd("❌ Индексация остановлена на Stage 4: LLM не дала сводку периода. `/index resume` повторит.")
                 return
-        # Stage 5 — фото (последней; текстовый граф уже готов и ищется, фото доливаются в фоне)
+        # Stage 5 — фото (последней; текстовый граф уже готов и ищется, фото доливаются в фоне).
+        # Режим: text — медиа не трогаем; gallery — вектора всех + описание только совпавших с досье; full — описываем всё.
+        mode = await _index_get_mode(chat_id)
         st5 = await _idx_get_state(chat_id, 5)
         if st5["status"] != "done":
-            await upd("✅ Граф, вектора и сводки готовы — поиск по тексту уже работает. 🖼 Дообрабатываю фото (долго, по одному)…")
-            res5 = await _index_stage5_media(chat_id, progress_cb=upd)
-            if res5 == "paused":
-                await upd("⏸ Индексация на паузе (Stage 5 — фото). `/index resume` — продолжить. Текстовый поиск уже работает.")
-                return
-            if res5 == "error":
-                await upd("⚠️ Часть фото не векторизовалась (Stage 5). `/index resume` дожмёт. Текстовый поиск уже работает.")
-                return
+            if mode == "text":
+                await _idx_set_state(chat_id, 5, status="done", stats={"mode": "text"})
+                log("INDEX", f"Stage5 чата {chat_id}: пропущен (режим text)")
+            else:
+                if mode == "gallery":
+                    await upd("✅ Граф, вектора и сводки готовы — поиск по тексту уже работает. "
+                              "🖼 Собираю галереи досье (вектора всех фото + описание совпавших)…")
+                    res5 = await _index_stage5_gallery(chat_id, progress_cb=upd)
+                else:
+                    await upd("✅ Граф, вектора и сводки готовы — поиск по тексту уже работает. 🖼 Дообрабатываю фото (долго, по одному)…")
+                    res5 = await _index_stage5_media(chat_id, progress_cb=upd)
+                if res5 == "paused":
+                    await upd("⏸ Индексация на паузе (Stage 5 — фото). `/index resume` — продолжить. Текстовый поиск уже работает.")
+                    return
+                if res5 == "error":
+                    await upd("⚠️ Часть фото не векторизовалась (Stage 5). `/index resume` дожмёт. Текстовый поиск уже работает.")
+                    return
         skipped = await _index_failed_count(chat_id, "skipped")
         skip_note = (f"\n⚠️ Пропущено poison-диапазонов: {skipped}. "
                      f"Смотри `/index failed`, повтор: `/index retry failed`.") if skipped else ""
@@ -10371,7 +10691,7 @@ async def _index_update_rewind_cursor(chat_id: int) -> int:
     return max(0, min(candidates) - 1)
 
 
-@client.on(events.NewMessage(pattern=r"^[./]index(?:\s+(go|status|pause|resume|stop|update))?\s*$"))
+@client.on(events.NewMessage(pattern=r"^[./]index(?:\s+(go|status|pause|resume|stop|update))?(?:\s+(gallery|text|full))?\s*$"))
 async def index_command(event):
     if await _slash_for_other_bot(event):
         return
@@ -10395,7 +10715,8 @@ async def index_command(event):
             return
         # status
         running = chat_id in _INDEX_TASKS
-        parts = ["📊 **Статус индексации этого чата:**"]
+        mode = await _index_get_mode(chat_id)
+        parts = [f"📊 **Статус индексации этого чата** (режим: {mode}):"]
         for stg, label in ((0, "Дамп"), (1, "Досье"), (2, "Граф связей"), (3, "Вектора"),
                            (4, "Сводки периодов"), (5, "Фото")):
             s = await _idx_get_state(chat_id, stg)
@@ -10422,8 +10743,11 @@ async def index_command(event):
         if chat_id in _INDEX_TASKS:
             await event.reply("🟢 Индексация этого чата уже идёт. `/index status` — прогресс.")
             return
+        mode = (event.pattern_match.group(2) or "").lower() or INDEX_MODE_DEFAULT
+        await _index_set_mode(chat_id, mode)
         _INDEX_CONTROL[chat_id] = "run"
-        status_msg = await event.reply("🚀 Запускаю индексацию в фоне… `/index status` — прогресс.")
+        mode_label = {"gallery": "🖼 галерея досье", "text": "📝 только текст", "full": "🔬 полное медиа"}[mode]
+        status_msg = await event.reply(f"🚀 Запускаю индексацию в фоне (режим: {mode_label})… `/index status` — прогресс.")
         _INDEX_TASKS[chat_id] = asyncio.create_task(_index_pipeline(chat_id, status_msg))
         return
 
@@ -10739,6 +11063,14 @@ async def entity_show_command(event):
                 other = id2name.get(r["target_id"] if r["source_id"] == ent["id"] else r["source_id"], "?")
                 parts.append(f"• {other} — {r['relation_type']} (было)")
     n_claims = len(claims)
+    try:  # галерея: фото, где сущность подтверждена медиа-моделью (entity_ids)
+        n_gal = (await db_read(
+            "SELECT COUNT(*) c FROM media_assets WHERE chat_id=%s AND JSON_CONTAINS(entity_ids, %s)",
+            (chat_id, str(int(ent["id"])))))[0]["c"]
+    except Exception:
+        n_gal = 0
+    if n_gal:
+        parts.append(f"\n🖼 Галерея: {n_gal} фото — `/entity gallery {ent['name']}`")
     parts.append(f"\n_id {ent['id']} · фактов: {n_claims} · связей: {len(rels)}_")
     await send_long(chat_id, "\n".join(parts), parse_mode="md", reply_to=event.id)
 
@@ -10802,6 +11134,51 @@ async def entity_relink_command(event):
     tail = (f" Осталось {total - linked} (модель переименовала в непохожее имя — при желании поправь `/entity`)."
             if total - linked else "")
     await event.reply(f"🔗 Привязка участников: **{linked}** из {total} несопоставленных получили tg_user_id.{tail}")
+
+
+@client.on(events.NewMessage(pattern=r"^[./]entity\s+gallery\s+(.+)$"))
+async def entity_gallery_command(event):
+    """Галерея сущности: пересылает в чат фото, где медиа-модель подтвердила её присутствие (entity_ids)."""
+    if await _slash_for_other_bot(event):
+        return
+    if not event.out:
+        return
+    reason = _index_available()
+    if reason:
+        await event.reply(f"⚠️ /entity недоступен: {reason}")
+        return
+    try:
+        await _index_ensure_ddl()
+    except Exception as e:
+        await event.reply(f"❌ Не подключиться к базе индексации: {e}")
+        return
+    chat_id = event.chat_id
+    query = event.pattern_match.group(1).strip()
+    ent = await _index_find_entity(chat_id, query)
+    if not ent:
+        await event.reply(f"🔍 Не нашёл сущность «{query}» в этом чате.")
+        return
+    rows = await db_read(
+        "SELECT msg_id FROM media_assets WHERE chat_id=%s AND JSON_CONTAINS(entity_ids, %s) ORDER BY msg_id DESC LIMIT 20",
+        (chat_id, str(int(ent["id"]))))
+    if not rows:
+        await event.reply(f"📭 В галерее «{ent['name']}» пока нет фото. Галереи собирает `/index go` "
+                          f"(режим gallery/full); дособрать новое — `/index update`.")
+        return
+    msg_ids = [r["msg_id"] for r in rows]
+    try:
+        await client.forward_messages(chat_id, msg_ids, chat_id)
+        await event.reply(f"🖼 Галерея «{ent['name']}»: {len(msg_ids)} фото (новые сверху).")
+    except Exception as e:  # часть сообщений могла быть удалена — пробуем по одному
+        sent = 0
+        for mid in msg_ids:
+            try:
+                await client.forward_messages(chat_id, mid, chat_id)
+                sent += 1
+            except Exception:
+                continue
+        await event.reply(f"🖼 Галерея «{ent['name']}»: переслал {sent}/{len(msg_ids)} (часть фото удалена: {e})"
+                          if sent else f"⚠️ Не удалось переслать фото галереи: {e}")
 
 
 @client.on(events.NewMessage(pattern=r"^[./]entity\s+list\b\s*(.*)$"))
@@ -10906,6 +11283,7 @@ async def entity_admin_command(event):
                 ("DELETE FROM relations WHERE chat_id=%s AND source_id=target_id", (chat_id,)),
                 ("DELETE FROM entities WHERE chat_id=%s AND id=%s", (chat_id, b)),
             ])
+            await _index_media_relink_entity(chat_id, a, b)  # галерея влитой сущности переезжает
             _index_invalidate(chat_id, "entities", "relations")
             await event.reply(f"✅ «{e2['name']}» (id {b}) влит в «{e1['name']}» (id {a}). "
                               f"Векторы досье обновятся на `/index update`.")
