@@ -146,7 +146,10 @@ INDEX_SCENE_MIN_TOKENS = 1000 # stage 2: сцены короче — докле�
 INDEX_SCENE_HARD_GAP_SEC = 6 * 60 * 60  # даже короткую сцену не склеиваем через многочасовую паузу
 INDEX_STAGE2_CONCURRENCY = 6  # stage 2: сколько сцен экстрагировать параллельно (перекрыть ~34с латентность на вызов)
 INDEX_STAGE1_MICRO_TOKENS = 32_000      # stage 1: размер блока экстракции (вывод не режется — cap поднят до INDEX_EXTRACT_MAX_TOKENS)
-INDEX_EXTRACT_MAX_TOKENS = 64_000       # ПОТОЛОК ВЫВОДА экстракции: official DeepSeek V4 допускает до 384k; thinking отключаем для JSON
+INDEX_EXTRACT_MAX_TOKENS = 384_000      # ПОТОЛОК ВЫВОДА = максимум модели (official DeepSeek V4 = 384k) → фактически БЕЗ лимита:
+#   модель сама останавливается на finish=stop, бесконечно писать не может. Платим только за реально сгенерированные токены,
+#   поэтому высокий потолок бесплатен — он лишь убирает искусственную обрезку (раньше 64k → finish=length → дробление блока).
+#   Клампится под реальный лимит модели в _index_extract (min с INDEX_MODEL_MAX_OUT). thinking выключаем для JSON.
 INDEX_MODEL_MAX_OUT = {                  # per-model кламп потолка вывода; OpenRouter-fallback может быть ниже official DeepSeek
     "deepseek-v4-flash": 384_000,
     "deepseek-v4-pro": 384_000,
@@ -7901,7 +7904,7 @@ async def _index_extract(system: str, user: str, max_tokens: int = INDEX_EXTRACT
                     "temperature": 0.2,
                     "response_format": {"type": "json_object"},
                     "messages": [{"role": "system", "content": system}, {"role": "user", "content": user}],
-                    "timeout": 240,
+                    "timeout": 480,  # потолок вывода снят (384k) → даём большому легитимному JSON время дописаться, а не рубим по таймауту
                 }
                 if provider == "deepseek":
                     # Официальный DeepSeek: extraction должен возвращать JSON, поэтому thinking выключаем
