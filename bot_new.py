@@ -1546,6 +1546,11 @@ _tts_key_idx = 0  # round-robin указатель по GOOGLE_TTS_KEYS
 TTS_ENGINE = _model_state.get("tts_engine", "gemini")  # "gemini" | "fish"
 FISH_VOICE = _model_state.get("fish_voice")            # активный reference_id Fish (или None)
 FISH_FAVORITES = _model_state.get("fish_favorites", [])  # [{"id","title"}]
+# Ген-модель /gen: OPENROUTER_IMAGE_MODEL — неизменяемый дефолт; юзер меняет через /model gen
+# (валидация по авторитетному /api/v1/images/models — тому же набору, что принимает /api/v1/images).
+GEN_IMAGE_MODEL = _model_state.get("gen_image_model") or OPENROUTER_IMAGE_MODEL
+GEN_IMAGE_RES = _model_state.get("gen_image_res") or []  # поддерживаемые разрешения выбранной модели (для клампа); [] → без клампа
+GEN_IMAGE_INPUT = bool(_model_state.get("gen_image_input", True))  # принимает ли ген-модель картинки на вход (реф/правка); дефолт gpt-image-2 — да
 
 
 def get_active_model():
@@ -1659,6 +1664,55 @@ async def _openrouter_model_info(model_id: str):
         return None, False, 0, None
 
 
+_IMAGE_MODELS_CACHE = {"ts": 0.0, "data": None}  # кэш списка ген-моделей OpenRouter в процессе
+_IMAGE_MODELS_TTL = 600  # 10 мин — список меняется редко, не дёргать /images/models на каждый листинг
+
+
+async def _openrouter_image_models(force: bool = False):
+    """Список моделей ГЕНЕРАЦИИ картинок OpenRouter (GET /api/v1/images/models — авторитетный набор,
+    ровно то, что принимает /api/v1/images; в отличие от /models он ВКЛЮЧАЕТ pure-image модели вроде gpt-image-2).
+    Возвращает list[dict] (id/name/supported_parameters) или None при сбое. Кэш _IMAGE_MODELS_TTL."""
+    now = time.monotonic()
+    if not force and _IMAGE_MODELS_CACHE["data"] is not None and (now - _IMAGE_MODELS_CACHE["ts"]) < _IMAGE_MODELS_TTL:
+        return _IMAGE_MODELS_CACHE["data"]
+
+    def _fetch():
+        headers = {"Authorization": f"Bearer {openrouter_api_key}"} if openrouter_api_key else {}
+        r = requests.get(f"{OPENROUTER_BASE_URL}/images/models", headers=headers, timeout=20)
+        r.raise_for_status()
+        return r.json().get("data", [])
+    try:
+        data = await asyncio.to_thread(_fetch)
+        _IMAGE_MODELS_CACHE["data"] = data
+        _IMAGE_MODELS_CACHE["ts"] = now
+        return data
+    except Exception as e:
+        log("MODEL", f"Список ген-моделей OpenRouter: {e}")
+        return None
+
+
+def _image_model_resolutions(m: dict) -> list:
+    """Поддерживаемые разрешения (1K/2K/4K) из supported_parameters ген-модели."""
+    sp = (m.get("supported_parameters") or {}).get("resolution") or {}
+    return [str(v) for v in (sp.get("values") or [])]
+
+
+def _image_model_takes_refs(m: dict) -> bool:
+    """Принимает ли ген-модель картинки на вход (image→image / референсы). По architecture.input_modalities."""
+    return "image" in ((m.get("architecture") or {}).get("input_modalities") or [])
+
+
+async def _openrouter_image_model_info(slug: str):
+    """(exists, name, resolutions) для ген-модели по /images/models. exists=None если не удалось проверить."""
+    data = await _openrouter_image_models()
+    if data is None:
+        return None, None, []
+    for m in data:
+        if m.get("id") == slug:
+            return True, (m.get("name") or slug), _image_model_resolutions(m)
+    return False, None, []
+
+
 def _fmt_ctx(n: int) -> str:
     if n >= 1_000_000:
         return f"{n / 1_000_000:.0f}M"
@@ -1680,7 +1734,7 @@ def count_tokens(text: str) -> int:
 
 
 def _save_model_state():
-    save_json(MODEL_STATE_PATH, {"active": ACTIVE_MODEL, "tools_support": MODEL_TOOLS_SUPPORT, "active_media": ACTIVE_MEDIA_MODEL, "custom_models": CUSTOM_MODELS, "active_voice": ACTIVE_VOICE, "voice_auto": VOICE_AUTO, "tts_engine": TTS_ENGINE, "fish_voice": FISH_VOICE, "fish_favorites": FISH_FAVORITES, "reasoning_effort": REASONING_EFFORT})
+    save_json(MODEL_STATE_PATH, {"active": ACTIVE_MODEL, "tools_support": MODEL_TOOLS_SUPPORT, "active_media": ACTIVE_MEDIA_MODEL, "custom_models": CUSTOM_MODELS, "active_voice": ACTIVE_VOICE, "voice_auto": VOICE_AUTO, "tts_engine": TTS_ENGINE, "fish_voice": FISH_VOICE, "fish_favorites": FISH_FAVORITES, "reasoning_effort": REASONING_EFFORT, "gen_image_model": GEN_IMAGE_MODEL, "gen_image_res": GEN_IMAGE_RES, "gen_image_input": GEN_IMAGE_INPUT})
 
 
 def _set_tools_support(slug, ok):
@@ -5254,6 +5308,23 @@ async def _gen_rate_gate():
         _GEN_LAST_CALL[0] = time.monotonic()
 
 
+_RES_RANK = {"1K": 1, "2K": 2, "4K": 4}
+
+
+def _clamp_resolution(size, supported):
+    """Опускает запрошенное разрешение до макс. поддерживаемого моделью (supported — список '1K'/'2K'/'4K').
+    Пусто/поддерживается → без изменений. Иначе берём наибольший поддерживаемый ≤ запрошенного, а если все
+    больше запрошенного — наименьший доступный. Защищает 1K-only модели от 400 на запрос 2K/4K."""
+    if not supported or size in supported:
+        return size
+    ok = [s for s in supported if s in _RES_RANK]
+    if not ok:
+        return size
+    want = _RES_RANK.get(size, 2)
+    le = [s for s in ok if _RES_RANK[s] <= want]
+    return max(le, key=lambda s: _RES_RANK[s]) if le else min(ok, key=lambda s: _RES_RANK[s])
+
+
 async def _gen_one_image(final_prompt, input_b64s, image_size, aspect_ratio, allow_repair, user_prompt, status_cb=None):
     """Один цикл генерации с ретраями (transient тем же промптом / фолбэк на Fast / repair при модерации).
     Возвращает (raw, mime, used_prompt, used_fallback) при успехе или (None, reason, None, used_fallback)
@@ -5262,12 +5333,21 @@ async def _gen_one_image(final_prompt, input_b64s, image_size, aspect_ratio, all
     async def _s(text):
         if status_cb:
             await status_cb(text)
-    gen_model = OPENROUTER_IMAGE_MODEL
+    gen_model = GEN_IMAGE_MODEL
     used_fallback = False
     transient_left = 2  # ретраи дорогие: провальная попытка тоже списывается из дневной квоты
     repair_left = 2 if allow_repair else 0
     attempt = 0
-    size = image_size
+    size = _clamp_resolution(image_size, GEN_IMAGE_RES)  # primary может не уметь 4K → опускаем (фолбэк восстановит запрошенное)
+    if size != image_size:
+        log("GEN", f"{gen_model} не поддерживает {image_size} → генерирую в {size}")
+    # Референсы/правка есть, но выбранная модель — только text→image? Сразу на Gemini-фолбэк (он умеет image→image),
+    # иначе input_references уйдут модели, которая их не принимает, и запрос упадёт.
+    if input_b64s and not GEN_IMAGE_INPUT and OPENROUTER_IMAGE_FALLBACK and OPENROUTER_IMAGE_FALLBACK != gen_model:
+        log("GEN", f"{gen_model} не принимает картинки на вход (text→image) — генерирую с референсами на запасной {OPENROUTER_IMAGE_FALLBACK}")
+        gen_model = OPENROUTER_IMAGE_FALLBACK
+        used_fallback = True
+        size = image_size
     fp = final_prompt
     while True:
         try:
@@ -5280,6 +5360,7 @@ async def _gen_one_image(final_prompt, input_b64s, image_size, aspect_ratio, all
             if not used_fallback and OPENROUTER_IMAGE_FALLBACK and OPENROUTER_IMAGE_FALLBACK != gen_model:
                 used_fallback = True
                 gen_model = OPENROUTER_IMAGE_FALLBACK
+                size = image_size  # gemini-фолбэк тянет запрошенное разрешение (кламп был под primary)
                 log("GEN", f"Пробую запасную {gen_model} (у неё своя квота)…")
                 await _s("🔁 Дневной лимит основной модели — пробую запасную (Gemini)…")
                 continue
@@ -5301,6 +5382,7 @@ async def _gen_one_image(final_prompt, input_b64s, image_size, aspect_ratio, all
             if _http_code >= 500 and not used_fallback and OPENROUTER_IMAGE_FALLBACK and OPENROUTER_IMAGE_FALLBACK != gen_model:
                 used_fallback = True
                 gen_model = OPENROUTER_IMAGE_FALLBACK
+                size = image_size  # gemini-фолбэк тянет запрошенное разрешение (кламп был под primary)
                 transient_left = 2
                 attempt = 0
                 log("GEN", f"Основная модель отдаёт {_http_code} — сразу переключаюсь на запасную {gen_model}")
@@ -5317,6 +5399,7 @@ async def _gen_one_image(final_prompt, input_b64s, image_size, aspect_ratio, all
             if not used_fallback and OPENROUTER_IMAGE_FALLBACK and OPENROUTER_IMAGE_FALLBACK != gen_model:
                 used_fallback = True
                 gen_model = OPENROUTER_IMAGE_FALLBACK
+                size = image_size  # gemini-фолбэк тянет запрошенное разрешение (кламп был под primary)
                 transient_left = 2
                 attempt = 0
                 log("GEN", f"Основная модель не отвечает — переключаюсь на запасную {gen_model}")
@@ -6043,7 +6126,7 @@ async def scheduler_loop():
 async def model_command(event):
     if await _slash_for_other_bot(event):
         return
-    global ACTIVE_MODEL, ACTIVE_MEDIA_MODEL, REASONING_EFFORT
+    global ACTIVE_MODEL, ACTIVE_MEDIA_MODEL, REASONING_EFFORT, GEN_IMAGE_MODEL, GEN_IMAGE_RES, GEN_IMAGE_INPUT
     arg = (event.pattern_match.group(1) or "").strip()
     slugs = list(MODEL_REGISTRY.keys())
 
@@ -6108,6 +6191,59 @@ async def model_command(event):
         log("MODEL", f"Активная медиа-модель (кастомная): {marg}, vision={supports_img}")
         warn = "" if supports_img else "\n⚠️ Модель не поддерживает изображения — описание фото работать не будет (голос/аудио идут через Parakeet)."
         await event.edit(f"✅ Медиа-модель (vision): `{marg}` (кастомная, OpenRouter){warn}")
+        return
+
+    # --- выбор ген-модели (генерация картинок /gen): /model gen [N|slug|reset] ---
+    if arg.lower() == "gen" or arg.lower().startswith("gen "):
+        garg = arg[3:].strip()
+        low = garg.lower()
+        if low in ("reset", "default", "сброс"):
+            GEN_IMAGE_MODEL = OPENROUTER_IMAGE_MODEL
+            GEN_IMAGE_RES = []
+            GEN_IMAGE_INPUT = True
+            _save_model_state()
+            log("MODEL", f"Ген-модель /gen сброшена на дефолт {OPENROUTER_IMAGE_MODEL}")
+            await event.edit(f"✅ Ген-модель `/gen` сброшена на дефолт: `{OPENROUTER_IMAGE_MODEL}` (GPT Image 2).")
+            return
+        await event.edit("🔎 Тяну список ген-моделей OpenRouter…")
+        data = await _openrouter_image_models()
+        if data is None:
+            await event.edit("⚠️ OpenRouter недоступен — список ген-моделей не получить. Модель не изменена.")
+            return
+        items = [(m.get("id"), m.get("name") or m.get("id"), _image_model_resolutions(m), _image_model_takes_refs(m)) for m in data if m.get("id")]
+        if not garg:
+            lines = ["🎨 **Ген-модели `/gen`** (OpenRouter Image API) — ▶ активная:"]
+            for i, (mid, name, res, takes) in enumerate(items, 1):
+                mk = f"▶{i}." if mid == GEN_IMAGE_MODEL else f"{i}."
+                rtag = "/".join(res) if res else "?"
+                itag = "" if takes else " · text→image"  # без image-input (реф/правку не примет)
+                lines.append(f"{mk} `{mid}` — {rtag}{itag}")
+            if GEN_IMAGE_MODEL not in [it[0] for it in items]:
+                lines.append(f"▶ (не в текущем списке OpenRouter) `{GEN_IMAGE_MODEL}`")
+            lines.append(f"\nДефолт: `{OPENROUTER_IMAGE_MODEL}` · фолбэк всегда `{OPENROUTER_IMAGE_FALLBACK}`")
+            lines.append("`/model gen N` / `/model gen <vendor/model>` — выбрать · `/model gen reset` — вернуть дефолт")
+            await event.edit("\n".join(lines)[:4000])
+            return
+        chosen = None
+        if garg.isdigit() and 1 <= int(garg) <= len(items):
+            chosen = items[int(garg) - 1]
+        else:
+            for it in items:
+                if it[0] == garg:
+                    chosen = it
+                    break
+        if not chosen:
+            await event.edit(f"❌ `{garg}` не найдена среди ген-моделей OpenRouter (это НЕ обычный /models — а набор для генерации). `/model gen` — список доступных.")
+            return
+        mid, name, res, takes = chosen
+        GEN_IMAGE_MODEL = mid
+        GEN_IMAGE_RES = res
+        GEN_IMAGE_INPUT = takes
+        _save_model_state()
+        log("MODEL", f"Ген-модель /gen: {mid} (разрешения {res or 'по умолчанию'}, image-input={takes})")
+        rtag = "/".join(res) if res else "по умолчанию модели"
+        warn = "" if takes else f"\n⚠️ Только text→image — правку/референсы фото сама НЕ примет; для них подстрахует `{OPENROUTER_IMAGE_FALLBACK}`."
+        await event.edit(f"✅ Ген-модель `/gen`: **{name}**\n`{mid}` · разрешения: {rtag}\nФолбэк остаётся `{OPENROUTER_IMAGE_FALLBACK}`.{warn}")
         return
 
     # --- избранное (кастомные OpenRouter-модели): /model fav ---
@@ -7012,7 +7148,10 @@ _HELP_SECTIONS = {
     "gen": (
         "🎨 **`/gen` — генерация и редактирование изображений**\n"
         "\n"
-        "Модель-генератор: GPT Image 2 (OpenRouter, платная), при сбое/перегрузке — запасная Gemini 3.1 Flash Image. Нужен `OPENROUTER_API_KEY`.\n"
+        "Модель-генератор по умолчанию: GPT Image 2 (OpenRouter, платная), при сбое/перегрузке — запасная Gemini 3.1 Flash Image. Нужен `OPENROUTER_API_KEY`.\n"
+        "   **`/model gen`** — сменить ген-модель на ЛЮБУЮ из OpenRouter Image API (flux.2, seedream, recraft, riverflow, grok-imagine…): "
+        "`/model gen` — список · `/model gen N` или `/model gen <vendor/model>` — выбрать (с валидацией) · `/model gen reset` — вернуть дефолт. "
+        "Разрешение подстраивается под модель (1K-only не упадёт на `-4k`); запасная всегда Gemini.\n"
         "Промпт строит **активная модель-ответчик** (`/model`); если она с vision — сама смотрит картинки чата, если текстовая — по их описаниям (медиа-модель `/media`). DeepSeek — фолбэк.\n"
         "\n"
         "**Синтаксис:** `/gen [N] [-i|-c|-r] [-ni|-m] [-v|-h|-sq] [-2k|-4k|-1k] [-xK] [@юзер|!@юзер] <промпт>`\n"
@@ -7024,7 +7163,7 @@ _HELP_SECTIONS = {
         "**🖼 Картинки из истории как референсы (по умолчанию для `/gen N`):** модель видит фото в окне N,\n"
         "   САМА выбирает подходящие как референсы (особенно ФОТО ПЕРСОНАЖЕЙ чата — для узнаваемости лиц) и в\n"
         "   промпте говорит, что с ними делать (взять лицо/персонажа, стиль, фон, объединить). В генератор уходит\n"
-        "   до 16 выбранных (потолок GPT Image 2).\n"
+        "   до 16 выбранных (потолок GPT Image 2; у другой ген-модели лимит может отличаться).\n"
         "   • **vision-модель** смотрит фото НАПРЯМУЮ — до 20 свежих;\n"
         "   • **текстовая модель** или флаг **`-m`** — по ОПИСАНИЯМ (медиа-модель), но больший пул — до 300 фото\n"
         "     (больше выбор; первый прогон дольше — описания кэшируются);\n"
@@ -7361,7 +7500,8 @@ async def status_command(event):
     _dig = load_json(DIGEST_STATE_PATH, {}).get("digest_time", "09:00")
     L.append(f"📡 **Каналы:** подключено {len(get_tracked())} · дайджест в {_dig}")
     # — генерация изображений —
-    L.append(f"🎨 **Генерация (`/gen`):** GPT Image 2 → Gemini 3.1 Flash Image (фолбэк) {'✅' if openrouter_client is not None else '❌ нет OPENROUTER_API_KEY'}")
+    _gen_def = " (дефолт)" if GEN_IMAGE_MODEL == OPENROUTER_IMAGE_MODEL else " (`/model gen`)"
+    L.append(f"🎨 **Генерация (`/gen`):** `{GEN_IMAGE_MODEL}`{_gen_def} → `{OPENROUTER_IMAGE_FALLBACK}` (фолбэк) {'✅' if openrouter_client is not None else '❌ нет OPENROUTER_API_KEY'}")
     # — избранное —
     L.append(f"⭐ **Избранное:** {len(FISH_FAVORITES)} Fish-голос(ов) · {len(CUSTOM_MODELS)} кастомных моделей")
     # — ключи —
