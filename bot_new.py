@@ -2425,6 +2425,13 @@ def _gen_catalog_ref_label(it: dict, include_missing_desc: bool = True) -> str:
     flags = []
     if it.get("from_index"):
         flags.append("из памяти чата")
+        src = []
+        if it.get("text_hit"):
+            src.append("text")
+        if it.get("image_hit"):
+            src.append("image")
+        if src:
+            flags.append("hit:" + "+".join(src))
     if it.get("from_owner"):
         flags.append("фото запросившего/прошлая генерация")
     if flags:
@@ -3395,10 +3402,12 @@ async def ask_agentic(context: str, question: str, must_search: bool = False, ca
     has_channels = len(channels) > 0
     has_web = bool(tavily_api_key)        # веб-инструменты Tavily (web_search/web_extract/web_crawl/web_map)
     has_reply = chat_id is not None and bool(msg_by_id)  # адресный реплай по #id истории
-    has_memory = False                    # GraphRAG-память /index (memory_search/entity/media) — если чат проиндексирован
+    has_memory = False                    # GraphRAG-память /index (stage-aware readiness по idx_state)
+    memory_ready_tools, memory_status_notes = {}, {}
     if memory_allowed and chat_id is not None and not _index_available():
         try:
-            has_memory = (await db_read("SELECT COUNT(*) c FROM entities WHERE chat_id=%s", (chat_id,)))[0]["c"] > 0
+            memory_ready_tools, memory_status_notes = await _index_ready_memory_tools(chat_id)
+            has_memory = bool(memory_ready_tools)
         except Exception as e:
             log("ASK", f"Проверка памяти /index не удалась: {e}")
     has_tools = has_channels or has_web or has_reply or has_memory
@@ -3428,15 +3437,15 @@ async def ask_agentic(context: str, question: str, must_search: bool = False, ca
                           "в поле quote передай дословную подстроку этого сообщения (удобно для длинных). После реплаев, "
                           "как правило, стоит дать и общий итоговый ответ обычным текстом. Что выбрать — на твоё усмотрение.")
     if has_memory:
-        system_prompt += ("\n\nУ этого чата есть ПРОИНДЕКСИРОВАННАЯ ПАМЯТЬ (команда /index) — база по всей истории: "
-                          "memory_search (смысловой поиск по сценам-диалогам, досье и связям — для ТОЧЕЧНЫХ фактов и "
-                          "конкретных реплик), memory_overview (высокоуровневое обобщение по теме для ГЛОБАЛЬНЫХ/"
-                          "ТЕМАТИЧЕСКИХ вопросов — атмосфера, общее отношение к кому-то, динамика — из сжатых досье и "
-                          "связей, без сырых диалогов), memory_entity (полное досье персонажа/участника по имени или "
-                          "прозвищу — canon-факты, мнение чата, связи), "
-                          "memory_media (найти и переслать в чат фото из истории по описанию). Используй их для вопросов "
-                          "про историю чата, лор, персонажей, прошлые споры и события, про которых нет в текущем контексте, "
-                          "и когда просят найти/скинуть старое фото. Имена и прозвища разрешаются автоматически. "
+        available = ", ".join(memory_ready_tools.keys())
+        unavailable = ", ".join(name for name in _INDEX_TOOL_STAGE if name not in memory_ready_tools) or "нет"
+        system_prompt += ("\n\nУ этого чата есть ПРОИНДЕКСИРОВАННАЯ ПАМЯТЬ (команда /index) — база по всей истории. "
+                          f"Доступные сейчас tools: {available}. Недоступные из-за частичной индексации: {unavailable}. "
+                          "memory_search ищет сцены-диалоги, досье и связи для точечных фактов/реплик; "
+                          "memory_entity даёт полное досье сущности; memory_overview даёт высокоуровневую картину по "
+                          "сжатым периодам/досье/связям; memory_media находит и пересылает фото из истории. "
+                          "Используй доступные tools для вопросов про историю чата, лор, персонажей, прошлые споры и "
+                          "события, а также старые фото. Имена и прозвища разрешаются автоматически. "
                           "Если memory_search вернул слабые/пустые совпадения (помечено ⚠️) — не выдавай догадку за факт: "
                           "переспроси другими словами (конкретнее имена/событие) один раз или, для внешних тем, используй веб. "
                           "Иногда к вопросу приложена справка о спрашивающем из памяти — учитывай её, только если релевантно.")
@@ -3449,7 +3458,7 @@ async def ask_agentic(context: str, question: str, must_search: bool = False, ca
         system_prompt += _voice_auto_hint(TTS_ENGINE, FISH_TTS_MODEL)
 
     user_text = _build_ask_user_content(context, question, caller, now_str)
-    if has_memory and asker_id:  # персональная память: бот узнаёт спрашивающего и подтягивает его досье
+    if has_memory and asker_id and "memory_entity" in memory_ready_tools:  # персональная память: бот узнаёт спрашивающего и подтягивает его досье
         try:
             _who = await _index_asker_brief(chat_id, asker_id)
             if _who:
@@ -3472,8 +3481,11 @@ async def ask_agentic(context: str, question: str, must_search: bool = False, ca
     max_iterations = 20
     force_tool = must_search and (has_channels or has_web)  # принудительный поиск только для search-инструментов
     force_tool_name = "telegram_search" if has_channels else "web_search"
+    memory_tools_list = []
+    if has_memory:
+        memory_tools_list = [t for t in INDEX_MEMORY_TOOLS if t["function"]["name"] in memory_ready_tools]
     tools_list = (([TELEGRAM_SEARCH_TOOL] if has_channels else []) + (WEB_TOOLS if has_web else [])
-                  + ([REPLY_TOOL] if has_reply else []) + (INDEX_MEMORY_TOOLS if has_memory else []))
+                  + ([REPLY_TOOL] if has_reply else []) + memory_tools_list)
     reply_sent = [0]  # счётчик отправленных реплаев (анти-спам, лимит REPLY_MAX)
     sstats = {"iters": 0, "calls": 0, "posts": 0, "web": 0, "replies": 0, "memory": 0}  # сводка (-c)
 
@@ -3630,7 +3642,10 @@ async def ask_agentic(context: str, question: str, must_search: bool = False, ca
             # — GraphRAG-память /index —
             if tname in ("memory_search", "memory_entity", "memory_media", "memory_overview"):
                 sstats["memory"] = sstats.get("memory", 0) + 1
-                if tname == "memory_search":
+                ready, note = await _index_memory_ready(chat_id, tname)
+                if not ready:
+                    res = note
+                elif tname == "memory_search":
                     res = await _index_tool_search(chat_id, args.get("query", ""), args.get("kind", "all"))
                 elif tname == "memory_overview":
                     res = await _index_tool_overview(chat_id, args.get("topic", ""))
@@ -5050,38 +5065,14 @@ async def _gen_history_catalog(ordered, want_vision: bool, limit: int = GEN_CTX_
                         "date": _fmt_date(getattr(m, "date", None)),
                         "author": "me" if getattr(m, "out", False) else (f"user:{sid}" if sid else None),
                         "nearby_text": _nearby_text(m),
+                        "cache_key": "gen:" + _media_key(m),
                         "from_owner": bool(getattr(m, "out", False)),  # моё фото / прошлая генерация — для пометки «не повторяй»
                         "_m": m})
 
     if catalog:  # ген-формат ТИП/СУТЬ/ЛЮДИ нужен text-mode, а vision-mode — для junk-фильтра и привязки label→image
-        sem = asyncio.Semaphore(4)
-        done = [0]
-
-        async def _desc(it):
-            key = "gen:" + _media_key(it["_m"])
-            cached = MEDIA_CACHE.get(key)
-            if cached and cached not in MEDIA_FAILURE_MARKERS:
-                it["desc"] = cached
-                it["visual_desc"] = cached
-            else:
-                async with sem:
-                    try:
-                        d = await describe_image(it["thumb"], caption=it["caption"], prompt=_GEN_DESC_PROMPT)
-                    except Exception as e:
-                        log("GEN", f"Каталог: описание не удалось: {e}")
-                        d = None
-                if d and d not in MEDIA_FAILURE_MARKERS and not _looks_like_refusal(d):
-                    it["desc"] = d
-                    it["visual_desc"] = d
-                    _media_cache_set(key, d)
-            done[0] += 1
-            if progress_cb and done[0] % 3 == 0:
-                verb = "Классифицирую" if want_vision else "Описываю"
-                await progress_cb(f"🖋 {verb} фото для модели ({done[0]}/{len(catalog)})…")
-        try:
-            await asyncio.wait_for(asyncio.gather(*[_desc(it) for it in catalog]), timeout=timeout)
-        except asyncio.TimeoutError:
-            log("GEN", "Каталог: описания превысили тайм-бюджет — часть фото пойдёт без описания")
+        described = await _gen_describe_candidates_bounded(catalog, timeout=timeout, progress_cb=progress_cb)
+        if described < len(catalog):
+            log("GEN", f"Каталог: описания превысили тайм-бюджет — готово {described}/{len(catalog)}")
 
         # пре-фильтр по типу: скриншоты (переписки/интерфейсы/превью) и мемы промптеру не показываем вовсе —
         # именно этот мусор текстовые модели тащили в референсы. Нужен скриншот — юзер приложит его реплаем.
@@ -7507,7 +7498,7 @@ _INDEX_DDL = [
         KEY k_chat (chat_id), KEY k_pair (chat_id, source_id, target_id)) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4""",
     """CREATE TABLE IF NOT EXISTS media_assets (
         chat_id BIGINT NOT NULL, msg_id BIGINT NOT NULL, file_uid VARCHAR(64) NULL, image_description MEDIUMTEXT NULL,
-        entity_ids JSON NULL, emb_text VARBINARY(4096) NULL, emb_image VARBINARY(8192) NULL,
+        visual_description MEDIUMTEXT NULL, entity_ids JSON NULL, emb_text VARBINARY(4096) NULL, emb_image VARBINARY(8192) NULL,
         PRIMARY KEY (chat_id, msg_id)) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4""",
     """CREATE TABLE IF NOT EXISTS chat_chunks (
         id BIGINT AUTO_INCREMENT PRIMARY KEY, chat_id BIGINT NOT NULL, start_msg_id BIGINT NULL, end_msg_id BIGINT NULL,
@@ -7553,6 +7544,7 @@ _INDEX_MIGRATIONS = [
        AND c1.end_msg_id=c2.end_msg_id AND c1.id>c2.id""",
     "ALTER TABLE chat_chunks ADD UNIQUE KEY u_scene (chat_id, start_msg_id, end_msg_id)",
     "ALTER TABLE chat_chunks ADD KEY k_scene_range (chat_id, start_msg_id, end_msg_id)",
+    "ALTER TABLE media_assets ADD COLUMN visual_description MEDIUMTEXT NULL",
 ]
 
 
@@ -8458,31 +8450,45 @@ async def _index_process_media(chat_id: int, image_msgs: list, scene_text: str, 
     done = 0
     for msg in image_msgs:
         exists = await db_read(
-            "SELECT image_description, emb_image FROM media_assets WHERE chat_id=%s AND msg_id=%s",
+            "SELECT image_description, visual_description, entity_ids, emb_image FROM media_assets WHERE chat_id=%s AND msg_id=%s",
             (chat_id, msg.id))
-        if exists and (exists[0].get("image_description") or "").strip() and exists[0].get("emb_image"):
+        old = exists[0] if exists else {}
+        if (old.get("image_description") or "").strip() and (old.get("visual_description") or "").strip() and old.get("emb_image"):
             done += 1
             continue
         raw = await _index_download_media(msg)
         if not raw:
             continue
+        desc = (old.get("image_description") or "").strip()
+        visual_desc = (old.get("visual_description") or "").strip()
+        data = None
         try:
-            b64 = base64.b64encode(raw).decode("utf-8")
-            user = (f"Справочник персонажей:\n{registry[:4000]}\n\nКонтекст сцены:\n{scene_text[:2500]}")
-            resp = await asyncio.to_thread(
-                mclient.chat.completions.create, model=model, max_tokens=3000, timeout=90,
-                messages=[{"role": "user", "content": [
-                    {"type": "text", "text": _INDEX_MEDIA_SYSTEM + "\n\n" + user},
-                    {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{b64}", "detail": "high"}}]}])
-            data = _json_from_llm(resp.choices[0].message.content or "")
+            if not desc:
+                b64 = base64.b64encode(raw).decode("utf-8")
+                user = (f"Справочник персонажей:\n{registry[:4000]}\n\nКонтекст сцены:\n{scene_text[:2500]}")
+                resp = await asyncio.to_thread(
+                    mclient.chat.completions.create, model=model, max_tokens=3000, timeout=90,
+                    messages=[{"role": "user", "content": [
+                        {"type": "text", "text": _INDEX_MEDIA_SYSTEM + "\n\n" + user},
+                        {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{b64}", "detail": "high"}}]}])
+                data = _json_from_llm(resp.choices[0].message.content or "")
         except Exception as e:
             log("INDEX", f"Медиа-описание id={msg.id} не удалось: {e}")
             data = None
-        if not isinstance(data, dict):
+        if not desc and not isinstance(data, dict):
             continue
-        desc = (data.get("description") or "").strip()
-        ent_ids = []
-        for c in (data.get("characters") or []):
+        if isinstance(data, dict):
+            desc = (data.get("description") or "").strip()
+        if not visual_desc:
+            try:
+                thumb = await _downscale_img(raw)
+                vd = await describe_image(thumb, caption="", prompt=_GEN_DESC_PROMPT)
+                if vd and vd not in MEDIA_FAILURE_MARKERS and not _looks_like_refusal(vd):
+                    visual_desc = vd
+            except Exception as e:
+                log("INDEX", f"Чистое visual-описание id={msg.id} не удалось: {e}")
+        ent_ids = _index_json_list(old.get("entity_ids"))
+        for c in ((data or {}).get("characters") or []):
             if not isinstance(c, dict):
                 continue
             eid = name2id.get(str(c.get("name", "")).lower().strip())
@@ -8509,12 +8515,13 @@ async def _index_process_media(chat_id: int, image_msgs: list, scene_text: str, 
                      chat_id, eid, app, json.dumps([msg.id], ensure_ascii=False)))
         uid, _ = _media_meta(msg)
         # вектор САМОЙ картинки (gemini-embedding-2) считаем здесь, пока байты в руках — иначе Stage 3 качал бы фото повторно
-        emb_img = await _index_embed_image(raw)
+        emb_img = old.get("emb_image") or await _index_embed_image(raw)
         await db_write(
-            """INSERT INTO media_assets (chat_id,msg_id,file_uid,image_description,entity_ids,emb_image)
-               VALUES (%s,%s,%s,%s,%s,%s) ON DUPLICATE KEY UPDATE image_description=VALUES(image_description),
-               entity_ids=VALUES(entity_ids), file_uid=VALUES(file_uid), emb_image=VALUES(emb_image), emb_text=NULL""",
-            (chat_id, msg.id, uid, desc, json.dumps(ent_ids, ensure_ascii=False), emb_img))
+            """INSERT INTO media_assets (chat_id,msg_id,file_uid,image_description,visual_description,entity_ids,emb_image)
+               VALUES (%s,%s,%s,%s,%s,%s,%s) ON DUPLICATE KEY UPDATE image_description=VALUES(image_description),
+               visual_description=VALUES(visual_description), entity_ids=VALUES(entity_ids),
+               file_uid=VALUES(file_uid), emb_image=VALUES(emb_image), emb_text=NULL""",
+            (chat_id, msg.id, uid, desc, visual_desc, json.dumps(ent_ids, ensure_ascii=False), emb_img))
         _index_invalidate(chat_id, "media_text", "media_image")
         done += 1
     return done
@@ -8924,6 +8931,8 @@ async def _index_stage3_vectors(chat_id: int, progress_cb=None):
     """Векторизует досье, связи, сцены и описания фото (text-embedding-3-small). Картинки (emb_image) —
     уже в Stage 2. Каждый текст непустой (fallback-заглушки), чтобы не плодить вечные NULL."""
     await _idx_set_state(chat_id, 3, status="running")
+    ent_rows = await db_read("SELECT id, name, aliases FROM entities WHERE chat_id=%s", (chat_id,))
+    rel_entities = {r["id"]: r for r in ent_rows}
 
     def _ent_text(r):
         al = json.loads(r["aliases"]) if r["aliases"] else []
@@ -8932,7 +8941,7 @@ async def _index_stage3_vectors(chat_id: int, progress_cb=None):
 
     targets = [
         ("entities", "id", "embedding", _ent_text, "досье"),
-        ("relations", "id", "embedding", lambda r: (r.get("context_summary") or r.get("relation_type") or "связь"), "связи"),
+        ("relations", "id", "embedding", lambda r: _index_relation_embedding_text(r, rel_entities), "связи"),
         ("chat_chunks", "id", "embedding", lambda r: (r.get("enriched_text") or "сцена")[:8000], "сцены"),
         ("media_assets", "msg_id", "emb_text", lambda r: (r.get("image_description") or "изображение")[:8000], "фото"),
     ]
@@ -9139,36 +9148,48 @@ async def _index_stage5_media(chat_id: int, progress_cb=None):
 
 
 # --- поиск по векторам (numpy-косинус; матрицы кэшируются per chat) ---
-_INDEX_MATRIX: dict = {}   # {(chat_id, kind): {"mat": ndarray, "ids": [...], "extra": [...], "n": int}}
-_INDEX_HNSW: dict = {}     # optional ANN cache {(chat_id, kind): {"idx": hnsw, "ids": [...], "extra": [...], "n": int}}
+_INDEX_MATRIX: dict = {}   # {(chat_id, kind): {"mat": ndarray, "ids": [...], "n": int}}
+_INDEX_HNSW: dict = {}     # optional ANN cache {(chat_id, kind): {"idx": hnsw, "ids": [...], "n": int}}
 # kind → (table, emb_col, key_col, доп.поля-для-сниппета)
 _INDEX_KINDS = {
     "entities":    ("entities", "embedding", "id", "name, entity_type, canon_summary, fanon_summary, visual_features"),
-    "relations":   ("relations", "embedding", "id", "source_id, target_id, relation_type, context_summary, status"),
+    "relations":   ("relations", "embedding", "id", "source_id, target_id, relation_type, canonical_type, context_summary, status, weight, first_seen, last_seen, evidence"),
     "chunks":      ("chat_chunks", "embedding", "id", "start_msg_id, end_msg_id, enriched_text"),
-    "media_text":  ("media_assets", "emb_text", "msg_id", "msg_id, image_description, entity_ids"),
-    "media_image": ("media_assets", "emb_image", "msg_id", "msg_id, image_description, entity_ids"),
+    "media_text":  ("media_assets", "emb_text", "msg_id", "msg_id, image_description, visual_description, entity_ids"),
+    "media_image": ("media_assets", "emb_image", "msg_id", "msg_id, image_description, visual_description, entity_ids"),
     "rollups":     ("time_rollups", "embedding", "id", "level, bucket_key, summary, period_start, period_end"),
 }
 
 
+async def _index_fetch_hit_extras(chat_id: int, kind: str, ids: list) -> dict:
+    """Дотягивает текстовые/служебные поля только для финальных top hits, не держа их в RAM-кэше."""
+    ids = [x for x in ids if x is not None]
+    if not ids:
+        return {}
+    table, _emb_col, key_col, extra = _INDEX_KINDS[kind]
+    ph = ",".join(["%s"] * len(ids))
+    rows = await db_read(
+        f"SELECT {key_col} AS _k, {extra} FROM {table} WHERE chat_id=%s AND {key_col} IN ({ph})",
+        tuple([chat_id] + ids))
+    return {r["_k"]: {k: v for k, v in r.items() if k != "_k"} for r in rows}
+
+
 async def _index_load_matrix(chat_id: int, kind: str) -> dict:
     """Матрица векторов kind для чата с ленивым кэшем и досинхронизацией по числу строк."""
-    table, emb_col, key_col, extra = _INDEX_KINDS[kind]
+    table, emb_col, key_col, _extra = _INDEX_KINDS[kind]
     ck = (chat_id, kind)
     n_now = await _index_count_ok(chat_id, kind)
     cached = _INDEX_MATRIX.get(ck)
     if cached and cached["n"] == n_now:
         return cached
     rows = await db_read(
-        f"SELECT {key_col} AS _k, {emb_col} AS _emb, {extra} FROM {table} WHERE chat_id=%s AND {emb_col} IS NOT NULL ORDER BY {key_col}",
+        f"SELECT {key_col} AS _k, {emb_col} AS _emb FROM {table} WHERE chat_id=%s AND {emb_col} IS NOT NULL ORDER BY {key_col}",
         (chat_id,))
     if rows:
         mat = _np.vstack([_np.frombuffer(r["_emb"], dtype=_np.float16).astype(_np.float32) for r in rows])
     else:
         mat = _np.zeros((0, INDEX_EMBED_DIM), dtype=_np.float32)
-    obj = {"mat": mat, "ids": [r["_k"] for r in rows],
-           "extra": [{k: v for k, v in r.items() if k not in ("_emb", "_k")} for r in rows], "n": n_now}
+    obj = {"mat": mat, "ids": [r["_k"] for r in rows], "n": n_now}
     _INDEX_MATRIX[ck] = obj
     return obj
 
@@ -9188,26 +9209,28 @@ async def _index_vector_search(chat_id: int, kind: str, qvec, top_n: int = 8) ->
     """Топ-N совпадений: [{score, key, ...доп.поля}]."""
     if qvec is None:
         return []
-    table, emb_col, key_col, extra = _INDEX_KINDS[kind]
     n_now = await _index_count_ok(chat_id, kind)  # кэш — не сканим БД на каждый поиск
     if n_now > INDEX_MATRIX_CACHE_MAX_ROWS:
         if index_use_hnsw and _hnswlib is not None:
             h = await _index_load_hnsw(chat_id, kind, n_now)
             if h:
-                return _index_hnsw_search(h, qvec, top_n)
+                return await _index_hnsw_search(chat_id, kind, h, qvec, top_n)
         return await _index_vector_search_stream(chat_id, kind, qvec, top_n)
     m = await _index_load_matrix(chat_id, kind)
     hits = _index_topk(m["mat"], qvec, top_n)
+    hit_ids = [m["ids"][ri] for ri, _score in hits]
+    extras = await _index_fetch_hit_extras(chat_id, kind, hit_ids)
     out = []
     for ri, score in hits:
-        item = {"score": round(score, 4), "key": m["ids"][ri]}
-        item.update(m["extra"][ri])
+        key = m["ids"][ri]
+        item = {"score": round(score, 4), "key": key}
+        item.update(extras.get(key, {}))
         out.append(item)
     return out
 
 
 async def _index_load_hnsw(chat_id: int, kind: str, n_now: int = None):
-    table, emb_col, key_col, extra = _INDEX_KINDS[kind]
+    table, emb_col, key_col, _extra = _INDEX_KINDS[kind]
     ck = (chat_id, kind)
     if n_now is None:
         n_now = await _index_count_ok(chat_id, kind)
@@ -9218,15 +9241,14 @@ async def _index_load_hnsw(chat_id: int, kind: str, n_now: int = None):
         return None
     try:
         rows = await db_read(
-            f"SELECT {key_col} AS _k, {emb_col} AS _emb, {extra} FROM {table} WHERE chat_id=%s AND {emb_col} IS NOT NULL ORDER BY {key_col}",
+            f"SELECT {key_col} AS _k, {emb_col} AS _emb FROM {table} WHERE chat_id=%s AND {emb_col} IS NOT NULL ORDER BY {key_col}",
             (chat_id,))
         mat = _np.vstack([_np.frombuffer(r["_emb"], dtype=_np.float16).astype(_np.float32) for r in rows])
         idx = _hnswlib.Index(space="cosine", dim=INDEX_EMBED_DIM)
         idx.init_index(max_elements=len(rows), ef_construction=100, M=16)
         idx.add_items(mat, _np.arange(len(rows)))
         idx.set_ef(min(100, max(10, len(rows))))
-        obj = {"idx": idx, "ids": [r["_k"] for r in rows],
-               "extra": [{k: v for k, v in r.items() if k not in ("_emb", "_k")} for r in rows], "n": n_now}
+        obj = {"idx": idx, "ids": [r["_k"] for r in rows], "n": n_now}
         _INDEX_HNSW[ck] = obj
         return obj
     except Exception as e:
@@ -9235,27 +9257,30 @@ async def _index_load_hnsw(chat_id: int, kind: str, n_now: int = None):
         return None
 
 
-def _index_hnsw_search(obj: dict, qvec, top_n: int) -> list:
+async def _index_hnsw_search(chat_id: int, kind: str, obj: dict, qvec, top_n: int) -> list:
     if qvec is None or not obj or not obj.get("ids"):
         return []
     k = min(top_n, len(obj["ids"]))
     labels, distances = obj["idx"].knn_query(qvec.reshape(1, -1), k=k)
+    hit_ids = [obj["ids"][int(lab)] for lab in labels[0]]
+    extras = await _index_fetch_hit_extras(chat_id, kind, hit_ids)
     out = []
     for lab, dist in zip(labels[0], distances[0]):
         ri = int(lab)
-        item = {"score": round(1.0 - float(dist), 4), "key": obj["ids"][ri]}
-        item.update(obj["extra"][ri])
+        key = obj["ids"][ri]
+        item = {"score": round(1.0 - float(dist), 4), "key": key}
+        item.update(extras.get(key, {}))
         out.append(item)
     return out
 
 
 async def _index_vector_search_stream(chat_id: int, kind: str, qvec, top_n: int = 8) -> list:
     """Top-k по большим индексам без полной загрузки kind в память процесса."""
-    table, emb_col, key_col, extra = _INDEX_KINDS[kind]
+    table, emb_col, key_col, _extra = _INDEX_KINDS[kind]
     cur, best = 0, []
     while True:
         rows = await db_read(
-            f"SELECT {key_col} AS _k, {emb_col} AS _emb, {extra} FROM {table} "
+            f"SELECT {key_col} AS _k, {emb_col} AS _emb FROM {table} "
             f"WHERE chat_id=%s AND {emb_col} IS NOT NULL AND {key_col}>%s ORDER BY {key_col} LIMIT %s",
             (chat_id, cur, INDEX_SEARCH_DB_BATCH))
         if not rows:
@@ -9265,16 +9290,17 @@ async def _index_vector_search_stream(chat_id: int, kind: str, qvec, top_n: int 
         sims = mat @ qvec
         for i, score in enumerate(sims):
             r = rows[i]
-            extra_item = {k: v for k, v in r.items() if k not in ("_emb", "_k")}
-            best.append((float(score), r["_k"], extra_item))
+            best.append((float(score), r["_k"]))
         if len(best) > top_n * 4:
             best.sort(key=lambda x: x[0], reverse=True)
             best = best[:top_n]
     best.sort(key=lambda x: x[0], reverse=True)
+    hit_ids = [key for _score, key in best[:top_n]]
+    extras = await _index_fetch_hit_extras(chat_id, kind, hit_ids)
     out = []
-    for score, key, extra_item in best[:top_n]:
+    for score, key in best[:top_n]:
         item = {"score": round(score, 4), "key": key}
-        item.update(extra_item)
+        item.update(extras.get(key, {}))
         out.append(item)
     return out
 
@@ -9325,6 +9351,372 @@ def _idx_snip(text, n=180):
     return re.sub(r"\s+", " ", (text or "")).strip()[:n]
 
 
+def _index_json_list(value) -> list:
+    if value is None:
+        return []
+    if isinstance(value, list):
+        return value
+    try:
+        data = json.loads(value)
+        return data if isinstance(data, list) else []
+    except Exception:
+        return []
+
+
+def _index_evidence_ids(value, limit: int = 6) -> list:
+    out = []
+    for x in _index_json_list(value):
+        try:
+            out.append(int(x))
+        except Exception:
+            continue
+        if len(out) >= limit:
+            break
+    return out
+
+
+def _index_msg_refs(chat_ent, evidence, limit: int = 4) -> str:
+    ids = _index_evidence_ids(evidence, limit=limit)
+    if not ids:
+        return ""
+    bits = [f"#{mid}" for mid in ids]
+    if chat_ent:
+        links = []
+        for mid in ids:
+            try:
+                links.append(build_msg_link(chat_ent, mid))
+            except Exception:
+                pass
+        if links:
+            return "evidence msg_ids=" + ", ".join(bits) + " links=" + ", ".join(links)
+    return "evidence msg_ids=" + ", ".join(bits)
+
+
+def _index_date_short(value) -> str:
+    if not value:
+        return ""
+    if hasattr(value, "strftime"):
+        return value.strftime("%Y-%m-%d")
+    return str(value)[:10]
+
+
+async def _index_entity_name_map(chat_id: int, ids: set) -> dict:
+    ids = {int(x) for x in ids if x}
+    if not ids:
+        return {}
+    ph = ",".join(["%s"] * len(ids))
+    rows = await db_read(f"SELECT id, name, aliases FROM entities WHERE chat_id=%s AND id IN ({ph})",
+                         tuple([chat_id] + list(ids)))
+    return {r["id"]: r for r in rows}
+
+
+def _index_relation_embedding_text(row: dict, entities: dict = None) -> str:
+    """Текст ребра для embedding: имена/алиасы + тип + статус + summary + краткие evidence ids."""
+    entities = entities or {}
+    src = entities.get(row.get("source_id"), {})
+    tgt = entities.get(row.get("target_id"), {})
+
+    def _names(ent):
+        aliases = _index_json_list(ent.get("aliases"))
+        vals = [ent.get("name"), *aliases]
+        return ", ".join(dict.fromkeys([str(x).strip() for x in vals if str(x or "").strip()]))
+
+    ev = _index_evidence_ids(row.get("evidence"), limit=5)
+    parts = [
+        f"source: {_names(src) or row.get('source_id')}",
+        f"target: {_names(tgt) or row.get('target_id')}",
+        f"relation_type: {row.get('relation_type') or 'связь'}",
+        f"canonical_type: {row.get('canonical_type') or ''}",
+        f"status: {row.get('status') or 'active'}",
+        f"weight: {row.get('weight') or ''}",
+        f"evidence_msg_ids: {', '.join(str(x) for x in ev)}" if ev else "",
+        row.get("context_summary") or "",
+    ]
+    return " | ".join(str(x).strip() for x in parts if str(x or "").strip())[:8000]
+
+
+async def _index_relation_names(chat_id: int, rels: list) -> dict:
+    ids = set()
+    for r in rels or []:
+        ids.add(r.get("source_id"))
+        ids.add(r.get("target_id"))
+    rows = await _index_entity_name_map(chat_id, ids)
+    return {eid: (r.get("name") or "?") for eid, r in rows.items()}
+
+
+def _index_relation_doc(hit: dict, names: dict) -> str:
+    a, b = names.get(hit.get("source_id"), "?"), names.get(hit.get("target_id"), "?")
+    status = hit.get("status") or "active"
+    return (f"{a} -> {b}: {hit.get('relation_type') or 'связь'} "
+            f"({hit.get('canonical_type') or '?'}, {status}, weight={hit.get('weight') or 1}) — "
+            f"{_idx_snip(hit.get('context_summary'), 500)}")
+
+
+def _index_relation_line(hit: dict, names: dict, chat_ent=None, rel_score=None) -> str:
+    a, b = names.get(hit.get("source_id"), "?"), names.get(hit.get("target_id"), "?")
+    st = "" if hit.get("status") == "active" else " (в прошлом)"
+    weight = hit.get("weight")
+    dates = ""
+    first, last = _index_date_short(hit.get("first_seen")), _index_date_short(hit.get("last_seen"))
+    if first or last:
+        dates = f"; {first or '?'}..{last or '?'}"
+    ev = _index_msg_refs(chat_ent, hit.get("evidence"))
+    score = f" [rel {rel_score:.2f}]" if rel_score is not None else ""
+    tail = "; " + ev if ev else ""
+    return (f"• [связь] {a} -> {b}: {hit.get('relation_type') or 'связь'}"
+            f"/{hit.get('canonical_type') or '?'}{st} — {_idx_snip(hit.get('context_summary'), 180)} "
+            f"(вес {weight or 1}{dates}{tail}){score}")
+
+
+_INDEX_TOOL_STAGE = {
+    "memory_search": 3,
+    "memory_entity": 3,
+    "memory_overview": 4,
+    "memory_media": 5,
+}
+
+
+async def _index_memory_ready(chat_id: int, tool_name: str) -> tuple:
+    """Готовность memory-tool по idx_state, а не по наличию сущностей."""
+    if not chat_id:
+        return False, "Память /index недоступна: неизвестный chat_id."
+    reason = _index_available()
+    if reason:
+        return False, f"Память /index недоступна: {reason}"
+    try:
+        await _index_ensure_ddl()
+    except Exception as e:
+        return False, f"Память /index недоступна: не удалось применить DDL/migrations: {e}"
+    req = _INDEX_TOOL_STAGE.get(tool_name, 3)
+    try:
+        rows = await db_read("SELECT stage, status FROM idx_state WHERE chat_id=%s AND stage IN (3,4,5)", (chat_id,))
+    except Exception as e:
+        return False, f"Память /index ещё не готова или таблицы не созданы: {e}"
+    status = {int(r["stage"]): r["status"] for r in rows}
+    if status.get(req) == "done":
+        return True, f"{tool_name}: готово (Stage {req}=done)."
+    done = [s for s in (3, 4, 5) if status.get(s) == "done"]
+    available = []
+    if 3 in done:
+        available += ["memory_search", "memory_entity"]
+    if 4 in done:
+        available.append("memory_overview")
+    if 5 in done:
+        available.append("memory_media")
+    have = ", ".join(available) if available else "пока нет"
+    return False, (f"Память /index частично готова: для {tool_name} нужен Stage {req}=done, "
+                   f"сейчас Stage {req}={status.get(req) or 'нет записи'}. Доступно: {have}.")
+
+
+async def _index_ready_memory_tools(chat_id: int) -> tuple:
+    ready, notes = {}, {}
+    for tool_name in _INDEX_TOOL_STAGE:
+        ok, note = await _index_memory_ready(chat_id, tool_name)
+        notes[tool_name] = note
+        if ok:
+            ready[tool_name] = note
+    return ready, notes
+
+
+async def _index_entities_mentioned(chat_id: int, query: str, limit: int = 6) -> list:
+    qn = _index_norm_name(query)
+    if not qn:
+        return []
+    rows = await db_read("SELECT id, name, aliases FROM entities WHERE chat_id=%s", (chat_id,))
+    hits = []
+    for r in rows:
+        aliases = _index_json_list(r.get("aliases"))
+        terms = [r.get("name"), *aliases]
+        best = ""
+        for term in terms:
+            tn = _index_identity_key(term)
+            if not tn:
+                continue
+            if re.search(r"(?<!\w)" + re.escape(tn) + r"(?!\w)", qn, flags=re.I):
+                if len(tn) > len(best):
+                    best = tn
+        if best:
+            hits.append((len(best), r["id"], r))
+    hits.sort(reverse=True, key=lambda x: x[0])
+    out, seen = [], set()
+    for _ln, eid, row in hits:
+        if eid not in seen:
+            out.append(row)
+            seen.add(eid)
+        if len(out) >= limit:
+            break
+    if not out:
+        ent = await _index_find_entity(chat_id, query)
+        if ent:
+            out.append(ent)
+    return out
+
+
+async def _index_relation_direct_hits(chat_id: int, query: str) -> list:
+    """Прямой graph lookup по сущностям в query: пары при 2+ участниках, incident edges при одном."""
+    ents = await _index_entities_mentioned(chat_id, query)
+    ids = [int(e["id"]) for e in ents if e.get("id")]
+    if not ids:
+        return []
+    if len(ids) >= 2:
+        ph = ",".join(["%s"] * len(ids))
+        rows = await db_read(
+            f"""SELECT id AS `key`, source_id, target_id, relation_type, canonical_type, context_summary,
+                      status, weight, first_seen, last_seen, evidence
+                FROM relations
+                WHERE chat_id=%s AND source_id IN ({ph}) AND target_id IN ({ph})
+                ORDER BY status='active' DESC, weight DESC, last_seen DESC LIMIT 12""",
+            tuple([chat_id] + ids + ids))
+    else:
+        eid = ids[0]
+        rows = await db_read(
+            """SELECT id AS `key`, source_id, target_id, relation_type, canonical_type, context_summary,
+                      status, weight, first_seen, last_seen, evidence
+               FROM relations
+               WHERE chat_id=%s AND (source_id=%s OR target_id=%s)
+               ORDER BY status='active' DESC, weight DESC, last_seen DESC LIMIT 12""",
+            (chat_id, eid, eid))
+    out = []
+    for r in rows:
+        r["score"] = 1.0
+        r["direct"] = True
+        out.append(r)
+    return out
+
+
+def _index_norm_score(score) -> float:
+    try:
+        return max(0.0, min(1.0, (float(score) + 1.0) / 2.0))
+    except Exception:
+        return 0.0
+
+
+async def _index_media_hybrid_hits(chat_id: int, query: str, count: int, for_gen: bool = False) -> list:
+    """Union media_text(text space) + media_image(image space from text query), deduped by msg_id."""
+    query = (query or "").strip()
+    if not query:
+        return []
+    pool = max(count, GEN_INDEX_POOL if for_gen else INDEX_RERANK_POOL)
+    combined = {}
+
+    async def _merge(kind, qv, flag):
+        if qv is None:
+            return
+        hits = await _index_vector_search(chat_id, kind, qv, pool)
+        for h in hits:
+            mid = h.get("msg_id") or h.get("key")
+            if mid is None:
+                continue
+            raw_score = float(h.get("score") or 0.0)
+            if raw_score < (0.18 if for_gen else INDEX_SEARCH_FLOOR):
+                continue
+            item = combined.setdefault(mid, {
+                "key": mid, "msg_id": mid, "score": 0.0, "text_hit": False, "image_hit": False,
+                "text_score": None, "image_score": None,
+                "image_description": h.get("image_description"),
+                "visual_description": h.get("visual_description"),
+                "entity_ids": h.get("entity_ids"),
+            })
+            item.update({k: v for k, v in h.items() if k not in ("score", "key") and v is not None})
+            item[flag] = True
+            item[f"{'text' if flag == 'text_hit' else 'image'}_score"] = raw_score
+            item["score"] = max(item["score"], _index_norm_score(raw_score))
+
+    qv_text = await _index_embed_query(query)
+    await _merge("media_text", qv_text, "text_hit")
+    qv_image = await _index_embed_query(query, image_space=True)
+    await _merge("media_image", qv_image, "image_hit")
+    return sorted(combined.values(), key=lambda h: h.get("score", 0), reverse=True)[:count]
+
+
+async def _gen_nearby_text_from_db(chat_id: int, msg_id: int) -> str:
+    """±2 сообщения вокруг indexed ref из таблицы messages; отсутствие дампа не считается ошибкой."""
+    try:
+        rows = await db_read(
+            """SELECT msg_id, author_id, txt FROM messages
+               WHERE chat_id=%s AND msg_id BETWEEN %s AND %s
+               ORDER BY msg_id""",
+            (chat_id, int(msg_id) - 2, int(msg_id) + 2))
+    except Exception:
+        return ""
+    lines = []
+    for r in rows:
+        if int(r["msg_id"]) == int(msg_id):
+            continue
+        txt = (r.get("txt") or "").strip()
+        if not txt or re.match(r"^[./]gen\b", txt, re.I):
+            continue
+        side = "до" if int(r["msg_id"]) < int(msg_id) else "после"
+        who = f"user:{r.get('author_id')}" if r.get("author_id") else "user:?"
+        lines.append(f"{side} {who}: {_preview(txt, 140)}")
+    return " | ".join(lines)
+
+
+async def _gen_describe_candidates_bounded(items: list, timeout: float, progress_cb=None) -> int:
+    """Дозаполняет visual_desc/desc без создания сотен vision tasks заранее."""
+    if not items:
+        return 0
+    deadline = time.monotonic() + max(0.0, float(timeout or 0))
+    idx, done = 0, 0
+    lock = asyncio.Lock()
+
+    async def _worker():
+        nonlocal idx, done
+        while True:
+            if time.monotonic() >= deadline:
+                return
+            async with lock:
+                if idx >= len(items):
+                    return
+                it = items[idx]
+                idx += 1
+            if it.get("visual_desc") or it.get("desc"):
+                done += 1
+                continue
+            key = it.get("cache_key")
+            if not key and it.get("_m") is not None:
+                key = "gen:" + _media_key(it["_m"])
+                it["cache_key"] = key
+            cached = MEDIA_CACHE.get(key) if key else None
+            if cached and cached not in MEDIA_FAILURE_MARKERS:
+                it["desc"] = cached
+                it["visual_desc"] = cached
+            else:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    return
+                try:
+                    d = await asyncio.wait_for(
+                        describe_image(it["thumb"], caption=it.get("caption") or "", prompt=_GEN_DESC_PROMPT),
+                        timeout=max(1.0, remaining))
+                except asyncio.TimeoutError:
+                    return
+                except Exception as e:
+                    log("GEN", f"Описание кандидата не удалось для msg_id={it.get('mid')}: {e}")
+                    d = None
+                if d and d not in MEDIA_FAILURE_MARKERS and not _looks_like_refusal(d):
+                    it["desc"] = d
+                    it["visual_desc"] = d
+                    if key:
+                        _media_cache_set(key, d)
+                    if it.get("index_chat_id") and it.get("mid"):
+                        try:
+                            await db_write(
+                                """UPDATE media_assets SET visual_description=%s
+                                   WHERE chat_id=%s AND msg_id=%s
+                                     AND (visual_description IS NULL OR visual_description='')""",
+                                (d, it["index_chat_id"], it["mid"]))
+                        except Exception as e:
+                            log("GEN", f"visual_description не сохранился для msg_id={it.get('mid')}: {e}")
+            done += 1
+            if progress_cb and done % 3 == 0:
+                await progress_cb(f"🖋 Описываю фото для модели ({done}/{len(items)})…")
+
+    workers = [asyncio.create_task(_worker()) for _ in range(min(4, len(items)))]
+    await asyncio.gather(*workers, return_exceptions=True)
+    return done
+
+
 async def _index_chat_entity(chat_id):
     try:
         return await client.get_entity(chat_id)
@@ -9333,17 +9725,44 @@ async def _index_chat_entity(chat_id):
 
 
 async def _index_tool_search(chat_id: int, query: str, kind: str = "all") -> str:
+    ready, note = await _index_memory_ready(chat_id, "memory_search")
+    if not ready:
+        return note
     if not (query or "").strip():
         return "Пустой запрос."
-    qv = await _index_embed_query(query)
-    if qv is None:
-        return "Не удалось векторизовать запрос."
     ent = await _index_chat_entity(chat_id)
     kinds = {"scenes": ["chunks"], "dossiers": ["entities"], "relations": ["relations"]}.get(kind, ["chunks", "entities", "relations"])
-    # 1) вектор достаёт ШИРОКИЙ пул кандидатов; для каждого — текст под rerank + строка вывода + косинус
+    # 1) Прямой graph lookup по участникам в query: не зависит от cosine и чинит вопросы вида "X и Y".
     cands = []  # {"doc","line","cos"}
+    seen = set()
+    if "relations" in kinds:
+        direct = await _index_relation_direct_hits(chat_id, query)
+        if direct:
+            names = await _index_relation_names(chat_id, direct)
+            for h in direct:
+                seen.add(("relations", h["key"]))
+                cands.append({
+                    "doc": _index_relation_doc(h, names),
+                    "line": _index_relation_line(h, names, ent),
+                    "cos": 1.0,
+                    "direct": True,
+                })
+
+    qv = await _index_embed_query(query)
+    if qv is None and not cands:
+        return "Не удалось векторизовать запрос."
+    # 2) вектор достаёт ШИРОКИЙ пул кандидатов; для каждого — текст под rerank + строка вывода + косинус
     for k in kinds:
-        for h in await _index_vector_search(chat_id, k, qv, INDEX_RERANK_POOL):
+        if qv is None:
+            continue
+        hits = await _index_vector_search(chat_id, k, qv, INDEX_RERANK_POOL)
+        if k == "relations":
+            names = await _index_relation_names(chat_id, hits)
+        for h in hits:
+            sk = (k, h.get("key"))
+            if sk in seen:
+                continue
+            seen.add(sk)
             if k == "chunks":
                 link = (f" {build_msg_link(ent, h['start_msg_id'])}" if ent and h.get("start_msg_id") else "")
                 doc = _idx_snip(h.get("enriched_text"), 600)
@@ -9352,31 +9771,33 @@ async def _index_tool_search(chat_id: int, query: str, kind: str = "all") -> str
                 doc = f"{h['name']}: {_idx_snip(h.get('canon_summary') or h.get('fanon_summary'), 500)}"
                 line = f"• [досье] {h['name']} ({h['entity_type']}): {_idx_snip(h.get('canon_summary'), 160)}"
             elif k == "relations":
-                nm = await db_read("SELECT id, name FROM entities WHERE id IN (%s,%s)", (h["source_id"], h["target_id"]))
-                n = {r["id"]: r["name"] for r in nm}
-                a, b = n.get(h["source_id"], "?"), n.get(h["target_id"], "?")
-                st = "" if h.get("status") == "active" else " (в прошлом)"
-                doc = f"{a} → {b}: {h.get('relation_type') or ''} — {_idx_snip(h.get('context_summary'), 400)}"
-                line = f"• [связь] {a} → {b}: {h.get('relation_type') or ''}{st} — {_idx_snip(h.get('context_summary'), 140)}"
+                doc = _index_relation_doc(h, names)
+                line = _index_relation_line(h, names, ent)
             else:
                 continue
             cands.append({"doc": doc, "line": line, "cos": h["score"]})
     if not cands:
         return ("В памяти ничего не нашёл. Переформулируй запрос другими словами (конкретнее: имена, о чём "
                 "именно спор/событие) или, если вопрос про внешний мир, используй web_search.")
-    # 2) cohere-rerank переупорядочивает пул по истинной релевантности; при сбое — косинус-порядок
+    # 3) cohere-rerank переупорядочивает пул по истинной релевантности; при сбое — косинус-порядок
     order = await _index_rerank(query, [c["doc"] for c in cands], top_n=INDEX_RERANK_TOPN)
     if order is not None:
-        kept = [(cands[i], rel) for i, rel in order if 0 <= i < len(cands) and rel >= INDEX_RERANK_MIN]
+        kept = [(cands[i], rel) for i, rel in order
+                if 0 <= i < len(cands) and (rel >= INDEX_RERANK_MIN or cands[i].get("direct"))]
         best = order[0][1] if order else 0.0
         confident = INDEX_RERANK_CONFIDENT
-        out = [f"{c['line']} [rel {rel:.2f}]" for c, rel in kept]
+        if any(c.get("direct") for c, _rel in kept):
+            best = max(best, confident)
+        out = [f"{c['line']} [rel {rel:.2f}{', direct' if c.get('direct') else ''}]" for c, rel in kept]
     else:  # фолбэк без rerank — косинус
         cands.sort(key=lambda c: -c["cos"])
         best = cands[0]["cos"] if cands else 0.0
         confident = INDEX_SEARCH_CONFIDENT
-        out = [f"{c['line']} [{c['cos']:.2f}]" for c in cands[:INDEX_RERANK_TOPN] if c["cos"] >= INDEX_SEARCH_FLOOR]
-    # 3) Corrective RAG: слабая/пустая выдача → просим модель переспросить/веб, а не выдумывать
+        out = [f"{c['line']} [{c['cos']:.2f}{', direct' if c.get('direct') else ''}]"
+               for c in cands[:INDEX_RERANK_TOPN] if c.get("direct") or c["cos"] >= INDEX_SEARCH_FLOOR]
+        if any(c.get("direct") for c in cands[:INDEX_RERANK_TOPN]):
+            best = max(best, confident)
+    # 4) Corrective RAG: слабая/пустая выдача → просим модель переспросить/веб, а не выдумывать
     if not out:
         return (f"В памяти ничего релевантного не нашёл (лучшее совпадение {best:.2f}). Переформулируй запрос "
                 f"другими словами или, если вопрос про внешний мир, используй web_search.")
@@ -9389,6 +9810,9 @@ async def _index_tool_search(chat_id: int, query: str, kind: str = "all") -> str
 async def _index_tool_overview(chat_id: int, topic: str) -> str:
     """LightRAG high-level: тематическое обобщение ТОЛЬКО из саммари (сжатые досье + обобщённые связи, без сырых сцен).
     Роутер = выбор модели между этим (тематика/картина в целом) и memory_search (точечные факты/реплики)."""
+    ready, note = await _index_memory_ready(chat_id, "memory_overview")
+    if not ready:
+        return note
     if not (topic or "").strip():
         return "Пустая тема."
     qv = await _index_embed_query(topic)
@@ -9438,6 +9862,7 @@ async def _index_tool_overview(chat_id: int, topic: str) -> str:
 
 async def _index_entity_report(chat_id: int, ent: dict) -> str:
     """Текстовое досье сущности для модели (факты + связи с именами)."""
+    chat_ent = await _index_chat_entity(chat_id)
     aliases = json.loads(ent["aliases"]) if ent["aliases"] else []
     parts = [f"{ent['name']} ({'персонаж' if ent['entity_type'] == 'character' else 'участник'})"]
     if [a for a in aliases if a != ent["name"]]:
@@ -9448,32 +9873,48 @@ async def _index_entity_report(chat_id: int, ent: dict) -> str:
         parts.append("Мнение чата (fanon): " + ent["fanon_summary"].strip())
     if (ent.get("visual_features") or "").strip():
         parts.append("Внешность: " + ent["visual_features"].strip())
-    claims = await db_read("SELECT kind, claim FROM entity_claims WHERE chat_id=%s AND entity_id=%s ORDER BY id",
+    claims = await db_read("SELECT kind, claim, evidence FROM entity_claims WHERE chat_id=%s AND entity_id=%s ORDER BY id",
                            (chat_id, ent["id"]))
-    for kind, title in (("canon", "Факты"), ("fanon", "Мнения")):
-        ck = [c["claim"] for c in claims if c["kind"] == kind][:8]
+    for kind, title in (("canon", "Факты"), ("fanon", "Мнения"), ("visual", "Визуальные факты")):
+        ck = [c for c in claims if c["kind"] == kind][:8]
         if ck:
-            parts.append(f"{title}: " + "; ".join(ck))
+            bits = []
+            for c in ck:
+                ev = _index_msg_refs(chat_ent, c.get("evidence"), limit=3)
+                bits.append(c["claim"] + (f" ({ev})" if ev else ""))
+            parts.append(f"{title}: " + "; ".join(bits))
     rels = await db_read(
-        "SELECT source_id, target_id, relation_type, canonical_type, status FROM relations "
+        "SELECT source_id, target_id, relation_type, canonical_type, context_summary, weight, first_seen, last_seen, status, evidence FROM relations "
         "WHERE chat_id=%s AND (source_id=%s OR target_id=%s) ORDER BY status, weight DESC LIMIT 20",
         (chat_id, ent["id"], ent["id"]))
     if rels:
         need = {r["source_id"] for r in rels} | {r["target_id"] for r in rels}
         nm = await db_read("SELECT id, name FROM entities WHERE id IN (%s)" % ",".join(str(int(i)) for i in need))
         n = {r["id"]: r["name"] for r in nm}
-        cur = [f"{n.get(r['target_id'] if r['source_id'] == ent['id'] else r['source_id'], '?')} ({r['relation_type']})"
-               for r in rels if r["status"] == "active"]
-        past = [f"{n.get(r['target_id'] if r['source_id'] == ent['id'] else r['source_id'], '?')} ({r['relation_type']}, в прошлом)"
-                for r in rels if r["status"] != "active"]
+        def _rel_bit(r):
+            other = n.get(r["target_id"] if r["source_id"] == ent["id"] else r["source_id"], "?")
+            dates = ""
+            first, last = _index_date_short(r.get("first_seen")), _index_date_short(r.get("last_seen"))
+            if first or last:
+                dates = f"; {first or '?'}..{last or '?'}"
+            ev = _index_msg_refs(chat_ent, r.get("evidence"), limit=3)
+            ev = f"; {ev}" if ev else ""
+            return (f"{other} ({r.get('relation_type') or 'связь'}/{r.get('canonical_type') or '?'}, "
+                    f"вес {r.get('weight') or 1}{dates}{ev}) — {_idx_snip(r.get('context_summary'), 180)}")
+
+        cur = [_rel_bit(r) for r in rels if r["status"] == "active"]
+        past = [_rel_bit(r) + " [в прошлом]" for r in rels if r["status"] != "active"]
         if cur:
-            parts.append("Связи сейчас: " + ", ".join(cur[:12]))
+            parts.append("Связи сейчас:\n" + "\n".join("• " + x for x in cur[:12]))
         if past:
-            parts.append("Бывшие связи: " + ", ".join(past[:8]))
+            parts.append("Бывшие связи:\n" + "\n".join("• " + x for x in past[:8]))
     return "\n".join(parts)
 
 
 async def _index_tool_entity(chat_id: int, name: str) -> str:
+    ready, note = await _index_memory_ready(chat_id, "memory_entity")
+    if not ready:
+        return note
     ent = await _index_find_entity(chat_id, name)
     if not ent:
         return f"Сущность «{name}» в памяти чата не найдена."
@@ -9519,27 +9960,37 @@ async def _index_asker_brief(chat_id: int, tg_id: int) -> str:
 async def _index_tool_media(chat_id: int, query: str, count: int = 1, visual: bool = False, query_image: bytes = None) -> str:
     """Поиск фото по описанию (текст → emb_text) или ПО КАРТИНКЕ (visual=true, приложенное/реплай-фото →
     emb_image, «найди похожие арты»). Найденное пересылается в чат."""
+    ready, note = await _index_memory_ready(chat_id, "memory_media")
+    if not ready:
+        return note
     count = max(1, min(3, count))
     if visual and query_image:
         qv = await _index_embed_query_image(query_image)
-        space = "media_image"
+        if qv is None:
+            return "Не удалось векторизовать запрос."
+        all_hits = await _index_vector_search(chat_id, "media_image", qv, max(INDEX_RERANK_POOL, count * 4))
+        best = max((h["score"] for h in all_hits), default=0.0)
+        hits = [h for h in all_hits if h["score"] >= INDEX_SEARCH_CONFIDENT][:count]
     else:
         if not (query or "").strip():
             return "Пустой запрос."
-        qv = await _index_embed_query(query)
-        space = "media_text"
-    if qv is None:
-        return "Не удалось векторизовать запрос."
-    all_hits = await _index_vector_search(chat_id, space, qv, INDEX_RERANK_POOL)
-    best = max((h["score"] for h in all_hits), default=0.0)
-    hits = None
-    if not visual and all_hits:  # текстовый поиск фото — реранкуем описания по запросу (визуальный image→image оставляем на косинусе)
-        order = await _index_rerank(query, [h.get("image_description") or "изображение" for h in all_hits], top_n=count)
+        all_hits = await _index_media_hybrid_hits(chat_id, query, max(INDEX_RERANK_POOL, count * 4))
+        best = max((h["score"] for h in all_hits), default=0.0)
+        hits = None
+        if all_hits:
+            docs = []
+            for h in all_hits:
+                visual_desc = h.get("visual_description") or ""
+                context_desc = h.get("image_description") or ""
+                docs.append(("visual: " + visual_desc + "\ncontext: " + context_desc).strip() or "изображение")
+            order = await _index_rerank(query, docs, top_n=count)
+        else:
+            order = None
         if order is not None:
             best = order[0][1] if order else 0.0
             hits = [all_hits[i] for i, rel in order if 0 <= i < len(all_hits) and rel >= INDEX_RERANK_MIN][:count]
-    if hits is None:  # визуальный режим или фолбэк без rerank — косинус
-        hits = [h for h in all_hits if h["score"] >= INDEX_SEARCH_FLOOR][:count]
+        if hits is None:  # фолбэк без rerank — hybrid score
+            hits = [h for h in all_hits if h["score"] >= _index_norm_score(INDEX_SEARCH_FLOOR)][:count]
     if not hits:
         note = f" (лучшее {best:.2f})" if best else ""
         return f"Подходящих фото в памяти не нашёл{note}. Опиши искомое иначе — что на фото, кто, какое событие."
@@ -9548,7 +9999,19 @@ async def _index_tool_media(chat_id: int, query: str, count: int = 1, visual: bo
         await client.forward_messages(chat_id, msg_ids, chat_id)
     except Exception as e:
         return f"Нашёл фото (msg {msg_ids}), но не смог переслать: {e}"
-    return "Переслал в чат: " + "; ".join(_idx_snip(h.get("image_description"), 90) for h in hits)
+    lines = []
+    for h in hits:
+        src = []
+        if h.get("text_hit"):
+            src.append(f"text {h.get('text_score'):.2f}" if h.get("text_score") is not None else "text")
+        if h.get("image_hit"):
+            src.append(f"image {h.get('image_score'):.2f}" if h.get("image_score") is not None else "image")
+        visual_desc = _idx_snip(h.get("visual_description"), 110)
+        context_desc = _idx_snip(h.get("image_description"), 110)
+        score_label = ", ".join(src) if src else f"score {float(h.get('score') or 0.0):.2f}"
+        lines.append(f"msg_id={h.get('msg_id') or h.get('key')} ({score_label}): "
+                     f"visual={visual_desc or '—'}; context={context_desc or '—'}")
+    return "Переслал в чат:\n" + "\n".join(lines)
 
 
 async def _index_embed_query_image(raw: bytes):
@@ -9563,7 +10026,8 @@ async def _index_embed_query_image(raw: bytes):
 
 async def _index_media_count(chat_id: int) -> int:
     """Сколько фото в памяти чата пригодны для поиска (emb_text проставлен). 0 → чат не индексирован."""
-    if _index_available():
+    ready, _note = await _index_memory_ready(chat_id, "memory_media")
+    if not ready:
         return 0
     try:
         return (await db_read("SELECT COUNT(*) c FROM media_assets WHERE chat_id=%s AND emb_text IS NOT NULL", (chat_id,)))[0]["c"]
@@ -9572,13 +10036,9 @@ async def _index_media_count(chat_id: int) -> int:
 
 
 async def _index_chat_indexed(chat_id: int) -> bool:
-    """True, если у чата есть проиндексированные сущности (для подтягивания досье/референсов в /gen и /ask)."""
-    if _index_available():
-        return False
-    try:
-        return (await db_read("SELECT COUNT(*) c FROM entities WHERE chat_id=%s", (chat_id,)))[0]["c"] > 0
-    except Exception:
-        return False
+    """True, если Stage 3 готов: можно подтягивать досье/связи; Stage 5 проверяется отдельно для фото."""
+    ready, _note = await _index_memory_ready(chat_id, "memory_search")
+    return bool(ready)
 
 
 async def _gen_rerank_index_items(prompt: str, items: list, limit: int) -> list:
@@ -9636,13 +10096,15 @@ async def _gen_index_candidates(chat_id: int, prompt: str, limit: int = GEN_INDE
     (внешность релевантных персонажей — ключ к узнаваемым референсам)."""
     if not chat_id or _index_available() or not (prompt or "").strip():
         return [], None
-    qv = await _index_embed_query(prompt)
-    if qv is None:
+    search_ready, _search_note = await _index_memory_ready(chat_id, "memory_search")
+    if not search_ready:
         return [], None
-    # media_text — лорное/контекстное описание; используем только как retrieval-сито, затем чистый visual rerank.
-    media_hits = [h for h in await _index_vector_search(chat_id, "media_text", qv, GEN_INDEX_POOL) if h["score"] >= 0.2]
+    qv = await _index_embed_query(prompt)
+    media_ready, _media_note = await _index_memory_ready(chat_id, "memory_media")
+    # media_text — лорное/контекстное описание, media_image — визуальное пространство gemini-embedding-2.
+    media_hits = await _index_media_hybrid_hits(chat_id, prompt, GEN_INDEX_POOL, for_gen=True) if media_ready else []
     # релевантные персонажи → их внешность в контекст промптера
-    ent_hits = [h for h in await _index_vector_search(chat_id, "entities", qv, 5) if h["score"] >= 0.25]
+    ent_hits = [h for h in await _index_vector_search(chat_id, "entities", qv, 5) if h["score"] >= 0.25] if qv is not None else []
     ctx_lines = []
     for h in ent_hits:
         vf = (h.get("visual_features") or "").strip()
@@ -9658,6 +10120,8 @@ async def _gen_index_candidates(chat_id: int, prompt: str, limit: int = GEN_INDE
         media_hits = media_hits[:GEN_INDEX_VISUAL_POOL]
         mids = [h["msg_id"] for h in media_hits]
         desc_by_mid = {h["msg_id"]: (h.get("image_description") or "") for h in media_hits}
+        visual_by_mid = {h["msg_id"]: (h.get("visual_description") or "") for h in media_hits}
+        hit_by_mid = {h["msg_id"]: h for h in media_hits}
         score_by_mid = {h["msg_id"]: h.get("score") for h in media_hits}
         try:
             fetched = []
@@ -9680,17 +10144,21 @@ async def _gen_index_candidates(chat_id: int, prompt: str, limit: int = GEN_INDE
                 return None
             thumb = await _downscale_img(raw)
             cached_key = "gen:" + _media_key(m)
-            visual_desc = MEDIA_CACHE.get(cached_key)
+            visual_desc = visual_by_mid.get(m.id) or MEDIA_CACHE.get(cached_key)
             if not visual_desc or visual_desc in MEDIA_FAILURE_MARKERS:
                 visual_desc = None
+            hit = hit_by_mid.get(m.id) or {}
             return {"idx": 0, "mid": m.id, "bytes": raw, "thumb": thumb,
                     "caption": (m.raw_text or "").strip(), "desc": visual_desc,
                     "visual_desc": visual_desc, "index_desc": desc_by_mid.get(m.id) or None,
-                    "score": score_by_mid.get(m.id),
+                    "score": score_by_mid.get(m.id), "text_hit": bool(hit.get("text_hit")),
+                    "image_hit": bool(hit.get("image_hit")), "text_score": hit.get("text_score"),
+                    "image_score": hit.get("image_score"),
                     "date": _fmt_date(getattr(m, "date", None)),
                     "author": "me" if getattr(m, "out", False) else (f"user:{getattr(m, 'sender_id', None)}" if getattr(m, "sender_id", None) else None),
-                    "nearby_text": "",
+                    "nearby_text": await _gen_nearby_text_from_db(chat_id, m.id),
                     "cache_key": cached_key,
+                    "index_chat_id": chat_id,
                     "from_owner": bool(getattr(m, "out", False)), "from_index": True}
         try:
             res = await asyncio.wait_for(asyncio.gather(*[_dl(m) for m in msgs]), timeout=GEN_CATALOG_TIMEOUT)
@@ -9698,27 +10166,9 @@ async def _gen_index_candidates(chat_id: int, prompt: str, limit: int = GEN_INDE
         except asyncio.TimeoutError:
             log("GEN", "Индекс-референсы: скачивание превысило тайм-бюджет")
         if items:
-            sem = asyncio.Semaphore(4)
-
-            async def _ensure_visual_desc(it):
-                if it.get("visual_desc"):
-                    return
-                async with sem:
-                    try:
-                        d = await describe_image(it["thumb"], caption=it.get("caption") or "", prompt=_GEN_DESC_PROMPT)
-                    except Exception as e:
-                        log("GEN", f"Индекс-референсы: visual-desc не удалось для msg_id={it.get('mid')}: {e}")
-                        d = None
-                if d and d not in MEDIA_FAILURE_MARKERS and not _looks_like_refusal(d):
-                    it["desc"] = d
-                    it["visual_desc"] = d
-                    if it.get("cache_key"):
-                        _media_cache_set(it["cache_key"], d)
-
-            try:
-                await asyncio.wait_for(asyncio.gather(*[_ensure_visual_desc(it) for it in items]), timeout=GEN_CATALOG_TIMEOUT)
-            except asyncio.TimeoutError:
-                log("GEN", "Индекс-референсы: visual-desc превысил тайм-бюджет — rerank по доступным описаниям")
+            described = await _gen_describe_candidates_bounded(items, timeout=GEN_CATALOG_TIMEOUT)
+            if described < len(items):
+                log("GEN", f"Индекс-референсы: visual-desc превысил тайм-бюджет — готово {described}/{len(items)}")
             junk = [it for it in items if _gen_desc_kind(it.get("visual_desc") or it.get("desc")) in ("скриншот", "мем")]
             if junk:
                 items = [it for it in items if it not in junk]
