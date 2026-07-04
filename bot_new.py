@@ -11161,26 +11161,14 @@ async def _index_recategorize_run(chat_id: int, progress_cb=None) -> dict:
 
 
 @client.on(events.NewMessage(pattern=r"^[./]index\s+recategorize\s*$"))
-async def index_recategorize_command(event):
-    if await _slash_for_other_bot(event) or not event.out:
-        return
-    chat_id = event.chat_id
-    reason = _index_available()
-    if reason:
-        await event.reply(f"⚠️ /index recategorize недоступен: {reason}")
-        return
-    try:
-        await _index_ensure_ddl()
-    except Exception as e:
-        await event.reply(f"❌ Не подключиться к базе индексации: {e}")
-        return
-    if chat_id in _INDEX_TASKS:
-        await event.reply("🟢 Индексация/maintenance уже идёт — дождись завершения или `/index stop`.")
-        return
+def _index_start_recategorize(chat_id: int, status_msg=None):
+    """Ставит recategorize-задачу в фон. Переиспользуется командой И watchdog-авторезюмом
+    (status_msg=None → прогресс молча в лог). Идемпотентна: recategorize сам резюмится по чекпоинту."""
     _INDEX_CONTROL[chat_id] = "run"
-    status_msg = await event.reply("🏷 Запускаю recategorize связей в фоне… `/index stop` — мягко остановить.")
 
     async def upd(text):
+        if status_msg is None:
+            return
         try:
             await status_msg.edit(text)
         except Exception:
@@ -11207,6 +11195,26 @@ async def index_recategorize_command(event):
             _INDEX_TASKS.pop(chat_id, None)
 
     _INDEX_TASKS[chat_id] = asyncio.create_task(runner())
+
+
+async def index_recategorize_command(event):
+    if await _slash_for_other_bot(event) or not event.out:
+        return
+    chat_id = event.chat_id
+    reason = _index_available()
+    if reason:
+        await event.reply(f"⚠️ /index recategorize недоступен: {reason}")
+        return
+    try:
+        await _index_ensure_ddl()
+    except Exception as e:
+        await event.reply(f"❌ Не подключиться к базе индексации: {e}")
+        return
+    if chat_id in _INDEX_TASKS:
+        await event.reply("🟢 Индексация/maintenance уже идёт — дождись завершения или `/index stop`.")
+        return
+    status_msg = await event.reply("🏷 Запускаю recategorize связей в фоне… `/index stop` — мягко остановить.")
+    _index_start_recategorize(chat_id, status_msg=status_msg)
 
 
 @client.on(events.NewMessage(pattern=r"^[./]index(?:\s+(go|status|pause|resume|stop|update))?(?:\s+(gallery|text|full))?\s*$"))
@@ -11869,26 +11877,63 @@ async def entity_admin_command(event):
 _scheduler_started = False
 
 
-async def _index_boot_resume():
-    """Автовозобновление индексации после рестарта: подхватывает чаты в статусе 'running' (их фоновая задача
-    умерла с процессом) И 'error' (транзиентный сбой провайдера — рестарт даёт свежую попытку). Прогресс
-    checkpoint'ится в БД, продолжаем с чекпоинта. Паузу ('paused') НЕ трогаем — её продолжает пользователь вручную.
-    Одна попытка на буст (не тайт-луп): если снова упадёт — стадия опять встанет в error, ждёт следующего рестарта/resume."""
-    if _index_available():   # DSN не настроен → индекс-памяти нет
+INDEX_WATCHDOG_INTERVAL = 180    # сек между тиками watchdog (самолечение без рестарта)
+INDEX_RESUME_COOLDOWN = 600      # сек бэкоффа авто-резюма одного чата (не тайт-луп на постоянно падающем)
+INDEX_RESUME_MAX_CONCURRENT = 2  # не больше N чатов возобновляем одновременно (общая квота провайдера)
+_index_last_resume: dict = {}    # chat_id → monotonic последней авто-попытки (бэкофф)
+
+
+async def _index_resume_scan(first: bool = False):
+    """Подхватывает прерванные (running — задача умерла с процессом) и сбойные (error — транзиент провайдера)
+    процессы индексации/recategorize БЕЗ ручного вмешательства. Живые задачи и паузу ('paused') не трогает.
+    first=True (сразу после старта): игнорируем бэкофф — рестарт = немедленный резюм. Иначе — бэкофф на чат,
+    чтобы постоянно падающий чат не крутился в тайт-луп; лимит параллелизма бережёт квоту провайдера."""
+    if _index_available():
         return
     try:
         await _index_ensure_ddl()
-        rows = await db_read("SELECT DISTINCT chat_id FROM idx_state WHERE stage IN (0,1,2,3,4,5) AND status IN ('running','error')")
+        rows = await db_read(
+            "SELECT chat_id, stage FROM idx_state WHERE stage IN (0,1,2,3,4,5,8) AND status IN ('running','error')")
     except Exception as e:
-        log("INDEX", f"Автовозобновление: состояние недоступно ({e})")
+        log("INDEX", f"Watchdog: состояние индексации недоступно ({e})")
         return
+    per_chat = {}
     for r in rows:
-        cid = r["chat_id"]
+        per_chat.setdefault(r["chat_id"], set()).add(int(r["stage"]))
+    now = time.monotonic()
+    for cid, stages in per_chat.items():
+        if len(_INDEX_TASKS) >= INDEX_RESUME_MAX_CONCURRENT:
+            break  # остальные подхватит следующий тик
         if cid in _INDEX_TASKS:
-            continue
-        _INDEX_CONTROL[cid] = "run"
-        _INDEX_TASKS[cid] = asyncio.create_task(_index_pipeline(cid, None))  # status_msg=None → прогресс молча в лог
-        log("INDEX", f"Автовозобновление индексации чата {cid} (с последнего чекпоинта)")
+            continue  # живая задача уже работает
+        if not first and cid in _index_last_resume and now - _index_last_resume[cid] < INDEX_RESUME_COOLDOWN:
+            continue  # уже пробовали недавно — бэкофф (впервые увиденный error резюмим сразу, без задержки)
+        _index_last_resume[cid] = now
+        pipeline_stages = stages & {0, 1, 2, 3, 4, 5}
+        if pipeline_stages:  # незакрытый основной пайплайн приоритетнее (recategorize идёт уже после него)
+            _INDEX_CONTROL[cid] = "run"
+            _INDEX_TASKS[cid] = asyncio.create_task(_index_pipeline(cid, None))
+            log("INDEX", f"Watchdog: авто-резюм пайплайна чата {cid} (незакрытые стадии {sorted(pipeline_stages)})")
+        elif 8 in stages:
+            _index_start_recategorize(cid, status_msg=None)
+            log("INDEX", f"Watchdog: авто-резюм recategorize чата {cid}")
+
+
+async def _index_watchdog_loop():
+    """Первый тик сразу (замена boot-resume), далее периодически — самолечение без рестарта:
+    транзиентный error, подхваченный посреди работы, сам продолжится через ≤ INDEX_WATCHDOG_INTERVAL."""
+    try:
+        await _index_resume_scan(first=True)
+    except Exception as e:
+        log("INDEX", f"Watchdog: первый резюм-скан упал ({e})")
+    while True:
+        try:
+            await asyncio.sleep(INDEX_WATCHDOG_INTERVAL)
+            await _index_resume_scan(first=False)
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            log("INDEX", f"Watchdog: тик упал ({e}) — продолжаю")
 
 
 async def main():
@@ -11907,7 +11952,7 @@ async def main():
     if not _scheduler_started:
         asyncio.create_task(scheduler_loop())  # один раз на процесс
         _scheduler_started = True
-    asyncio.create_task(_index_boot_resume())  # подхватить прерванную рестартом индексацию (с чекпоинта)
+    asyncio.create_task(_index_watchdog_loop())  # авто-резюм с чекпоинта: сразу при старте + периодически (самолечение)
     log("BOOT", "Userbot запущен.")
     await client.run_until_disconnected()
 
