@@ -194,6 +194,8 @@ INDEX_GALLERY_GROW_MIN = 0.60   # gallery 5c: image→image порог рост�
 INDEX_GALLERY_GROW_ROUNDS = 2   # gallery 5c: раундов verified growth (описание→подтверждение→новые якоря)
 INDEX_GALLERY_MAX_PER_ENTITY = 30  # gallery: кап фото в галерее сущности за прогон
 INDEX_GALLERY_SCENE_CAP = 12    # gallery 5b: кап фото-кандидатов из сцен с упоминанием сущности (recall-приор)
+INDEX_GALLERY_COLDSTART_MIN = 3 # gallery 5b: cold-start запускаем, если СИЛЬНЫХ хитов (аватарка/внешность) меньше N —
+#   слабый/шумный хит не глушит верный путь (E1), но при уверенной аватарке не гоняем LIKE-скан на каждую сущность
 INDEX_EMBED_BATCH = 192       # stage 3: строк на батч эмбеддинга (96→192: qwen окно больше; INDEX_EMBED_MAX_CHARS сам дробит по символам)
 INDEX_EMBED_MAX_CHARS = 200_000  # stage 3: потолок символов на ОДИН запрос эмбеддинга — провайдер режет
 #                                  запрос на 300k токенов; 96 плотных сцен ×8000 симв. это превышают,
@@ -8687,9 +8689,13 @@ _INDEX_MEDIA_SYSTEM = (
 )
 
 
-async def _index_relation_registry(chat_id: int, scene_text: str = None) -> tuple:
-    """(candidate-listing для prompt, полный {lower(имя/алиас): entity_id} для валидации)."""
-    rows = await db_read("SELECT id, name, entity_type, aliases FROM entities WHERE chat_id=%s ORDER BY id", (chat_id,))
+async def _index_relation_registry(chat_id: int, scene_text: str = None,
+                                   scene_author_ids=None, scene_msg_range=None) -> tuple:
+    """(candidate-listing для prompt, полный {lower(имя/алиас): entity_id} для валидации).
+    scene_author_ids/scene_msg_range — контекст сцены для умного фолбэка кандидатов (H2)."""
+    rows = await db_read(
+        "SELECT id, name, entity_type, aliases, tg_user_id, canon_summary FROM entities WHERE chat_id=%s ORDER BY id",
+        (chat_id,))
     name2id, by_id = {}, {}
     for r in rows:
         by_id[r["id"]] = r
@@ -8727,7 +8733,35 @@ async def _index_relation_registry(chat_id: int, scene_text: str = None) -> tupl
         except Exception as e:
             log("INDEX", f"Registry semantic candidates не получились: {e}")
     if not selected:
-        selected = [r["id"] for r in rows[:INDEX_REGISTRY_FALLBACK_LIMIT]]
+        # H2: не «300 старейших» (произвольный мусор), а связанные со сценой — авторы сцены + сущности соседних сцен, затем свежие
+        fb, seen_fb = [], set()
+        if scene_author_ids:
+            aset = {int(a) for a in scene_author_ids if a is not None}
+            for r in rows:
+                if r.get("tg_user_id") in aset and r["id"] not in seen_fb:
+                    fb.append(r["id"]); seen_fb.add(r["id"])
+        if scene_msg_range and scene_msg_range[0]:
+            near = await db_read(
+                "SELECT meta FROM chat_chunks WHERE chat_id=%s AND end_msg_id<%s ORDER BY end_msg_id DESC LIMIT 3",
+                (chat_id, int(scene_msg_range[0])))
+            for nr in near:
+                try:
+                    meta = json.loads(nr["meta"]) if nr["meta"] else {}
+                except Exception:
+                    meta = {}
+                for x in (meta.get("entities") or []):
+                    try:
+                        xi = int(x)
+                    except (TypeError, ValueError):
+                        continue
+                    if xi in by_id and xi not in seen_fb:
+                        fb.append(xi); seen_fb.add(xi)
+        for r in reversed(rows):  # свежие сущности (id DESC) релевантнее старейших-по-id
+            if len(fb) >= INDEX_REGISTRY_FALLBACK_LIMIT:
+                break
+            if r["id"] not in seen_fb:
+                fb.append(r["id"]); seen_fb.add(r["id"])
+        selected = fb[:INDEX_REGISTRY_FALLBACK_LIMIT]  # строгий кап (авторы+соседи могли уже добить лимит)
     selected_ids = []
     seen = set()
     for eid in selected:
@@ -8740,7 +8774,12 @@ async def _index_relation_registry(chat_id: int, scene_text: str = None) -> tupl
         al = json.loads(r["aliases"]) if r["aliases"] else []
         tag = "персонаж" if r["entity_type"] == "character" else "участник"
         extra = f" (алиасы: {', '.join(a for a in al if a != r['name'])})" if len(al) > 1 else ""
-        lines.append(f"{r['name']} — {tag}{extra}")
+        # H4: компактная карточка фактов — помогает связать неоднозначное («тот самый брат Ани»), не подменяя сцену
+        card = f"{r['name']} — {tag}{extra}"
+        cs = _idx_snip(r.get("canon_summary") or "", 160)
+        if cs:
+            card += f" · {cs}"
+        lines.append(card)
     listing = "\n".join(lines) if lines else "(справочник пуст)"
     if count_tokens(listing) > 50000:
         listing = "\n".join(lines[:2000]) + f"\n… (+{max(0, len(lines) - 2000)} ещё)"
@@ -8751,14 +8790,20 @@ async def _index_apply_relations(chat_id: int, rels: list, name2id: dict, scene_
     """Темпоральный UPSERT связей. Сентимент-ребро (pos/neg) одно на пару (s→t): смена полярности
     закрывает старое и открывает новое (событие «поссорились/помирились»). neutral — отдельное стойкое ребро.
     Идемпотентность веса — через relation_events с дневным ключом (устойчив к resume/update overlap).
-    Возвращает (число применённых, множество затронутых entity_id)."""
-    applied, touched = 0, set()
+    Возвращает (число применённых, множество затронутых entity_id, число выкинутых концов к незарегистр. именам)."""
+    applied, touched, dropped = 0, set(), []
     for rel in rels or []:
         if not isinstance(rel, dict):
             continue
-        s = name2id.get(str(rel.get("source", "")).lower().strip())
-        t = name2id.get(str(rel.get("target", "")).lower().strip())
+        s_nm = str(rel.get("source", "")).strip()
+        t_nm = str(rel.get("target", "")).strip()
+        s = name2id.get(s_nm.lower())
+        t = name2id.get(t_nm.lower())
         if not s or not t or s == t:
+            # H3: не теряем молча — фиксируем незарегистрированные концы (сигнал: Stage 1 пропустил сущность/алиас)
+            for nm, eid in ((s_nm, s), (t_nm, t)):
+                if nm and not eid:
+                    dropped.append(nm)
             continue
         touched.add(s)
         touched.add(t)
@@ -8809,7 +8854,11 @@ async def _index_apply_relations(chat_id: int, rels: list, name2id: dict, scene_
                    weight,first_seen,last_seen,status,evidence) VALUES (%s,%s,%s,%s,%s,%s,%s,1,%s,%s,'active',%s)""",
                 (chat_id, s, t, rtype, pol, cat, summ, scene_date, scene_date, json.dumps(ev, ensure_ascii=False)))
         applied += 1
-    return applied, touched
+    if dropped:
+        uniq = list(dict.fromkeys(dropped))
+        log("INDEX", f"Stage2 связи чата {chat_id}: {len(dropped)} концов к незарегистрированным именам "
+                     f"(напр. {', '.join(uniq[:5])}) — Stage 1 пропустил сущность/алиас")
+    return applied, touched, len(dropped)
 
 
 async def _index_download_media(msg, thumb: bool = False):
@@ -8840,19 +8889,23 @@ async def _index_download_media(msg, thumb: bool = False):
     return None
 
 
-async def _index_process_media(chat_id: int, image_msgs: list, scene_text: str, registry: str, name2id: dict):
-    """Распознаёт картинки сцены медиа-моделью → media_assets + visual-факты сущностям. Возвращает число обработанных."""
+async def _index_process_media(chat_id: int, image_msgs: list, scene_text: str, registry: str, name2id: dict, reverify_mids=None):
+    """Распознаёт картинки сцены медиа-моделью → media_assets + visual-факты сущностям. Возвращает число обработанных.
+    reverify_mids (E2): множество msg_id уже-описанных фото, которым нужен точечный ре-verify под новый seeker-контекст —
+    гоним vision заново ТОЛЬКО ради распознавания персонажей (старое описание сохраняем)."""
     model = get_active_media_model()
     mclient = _client_for_media_model(model)
     if not mclient:
         return 0
+    reverify_mids = reverify_mids or set()
     done = 0
     for msg in image_msgs:
         exists = await db_read(
             "SELECT image_description, visual_description, entity_ids, emb_image FROM media_assets WHERE chat_id=%s AND msg_id=%s",
             (chat_id, msg.id))
         old = exists[0] if exists else {}
-        if (old.get("image_description") or "").strip() and (old.get("visual_description") or "").strip() and old.get("emb_image"):
+        reverify = msg.id in reverify_mids
+        if (old.get("image_description") or "").strip() and (old.get("visual_description") or "").strip() and old.get("emb_image") and not reverify:
             done += 1
             continue
         raw = await _index_download_media(msg)
@@ -8862,7 +8915,7 @@ async def _index_process_media(chat_id: int, image_msgs: list, scene_text: str, 
         visual_desc = (old.get("visual_description") or "").strip()
         data = None
         try:
-            if not desc:
+            if not desc or reverify:  # E2: на ре-verify гоним vision заново (для characters), desc НЕ перезаписываем ниже
                 b64 = base64.b64encode(raw).decode("utf-8")
                 user = (f"Справочник персонажей:\n{registry[:4000]}\n\nКонтекст сцены:\n{scene_text[:2500]}")
                 resp = await asyncio.to_thread(
@@ -8876,7 +8929,7 @@ async def _index_process_media(chat_id: int, image_msgs: list, scene_text: str, 
             data = None
         if not desc and not isinstance(data, dict):
             continue
-        if isinstance(data, dict):
+        if isinstance(data, dict) and not desc:  # desc ставим ТОЛЬКО если его не было (E2 ре-verify не переписывает описание)
             desc = (data.get("description") or "").strip()
         if not visual_desc:
             try:
@@ -8927,6 +8980,21 @@ async def _index_process_media(chat_id: int, image_msgs: list, scene_text: str, 
     return done
 
 
+def _index_entity_embedding_text(r) -> str:
+    """Текст для эмбеддинга сущности (досье): имя | алиасы | canon | fanon | внешность. Используется и в Stage 3
+    (векторизация), и в пред-эмбеддинге сущностей перед Stage 2 (H1 — семантический подбор кандидатов)."""
+    al = json.loads(r["aliases"]) if r.get("aliases") else []
+    return " | ".join(x for x in [r["name"], ", ".join(al), r.get("canon_summary") or "",
+                                  r.get("fanon_summary") or "", r.get("visual_features") or ""] if x).strip() or r["name"]
+
+
+async def _index_embed_entities(chat_id: int, progress_cb=None):
+    """H1: эмбеддит сущности (NULL-фильтр, идемпотентно) ДО цикла Stage 2, чтобы семантический подбор кандидатов
+    в _index_relation_registry работал уже на первой сборке графа (иначе вектора появляются только в Stage 3, после)."""
+    return await _index_vectorize_loop(chat_id, "entities", "id", "embedding",
+                                       _index_entity_embedding_text, progress_cb, "сущности (пред-Stage2)")
+
+
 async def _index_stage2_graph(chat_id: int, progress_cb=None):
     """Нарезает сцены (гэп >15 мин или токен-кап), строит граф связей и распознаёт фото. Чекпоинт по msg_id сцены.
     Пишет chat_chunks (enriched_text + мета) с embedding=NULL — векторизует Stage 3."""
@@ -8950,16 +9018,48 @@ async def _index_stage2_graph(chat_id: int, progress_cb=None):
             scenes_done = (await db_read("SELECT COUNT(*) c FROM chat_chunks WHERE chat_id=%s", (chat_id,)))[0]["c"]
     ent_count = (await db_read("SELECT COUNT(*) c FROM entities WHERE chat_id=%s", (chat_id,)))[0]["c"]
     log("INDEX", f"Stage2 граф чата {chat_id}: с msg_id>{cursor}, сущностей {ent_count}")
+    # H1: пред-эмбеддинг сущностей → семантический подбор кандидатов в _index_relation_registry живой уже сейчас
+    # (иначе вектора только в Stage 3, после графа). Сущности стабильны (Stage 1 done). Сбой не роняет граф.
+    try:
+        await _index_embed_entities(chat_id, progress_cb)
+    except Exception as e:
+        log("INDEX", f"Stage2: пред-эмбеддинг сущностей не удался ({e}) — семантический подбор кандидатов частичен")
 
     scene, scene_tok, prev_date = [], 0, None
+    recent_scenes = []  # H5/E4: скользящий контекст последних закоммиченных сцен [{summary, names}] для непрерывности
 
-    async def _write_chunk(sc, scene_text, rels_applied, touched, media_done, failed=False, scene_summary=None):
+    async def _push_recent(summary, touched):
+        """H5/E4: добавить закоммиченную сцену в скользящий контекст (сводка + участники), держим последние 3."""
+        if not (summary or touched):
+            return
+        names = []
+        if touched:
+            ph = ",".join(str(int(i)) for i in list(touched)[:8])
+            names = [r["name"] for r in await db_read(
+                f"SELECT name FROM entities WHERE chat_id=%s AND id IN ({ph})", (chat_id,))]
+        recent_scenes.append({"summary": _idx_snip(summary or "", 200), "names": names})
+        del recent_scenes[:-3]
+
+    def _recent_block():
+        """H5/E4: блок «недавние сцены» в промпт извлечения — межбатчевая непрерывность (связи оттуда НЕ извлекаем)."""
+        parts = []
+        for s in recent_scenes[-3:]:
+            seg = s.get("summary") or ""
+            if s.get("names"):
+                seg = (seg + " · участники: " + ", ".join(s["names"])).strip(" ·")
+            if seg:
+                parts.append("- " + seg)
+        return ("НЕДАВНИЕ СЦЕНЫ (контекст непрерывности, связи ОТСЮДА НЕ извлекай):\n" + "\n".join(parts) + "\n\n") if parts else ""
+
+    async def _write_chunk(sc, scene_text, rels_applied, touched, media_done, failed=False, scene_summary=None, dropped=0):
         nonlocal scenes_done
         if not sc:
             return
         s_date = sc[-1]["date"]
         ent_ids = sorted(touched)
         meta = {"entities": ent_ids[:60], "relations": rels_applied, "photos": media_done, "failed": bool(failed)}
+        if dropped:
+            meta["dropped"] = int(dropped)  # H3: связи к незарегистрированным именам (видимость потерь)
         if (scene_summary or "").strip():
             meta["summary"] = _idx_snip(scene_summary, 600)
         enriched = scene_text
@@ -8986,12 +9086,14 @@ async def _index_stage2_graph(chat_id: int, progress_cb=None):
         lines = [f"[{r['msg_id']}] {amap.get(r['author_id'], 'user' + str(r['author_id'])) }: {r['txt']}"
                  for r in sc if (r["txt"] or "").strip()]
         scene_text = "\n".join(lines)
-        registry, name2id = await _index_relation_registry(chat_id, scene_text)
-        rels_applied, touched = 0, set()
+        registry, name2id = await _index_relation_registry(
+            chat_id, scene_text, scene_author_ids=[r.get("author_id") for r in sc],
+            scene_msg_range=(sc[0]["msg_id"], sc[-1]["msg_id"]))
+        rels_applied, touched, dropped = 0, set(), 0
         failed = False
         scene_summary = None
         if scene_text.strip():
-            data = await _index_extract(_INDEX_REL_SYSTEM + "\n\nСПРАВОЧНИК:\n" + registry, "СЦЕНА:\n" + scene_text)
+            data = await _index_extract(_INDEX_REL_SYSTEM + "\n\nСПРАВОЧНИК:\n" + registry, _recent_block() + "СЦЕНА:\n" + scene_text)
             if data is None or not isinstance(data.get("relations"), list):
                 if len(sc) > 1:
                     mid = max(1, len(sc) // 2)
@@ -9006,9 +9108,10 @@ async def _index_stage2_graph(chat_id: int, progress_cb=None):
                 log("INDEX", f"Stage2 poison scene skipped: {sc[0]['msg_id']}..{sc[-1]['msg_id']}")
             else:
                 scene_summary = data.get("scene_summary")
-                rels_applied, touched = await _index_apply_relations(chat_id, data["relations"], name2id, s_date)
+                rels_applied, touched, dropped = await _index_apply_relations(chat_id, data["relations"], name2id, s_date)
+                await _push_recent(scene_summary, touched)
         # медиа НЕ качаем в Stage 2 (это блокировало граф на часы) — фото обрабатывает отдельная Stage 5
-        await _write_chunk(sc, scene_text, rels_applied, touched, 0, failed=failed, scene_summary=scene_summary)
+        await _write_chunk(sc, scene_text, rels_applied, touched, 0, failed=failed, scene_summary=scene_summary, dropped=dropped)
 
     # --- параллельная экстракция: завершённые сцены копятся в batch → экстрагируются concurrently → применяются по очереди ---
     batch = []
@@ -9019,10 +9122,12 @@ async def _index_stage2_graph(chat_id: int, progress_cb=None):
         lines = [f"[{r['msg_id']}] {amap.get(r['author_id'], 'user' + str(r['author_id']))}: {r['txt']}"
                  for r in sc if (r["txt"] or "").strip()]
         scene_text = "\n".join(lines)
-        registry, name2id = await _index_relation_registry(chat_id, scene_text)
+        registry, name2id = await _index_relation_registry(
+            chat_id, scene_text, scene_author_ids=[r.get("author_id") for r in sc],
+            scene_msg_range=(sc[0]["msg_id"], sc[-1]["msg_id"]))
         data = None
         if scene_text.strip():
-            data = await _index_extract(_INDEX_REL_SYSTEM + "\n\nСПРАВОЧНИК:\n" + registry, "СЦЕНА:\n" + scene_text)
+            data = await _index_extract(_INDEX_REL_SYSTEM + "\n\nСПРАВОЧНИК:\n" + registry, _recent_block() + "СЦЕНА:\n" + scene_text)
         return scene_text, name2id, data, s_date
 
     async def _apply_scene(sc, scene_text, name2id, data, s_date):
@@ -9030,12 +9135,13 @@ async def _index_stage2_graph(chat_id: int, progress_cb=None):
         if scene_text.strip() and (data is None or not isinstance(data.get("relations"), list)):
             await _finalize(sc)  # редкий poison-путь: пере-извлечёт и раздробит/запишет failed
             return
-        rels_applied, touched = 0, set()
+        rels_applied, touched, dropped = 0, set(), 0
         scene_summary = None
         if data and isinstance(data.get("relations"), list):
             scene_summary = data.get("scene_summary")
-            rels_applied, touched = await _index_apply_relations(chat_id, data["relations"], name2id, s_date)
-        await _write_chunk(sc, scene_text, rels_applied, touched, 0, failed=False, scene_summary=scene_summary)
+            rels_applied, touched, dropped = await _index_apply_relations(chat_id, data["relations"], name2id, s_date)
+            await _push_recent(scene_summary, touched)
+        await _write_chunk(sc, scene_text, rels_applied, touched, 0, failed=False, scene_summary=scene_summary, dropped=dropped)
 
     async def _flush_batch():
         """Экстрагирует batch параллельно, применяет по очереди, чекпоинтит по сцене. Устойчив к транзиентам:
@@ -9349,13 +9455,8 @@ async def _index_stage3_vectors(chat_id: int, progress_cb=None):
     ent_rows = await db_read("SELECT id, name, aliases FROM entities WHERE chat_id=%s", (chat_id,))
     rel_entities = {r["id"]: r for r in ent_rows}
 
-    def _ent_text(r):
-        al = json.loads(r["aliases"]) if r["aliases"] else []
-        return " | ".join(x for x in [r["name"], ", ".join(al), r.get("canon_summary") or "",
-                                      r.get("fanon_summary") or "", r.get("visual_features") or ""] if x).strip() or r["name"]
-
     targets = [
-        ("entities", "id", "embedding", _ent_text, "досье", ""),
+        ("entities", "id", "embedding", _index_entity_embedding_text, "досье", ""),
         ("relations", "id", "embedding", lambda r: _index_relation_embedding_text(r, rel_entities), "связи", ""),
         ("chat_chunks", "id", "embedding", _index_chunk_embedding_text, "сцены", ""),
         # только описанные: в gallery-режиме у большинства фото есть emb_image, но нет описания —
@@ -9567,11 +9668,12 @@ async def _index_stage5_media(chat_id: int, progress_cb=None):
     return "done"
 
 
-async def _index_describe_msg_ids(chat_id: int, msg_ids, seekers_by_mid: dict = None, progress_cb=None):
+async def _index_describe_msg_ids(chat_id: int, msg_ids, seekers_by_mid: dict = None, reverify_mids=None, progress_cb=None):
     """Описывает КОНКРЕТНЫЕ фото (gallery-режим): группирует их по сценам → сценовый контекст + справочник →
     _index_process_media. seekers_by_mid {mid: [(имя, тег, внешность)]} — кого мы ИЩЕМ на этих фото: их имена идут
     В НАЧАЛО справочника (process_media режет его [:4000] — в конце их бы отрезало, и модель не смогла бы
-    назвать сущность → подтверждение не сработало бы). Уже описанные скипаются внутри (describe-once)."""
+    назвать сущность → подтверждение не сработало бы). Уже описанные скипаются внутри (describe-once),
+    КРОМЕ reverify_mids (E2) — им гоним vision заново под новый seeker-контекст."""
     msg_ids = sorted({int(m) for m in (msg_ids or [])})
     if not msg_ids:
         return 0
@@ -9609,12 +9711,67 @@ async def _index_describe_msg_ids(chat_id: int, msg_ids, seekers_by_mid: dict = 
             for i in range(0, len(mids), 100):
                 msgs = await client.get_messages(chat_id, ids=mids[i:i + 100])
                 image_msgs += [m for m in msgs if _index_is_image_msg(m)]
-            done += await _index_process_media(chat_id, image_msgs, scene_text, registry, name2id)
+            done += await _index_process_media(chat_id, image_msgs, scene_text, registry, name2id, reverify_mids=reverify_mids)
         except Exception as e:
             log("INDEX", f"Gallery: описание пачки фото не удалось: {e}")
         if progress_cb:
             await progress_cb(f"🖼 Галерея: описано {done}/{total} кандидатов…")
     return done
+
+
+async def _gallery_cold_start_mids(chat_id: int, e: dict) -> list:
+    """H6/H8: фото-кандидаты для сущности из (1) сцен с упоминанием имени/алиасов (SQL LIKE сужает, Python-регекс
+    подтверждает ГРАНИЦУ СЛОВА — короткий алиас не оверматчит), (2) evidence-msg_id её claim'ов (фото той же сцены).
+    Кап INDEX_GALLERY_SCENE_CAP. Ломает cold-start-невидимость: первые кандидаты на vision-верификацию (→ заведётся visual_features).
+    Фото самого автора НЕ берём (отправленное ≠ фото человека; лицо участника ловит аватарка-сид)."""
+    cap = INDEX_GALLERY_SCENE_CAP
+    mids, seen = [], set()
+
+    def _push(m):
+        if m is not None and m not in seen:
+            seen.add(m); mids.append(m)
+
+    async def _photos_in_scene_of(msg_id):
+        for c in await db_read(
+                "SELECT start_msg_id, end_msg_id FROM chat_chunks WHERE chat_id=%s AND start_msg_id<=%s AND end_msg_id>=%s LIMIT 1",
+                (chat_id, msg_id, msg_id)):
+            for q in await db_read(
+                    "SELECT msg_id FROM messages WHERE chat_id=%s AND msg_id BETWEEN %s AND %s AND media_kind IN (1,2) LIMIT 5",
+                    (chat_id, c["start_msg_id"], c["end_msg_id"])):
+                _push(q["msg_id"])
+
+    # (1) имя + все алиасы в enriched_text сцен — LIKE сужает, регекс подтверждает границу слова
+    terms = [e.get("name")] + _index_json_list(e.get("aliases"))
+    for term in terms:
+        key = _index_identity_key(term or "")
+        if not key or len(key) < 3 or _INDEX_USERID_RE.match((term or "").strip()):
+            continue
+        pat = re.compile(r"(?<!\w)" + re.escape(key) + r"(?!\w)", re.I)
+        like = "%" + key.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_") + "%"
+        for r in await db_read(
+                "SELECT start_msg_id, end_msg_id, enriched_text FROM chat_chunks WHERE chat_id=%s AND LOWER(enriched_text) LIKE %s LIMIT 20",
+                (chat_id, like)):
+            if not pat.search(r.get("enriched_text") or ""):
+                continue  # подстрока совпала, но не по границе слова (напр. «Ан» в «банан») → пропуск
+            for p in await db_read(
+                    "SELECT msg_id FROM messages WHERE chat_id=%s AND msg_id BETWEEN %s AND %s AND media_kind IN (1,2) LIMIT 5",
+                    (chat_id, r["start_msg_id"], r["end_msg_id"])):
+                _push(p["msg_id"])
+            if len(mids) >= cap:
+                break
+        if len(mids) >= cap:
+            break
+    # (2) evidence-msg_id claim'ов → фото их сцен
+    if len(mids) < cap:
+        ev = []
+        for r in await db_read("SELECT evidence FROM entity_claims WHERE chat_id=%s AND entity_id=%s LIMIT 40",
+                               (chat_id, e["id"])):
+            ev += [int(x) for x in _index_json_list(r.get("evidence")) if str(x).lstrip("-").isdigit()]
+        for mid0 in ev[:20]:
+            await _photos_in_scene_of(mid0)
+            if len(mids) >= cap:
+                break
+    return mids[:cap]
 
 
 async def _index_stage5_gallery(chat_id: int, progress_cb=None):
@@ -9687,7 +9844,7 @@ async def _index_stage5_gallery(chat_id: int, progress_cb=None):
     if progress_cb:
         await progress_cb("🖼 Галерея: ищу кандидатов по аватаркам и канон-описаниям…")
     ents = await db_read(
-        "SELECT id, name, entity_type, tg_user_id, visual_features, canon_summary FROM entities WHERE chat_id=%s",
+        "SELECT id, name, entity_type, tg_user_id, visual_features, canon_summary, aliases FROM entities WHERE chat_id=%s",
         (chat_id,))
     cand = {}      # eid → {mid: score}
     ent_tag = {}   # eid → (имя, тег) для «кого ищем на фото» в справочнике описания
@@ -9721,29 +9878,20 @@ async def _index_stage5_gallery(chat_id: int, progress_cb=None):
                                 INDEX_GALLERY_SEED_MIN)
             except Exception as ex:
                 log("INDEX", f"Gallery 5b: аватарка «{e['name']}» не взялась: {ex}")
-        # 2) текст-канон внешности (главный сид персонажей) — text→image, порог выше (кросс-модальность грубее)
-        vtxt = (e.get("visual_features") or "").strip() or (e.get("canon_summary") or "").strip()[:600]
+        # 2) текст-канон внешности — text→image. H7: ТОЛЬКО реальная внешность (visual_features); общий canon = шум при пороге 0.45
+        vtxt = (e.get("visual_features") or "").strip()
         if vtxt:
             qv = await _index_embed_query(vtxt[:2000], image_space=True)
             if qv is not None:
                 got += _add(eid, await _index_vector_search(chat_id, "media_image", qv, INDEX_GALLERY_POOL),
                             INDEX_GALLERY_TEXT_MIN)
-        if not got:  # 3) cold-start: фото из сцен, где сущность упоминается (кап, скор 0 — чисто кандидаты на проверку)
-            nm = (e["name"] or "").strip()
-            if nm and not _INDEX_USERID_RE.match(nm):
-                like = "%" + nm.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_") + "%"
-                mids = []
-                for r in await db_read(
-                        "SELECT start_msg_id, end_msg_id FROM chat_chunks WHERE chat_id=%s AND enriched_text LIKE %s LIMIT 20",
-                        (chat_id, like)):
-                    for p in await db_read(
-                            "SELECT msg_id FROM messages WHERE chat_id=%s AND msg_id BETWEEN %s AND %s AND media_kind IN (1,2) LIMIT 5",
-                            (chat_id, r["start_msg_id"], r["end_msg_id"])):
-                        mids.append(p["msg_id"])
-                    if len(mids) >= INDEX_GALLERY_SCENE_CAP:
-                        break
+        # 3) cold-start: подмешиваем, если СИЛЬНЫХ хитов мало (E1 — слабый хит не глушит путь; но при уверенной аватарке
+        #    не гоняем LIKE-скан на каждую сущность → перф на больших чатах). H8: имя+алиасы+evidence, скор 0 → на проверку.
+        if got < INDEX_GALLERY_COLDSTART_MIN:
+            cold = await _gallery_cold_start_mids(chat_id, e)
+            if cold:
                 d = cand.setdefault(eid, {})
-                for mid in mids[:INDEX_GALLERY_SCENE_CAP]:
+                for mid in cold:
                     d.setdefault(mid, 0.0)
         if cand.get(eid):
             cand[eid] = dict(sorted(cand[eid].items(), key=lambda kv: -kv[1])[:INDEX_GALLERY_POOL])
@@ -9767,6 +9915,7 @@ async def _index_stage5_gallery(chat_id: int, progress_cb=None):
         return out
 
     galleries = {eid: set() for eid in cand}
+    reverified = set()  # E2: (eid,mid) уже отправленные на точечный ре-verify — не гоняем каждый раунд
     for rnd in range(INDEX_GALLERY_GROW_ROUNDS + 1):
         if _INDEX_CONTROL.get(chat_id) == "pause":
             await _idx_set_state(chat_id, 5, status="paused")
@@ -9774,17 +9923,30 @@ async def _index_stage5_gallery(chat_id: int, progress_cb=None):
         all_mids = sorted({m for eid, d in cand.items() for m in d if len(galleries[eid]) < INDEX_GALLERY_MAX_PER_ENTITY})
         if not all_mids:
             break
-        have = {r["msg_id"] for r in await _media_rows_chunked(
-            all_mids, "msg_id", "AND image_description IS NOT NULL AND image_description<>''")}
+        desc_rows = await _media_rows_chunked(
+            all_mids, "msg_id, entity_ids", "AND image_description IS NOT NULL AND image_description<>''")
+        have = {r["msg_id"] for r in desc_rows}
+        ent_by_mid = {r["msg_id"]: {int(x) for x in _index_json_list(r.get("entity_ids")) if str(x).lstrip("-").isdigit()}
+                      for r in desc_rows}
         undesc = [m for m in all_mids if m not in have]
-        if undesc:
+        # E2: описанные фото, где ожидаемый seeker-eid НЕ в entity_ids → точечный ре-verify (один раз на пару eid,mid)
+        reverify = set()
+        for eid, d in cand.items():
+            if eid not in ent_tag:
+                continue
+            for mid in d:
+                if mid in have and (eid, mid) not in reverified and eid not in ent_by_mid.get(mid, set()):
+                    reverify.add(mid)
+                    reverified.add((eid, mid))
+        to_describe = undesc + sorted(reverify)
+        if to_describe:
             sbm = {}  # mid → кого на нём ищем (для головы справочника)
             for eid, d in cand.items():
                 for mid in d:
-                    if mid in have or eid not in ent_tag:
+                    if eid not in ent_tag or (mid not in undesc and mid not in reverify):
                         continue
                     sbm.setdefault(mid, []).append(ent_tag[eid])
-            await _index_describe_msg_ids(chat_id, undesc, seekers_by_mid=sbm, progress_cb=progress_cb)
+            await _index_describe_msg_ids(chat_id, to_describe, seekers_by_mid=sbm, reverify_mids=reverify, progress_cb=progress_cb)
             if _INDEX_CONTROL.get(chat_id) == "pause":
                 await _idx_set_state(chat_id, 5, status="paused")
                 return "paused"
