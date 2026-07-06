@@ -156,7 +156,9 @@ GEN_INDEX_VISUAL_POOL = 16  # /gen: сколько индекс-кандидат
 INDEX_EXTRACT_CEREBRAS_MODEL = "gemma-4-31b"  # Cerebras free: 0.6с, JSON-native. Лимиты free: 30k ток/мин, 5 req/мин, 1M/день
 # Free-tier Cerebras: 30k токенов/мин → блок Stage1 (96k) НЕ влезет физически. Пускаем Gemma первой ТОЛЬКО когда вход
 # укладывается в лимит (обобщение досье ~16k, связи), иначе сразу nemotron — иначе жгли бы скудный req-бюджет (5/мин) в заведомый 429.
-INDEX_CEREBRAS_MAX_INPUT_TOKENS = 18_000      # порог входа (оценка count_tokens) для маршрута через Gemma; запас под вывод в 30k TPM
+INDEX_CEREBRAS_MAX_INPUT_TOKENS = 24_000      # порог входа (оценка count_tokens) для маршрута через Gemma. 24k+вывод ≲ 30k TPM/ключ →
+#   плотные Stage2-сцены (реестр кандидатов ~22k, замер по чату 785 сущ.) тоже идут на Gemma. Крупнее → hy3. Ротация 5 ключей держит req-темп;
+#   если сцена всё же упрётся в 30k TPM → 429 → пер-ключевой кулдаун уводит на след. ключ/hy3 (мгновенно, не ломает)
 INDEX_CEREBRAS_COOLDOWN = 60                   # после 429 (TPM/req исчерпан) — столько секунд НЕ трогаем Cerebras (окно минуты), чтобы не долбить
 INDEX_EXTRACT_OR_HY3 = "tencent/hy3:free"     # фолбэк Gemma (#2): free, 256k контекст (тянет большие блоки!), reasoning-модель;
 #                                               response_format НЕ поддерживает → JSON ТОЛЬКО по промпту; reasoning гасим (extra_body)
