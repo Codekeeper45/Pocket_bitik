@@ -8323,11 +8323,41 @@ def _index_resolve_tg(name2author: dict, name: str, aliases: list):
     return int(m.group(1)) if m else None
 
 
+def _claim_dates(ev: list, date_map: dict):
+    """(first_seen, last_seen) claim'а из дат его evidence-сообщений. None,None если ни один msg_id не резолвится."""
+    ds = [date_map[m] for m in (ev or []) if date_map.get(m) is not None]
+    if not ds:
+        return None, None
+    return min(ds), max(ds)
+
+
 async def _index_apply_entities(chat_id: int, ents: list, name2author: dict):
     """UPSERT сущностей и claim'ов из ответа модели. name2author — {lower(name): author_id} для tg_user_id."""
     if not ents:
         return 0
     touched = 0
+    # пред-сбор дат evidence всех входящих claim'ов (один батч) → темпоральные first_seen/last_seen у claim'ов
+    _ev_all = set()
+    for e in ents:
+        if not isinstance(e, dict):
+            continue
+        for kind in ("canon", "fanon"):
+            for c in (e.get(kind) or []):
+                if isinstance(c, dict):
+                    for x in (c.get("evidence") or []):
+                        if isinstance(x, (int, str)) and str(x).isdigit():
+                            _ev_all.add(int(x))
+    date_map = {}
+    if _ev_all:
+        ids = list(_ev_all)
+        for i in range(0, len(ids), 500):
+            chunk = ids[i:i + 500]
+            ph = ",".join(["%s"] * len(chunk))
+            rows = await db_read(f"SELECT msg_id, `date` FROM messages WHERE chat_id=%s AND msg_id IN ({ph})",
+                                 (chat_id, *chunk))
+            for r in rows:
+                if r["date"] is not None:
+                    date_map[int(r["msg_id"])] = r["date"]
     for e in ents:
         if not isinstance(e, dict):
             continue
@@ -8402,13 +8432,22 @@ async def _index_apply_entities(chat_id: int, ents: list, name2author: dict):
                     old_ev = json.loads(r["evidence"]) if r["evidence"] else []
                     new_ev = list(dict.fromkeys(old_ev + ev))
                     if new_ev != old_ev:
-                        await db_write("UPDATE entity_claims SET evidence=%s WHERE id=%s",
-                                       (json.dumps(new_ev, ensure_ascii=False), r["id"]))
+                        fs, ls = _claim_dates(new_ev, date_map)  # раздвигаем окно свежести по новым evidence
+                        if fs is not None:
+                            await db_write(
+                                "UPDATE entity_claims SET evidence=%s, first_seen=LEAST(COALESCE(first_seen,%s),%s),"
+                                " last_seen=GREATEST(COALESCE(last_seen,%s),%s) WHERE id=%s",
+                                (json.dumps(new_ev, ensure_ascii=False), fs, fs, ls, ls, r["id"]))
+                        else:
+                            await db_write("UPDATE entity_claims SET evidence=%s WHERE id=%s",
+                                           (json.dumps(new_ev, ensure_ascii=False), r["id"]))
                         dirty_summary = True
                 else:
+                    fs, ls = _claim_dates(ev, date_map)
                     await db_write(
-                        "INSERT INTO entity_claims (chat_id,entity_id,kind,claim,evidence) VALUES (%s,%s,%s,%s,%s)",
-                        (chat_id, ent_id, kind, claim, json.dumps(ev, ensure_ascii=False)))
+                        "INSERT INTO entity_claims (chat_id,entity_id,kind,claim,evidence,first_seen,last_seen)"
+                        " VALUES (%s,%s,%s,%s,%s,%s,%s)",
+                        (chat_id, ent_id, kind, claim, json.dumps(ev, ensure_ascii=False), fs, ls))
                     seen[keyc] = {"id": None, "kind": kind, "claim": claim, "evidence": json.dumps(ev)}
                     dirty_summary = True
         if dirty_summary:
@@ -8612,12 +8651,72 @@ _INDEX_SUMM_SYSTEM = (
     "Ты пишешь компактное досье персонажа/участника чата по собранным фактам. Даны CANON-факты (что считается "
     "правдой о нём) и FANON-факты (мнения и отношение участников). Верни СТРОГО JSON: "
     '{"canon":"<2–4 предложения: кто это, ключевой лор/роль, только по фактам>",'
-    ' "fanon":"<1–3 предложения: как к нему относятся в чате>"}. Без выдумок сверх фактов; если фактов нет — пустая строка.'
+    ' "fanon":"<1–3 предложения: как к нему относятся в чате>"}. Без выдумок сверх фактов; если фактов нет — пустая строка. '
+    "Факты идут от СТАРЫХ к СВЕЖИМ. При противоречии верь более СВЕЖИМ; устаревшее не выдавай как текущее. "
+    "Если факт эволюционировал во времени — отрази кратко («раньше…, теперь…»)."
 )
+
+
+async def _index_backfill_claim_dates(chat_id: int, entity_ids: list = None):
+    """Ретрофит: проставляет first_seen/last_seen у legacy claim'ов (NULL-даты) из дат их evidence.
+    Идемпотентно — после прогона резолвимых NULL-дат не остаётся (0 записей). Затронутым сущностям
+    зануляет саммари → пересоберутся уже с сигналом свежести на этом же прогоне."""
+    xwhere, params = "", [chat_id]
+    if entity_ids:
+        ids = [int(x) for x in entity_ids if x]
+        if not ids:
+            return
+        xwhere = " AND entity_id IN (" + ",".join(["%s"] * len(ids)) + ")"
+        params.extend(ids)
+    rows = await db_read(
+        "SELECT id, entity_id, evidence FROM entity_claims WHERE chat_id=%s AND last_seen IS NULL"
+        " AND evidence IS NOT NULL AND evidence NOT IN ('[]','null')" + xwhere, tuple(params))
+    if not rows:
+        return
+    # соберём все msg_id evidence → один батч дат
+    ev_by_claim, all_mids = {}, set()
+    for r in rows:
+        try:
+            ev = [int(x) for x in (json.loads(r["evidence"]) or []) if str(x).isdigit()]
+        except Exception:
+            ev = []
+        ev_by_claim[r["id"]] = ev
+        all_mids.update(ev)
+    date_map = {}
+    if all_mids:
+        mids = list(all_mids)
+        for i in range(0, len(mids), 500):
+            chunk = mids[i:i + 500]
+            ph = ",".join(["%s"] * len(chunk))
+            drows = await db_read(f"SELECT msg_id, `date` FROM messages WHERE chat_id=%s AND msg_id IN ({ph})",
+                                  (chat_id, *chunk))
+            for d in drows:
+                if d["date"] is not None:
+                    date_map[int(d["msg_id"])] = d["date"]
+    affected = set()
+    for r in rows:
+        fs, ls = _claim_dates(ev_by_claim.get(r["id"], []), date_map)
+        if fs is None:  # evidence не резолвится (сообщение вне дампа) — оставляем NULL
+            continue
+        await db_write("UPDATE entity_claims SET first_seen=%s, last_seen=%s WHERE id=%s", (fs, ls, r["id"]))
+        affected.add(r["entity_id"])
+    if affected:
+        aids = list(affected)
+        for i in range(0, len(aids), 200):
+            chunk = aids[i:i + 200]
+            ph = ",".join(["%s"] * len(chunk))
+            await db_write(f"DELETE FROM entity_summary_parts WHERE chat_id=%s AND entity_id IN ({ph})",
+                           (chat_id, *chunk))
+            await db_write(
+                f"UPDATE entities SET canon_summary=NULL, fanon_summary=NULL, embedding=NULL"
+                f" WHERE chat_id=%s AND id IN ({ph})", (chat_id, *chunk))
+        _index_invalidate(chat_id, "entities")
+        log("INDEX", f"Бэкофилл дат claim'ов чата {chat_id}: датировано, сущностей к пересборке {len(affected)}")
 
 
 async def _index_summarize_entities(chat_id: int, progress_cb=None, entity_ids: list = None):
     """Из claim'ов синтезирует entities.canon_summary/fanon_summary. Чекпоинт по entity id."""
+    await _index_backfill_claim_dates(chat_id, entity_ids)  # оживить даты legacy claim'ов (идемпотентно)
     xwhere, params = "", [chat_id]
     if entity_ids:
         ids = [int(x) for x in entity_ids if x]
@@ -8635,8 +8734,9 @@ async def _index_summarize_entities(chat_id: int, progress_cb=None, entity_ids: 
 
     async def _one(ent):
         nonlocal done
-        claims = await db_read(
-            "SELECT kind, claim FROM entity_claims WHERE chat_id=%s AND entity_id=%s ORDER BY id", (chat_id, ent["id"]))
+        claims = await db_read(  # старые→свежие (NULL last_seen = легаси «старые», сортируется первым)
+            "SELECT kind, claim FROM entity_claims WHERE chat_id=%s AND entity_id=%s ORDER BY last_seen ASC, id ASC",
+            (chat_id, ent["id"]))
         canon = [c["claim"] for c in claims if c["kind"] == "canon"]
         fanon = [c["claim"] for c in claims if c["kind"] == "fanon"]
         if not canon and not fanon:
@@ -9017,14 +9117,16 @@ async def _index_process_media(chat_id: int, image_msgs: list, scene_text: str, 
                     await db_write("UPDATE entities SET visual_features=%s, embedding=NULL WHERE chat_id=%s AND id=%s",
                                    (newvf, chat_id, eid))
                     _index_invalidate(chat_id, "entities")
+                _md = getattr(msg, "date", None)
+                _mds = _md.strftime("%Y-%m-%d %H:%M:%S") if _md else None
                 await db_write(
-                    """INSERT INTO entity_claims (chat_id,entity_id,kind,claim,evidence)
-                       SELECT %s,%s,'visual',%s,%s FROM DUAL
+                    """INSERT INTO entity_claims (chat_id,entity_id,kind,claim,evidence,first_seen,last_seen)
+                       SELECT %s,%s,'visual',%s,%s,%s,%s FROM DUAL
                        WHERE NOT EXISTS (
                          SELECT 1 FROM entity_claims
                          WHERE chat_id=%s AND entity_id=%s AND kind='visual' AND claim=%s AND evidence=%s
                          LIMIT 1)""",
-                    (chat_id, eid, app, json.dumps([msg.id], ensure_ascii=False),
+                    (chat_id, eid, app, json.dumps([msg.id], ensure_ascii=False), _mds, _mds,
                      chat_id, eid, app, json.dumps([msg.id], ensure_ascii=False)))
         uid, _ = _media_meta(msg)
         # вектор САМОЙ картинки (gemini-embedding-2) считаем здесь, пока байты в руках — иначе Stage 3 качал бы фото повторно
