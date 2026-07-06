@@ -156,9 +156,10 @@ GEN_INDEX_VISUAL_POOL = 16  # /gen: сколько индекс-кандидат
 INDEX_EXTRACT_CEREBRAS_MODEL = "gemma-4-31b"  # Cerebras free: 0.6с, JSON-native. Лимиты free: 30k ток/мин, 5 req/мин, 1M/день
 # Free-tier Cerebras: 30k токенов/мин → блок Stage1 (96k) НЕ влезет физически. Пускаем Gemma первой ТОЛЬКО когда вход
 # укладывается в лимит (обобщение досье ~16k, связи), иначе сразу nemotron — иначе жгли бы скудный req-бюджет (5/мин) в заведомый 429.
-INDEX_CEREBRAS_MAX_INPUT_TOKENS = 24_000      # порог входа (оценка count_tokens) для маршрута через Gemma. 24k+вывод ≲ 30k TPM/ключ →
-#   плотные Stage2-сцены (реестр кандидатов ~22k, замер по чату 785 сущ.) тоже идут на Gemma. Крупнее → hy3. Ротация 5 ключей держит req-темп;
-#   если сцена всё же упрётся в 30k TPM → 429 → пер-ключевой кулдаун уводит на след. ключ/hy3 (мгновенно, не ломает)
+INDEX_CEREBRAS_MAX_INPUT_TOKENS = 26_000      # порог входа под ПРАКТИЧЕСКИЙ МАКСИМУМ: 30k TPM/ключ — ЖЁСТКИЙ лимит Cerebras free, выше него
+#   запрос = мгновенный 429. 26k вход + ~3-4k вывод ≲ 30k. Крупнее (напр. Stage1 96k, жирные сцены) физически не влезут в один ключ → hy3 (256k).
+#   Реестр Stage2 сжимаем (_reg_aliases кап, canon_summary[:160]) — «самари, но контекста достаточно»; если сцена всё же упрётся в 30k → 429 →
+#   пер-ключевой кулдаун + ротация 5 ключей уводят на след. ключ/hy3 мгновенно (не ломает)
 INDEX_CEREBRAS_COOLDOWN = 60                   # после 429 (TPM/req исчерпан) — столько секунд НЕ трогаем Cerebras (окно минуты), чтобы не долбить
 INDEX_EXTRACT_OR_HY3 = "tencent/hy3:free"     # фолбэк Gemma (#2): free, 256k контекст (тянет большие блоки!), reasoning-модель;
 #                                               response_format НЕ поддерживает → JSON ТОЛЬКО по промпту; reasoning гасим (extra_body)
@@ -8330,6 +8331,18 @@ def _norm_claim(s: str) -> str:
     return re.sub(r"\s+", " ", (s or "").strip().lower())[:400]
 
 
+INDEX_REG_ALIAS_CAP = 12  # макс. алиасов в карточке реестра/досье — защита от раздутых сущностей
+
+
+def _reg_aliases(al: list) -> str:
+    """Компактный список алиасов с капом: 'a, b, … +N'. Защита от сущностей с сотнями алиасов-шума
+    (напр. 2904 алиаса → карточка ~20k ток), которые раздували реестр Stage2 (вход мимо гейта Gemma)
+    и качество извлечения. Кап только в ПРОМПТЕ/дисплее — сама сущность и name2id-матчинг не трогаются."""
+    al = list(al)
+    show = ", ".join(al[:INDEX_REG_ALIAS_CAP])
+    return show + (f" … +{len(al) - INDEX_REG_ALIAS_CAP}" if len(al) > INDEX_REG_ALIAS_CAP else "")
+
+
 async def _index_load_registry(chat_id: int) -> tuple:
     """Реестр сущностей для промпта: (текст-листинг, {id: row}). Компактно: id/имя/тип/алиасы (+суть если влезает)."""
     rows = await db_read(
@@ -8338,7 +8351,7 @@ async def _index_load_registry(chat_id: int) -> tuple:
     lines = []
     for r in rows:
         al = json.loads(r["aliases"]) if r["aliases"] else []
-        head = f"[id={r['id']}] {r['name']} ({r['entity_type']}) алиасы: {', '.join(al) if al else '—'}"
+        head = f"[id={r['id']}] {r['name']} ({r['entity_type']}) алиасы: {_reg_aliases(al) if al else '—'}"
         lines.append(head)
     listing = "\n".join(lines) if lines else "(пусто — сущностей ещё нет)"
     # если реестр огромен — не раздуваем (имена+алиасы уже без сути); грубый предохранитель
@@ -8988,7 +9001,7 @@ async def _index_relation_registry(chat_id: int, scene_text: str = None,
         r = by_id[eid]
         al = json.loads(r["aliases"]) if r["aliases"] else []
         tag = "персонаж" if r["entity_type"] == "character" else "участник"
-        extra = f" (алиасы: {', '.join(a for a in al if a != r['name'])})" if len(al) > 1 else ""
+        extra = f" (алиасы: {_reg_aliases([a for a in al if a != r['name']])})" if len(al) > 1 else ""
         # H4: компактная карточка фактов — помогает связать неоднозначное («тот самый брат Ани»), не подменяя сцену
         card = f"{r['name']} — {tag}{extra}"
         cs = _idx_snip(r.get("canon_summary") or "", 160)
@@ -11142,7 +11155,7 @@ async def _index_entity_report(chat_id: int, ent: dict) -> str:
     aliases = json.loads(ent["aliases"]) if ent["aliases"] else []
     parts = [f"{ent['name']} ({'персонаж' if ent['entity_type'] == 'character' else 'участник'})"]
     if [a for a in aliases if a != ent["name"]]:
-        parts.append("Алиасы: " + ", ".join(a for a in aliases if a != ent["name"]))
+        parts.append("Алиасы: " + _reg_aliases([a for a in aliases if a != ent["name"]]))
     if (ent.get("canon_summary") or "").strip():
         parts.append("Canon: " + ent["canon_summary"].strip())
     if (ent.get("fanon_summary") or "").strip():
@@ -12592,7 +12605,7 @@ async def entity_show_command(event):
     type_label = "🎭 персонаж" if ent["entity_type"] == "character" else "👤 участник"
     parts = [f"**{ent['name']}** — {type_label}"]
     if aliases and aliases != [ent["name"]]:
-        parts.append(f"_алиасы:_ {', '.join(a for a in aliases if a != ent['name'])}")
+        parts.append(f"_алиасы:_ {_reg_aliases([a for a in aliases if a != ent['name']])}")
     if (ent.get("canon_summary") or "").strip():
         parts.append(f"\n📖 **Canon:** {ent['canon_summary'].strip()}")
     if (ent.get("fanon_summary") or "").strip():
