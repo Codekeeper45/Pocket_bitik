@@ -15,6 +15,8 @@ import contextvars
 import base64
 import random
 import threading
+import concurrent.futures
+import functools
 import time
 import traceback
 import requests
@@ -164,6 +166,10 @@ INDEX_EXTRACT_HARD_TIMEOUT = 300        # wall-clock таймаут ОДНОГО
 #   стена: сработал → как транспортный таймаут (фолбэк на след. маршрут; leaked-поток сам добьётся и результат отбросится).
 INDEX_REL_MAX_TOKENS = 16_000           # ПОТОЛОК ВЫВОДА Stage 2 (связи ОДНОЙ сцены): столько связей сцене не нужно. Дегенерация упрётся
 #   в finish=length за ~2 мин → штатное дробление→скип (а не 33 мин), + дешевле в 24× vs 384k. Кламп теми же INDEX_MODEL_MAX_OUT.
+# Выделенный пул потоков ТОЛЬКО для extract-вызовов: при wall-clock таймауте (asyncio.wait_for) отменяется лишь await, а sync SDK-вызов
+# в потоке продолжает крутиться в фоне до SDK-timeout. Если гнать это через общий пул asyncio.to_thread (там же DB-операции!), утёкшие
+# потоки могли бы забить его и заморозить весь бот. Изоляция: утёкшие extract-потоки сидят ТУТ, DB/прочее — на дефолтном пуле, живы.
+_INDEX_EXTRACT_POOL = concurrent.futures.ThreadPoolExecutor(max_workers=16, thread_name_prefix="idx-extract")
 INDEX_MODEL_MAX_OUT = {                  # per-model кламп потолка вывода; OpenRouter-fallback может быть ниже official DeepSeek
     "deepseek-v4-flash": 384_000,
     "deepseek-v4-pro": 384_000,
@@ -8136,13 +8142,15 @@ async def _index_extract(system: str, user: str, max_tokens: int = INDEX_EXTRACT
                 # wall-clock стена ВНЕ http-клиента: SDK "timeout" — read-timeout между чанками, дегенеративный/keepalive-стрим
                 # его сбрасывает → вызов крутится десятки минут (30k вход → 1985с, 384k ток., finish=length). asyncio.wait_for
                 # рубит по реальному времени; TimeoutError ловится ниже как транспортный таймаут → фолбэк на след. маршрут.
-                # Отменённый to_thread оставляет поток дописываться в фоне (SDK-timeout его добьёт) — результат отбрасывается.
+                # Отменённый вызов оставляет поток дописываться в фоне (SDK-timeout его добьёт) — результат отбрасывается. Гоним через
+                # ВЫДЕЛЕННЫЙ _INDEX_EXTRACT_POOL (не asyncio.to_thread): утёкший extract-поток не забьёт общий пул с DB-операциями.
+                _loop = asyncio.get_running_loop()
                 resp = await asyncio.wait_for(
-                    asyncio.to_thread(
+                    _loop.run_in_executor(
+                        _INDEX_EXTRACT_POOL,
                         # max_retries=0: гасим ВНУТРЕННИЕ ретраи SDK (дефолт 2) — иначе таймаут крутится ~3×timeout внутри клиента
                         # ДО всплытия наружу. Ретраи/фолбэк — наш уровень. with_options не трогает /ask (свой клиент).
-                        llm_client.with_options(max_retries=0).chat.completions.create,
-                        **kwargs,
+                        functools.partial(llm_client.with_options(max_retries=0).chat.completions.create, **kwargs),
                     ),
                     timeout=INDEX_EXTRACT_HARD_TIMEOUT,
                 )
