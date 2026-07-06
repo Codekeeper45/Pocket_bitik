@@ -205,7 +205,7 @@ INDEX_MODEL_MAX_OUT = {                  # per-model кламп потолка �
     "deepseek-v4-pro": 384_000,
     "deepseek/deepseek-v4-flash": 16_384,
     "deepseek/deepseek-v4-pro": 384_000,
-    "gemma-4-31b": 8_192,                               # Cerebras free: скромный вывод (мелкие вызовы); всё равно ограничен 30k TPM
+    "gemma-4-31b": 24_576,                              # Cerebras free: потолок высокий, РЕАЛЬНЫЙ лимитер — динамический TPM-кламп (28k-in_tok) в _index_extract
     "tencent/hy3:free": 262_144,                        # free фолбэк Gemma: вывод до 256k (кламп теми же INDEX_EXTRACT_MAX_TOKENS в вызове)
     "nvidia/nemotron-3-super-120b-a12b:free": 262_144,  # free primary: вывод до 256k
     "poolside/laguna-xs-2.1:free": 32_768,              # free fallback: вывод до 32k (плотный Stage1 → finish=length → дробление)
@@ -8204,6 +8204,8 @@ async def _index_extract(system: str, user: str, max_tokens: int = INDEX_EXTRACT
         for attempt in range(1, INDEX_EXTRACT_RETRIES + 1):
             try:
                 mt = min(max_tokens, INDEX_MODEL_MAX_OUT.get(model, max_tokens))  # кламп под реальный лимит модели
+                if provider == "cerebras":  # 30k TPM/ключ = вход+ВЫХОД → отдаём выходу «остаток» бюджета (иначе плотная сцена → finish=length → дробление)
+                    mt = min(mt, max(1500, 28_000 - in_tok))
                 kwargs = {
                     "model": model,
                     "max_tokens": mt,
