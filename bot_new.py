@@ -136,8 +136,11 @@ GEN_INDEX_POOL = 32         # /gen: сколько индекс-кандидат
 GEN_INDEX_VISUAL_POOL = 16  # /gen: сколько индекс-кандидатов скачать/описать для визуального rerank
 
 # --- /index: GraphRAG-память по истории чата (MariaDB + numpy-вектора) ---
-INDEX_EXTRACT_MODEL = "deepseek-v4-flash"   # экстракция досье/графа через официальный DeepSeek API: 1M context, большой output
-INDEX_EXTRACT_FALLBACK = "deepseek-v4-pro"  # запасной официальный DeepSeek, дороже; используем только если Flash недоступен/сыпется
+# Экстракция досье/графа: primary/fallback — БЕСПЛАТНЫЕ OpenRouter-модели, официальный DeepSeek — крайняя платная страховка (гибрид).
+INDEX_EXTRACT_OR_PRIMARY = "nvidia/nemotron-3-super-120b-a12b:free"  # primary: free, JSON-mode (response_format), 1M контекст, 256k вывод
+INDEX_EXTRACT_OR_FALLBACK = "poolside/laguna-xs-2.1:free"            # free fallback: 256k контекст, 32k вывод, JSON ТОЛЬКО по промпту (без response_format!)
+INDEX_EXTRACT_MODEL = "deepseek-v4-flash"   # официальный DeepSeek — платная страховка при исчерпании free-капа/сбое: 1M context, большой output
+INDEX_EXTRACT_FALLBACK = "deepseek-v4-pro"  # запасной официальный DeepSeek, дороже; последний рубеж, чтобы индексация НЕ вставала
 INDEX_EMBED_TEXT_MODEL = "qwen/qwen3-embedding-8b"   # тексты: досье, связи, сцены, описания фото. SOTA MTEB, дешевле, 32k контекст, MRL 32–4096 (OpenRouter /embeddings)
 INDEX_EMBED_IMAGE_MODEL = "google/gemini-embedding-2"      # картинки (сам файл) + кросс-модальный текст-запрос (GA-слаг, 3072d)
 INDEX_EMBED_TEXT_DIM = 2048   # рабочая размерность ТЕКСТА (qwen3 MRL; 2048 сильнее text-emb-3-small@1536, при половине RAM/латентности от 4096)
@@ -175,6 +178,8 @@ INDEX_MODEL_MAX_OUT = {                  # per-model кламп потолка �
     "deepseek-v4-pro": 384_000,
     "deepseek/deepseek-v4-flash": 16_384,
     "deepseek/deepseek-v4-pro": 384_000,
+    "nvidia/nemotron-3-super-120b-a12b:free": 262_144,  # free primary: вывод до 256k
+    "poolside/laguna-xs-2.1:free": 32_768,              # free fallback: вывод до 32k (плотный Stage1 → finish=length → дробление)
 }
 INDEX_SUMMARY_MAX_TOKENS = 64_000       # ПОТОЛОК ВЫВОДА саммари (досье/роллапы): запас под reasoning, чтобы CoT не съедал бюджет до самого текста. Оплата — по факту токенов
 INDEX_STAGE1_MICRO_MESSAGES = 1500      # верхняя граница сообщений в блоке (потолок выборки из БД); блок набирается до ТОКЕН-бюджета
@@ -213,6 +218,9 @@ INDEX_EMBED_MAX_CHARS = 200_000  # stage 3: потолок символов на
 #                                  запрос на 300k токенов; 96 плотных сцен ×8000 симв. это превышают,
 #                                  а OpenRouter отдаёт отказ как HTTP 200 с error-телом (молчаливая потеря)
 INDEX_EXTRACT_RETRIES = 3     # LLM/JSON extractor: не двигаем чекпоинт после временного сбоя
+INDEX_FREE_COOLDOWN = 90      # после 429 от free-модели OpenRouter (исчерпан кап 1000/сутки или per-minute) — столько секунд НЕ трогаем
+#                               free-маршруты (идём сразу на платный DeepSeek), чтобы не жечь по ~28с ретраев на КАЖДЫЙ вызов после капа
+_INDEX_FREE_COOLDOWN_UNTIL = 0.0  # monotonic-время, до которого free-маршруты пропускаются (ставится при 429 от free)
 INDEX_EMBED_RETRIES = 3       # embeddings: 429/5xx у провайдера не должны превращаться в "done"
 INDEX_MATRIX_CACHE_MAX_ROWS = 10_000  # больше ищем потоково, без полной матрицы в RAM
 INDEX_SEARCH_DB_BATCH = 10_000  # потоковый векторный поиск: строк на выборку (5k→10k: быстрее стриминг, чуть больше транзиентной RAM)
@@ -7305,10 +7313,10 @@ _HELP_SECTIONS = {
         "   `/entity rename <id> <имя>` · `/entity alias <id> <алиас>` · `/entity split <id> <алиас>`\n"
         "   `/entity relink` — привязать несопоставленных участников к их Telegram-id (по author_id)\n"
         "\n"
-        "⚙️ Нужны: `INDEX_DB_URL` (MariaDB/MySQL), `DEEPSEEK_API_KEY` для экстракции,\n"
-        "   `OPENROUTER_API_KEY` для embeddings, пакеты `pymysql`+`numpy`.\n"
-        "🧠 Модели: официальный DeepSeek V4 Flash (экстракция), медиа-модель `/media` (фото),\n"
-        "   qwen3-embedding-8b (тексты, 2048d) + gemini-embedding-2 (картинки)."
+        "⚙️ Нужны: `INDEX_DB_URL` (MariaDB/MySQL), `OPENROUTER_API_KEY` (free-экстракция + embeddings),\n"
+        "   `DEEPSEEK_API_KEY` (платная страховка экстракции), пакеты `pymysql`+`numpy`.\n"
+        "🧠 Экстракция: free OpenRouter — nemotron-3-super-120b → laguna-xs-2.1, страховка — офиц. DeepSeek.\n"
+        "   Embeddings: qwen3-embedding-8b (тексты, 2048d) + gemini-embedding-2 (картинки); медиа — `/media`."
     ),
     "keys": (
         "🔑 **Какие API-ключи за что отвечают** (в файле `.env`)\n"
@@ -7623,10 +7631,10 @@ def _index_available() -> str:
         return "нет пакета numpy (добавь в requirements и переустанови зависимости)"
     if not index_db_url:
         return "не задан INDEX_DB_URL в .env (строка подключения к MariaDB)"
-    if deepseek_client is None:
-        return "нет DEEPSEEK_API_KEY (нужен для экстракции /index через официальный DeepSeek API)"
     if openrouter_client is None:
-        return "нет OPENROUTER_API_KEY (нужен для embeddings /index)"
+        return "нет OPENROUTER_API_KEY (free-экстракция nemotron/laguna + embeddings /index)"
+    if deepseek_client is None:
+        return "нет DEEPSEEK_API_KEY (платная страховка экстракции при исчерпании free-капа)"
     return ""
 
 
@@ -8101,25 +8109,31 @@ def _json_from_llm(text: str):
 
 
 async def _index_extract(system: str, user: str, max_tokens: int = INDEX_EXTRACT_MAX_TOKENS):
-    """Экстракция через официальный DeepSeek API (V4 Flash) с JSON-mode; OpenRouter — аварийный fallback.
+    """Экстракция: primary/fallback — БЕСПЛАТНЫЕ OpenRouter-модели (nemotron JSON-native → laguna по промпту),
+    официальный DeepSeek — платная страховка при исчерпании free-капа/сбое (гибрид: индексация НЕ встаёт).
     Возвращает dict при успехе; None — если провайдер ОТВЕТИЛ, но контент не парсится как JSON
     (детерминированный «poison» — можно дробить/скипать). Ошибки транспорта/ключа/квоты/параметров
     останавливают stage через IndexTransientError, чтобы не превращать системную проблему в skipped ranges."""
-    global _INDEX_EXTRACT_OK
+    global _INDEX_EXTRACT_OK, _INDEX_FREE_COOLDOWN_UNTIL
     routes = []
+    # primary/fallback — free OpenRouter (nemotron сильнее и JSON-native; laguna дешевле/быстрее, JSON по промпту).
+    # Пропускаем free, если недавно словили 429 (кап исчерпан) — идём сразу на DeepSeek, не тратя ретраи на заведомый 429.
+    free_on_cooldown = time.monotonic() < _INDEX_FREE_COOLDOWN_UNTIL
+    if openrouter_client is not None and not free_on_cooldown:
+        routes.append(("openrouter", openrouter_client, INDEX_EXTRACT_OR_PRIMARY))
+        routes.append(("openrouter", openrouter_client, INDEX_EXTRACT_OR_FALLBACK))
+    # крайняя ПЛАТНАЯ страховка: официальный DeepSeek flash→pro. Включается когда free-кап (1000/сутки) исчерпан или free-модели сыпятся.
     if deepseek_client is not None:
         routes.append(("deepseek", deepseek_client, INDEX_EXTRACT_MODEL))
         routes.append(("deepseek", deepseek_client, INDEX_EXTRACT_FALLBACK))
-    # аварийный путь: pro-слаг (потолок вывода 384k). НЕ flash-слаг — у OpenRouter flash режет вывод на 16k,
-    # плотный блок досье в него не влезает → обрыв JSON (finish=length). primary/fallback — официальный flash/pro.
-    if openrouter_client is not None:
-        routes.append(("openrouter", openrouter_client, "deepseek/deepseek-v4-pro"))
     got_response = False  # был ли хоть один валидный ответ провайдера (пусть и не-JSON)
     timed_out = False     # оттаймаутил ли хоть один маршрут (для спец-сигнала IndexTimeoutError, если ВСЕ)
+    warned_paid = False   # предупредили ли уже про переход на платный DeepSeek
     for ri, (provider, llm_client, model) in enumerate(routes):
-        if provider == "openrouter" and ri > 0:  # дошли до аварийного резерва → официальный не сработал: видно СРАЗУ, не по крупицам
-            log("INDEX", f"⚠️ Экстракция: официальный DeepSeek не сработал на этом блоке → аварийный OpenRouter {model} "
-                         f"(проверь квоту/доступ/нагрузку официального; резерв тоже платный)")
+        if provider == "deepseek" and not warned_paid:  # дошли до платной страховки → free не справились: видно СРАЗУ
+            warned_paid = True
+            log("INDEX", f"⚠️ Экстракция: free-модели OpenRouter не сработали на этом блоке → платный DeepSeek {model} "
+                         f"(free-кап 1000/сутки исчерпан или сбой; страховка платная)")
         for attempt in range(1, INDEX_EXTRACT_RETRIES + 1):
             try:
                 mt = min(max_tokens, INDEX_MODEL_MAX_OUT.get(model, max_tokens))  # кламп под реальный лимит модели
@@ -8127,10 +8141,11 @@ async def _index_extract(system: str, user: str, max_tokens: int = INDEX_EXTRACT
                     "model": model,
                     "max_tokens": mt,
                     "temperature": 0.2,
-                    "response_format": {"type": "json_object"},
                     "messages": [{"role": "system", "content": system}, {"role": "user", "content": user}],
                     "timeout": 400,  # блок ~96k → генерится за <400с; таймаут ловит реальный затык (мёртвый сокет) → фолбэк на след. маршрут
                 }
+                if model != INDEX_EXTRACT_OR_FALLBACK:  # laguna НЕ поддерживает response_format → JSON только промпт-инструкцией
+                    kwargs["response_format"] = {"type": "json_object"}
                 if provider == "deepseek":
                     # Официальный DeepSeek: extraction должен возвращать JSON, поэтому thinking выключаем
                     # и не тратим output budget на reasoning_content.
@@ -8181,6 +8196,12 @@ async def _index_extract(system: str, user: str, max_tokens: int = INDEX_EXTRACT
                     # Ретраить тот же маршрут = ещё timeout секунд впустую → сразу к следующему. Все оттаймаутили → IndexTimeoutError после цикла.
                     timed_out = True
                     log("INDEX", f"Экстракция {provider}/{model}: таймаут — перехожу на следующий маршрут (не дроблю блок)")
+                    break
+                if code == 429:  # rate-limit. Free OpenRouter: ставим кулдаун (не долбим free каждый вызов) и сразу на след. маршрут (DeepSeek).
+                    if provider == "openrouter":
+                        _INDEX_FREE_COOLDOWN_UNTIL = time.monotonic() + INDEX_FREE_COOLDOWN
+                    log("INDEX", f"Экстракция {provider}/{model}: 429 rate-limit — след. маршрут"
+                                 + (f" (free на паузе {INDEX_FREE_COOLDOWN}с → DeepSeek)" if provider == "openrouter" else ""))
                     break
                 if code in (401, 402):  # ключ/квота — фатально, НЕ poison: стопим стадию (иначе весь чат уйдёт в ложные skip)
                     raise IndexTransientError(f"{provider}/{model}: config {code} (ключ/квота недоступны) — стоп, не poison: {e}")
