@@ -149,11 +149,11 @@ INDEX_SCENE_TOKEN_CAP = 20000 # stage 2: мягкий потолок токен�
 INDEX_SCENE_MIN_TOKENS = 1000 # stage 2: сцены короче — доклеиваем к следующей (не дробим на мелочь)
 INDEX_SCENE_HARD_GAP_SEC = 6 * 60 * 60  # даже короткую сцену не склеиваем через многочасовую паузу
 INDEX_STAGE2_CONCURRENCY = 6  # stage 2: сколько сцен экстрагировать параллельно (перекрыть ~34с латентность на вызов)
-INDEX_STAGE1_MICRO_TOKENS = 300_000    # stage 1: размер блока экстракции. 300k (DeepSeek V4 = 1M контекст). Stage 1 строго ПОСЛЕДОВАТЕЛЕН
-#   (снежный ком), скорость = число блоков → крупнее блок = меньше блоков = быстрее. Цель — ОБОБЩЁННЫЕ досье (генерализация),
-#   поэтому потеря части гранулярных фактов на больших блоках приемлема. Страховка: таймаут на большом блоке → авто-дробление
-#   (IndexTimeoutError → _index_stage1_extract_rows), маленький таймаутит → транзиент (не скип). Плотность claims меряем A/B после рестарта.
-INDEX_STAGE1_TIMEOUT_SPLIT_MIN = 200    # stage 1: блок крупнее (в сообщениях) — таймаут дробит; мельче — таймаут = транзиент (сеть), не скипаем
+INDEX_STAGE1_MICRO_TOKENS = 96_000     # stage 1: размер блока экстракции. Опустили 300k→96k (Фаза 1): блок строго ПОСЛЕДОВАТЕЛЕН
+#   (снежный ком), но на нестабильном маршруте огромный блок амплифицирует сбои (таймаут×каскад) и раздувает prefill-латентность —
+#   выигрыш «меньше блоков = быстрее» съедается провалами. 96k ≈ 1400 сообщ, генерится за <400с → таймаут ловит реальный затык, а не долгую печать.
+#   Таймаут БОЛЬШЕ НЕ дробит блок (это был ложный сигнал «блок плотный»): _index_extract на таймауте фолбэкает на след. маршрут (OpenRouter — иной сетевой путь).
+INDEX_STAGE1_TIMEOUT_STRIKES = 2        # stage 1: столько all-route-таймаутов подряд на ОДНОМ курсоре → статус blocked (watchdog не крутит впустую; ручной /index go)
 INDEX_EXTRACT_MAX_TOKENS = 384_000      # ПОТОЛОК ВЫВОДА = максимум модели (official DeepSeek V4 = 384k) → фактически БЕЗ лимита:
 #   модель сама останавливается на finish=stop, бесконечно писать не может. Платим только за реально сгенерированные токены,
 #   поэтому высокий потолок бесплатен — он лишь убирает искусственную обрезку (раньше 64k → finish=length → дробление блока).
@@ -165,8 +165,8 @@ INDEX_MODEL_MAX_OUT = {                  # per-model кламп потолка �
     "deepseek/deepseek-v4-pro": 384_000,
 }
 INDEX_SUMMARY_MAX_TOKENS = 64_000       # ПОТОЛОК ВЫВОДА саммари (досье/роллапы): запас под reasoning, чтобы CoT не съедал бюджет до самого текста. Оплата — по факту токенов
-INDEX_STAGE1_MICRO_MESSAGES = 6000      # верхняя граница сообщений в блоке (потолок выборки из БД). Подняли до 6000, чтобы блок
-#   набирался до ТОКЕН-бюджета (300k ≈ 4400 сообщ при ~68 ток/сообщ), а не упирался в счётчик сообщений раньше времени.
+INDEX_STAGE1_MICRO_MESSAGES = 1500      # верхняя граница сообщений в блоке (потолок выборки из БД); блок набирается до ТОКЕН-бюджета
+#   (96k ≈ 1400 сообщ при ~68 ток/сообщ), счётчик сообщений — предохранитель для чатов с очень короткими сообщениями.
 INDEX_STAGE1_BLOCK_TOKENS = INDEX_STAGE1_MICRO_TOKENS  # legacy alias для старых комментариев/логов
 INDEX_FAILED_MIN_MESSAGES = 1
 INDEX_UPDATE_OVERLAP_MESSAGES = 300
@@ -8101,6 +8101,7 @@ async def _index_extract(system: str, user: str, max_tokens: int = INDEX_EXTRACT
     if openrouter_client is not None:
         routes.append(("openrouter", openrouter_client, "deepseek/deepseek-v4-pro"))
     got_response = False  # был ли хоть один валидный ответ провайдера (пусть и не-JSON)
+    timed_out = False     # оттаймаутил ли хоть один маршрут (для спец-сигнала IndexTimeoutError, если ВСЕ)
     for ri, (provider, llm_client, model) in enumerate(routes):
         if provider == "openrouter" and ri > 0:  # дошли до аварийного резерва → официальный не сработал: видно СРАЗУ, не по крупицам
             log("INDEX", f"⚠️ Экстракция: официальный DeepSeek не сработал на этом блоке → аварийный OpenRouter {model} "
@@ -8114,7 +8115,7 @@ async def _index_extract(system: str, user: str, max_tokens: int = INDEX_EXTRACT
                     "temperature": 0.2,
                     "response_format": {"type": "json_object"},
                     "messages": [{"role": "system", "content": system}, {"role": "user", "content": user}],
-                    "timeout": 600,  # запас под большой prefill (до 300k вход) + вывод; таймаут → IndexTimeoutError → дробление большого блока (страховка)
+                    "timeout": 400,  # блок ~96k → генерится за <400с; таймаут ловит реальный затык (мёртвый сокет) → фолбэк на след. маршрут
                 }
                 if provider == "deepseek":
                     # Официальный DeepSeek: extraction должен возвращать JSON, поэтому thinking выключаем
@@ -8123,20 +8124,23 @@ async def _index_extract(system: str, user: str, max_tokens: int = INDEX_EXTRACT
                 else:
                     # OpenRouter принимает reasoning как провайдерский параметр в теле запроса.
                     kwargs["extra_body"] = {"reasoning": {"enabled": False}}
+                _t0 = time.monotonic()
                 resp = await asyncio.to_thread(
-                    # max_retries=0: гасим ВНУТРЕННИЕ ретраи SDK (дефолт 2) — иначе таймаут большого блока крутится
-                    # ~3×600с внутри клиента ДО того как всплывёт IndexTimeoutError и сработает дробление. Ретраи — наш
-                    # уровень (INDEX_EXTRACT_RETRIES, только для НЕ-таймаутов). with_options не трогает /ask (свой клиент).
+                    # max_retries=0: гасим ВНУТРЕННИЕ ретраи SDK (дефолт 2) — иначе таймаут крутится ~3×timeout внутри клиента
+                    # ДО всплытия наружу. Ретраи/фолбэк — наш уровень. with_options не трогает /ask (свой клиент).
                     llm_client.with_options(max_retries=0).chat.completions.create,
                     **kwargs,
                 )
+                _dt = time.monotonic() - _t0
                 got_response = True
                 content = resp.choices[0].message.content or ""
                 data = _json_from_llm(content)
+                fin = resp.choices[0].finish_reason
+                # наблюдаемость: провайдер · вход · сколько длилось · finish · распарсился ли (различает «плотный блок» / «стойл» / «poison»)
+                log("INDEX", f"extract {provider}/{model}: вход~{len(user)//1000}k симв, {_dt:.0f}с, finish={fin}, {'JSON' if data is not None else 'no-JSON'}")
                 if data is not None:
                     _INDEX_EXTRACT_OK = True
                     return data
-                fin = resp.choices[0].finish_reason
                 if fin == "length":
                     # НЕ сбой провайдера: модель ОТВЕТИЛА, но блок слишком плотный — вывод упёрся в потолок max_tokens.
                     # Повтор/смена модели дадут ту же обрезку (детерминированно, но НЕ poison): возвращаем None →
@@ -8149,9 +8153,12 @@ async def _index_extract(system: str, user: str, max_tokens: int = INDEX_EXTRACT
                 code = getattr(e, "status_code", None) or getattr(getattr(e, "response", None), "status_code", None)
                 _elow = str(e).lower()
                 if code is None and ("timeout" in _elow or "timed out" in _elow or type(e).__name__ in ("APITimeoutError", "ReadTimeout", "Timeout", "TimeoutError", "ConnectTimeout", "ReadTimeoutError")):
-                    # таймаут (вероятно блок слишком большой/медленный) → сигналим наверх спец-исключением: caller решит
-                    # дробить (большой блок) или пробросить как транзиент (маленький). Ретраить тот же большой блок = жечь минуты.
-                    raise IndexTimeoutError(f"{provider}/{model}: таймаут экстракции")
+                    # таймаут: НЕ рейзим сразу и НЕ дробим (это НЕ «блок плотный», а зависший сокет). Официальный DeepSeek мог
+                    # умереть на мёртвом соединении — след. маршрут (особенно OpenRouter, иной сетевой путь) может ответить.
+                    # Ретраить тот же маршрут = ещё timeout секунд впустую → сразу к следующему. Все оттаймаутили → IndexTimeoutError после цикла.
+                    timed_out = True
+                    log("INDEX", f"Экстракция {provider}/{model}: таймаут — перехожу на следующий маршрут (не дроблю блок)")
+                    break
                 if code in (401, 402):  # ключ/квота — фатально, НЕ poison: стопим стадию (иначе весь чат уйдёт в ложные skip)
                     raise IndexTransientError(f"{provider}/{model}: config {code} (ключ/квота недоступны) — стоп, не poison: {e}")
                 if code in (403, 404):  # доступ/модель-not-found — пробуем запасную; если и она недоступна → transient-стоп (не skip)
@@ -8176,6 +8183,8 @@ async def _index_extract(system: str, user: str, max_tokens: int = INDEX_EXTRACT
                 await asyncio.sleep(min(30, 2 ** attempt) + random.random())
         if ri < len(routes) - 1:
             log("INDEX", f"Экстракция {provider}/{model}: пробую запасной маршрут")
+    if not got_response and timed_out:  # ВСЕ маршруты оттаймаутили — спец-сигнал для анти-грайнда Stage 1 (strikes → blocked)
+        raise IndexTimeoutError("extract: все маршруты оттаймаутили")
     if not got_response:  # провайдер недоступен — транзиент, НЕ poison
         raise IndexTransientError("extract: провайдер не ответил ни разу (сеть/5xx/timeout)")
     return None
@@ -8432,14 +8441,9 @@ async def _index_stage1_extract_rows(chat_id: int, rows: list, amap: dict, name2
     start, end = rows[0]["msg_id"], rows[-1]["msg_id"]
     registry, _ = await _index_load_registry(chat_id)
     user = f"РЕЕСТР (известные сущности):\n{registry}\n\nНОВЫЙ БЛОК:\n" + _index_rows_to_text(rows, amap)
-    try:
-        data = await _index_extract(_INDEX_STAGE1_SYSTEM, user)
-    except IndexTimeoutError:
-        if len(rows) > INDEX_STAGE1_TIMEOUT_SPLIT_MIN:  # большой блок не уложился в таймаут → страховка: дробим пополам (как finish=length)
-            log("INDEX", f"Stage1: таймаут на блоке {start}..{end} ({len(rows)} сообщ) → дроблю пополам")
-            data = None
-        else:
-            raise  # маленький блок таймаутит — это не размер, а транзиент (сеть): пробрасываем, НЕ скипаем реальные сообщения
+    # IndexTimeoutError (все маршруты оттаймаутили) НЕ ловим — пробрасываем в _index_stage1_dossiers (анти-грайнд: strikes→blocked).
+    # Дробление осталось ТОЛЬКО на детерминированный сигнал плотности (finish=length / 400/413/422 по размеру → _index_extract вернёт None).
+    data = await _index_extract(_INDEX_STAGE1_SYSTEM, user)
     if data and isinstance(data.get("entities"), list):
         touched = await _index_apply_entities(chat_id, data["entities"], name2author)
         return touched, 0
@@ -8461,6 +8465,8 @@ async def _index_stage1_dossiers(chat_id: int, progress_cb=None):
     cursor = int(st["cursor"].get("last_msg_id", 0))
     ents_seen = int(st["stats"].get("blocks", 0))
     skipped_seen = int(st["stats"].get("skipped", 0))
+    # анти-грайнд: счётчик подряд-таймаутов на одном курсоре. Ручной /index go после blocked — сбрасываем (даём свежие попытки).
+    t_strikes = 0 if st["status"] == "blocked" else int(st["stats"].get("t_strikes", 0))
     await _idx_set_state(chat_id, 1, status="running")
     amap = await _index_author_map(chat_id)
     name2author = {}
@@ -8493,10 +8499,24 @@ async def _index_stage1_dossiers(chat_id: int, progress_cb=None):
                 break
         try:
             touched, skipped = await _index_stage1_extract_rows(chat_id, block_rows, amap, name2author)
+        except IndexTimeoutError:  # ВСЕ маршруты оттаймаутили на этом блоке — считаем страйки (ловим прежде IndexTransientError!)
+            t_strikes += 1
+            blocked = t_strikes >= INDEX_STAGE1_TIMEOUT_STRIKES
+            await _idx_set_state(chat_id, 1, stats={"blocks": blocks_done, "skipped": skipped_seen, "t_strikes": t_strikes},
+                                 status="blocked" if blocked else "error")
+            if blocked:
+                log("INDEX", f"Stage1 чат {chat_id}: {t_strikes} таймаута подряд на блоке до {last} — все маршруты глухи → BLOCKED "
+                             f"(watchdog не крутит). Почини соединение/ключ и `/index go`.")
+                if progress_cb:
+                    await progress_cb("⛔ Досье встало: провайдеры экстракции не отвечают (таймауты подряд). После восстановления — `/index go`.")
+                return "blocked"
+            log("INDEX", f"Stage1 чат {chat_id}: таймаут на блоке до {last} (страйк {t_strikes}/{INDEX_STAGE1_TIMEOUT_STRIKES}) — error, watchdog повторит")
+            return "error"
         except IndexTransientError as e:  # авария провайдера — не двигаем курсор, встаём в error
             await _idx_set_state(chat_id, 1, status="error")
             log("INDEX", f"Stage1 транзиентный сбой на блоке до {last}: {e} — стадия в error, /index go добёрет")
             return "error"
+        t_strikes = 0  # успешный блок — сбрасываем страйки таймаутов
         cursor = last
         blocks_done += 1
         skipped_seen += skipped
@@ -11100,6 +11120,10 @@ async def _index_pipeline(chat_id: int, status_msg):
             res1 = await _index_stage1_dossiers(chat_id, progress_cb=upd)
             if res1 == "paused":
                 await upd("⏸ Индексация на паузе (Stage 1 — досье). `/index go` — продолжить.")
+                return
+            if res1 == "blocked":
+                await upd("⛔ Индексация встала на Stage 1: провайдеры экстракции не отвечают (таймауты подряд). "
+                          "Watchdog НЕ будет крутить это впустую. Почини соединение/ключ и `/index go`.")
                 return
             if res1 == "error":
                 await upd("❌ Индексация остановлена на Stage 1: LLM не вернула валидный JSON. `/index go` попробует тот же блок ещё раз.")
