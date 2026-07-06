@@ -11892,6 +11892,10 @@ async def index_reindex_command(event):
     # Умер посреди — watchdog возобновит running-стадии; повтор `/index reindex` идемпотентен (NULL-фильтр).
     if mode == "scenes":
         await _idx_set_state(chat_id, 2, cursor={"last_msg_id": 0}, stats={}, status="running")
+        # Stage 5 галерею тоже пересобрать: сцены/сущности изменились → членство галерей (cold-start кандидаты,
+        # E2 ре-verify) устарело. 5a NULL-фильтр (не перекачивает), 5c скипает описанные (vision заново НЕ гоняем) —
+        # переигрывается только дешёвое членство. В режиме text пайплайн сразу вернёт stage 5 в done.
+        await _idx_set_state(chat_id, 5, status="running")
     await _idx_set_state(chat_id, 3, status="running")
     await _idx_set_state(chat_id, 4, status="running")  # Stage 4 инкрементален: сцены не менялись (vectors) → без LLM, только переэмбеддинг роллапов
     # текстовые вектора пресервных строк зануляем В ОБОИХ режимах — иначе старая размерность (1536) останется и выпадет из поиска
@@ -11905,7 +11909,7 @@ async def index_reindex_command(event):
         await db_write("DELETE FROM chat_chunks WHERE chat_id=%s", (chat_id,))
         await db_write("DELETE FROM relations WHERE chat_id=%s", (chat_id,))
         await db_write("DELETE FROM relation_events WHERE chat_id=%s", (chat_id,))  # дедуп-ключи веса связей — иначе пересбор поедет криво
-        note = "пересборка сцен (20k) + связи заново (inline-категории) + переэмбеддинг всех текстов; досье Stage 1 и медиа-описания сохранены"
+        note = "пересборка сцен (20k) + связи заново (inline-категории) + переэмбеддинг всех текстов + пересбор членства галерей; досье Stage 1 и описания фото сохранены"
     _index_invalidate(chat_id, "entities", "relations", "chunks", "media_text", "media_image", "rollups")
     _INDEX_CONTROL[chat_id] = "run"
     status_msg = await event.reply(f"♻️ Reindex ({mode}): {note}.\nПрогресс — `/index status`, стоп — `/index stop`, резюм — авто.")
