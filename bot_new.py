@@ -77,7 +77,7 @@ except ValueError:
 api_hash = os.getenv("api_hash") or ""
 openrouter_api_key = os.getenv("OPENROUTER_API_KEY")
 deepseek_api_key = os.getenv("DEEPSEEK_API_KEY")
-cerebras_api_key = os.getenv("CEREBRAS_API_KEY")  # Cerebras Inference (OpenAI-совм.): free Gemma для /index-экстракции (best-effort primary)
+cerebras_api_keys = [k.strip() for k in (os.getenv("CEREBRAS_API_KEY") or "").split(",") if k.strip()]  # 1+ ключей через запятую (ротация аккаунтов)
 opencode_api_key = os.getenv("OPENCODE_API_KEY")
 modelgate_api_key = os.getenv("MODELGATE_API_KEY")  # шлюз Claude-моделей (OpenAI-совместимый, modelgate.app)
 openai_api_key = os.getenv("OPENAI_API_KEY")  # официальный OpenAI API (gpt-5.x / o3); reasoning-модели
@@ -234,7 +234,8 @@ INDEX_EXTRACT_RETRIES = 3     # LLM/JSON extractor: не двигаем чекп
 INDEX_FREE_COOLDOWN = 90      # после 429 от free-модели OpenRouter (исчерпан кап 1000/сутки или per-minute) — столько секунд НЕ трогаем
 #                               free-маршруты (идём сразу на платный DeepSeek), чтобы не жечь по ~28с ретраев на КАЖДЫЙ вызов после капа
 _INDEX_FREE_COOLDOWN_UNTIL = 0.0  # monotonic-время, до которого free-маршруты пропускаются (ставится при 429 от free)
-_INDEX_CEREBRAS_COOLDOWN_UNTIL = 0.0  # ОТДЕЛЬНЫЙ кулдаун Cerebras (свой TPM-квант) — не блокирует OpenRouter-nemotron
+_INDEX_CEREBRAS_CD = []   # ПЕР-КЛЮЧЕВОЙ кулдаун Cerebras (monotonic-until на каждый ключ ротации); длина = числу ключей. Не блокирует nemotron
+_INDEX_CEREBRAS_RR = 0    # round-robin счётчик стартового ключа (раскидывает нагрузку по аккаунтам → меньше 429)
 INDEX_EMBED_RETRIES = 3       # embeddings: 429/5xx у провайдера не должны превращаться в "done"
 INDEX_MATRIX_CACHE_MAX_ROWS = 10_000  # больше ищем потоково, без полной матрицы в RAM
 INDEX_SEARCH_DB_BATCH = 10_000  # потоковый векторный поиск: строк на выборку (5k→10k: быстрее стриминг, чуть больше транзиентной RAM)
@@ -973,8 +974,9 @@ Why am I alone now? (I don't know)"""
 client = TelegramClient("session_name", api_id, api_hash)
 openrouter_client = OpenAI(api_key=openrouter_api_key, base_url=OPENROUTER_BASE_URL) if openrouter_api_key else None
 deepseek_client = OpenAI(api_key=deepseek_api_key, base_url=DEEPSEEK_BASE_URL) if deepseek_api_key else None
-cerebras_client = OpenAI(api_key=cerebras_api_key, base_url=CEREBRAS_BASE_URL,
-                         default_headers={"User-Agent": BROWSER_UA}) if cerebras_api_key else None  # браузерный UA — страховка от CF-пробы
+cerebras_clients = [OpenAI(api_key=k, base_url=CEREBRAS_BASE_URL, default_headers={"User-Agent": BROWSER_UA})
+                    for k in cerebras_api_keys]  # по клиенту на ключ (ротация); браузерный UA — страховка от CF-пробы
+_INDEX_CEREBRAS_CD = [0.0] * len(cerebras_clients)  # инициализируем пер-ключевые кулдауны под число ключей
 opencode_client = OpenAI(api_key=opencode_api_key, base_url=OPENCODE_BASE_URL) if opencode_api_key else None
 modelgate_client = OpenAI(api_key=modelgate_api_key, base_url=MODELGATE_BASE_URL,
                           default_headers={"User-Agent": BROWSER_UA}) if modelgate_api_key else None
@@ -8148,16 +8150,22 @@ async def _index_extract(system: str, user: str, max_tokens: int = INDEX_EXTRACT
     Возвращает dict при успехе; None — если провайдер ОТВЕТИЛ, но контент не парсится как JSON
     (детерминированный «poison» — можно дробить/скипать). Ошибки транспорта/ключа/квоты/параметров
     останавливают stage через IndexTransientError, чтобы не превращать системную проблему в skipped ranges."""
-    global _INDEX_EXTRACT_OK, _INDEX_FREE_COOLDOWN_UNTIL, _INDEX_CEREBRAS_COOLDOWN_UNTIL
+    global _INDEX_EXTRACT_OK, _INDEX_FREE_COOLDOWN_UNTIL, _INDEX_CEREBRAS_RR
     routes = []
     now = time.monotonic()
     # PRIMARY — Cerebras Gemma (free, ~0.6с, JSON-native), НО только если вход укладывается в её TPM-лимит (30k/мин): блок Stage1 (96k)
-    # физически не влезет → его сразу на nemotron, не жжём скудный req-бюджет (5/мин) в заведомый 429. Свой кулдаун после 429 (TPM-квант).
+    # физически не влезет → его сразу на nemotron, не жжём скудный req-бюджет (5/мин) в заведомый 429.
+    # РОТАЦИЯ АККАУНТОВ: несколько ключей (CEREBRAS_API_KEY через запятую) → round-robin старт + пропуск ключей на пер-ключевом cooldown.
+    # В рамках вызова 429 на ключе → сразу следующий свежий ключ; когда все ключи исчерпаны → фолбэк hy3.
     in_tok = count_tokens(system) + count_tokens(user)
-    cerebras_ok = (cerebras_client is not None and now >= _INDEX_CEREBRAS_COOLDOWN_UNTIL
-                   and in_tok <= INDEX_CEREBRAS_MAX_INPUT_TOKENS)
-    if cerebras_ok:
-        routes.append(("cerebras", cerebras_client, INDEX_EXTRACT_CEREBRAS_MODEL))
+    if cerebras_clients and in_tok <= INDEX_CEREBRAS_MAX_INPUT_TOKENS:
+        ncb = len(cerebras_clients)
+        start = _INDEX_CEREBRAS_RR % ncb
+        _INDEX_CEREBRAS_RR += 1
+        for off in range(ncb):
+            i = (start + off) % ncb
+            if now >= _INDEX_CEREBRAS_CD[i]:  # ключ не на кулдауне (недавний 429/TPM-исчерпание) — в цепочку
+                routes.append(("cerebras", cerebras_clients[i], INDEX_EXTRACT_CEREBRAS_MODEL))
     # #2/#3 — free OpenRouter: hy3 (фолбэк Gemma: когда Gemma на лимите/cooldown/большой вход — hy3 тянет 256k) → nemotron.
     # Оба под общим free-cooldown (кап 1000/сутки на аккаунт — общий); при 429 пропускаем на DeepSeek, не жжём ретраи.
     free_on_cooldown = now < _INDEX_FREE_COOLDOWN_UNTIL
@@ -8241,8 +8249,11 @@ async def _index_extract(system: str, user: str, max_tokens: int = INDEX_EXTRACT
                     log("INDEX", f"Экстракция {provider}/{model}: таймаут — перехожу на следующий маршрут (не дроблю блок)")
                     break
                 if code == 429:  # rate-limit. Ставим кулдаун на исчерпанный free-провайдер и сразу на след. маршрут.
-                    if provider == "cerebras":  # TPM/req-квант Cerebras исчерпан → пауза на окно минуты (свой кулдаун, nemotron не трогаем)
-                        _INDEX_CEREBRAS_COOLDOWN_UNTIL = time.monotonic() + INDEX_CEREBRAS_COOLDOWN
+                    if provider == "cerebras":  # TPM/req этого КЛЮЧА исчерпан → кулдаун только ему (ротация уводит на след. ключ, nemotron не трогаем)
+                        try:
+                            _INDEX_CEREBRAS_CD[cerebras_clients.index(llm_client)] = time.monotonic() + INDEX_CEREBRAS_COOLDOWN
+                        except ValueError:
+                            pass
                     elif provider == "openrouter":
                         _INDEX_FREE_COOLDOWN_UNTIL = time.monotonic() + INDEX_FREE_COOLDOWN
                     log("INDEX", f"Экстракция {provider}/{model}: 429 rate-limit — след. маршрут"
