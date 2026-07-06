@@ -4,7 +4,7 @@ from telethon.extensions import html as tl_html
 from telethon.helpers import add_surrogate
 from telethon.tl.types import MessageEntityBlockquote, MessageEntityPre, MessageMediaWebPage, InputReplyToMessage, InputMessagesFilterPhotos
 from telethon.tl.functions.messages import SendMessageRequest
-from dotenv import load_dotenv
+from dotenv import load_dotenv, dotenv_values
 from openai import OpenAI
 from urllib.parse import urlsplit, unquote
 import os
@@ -67,8 +67,20 @@ except Exception as _tt_err:
     _ENC = None
     print(f"[BOOT] tiktoken недоступен ({_tt_err}) — подсчёт токенов по символам")
 
-load_dotenv(override=True)  # .env — источник истины (юзер правит вручную): перебивает пустые/устаревшие env, инжектнутые Pterodactyl
-#   (иначе, напр., пустой CEREBRAS_API_KEY из панели «затенял» бы ключи ротации из .env — load_dotenv по умолчанию НЕ перезаписывает)
+_ENV_ABS = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env")  # .env РЯДОМ со скриптом (абсолютный путь — не зависит от CWD)
+load_dotenv(_ENV_ABS, override=True)
+# ПУЛЕНЕПРОБИВАЕМО: dotenv_values читает файл НАПРЯМУЮ (НЕ гейтится PYTHON_DOTENV_DISABLED, не зависит от CWD/панельного env Pterodactyl)
+# → мержим значения файла в окружение как авторитетные. Иначе, напр., пустой CEREBRAS_API_KEY из панели «затенял» бы ключи ротации из .env.
+_ENV_FILE_VALS = {}
+try:
+    _ENV_FILE_VALS = dotenv_values(_ENV_ABS)
+    for _k, _v in _ENV_FILE_VALS.items():
+        if _v is not None:
+            os.environ[_k] = _v
+except Exception as _env_e:
+    print(f"[BOOT] dotenv_values merge не удался: {_env_e}")
+print(f"[BOOT] env: .env путь={_ENV_ABS} существует={os.path.exists(_ENV_ABS)} "
+      f"переменных_в_файле={len(_ENV_FILE_VALS)} dotenv_disabled={os.getenv('PYTHON_DOTENV_DISABLED')!r}")
 
 # Настройки
 try:
@@ -978,6 +990,7 @@ deepseek_client = OpenAI(api_key=deepseek_api_key, base_url=DEEPSEEK_BASE_URL) i
 cerebras_clients = [OpenAI(api_key=k, base_url=CEREBRAS_BASE_URL, default_headers={"User-Agent": BROWSER_UA})
                     for k in cerebras_api_keys]  # по клиенту на ключ (ротация); браузерный UA — страховка от CF-пробы
 _INDEX_CEREBRAS_CD = [0.0] * len(cerebras_clients)  # инициализируем пер-ключевые кулдауны под число ключей
+print(f"[BOOT] Cerebras: env_present={os.getenv('CEREBRAS_API_KEY') is not None} ключей_ротации={len(cerebras_api_keys)} · OPENROUTER={'да' if openrouter_api_key else 'нет'}")
 opencode_client = OpenAI(api_key=opencode_api_key, base_url=OPENCODE_BASE_URL) if opencode_api_key else None
 modelgate_client = OpenAI(api_key=modelgate_api_key, base_url=MODELGATE_BASE_URL,
                           default_headers={"User-Agent": BROWSER_UA}) if modelgate_api_key else None
