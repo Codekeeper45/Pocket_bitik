@@ -67,7 +67,8 @@ except Exception as _tt_err:
     _ENC = None
     print(f"[BOOT] tiktoken недоступен ({_tt_err}) — подсчёт токенов по символам")
 
-load_dotenv()
+load_dotenv(override=True)  # .env — источник истины (юзер правит вручную): перебивает пустые/устаревшие env, инжектнутые Pterodactyl
+#   (иначе, напр., пустой CEREBRAS_API_KEY из панели «затенял» бы ключи ротации из .env — load_dotenv по умолчанию НЕ перезаписывает)
 
 # Настройки
 try:
