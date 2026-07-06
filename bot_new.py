@@ -248,6 +248,9 @@ INDEX_REL_CATEGORY_LABELS = {
     "group": ("◦", "прочие контакты"),
 }
 GEN_INDEX_REF_MAX = 8         # /gen: сколько фото-референсов подтягивать из индекс-памяти (смысловой поиск по всей истории)
+GEN_AGENTIC_MAX_CHARS = 10    # /gen агентный добор: макс. персонажей на per-character заземление (иначе «нарисуй всех 20» взорвёт латентность)
+GEN_AGENTIC_MAX_ITERS = 4     # /gen агентный добор: кап итераций tool-loop
+GEN_AGENTIC_REFS_PER_CHAR = 2 # /gen агентный добор: сколько фото добирать на персонажа (1-й — в приоритет, остальные — добивка)
 # OCR фото в /ask по умолчанию (cost-effective вместо vision-модели; флаг -m возвращает vision).
 # Проверено живьём: v2-поток (files → parse tier=cost_effective → poll → markdown_full), ~11с/фото,
 # русский распознаёт отлично. ВАЖНО: text_full отдаёт мусор латиницей — читать markdown_full.
@@ -5619,9 +5622,24 @@ async def gen_command(event):
             if _index_memory_allowed(is_owner) and await _index_chat_indexed(event.chat_id):
                 await set_status("🧠 Ищу референсы и контекст в памяти чата…")
                 recent_mids = {it["mid"] for it in catalog if it.get("mid")}  # ② индекс не качает уже показанные свежие
-                idx_items, idx_ctx = await _gen_index_candidates(event.chat_id, user_prompt, exclude_mids=recent_mids)
+                idx_items, idx_ctx, seed_names = await _gen_index_candidates(event.chat_id, user_prompt, exclude_mids=recent_mids)
                 if idx_ctx:  # внешность релевантных персонажей → в контекст промптера
                     context_text = (context_text + "\n\n" + idx_ctx) if context_text else idx_ctx
+                # авто per-character добор: если базовый семантический поиск нашёл релевантных персонажей — по КАЖДОМУ
+                # его фото+облик (иначе на «нарисуй всех вместе»/косвенных падежах берутся общие рефы и внешности путаются).
+                # Модель сама решает, кого рисовать. Сид семантический → устойчив к склонениям и «всех чатерсов».
+                try:
+                    if seed_names:
+                        await set_status(f"🧠 Добираю референсы по персонажам ({len(seed_names)})…")
+                        seen_mids = recent_mids | {it["mid"] for it in idx_items if it.get("mid")}
+                        enrich_items, enrich_ctx = await _gen_agentic_enrich(event.chat_id, user_prompt, seed_names, exclude_mids=seen_mids)
+                        if enrich_ctx:
+                            context_text = (context_text + "\n\n" + enrich_ctx) if context_text else enrich_ctx
+                        if enrich_items:  # per-character рефы — В ПРИОРИТЕТ перед общими из базового поиска
+                            enrich_mids = {it["mid"] for it in enrich_items}
+                            idx_items = enrich_items + [it for it in idx_items if it.get("mid") not in enrich_mids]
+                except Exception as e:
+                    log("GEN", f"Агентный добор пропущен (сбой): {e}")
             # B: суммарный кап каталога — индекс (релевантное золото, ≤GEN_INDEX_REF_MAX) держим весь, свежие
             # обрезаем до newest-хвоста на остаток; total ≤ cap. Старое-но-релевантное покрыто индекс-путём.
             cap = GEN_CTX_IMG_MAX if want_vision else GEN_CTX_IMG_MAX_DESC
@@ -11190,17 +11208,224 @@ async def _gen_rerank_index_items(prompt: str, items: list, limit: int) -> list:
     return items[:limit]
 
 
+async def _gen_fetch_ref_items(chat_id: int, media_hits: list, exclude_mids=None, rerank_prompt: str = None,
+                               limit: int = GEN_INDEX_REF_MAX) -> list:
+    """Скачивает media-hits в catalog-item'ы /gen: get_messages → download → thumbnail → visual-desc →
+    отсев скриншотов/мемов и фото без описаний → опц. LLM-rerank по rerank_prompt (None — сохранить порядок).
+    Общий путь для _gen_index_candidates (поиск по всему промпту) и _gen_agentic_enrich (по имени персонажа)."""
+    exclude_mids = set(exclude_mids or ())
+    hits = [h for h in (media_hits or []) if h.get("msg_id") not in exclude_mids][:GEN_INDEX_VISUAL_POOL]
+    if not hits:
+        return []
+    mids = [h["msg_id"] for h in hits]
+    desc_by_mid = {h["msg_id"]: (h.get("image_description") or "") for h in hits}
+    visual_by_mid = {h["msg_id"]: (h.get("visual_description") or "") for h in hits}
+    hit_by_mid = {h["msg_id"]: h for h in hits}
+    score_by_mid = {h["msg_id"]: h.get("score") for h in hits}
+    try:
+        fetched = []
+        for i in range(0, len(mids), 100):
+            fetched += await client.get_messages(chat_id, ids=mids[i:i + 100])
+        by_id = {getattr(m, "id", None): m for m in fetched if m is not None}
+        msgs = [by_id.get(mid) for mid in mids]
+    except Exception as e:
+        log("GEN", f"Реф-фетч: get_messages не удался: {e}")
+        return []
+
+    async def _dl(m):
+        if not _index_is_image_msg(m) or _gen_is_own_generation(m):  # свои генерации — бан и из индекс-рефов
+            return None
+        try:
+            raw = await asyncio.wait_for(m.download_media(bytes), timeout=GEN_MEDIA_DL_TIMEOUT)
+        except asyncio.TimeoutError:
+            log("GEN", f"Реф-фетч: фото id={getattr(m, 'id', '?')} скачивалось дольше {GEN_MEDIA_DL_TIMEOUT}с — пропускаю")
+            return None
+        except Exception:
+            return None
+        if not raw:
+            return None
+        thumb = await _downscale_img(raw)
+        cached_key = "gen:" + _media_key(m)
+        visual_desc = visual_by_mid.get(m.id) or MEDIA_CACHE.get(cached_key)
+        if not visual_desc or visual_desc in MEDIA_FAILURE_MARKERS:
+            visual_desc = None
+        hit = hit_by_mid.get(m.id) or {}
+        return {"idx": 0, "mid": m.id, "bytes": raw, "thumb": thumb,
+                "caption": (m.raw_text or "").strip(), "desc": visual_desc,
+                "visual_desc": visual_desc, "index_desc": desc_by_mid.get(m.id) or None,
+                "score": score_by_mid.get(m.id), "text_hit": bool(hit.get("text_hit")),
+                "image_hit": bool(hit.get("image_hit")), "text_score": hit.get("text_score"),
+                "image_score": hit.get("image_score"),
+                "date": _fmt_date(getattr(m, "date", None)),
+                "author": "me" if getattr(m, "out", False) else (f"user:{getattr(m, 'sender_id', None)}" if getattr(m, "sender_id", None) else None),
+                "nearby_text": await _gen_nearby_text_from_db(chat_id, m.id),
+                "cache_key": cached_key,
+                "index_chat_id": chat_id,
+                "from_owner": bool(getattr(m, "out", False)), "from_index": True}
+
+    items = []
+    try:
+        res = await asyncio.wait_for(asyncio.gather(*[_dl(m) for m in msgs]), timeout=GEN_CATALOG_TIMEOUT)
+        items = [it for it in res if it]
+    except asyncio.TimeoutError:
+        log("GEN", "Реф-фетч: скачивание превысило тайм-бюджет")
+    if not items:
+        return []
+    described = await _gen_describe_candidates_bounded(items, timeout=GEN_CATALOG_TIMEOUT)
+    if described < len(items):
+        log("GEN", f"Реф-фетч: visual-desc превысил тайм-бюджет — готово {described}/{len(items)}")
+    junk = [it for it in items if _gen_desc_kind(it.get("visual_desc") or it.get("desc")) in ("скриншот", "мем")]
+    if junk:
+        items = [it for it in items if it not in junk]
+        log("GEN", f"Реф-фетч: исключено {len(junk)} скриншотов/мемов")
+    before = len(items)
+    # без свежего visual-desc / stage5-описания / подписи реранкеру нечего оценивать — кандидат остаётся чистым вектор-шумом
+    items = [it for it in items if it.get("visual_desc") or (it.get("index_desc") or "").strip()
+             or (it.get("caption") or "").strip()]
+    if before != len(items):
+        log("GEN", f"Реф-фетч: исключено {before - len(items)} фото без описаний")
+    if rerank_prompt:
+        items = await _gen_rerank_index_items(rerank_prompt, items, limit)
+    return items[:limit]
+
+
+GEN_AGENTIC_TOOLS = [
+    {"type": "function", "function": {
+        "name": "character",
+        "description": "Заземляет ОДНОГО персонажа для генерации: находит его собственные фото (добавляет в референсы) "
+                       "и возвращает его облик. Вызови по КАЖДОМУ персонажу, которого рисуешь, чтобы он вышел по канону, "
+                       "а не был скопирован с общего кадра.",
+        "parameters": {"type": "object", "properties": {
+            "name": {"type": "string", "description": "Имя или прозвище персонажа."}}, "required": ["name"]}}},
+    {"type": "function", "function": {
+        "name": "search",
+        "description": "Смысловой поиск по памяти чата: сцены, досье, факты, лор. Для деталей сцены/сюжета, если нужны.",
+        "parameters": {"type": "object", "properties": {
+            "query": {"type": "string", "description": "Что ищем, своими словами."},
+            "kind": {"type": "string", "enum": ["all", "scenes", "dossiers", "relations"]}}, "required": ["query"]}}},
+    {"type": "function", "function": {
+        "name": "connections",
+        "description": "Связи персонажа (кто с кем и как). Полезно для сцен «X и Y вместе» — понять их отношения.",
+        "parameters": {"type": "object", "properties": {
+            "entity": {"type": "string", "description": "Имя персонажа."}}, "required": ["entity"]}}},
+]
+
+
+async def _gen_agentic_enrich(chat_id: int, user_prompt: str, seed_names: list, exclude_mids=None) -> tuple:
+    """Агентный per-character добор для /gen: активная /ask-модель через tool-loop собирает по КАЖДОМУ персонажу
+    его фото (реф) + чистый облик, при нужде — связи/лор. seed_names — имена релевантных персонажей из базового
+    семантического поиска (хинт; модель дополняет из промпта). Best-effort: любой сбой/не-tool-модель → откат
+    (используем то, что успели собрать). Возвращает (catalog_items, appearance_context_text)."""
+    llm, model_id, _label = get_active_model()
+    if llm is None or MODEL_TOOLS_SUPPORT.get(ACTIVE_MODEL) is False:
+        return [], None
+    exclude_mids = set(exclude_mids or ())
+    primary_hits, extra_hits, appearance = [], [], []
+    seen_ref = set(exclude_mids)
+
+    async def _tool_character(name: str) -> str:
+        name = (name or "").strip()
+        if not name:
+            return "Пустое имя."
+        hits = await _index_media_hybrid_hits(chat_id, name, GEN_AGENTIC_REFS_PER_CHAR * 3, for_gen=True)
+        chosen = []
+        for h in hits:
+            mid = h.get("msg_id")
+            if mid is None or mid in seen_ref:
+                continue
+            seen_ref.add(mid)
+            chosen.append(h)
+            if len(chosen) >= GEN_AGENTIC_REFS_PER_CHAR:
+                break
+        if chosen:
+            primary_hits.append(chosen[0])   # 1-й реф персонажа — в приоритет (breadth-first при капе)
+            extra_hits.extend(chosen[1:])
+        # облик: visual_description фото → vision на лету по топ-фото → visual_features досье
+        look = (chosen[0].get("visual_description") or "").strip() if chosen else ""
+        if not look and chosen:
+            try:
+                fetched = await client.get_messages(chat_id, ids=[chosen[0]["msg_id"]])
+                m = fetched[0] if fetched else None
+                if m and _index_is_image_msg(m):
+                    raw = await asyncio.wait_for(m.download_media(bytes), timeout=GEN_MEDIA_DL_TIMEOUT)
+                    if raw:
+                        d = await describe_image(raw)
+                        if d and not _looks_like_refusal(d) and d != "[изображение]":
+                            look = d.strip()
+            except Exception:
+                pass
+        if not look:
+            ent = await _index_find_entity(chat_id, name)
+            if ent:
+                look = ((ent.get("visual_features") or ent.get("canon_summary") or "")).strip()
+        if look:
+            appearance.append(f"{name}: {_idx_snip(look, 220)}")
+        mids_txt = ", ".join(f"msg {h['msg_id']}" for h in chosen) or "фото не нашёл"
+        return f"{name} → рефы: {mids_txt}; облик: {_idx_snip(look, 220) or '—'}"
+
+    sys = ("Ты собираешь визуальные РЕФЕРЕНСЫ (фото) и ОБЛИК персонажей для генерации картинки. "
+           "Релевантные запросу персонажи чата (по памяти): " + ", ".join(seed_names) + ". "
+           "Определи, КОГО реально нужно нарисовать по запросу (это могут быть эти и/или названные в самом запросе, "
+           "в т.ч. в косвенных падежах), и по КАЖДОМУ вызови character(name) — это добавит его фото в референсы и "
+           "вернёт облик, чтобы он вышел по канону, а не был скопирован с общего кадра. Для сцен «X и Y вместе» можешь "
+           "уточнить connections(entity) или детали через search(query). НЕ пиши промпт и НЕ отвечай текстом — только "
+           "вызывай инструменты; когда прошёлся по нужным персонажам, заверши без вызова.")
+    messages = [{"role": "system", "content": sys},
+                {"role": "user", "content": f"Запрос генерации: {user_prompt}"}]
+    try:
+        for _it in range(GEN_AGENTIC_MAX_ITERS):
+            resp = await asyncio.to_thread(
+                llm.chat.completions.create, model=model_id, messages=messages,
+                max_tokens=1500, temperature=0.3, tools=GEN_AGENTIC_TOOLS, tool_choice="auto")
+            msg = resp.choices[0].message
+            if not getattr(msg, "tool_calls", None):
+                break
+            assistant_dict = {"role": "assistant", "content": msg.content,
+                              "tool_calls": [{"id": tc.id, "type": getattr(tc, "type", "function"),
+                                              "function": {"name": tc.function.name, "arguments": tc.function.arguments}}
+                                             for tc in msg.tool_calls]}
+            _reasoning = getattr(msg, "reasoning_content", None)
+            if _reasoning:
+                assistant_dict["reasoning_content"] = _reasoning
+            messages.append(assistant_dict)
+            for tc in msg.tool_calls:
+                try:
+                    args = json.loads(tc.function.arguments or "{}")
+                    args = args if isinstance(args, dict) else {}
+                except (json.JSONDecodeError, TypeError):
+                    args = {}
+                nm = tc.function.name
+                if nm == "character":
+                    res = await _tool_character(args.get("name", ""))
+                elif nm == "search":
+                    res = await _index_tool_search(chat_id, args.get("query", ""), args.get("kind", "all"))
+                elif nm == "connections":
+                    res = await _index_tool_connections(chat_id, args.get("entity"))
+                else:
+                    res = f"Неизвестный инструмент: {nm}"
+                messages.append({"role": "tool", "tool_call_id": tc.id, "content": (res or "")[:4000]})
+    except Exception as e:
+        log("GEN", f"Агентный добор: сбой tool-loop ({e}) — использую собранное частично")
+    ref_hits = primary_hits + extra_hits
+    items = await _gen_fetch_ref_items(chat_id, ref_hits, exclude_mids=exclude_mids,
+                                       rerank_prompt=None, limit=GEN_CTX_IMG_MAX) if ref_hits else []
+    ctx = ("Облик персонажей из памяти (заземли КАЖДОГО на его собственный реф, НЕ смешивай внешности):\n- "
+           + "\n- ".join(appearance)) if appearance else None
+    log("GEN", f"Агентный добор: сид {len(seed_names)} → рефов {len(items)}, обликов {len(appearance)}")
+    return items, ctx
+
+
 async def _gen_index_candidates(chat_id: int, prompt: str, limit: int = GEN_INDEX_REF_MAX, exclude_mids=None) -> tuple:
     """Для /gen: смысловой поиск референсов и контекста по ВСЕЙ проиндексированной истории (не только N последних).
-    Возвращает (catalog_items, context_text): фото-кандидаты в формате каталога /gen + текст-контекст из досье
-    (внешность релевантных персонажей — ключ к узнаваемым референсам).
+    Возвращает (catalog_items, context_text, seed_names): фото-кандидаты в формате каталога /gen + текст-контекст
+    из досье (внешность релевантных персонажей) + имена релевантных персонажей (сид агентного per-character добора).
     exclude_mids — msg_id уже показанных свежих фото: их пропускаем ДО скачивания (нет двойной загрузки, чистое
     разделение «свежее = контекст / индекс = релевантное из старого»)."""
     if not chat_id or _index_available() or not (prompt or "").strip():
-        return [], None
+        return [], None, []
     search_ready, _search_note = await _index_memory_ready(chat_id, "memory_search")
     if not search_ready:
-        return [], None
+        return [], None, []
     exclude_mids = set(exclude_mids or ())
     qv = await _index_embed_query(prompt)
     media_ready, _media_note = await _index_memory_ready(chat_id, "memory_media")
@@ -11209,7 +11434,7 @@ async def _gen_index_candidates(chat_id: int, prompt: str, limit: int = GEN_INDE
     if exclude_mids:
         media_hits = [h for h in media_hits if h.get("msg_id") not in exclude_mids]
     # релевантные персонажи → их внешность в контекст промптера
-    ent_hits = [h for h in await _index_vector_search(chat_id, "entities", qv, 5) if h["score"] >= 0.25] if qv is not None else []
+    ent_hits = [h for h in await _index_vector_search(chat_id, "entities", qv, GEN_AGENTIC_MAX_CHARS) if h["score"] >= 0.25] if qv is not None else []
     ctx_lines = []
     for h in ent_hits:
         vf = (h.get("visual_features") or "").strip()
@@ -11220,78 +11445,10 @@ async def _gen_index_candidates(chat_id: int, prompt: str, limit: int = GEN_INDE
     ctx = ("Из памяти чата — релевантные персонажи (можно опереться на их облик для узнаваемых референсов):\n"
            + "\n".join(ctx_lines)) if ctx_lines else None
 
-    items = []
-    if media_hits:
-        media_hits = media_hits[:GEN_INDEX_VISUAL_POOL]
-        mids = [h["msg_id"] for h in media_hits]
-        desc_by_mid = {h["msg_id"]: (h.get("image_description") or "") for h in media_hits}
-        visual_by_mid = {h["msg_id"]: (h.get("visual_description") or "") for h in media_hits}
-        hit_by_mid = {h["msg_id"]: h for h in media_hits}
-        score_by_mid = {h["msg_id"]: h.get("score") for h in media_hits}
-        try:
-            fetched = []
-            for i in range(0, len(mids), 100):
-                fetched += await client.get_messages(chat_id, ids=mids[i:i + 100])
-            by_id = {getattr(m, "id", None): m for m in fetched if m is not None}
-            msgs = [by_id.get(mid) for mid in mids]
-        except Exception as e:
-            log("GEN", f"Индекс-референсы: get_messages не удался: {e}")
-            msgs = []
-
-        async def _dl(m):
-            if not _index_is_image_msg(m) or _gen_is_own_generation(m):  # свои генерации — бан и из индекс-рефов
-                return None
-            try:
-                raw = await asyncio.wait_for(m.download_media(bytes), timeout=GEN_MEDIA_DL_TIMEOUT)
-            except asyncio.TimeoutError:
-                log("GEN", f"Индекс-референсы: фото id={getattr(m, 'id', '?')} скачивалось дольше {GEN_MEDIA_DL_TIMEOUT}с — пропускаю")
-                return None
-            except Exception:
-                return None
-            if not raw:
-                return None
-            thumb = await _downscale_img(raw)
-            cached_key = "gen:" + _media_key(m)
-            visual_desc = visual_by_mid.get(m.id) or MEDIA_CACHE.get(cached_key)
-            if not visual_desc or visual_desc in MEDIA_FAILURE_MARKERS:
-                visual_desc = None
-            hit = hit_by_mid.get(m.id) or {}
-            return {"idx": 0, "mid": m.id, "bytes": raw, "thumb": thumb,
-                    "caption": (m.raw_text or "").strip(), "desc": visual_desc,
-                    "visual_desc": visual_desc, "index_desc": desc_by_mid.get(m.id) or None,
-                    "score": score_by_mid.get(m.id), "text_hit": bool(hit.get("text_hit")),
-                    "image_hit": bool(hit.get("image_hit")), "text_score": hit.get("text_score"),
-                    "image_score": hit.get("image_score"),
-                    "date": _fmt_date(getattr(m, "date", None)),
-                    "author": "me" if getattr(m, "out", False) else (f"user:{getattr(m, 'sender_id', None)}" if getattr(m, "sender_id", None) else None),
-                    "nearby_text": await _gen_nearby_text_from_db(chat_id, m.id),
-                    "cache_key": cached_key,
-                    "index_chat_id": chat_id,
-                    "from_owner": bool(getattr(m, "out", False)), "from_index": True}
-        try:
-            res = await asyncio.wait_for(asyncio.gather(*[_dl(m) for m in msgs]), timeout=GEN_CATALOG_TIMEOUT)
-            items = [it for it in res if it]
-        except asyncio.TimeoutError:
-            log("GEN", "Индекс-референсы: скачивание превысило тайм-бюджет")
-        if items:
-            described = await _gen_describe_candidates_bounded(items, timeout=GEN_CATALOG_TIMEOUT)
-            if described < len(items):
-                log("GEN", f"Индекс-референсы: visual-desc превысил тайм-бюджет — готово {described}/{len(items)}")
-            junk = [it for it in items if _gen_desc_kind(it.get("visual_desc") or it.get("desc")) in ("скриншот", "мем")]
-            if junk:
-                items = [it for it in items if it not in junk]
-                log("GEN", f"Индекс-референсы: исключено {len(junk)} скриншотов/мемов")
-            before = len(items)
-            # безусловно: без свежего visual-desc, без stage5-описания (index_desc — тоже vision-продукт)
-            # и без подписи реранкеру нечего оценивать — кандидат остаётся чистым вектор-шумом (gallery-фото
-            # только с эмбеддингом при упавшем vision раньше просачивались с пустым visual=)
-            items = [it for it in items if it.get("visual_desc") or (it.get("index_desc") or "").strip()
-                     or (it.get("caption") or "").strip()]
-            if before != len(items):
-                log("GEN", f"Индекс-референсы: исключено {before - len(items)} фото без каких-либо описаний")
-            items = await _gen_rerank_index_items(prompt, items, limit)
+    items = await _gen_fetch_ref_items(chat_id, media_hits, rerank_prompt=prompt, limit=limit)
+    seed_names = [h["name"] for h in ent_hits if h.get("name")]  # релевантные персонажи → сид агентного per-character добора
     log("GEN", f"Индекс-референсы: {len(items)} фото + {len(ctx_lines)} досье из памяти по запросу «{_idx_snip(prompt, 50)}»")
-    return items, ctx
+    return items, ctx, seed_names
 
 
 # --- оркестратор пайплайна ---
