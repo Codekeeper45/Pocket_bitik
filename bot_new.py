@@ -77,6 +77,7 @@ except ValueError:
 api_hash = os.getenv("api_hash") or ""
 openrouter_api_key = os.getenv("OPENROUTER_API_KEY")
 deepseek_api_key = os.getenv("DEEPSEEK_API_KEY")
+cerebras_api_key = os.getenv("CEREBRAS_API_KEY")  # Cerebras Inference (OpenAI-совм.): free Gemma для /index-экстракции (best-effort primary)
 opencode_api_key = os.getenv("OPENCODE_API_KEY")
 modelgate_api_key = os.getenv("MODELGATE_API_KEY")  # шлюз Claude-моделей (OpenAI-совместимый, modelgate.app)
 openai_api_key = os.getenv("OPENAI_API_KEY")  # официальный OpenAI API (gpt-5.x / o3); reasoning-модели
@@ -113,6 +114,7 @@ tts_available = bool(GOOGLE_TTS_KEYS)
 # Константы
 AUTO_REPLY_ACCUMULATE_WINDOW = 1.5
 OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1"
+CEREBRAS_BASE_URL = "https://api.cerebras.ai/v1"   # Cerebras Inference, OpenAI-совместимый (Gemma free для /index)
 OPENROUTER_VISION_MODEL = "google/gemini-3.1-flash-lite"  # дефолт vision (можно сменить /model media)
 # Транскрипция (STT через /audio/transcriptions): chirp-3/whisper стали отдавать 400 (2026-06),
 # заменены на дешёвые STT (проверено живьём: HTTP 200, ogg напрямую). Gemini для STT дорог.
@@ -136,9 +138,15 @@ GEN_INDEX_POOL = 32         # /gen: сколько индекс-кандидат
 GEN_INDEX_VISUAL_POOL = 16  # /gen: сколько индекс-кандидатов скачать/описать для визуального rerank
 
 # --- /index: GraphRAG-память по истории чата (MariaDB + numpy-вектора) ---
-# Экстракция досье/графа: primary/fallback — БЕСПЛАТНЫЕ OpenRouter-модели, официальный DeepSeek — крайняя платная страховка (гибрид).
-INDEX_EXTRACT_OR_PRIMARY = "nvidia/nemotron-3-super-120b-a12b:free"  # primary: free, JSON-mode (response_format), 1M контекст, 256k вывод
-INDEX_EXTRACT_OR_FALLBACK = "poolside/laguna-xs-2.1:free"            # free fallback: 256k контекст, 32k вывод, JSON ТОЛЬКО по промпту (без response_format!)
+# Экстракция досье/графа (гибрид, free→free→платно): Cerebras Gemma (free, очень быстрая, но жёсткий TPM) →
+#   OpenRouter nemotron (free, тянет большие блоки) → официальный DeepSeek (крайняя платная страховка).
+INDEX_EXTRACT_CEREBRAS_MODEL = "gemma-4-31b"  # Cerebras free: 0.6с, JSON-native. Лимиты free: 30k ток/мин, 5 req/мин, 1M/день
+# Free-tier Cerebras: 30k токенов/мин → блок Stage1 (96k) НЕ влезет физически. Пускаем Gemma первой ТОЛЬКО когда вход
+# укладывается в лимит (обобщение досье ~16k, связи), иначе сразу nemotron — иначе жгли бы скудный req-бюджет (5/мин) в заведомый 429.
+INDEX_CEREBRAS_MAX_INPUT_TOKENS = 18_000      # порог входа (оценка count_tokens) для маршрута через Gemma; запас под вывод в 30k TPM
+INDEX_CEREBRAS_COOLDOWN = 60                   # после 429 (TPM/req исчерпан) — столько секунд НЕ трогаем Cerebras (окно минуты), чтобы не долбить
+INDEX_EXTRACT_OR_PRIMARY = "nvidia/nemotron-3-super-120b-a12b:free"  # #2: free, JSON-mode (response_format), 1M контекст, 256k вывод
+INDEX_EXTRACT_OR_FALLBACK = "poolside/laguna-xs-2.1:free"            # (выведен из цепочки экстракции; JSON ТОЛЬКО по промпту)
 INDEX_EXTRACT_MODEL = "deepseek-v4-flash"   # официальный DeepSeek — платная страховка при исчерпании free-капа/сбое: 1M context, большой output
 INDEX_EXTRACT_FALLBACK = "deepseek-v4-pro"  # запасной официальный DeepSeek, дороже; последний рубеж, чтобы индексация НЕ вставала
 INDEX_EMBED_TEXT_MODEL = "qwen/qwen3-embedding-8b"   # тексты: досье, связи, сцены, описания фото. SOTA MTEB, дешевле, 32k контекст, MRL 32–4096 (OpenRouter /embeddings)
@@ -178,6 +186,7 @@ INDEX_MODEL_MAX_OUT = {                  # per-model кламп потолка �
     "deepseek-v4-pro": 384_000,
     "deepseek/deepseek-v4-flash": 16_384,
     "deepseek/deepseek-v4-pro": 384_000,
+    "gemma-4-31b": 8_192,                               # Cerebras free: скромный вывод (мелкие вызовы); всё равно ограничен 30k TPM
     "nvidia/nemotron-3-super-120b-a12b:free": 262_144,  # free primary: вывод до 256k
     "poolside/laguna-xs-2.1:free": 32_768,              # free fallback: вывод до 32k (плотный Stage1 → finish=length → дробление)
 }
@@ -221,6 +230,7 @@ INDEX_EXTRACT_RETRIES = 3     # LLM/JSON extractor: не двигаем чекп
 INDEX_FREE_COOLDOWN = 90      # после 429 от free-модели OpenRouter (исчерпан кап 1000/сутки или per-minute) — столько секунд НЕ трогаем
 #                               free-маршруты (идём сразу на платный DeepSeek), чтобы не жечь по ~28с ретраев на КАЖДЫЙ вызов после капа
 _INDEX_FREE_COOLDOWN_UNTIL = 0.0  # monotonic-время, до которого free-маршруты пропускаются (ставится при 429 от free)
+_INDEX_CEREBRAS_COOLDOWN_UNTIL = 0.0  # ОТДЕЛЬНЫЙ кулдаун Cerebras (свой TPM-квант) — не блокирует OpenRouter-nemotron
 INDEX_EMBED_RETRIES = 3       # embeddings: 429/5xx у провайдера не должны превращаться в "done"
 INDEX_MATRIX_CACHE_MAX_ROWS = 10_000  # больше ищем потоково, без полной матрицы в RAM
 INDEX_SEARCH_DB_BATCH = 10_000  # потоковый векторный поиск: строк на выборку (5k→10k: быстрее стриминг, чуть больше транзиентной RAM)
@@ -959,6 +969,8 @@ Why am I alone now? (I don't know)"""
 client = TelegramClient("session_name", api_id, api_hash)
 openrouter_client = OpenAI(api_key=openrouter_api_key, base_url=OPENROUTER_BASE_URL) if openrouter_api_key else None
 deepseek_client = OpenAI(api_key=deepseek_api_key, base_url=DEEPSEEK_BASE_URL) if deepseek_api_key else None
+cerebras_client = OpenAI(api_key=cerebras_api_key, base_url=CEREBRAS_BASE_URL,
+                         default_headers={"User-Agent": BROWSER_UA}) if cerebras_api_key else None  # браузерный UA — страховка от CF-пробы
 opencode_client = OpenAI(api_key=opencode_api_key, base_url=OPENCODE_BASE_URL) if opencode_api_key else None
 modelgate_client = OpenAI(api_key=modelgate_api_key, base_url=MODELGATE_BASE_URL,
                           default_headers={"User-Agent": BROWSER_UA}) if modelgate_api_key else None
@@ -7650,7 +7662,7 @@ def _index_available() -> str:
     if not index_db_url:
         return "не задан INDEX_DB_URL в .env (строка подключения к MariaDB)"
     if openrouter_client is None:
-        return "нет OPENROUTER_API_KEY (free-экстракция nemotron/laguna + embeddings /index)"
+        return "нет OPENROUTER_API_KEY (free-экстракция nemotron + embeddings /index; Cerebras Gemma опционален как primary)"
     if deepseek_client is None:
         return "нет DEEPSEEK_API_KEY (платная страховка экстракции при исчерпании free-капа)"
     return ""
@@ -8127,19 +8139,25 @@ def _json_from_llm(text: str):
 
 
 async def _index_extract(system: str, user: str, max_tokens: int = INDEX_EXTRACT_MAX_TOKENS):
-    """Экстракция: primary/fallback — БЕСПЛАТНЫЕ OpenRouter-модели (nemotron JSON-native → laguna по промпту),
-    официальный DeepSeek — платная страховка при исчерпании free-капа/сбое (гибрид: индексация НЕ встаёт).
+    """Экстракция (гибрид free→free→платно): Cerebras Gemma (free, быстрая, только для входа ≤ TPM-лимита) →
+    OpenRouter nemotron (free, тянет большие блоки) → официальный DeepSeek (платная страховка при исчерпании free/сбое).
     Возвращает dict при успехе; None — если провайдер ОТВЕТИЛ, но контент не парсится как JSON
     (детерминированный «poison» — можно дробить/скипать). Ошибки транспорта/ключа/квоты/параметров
     останавливают stage через IndexTransientError, чтобы не превращать системную проблему в skipped ranges."""
-    global _INDEX_EXTRACT_OK, _INDEX_FREE_COOLDOWN_UNTIL
+    global _INDEX_EXTRACT_OK, _INDEX_FREE_COOLDOWN_UNTIL, _INDEX_CEREBRAS_COOLDOWN_UNTIL
     routes = []
-    # primary/fallback — free OpenRouter (nemotron сильнее и JSON-native; laguna дешевле/быстрее, JSON по промпту).
-    # Пропускаем free, если недавно словили 429 (кап исчерпан) — идём сразу на DeepSeek, не тратя ретраи на заведомый 429.
-    free_on_cooldown = time.monotonic() < _INDEX_FREE_COOLDOWN_UNTIL
+    now = time.monotonic()
+    # PRIMARY — Cerebras Gemma (free, ~0.6с, JSON-native), НО только если вход укладывается в её TPM-лимит (30k/мин): блок Stage1 (96k)
+    # физически не влезет → его сразу на nemotron, не жжём скудный req-бюджет (5/мин) в заведомый 429. Свой кулдаун после 429 (TPM-квант).
+    in_tok = count_tokens(system) + count_tokens(user)
+    cerebras_ok = (cerebras_client is not None and now >= _INDEX_CEREBRAS_COOLDOWN_UNTIL
+                   and in_tok <= INDEX_CEREBRAS_MAX_INPUT_TOKENS)
+    if cerebras_ok:
+        routes.append(("cerebras", cerebras_client, INDEX_EXTRACT_CEREBRAS_MODEL))
+    # #2 — free OpenRouter nemotron (JSON-native, тянет большие блоки). Пропускаем, если недавно 429 (кап исчерпан) — сразу на DeepSeek.
+    free_on_cooldown = now < _INDEX_FREE_COOLDOWN_UNTIL
     if openrouter_client is not None and not free_on_cooldown:
         routes.append(("openrouter", openrouter_client, INDEX_EXTRACT_OR_PRIMARY))
-        routes.append(("openrouter", openrouter_client, INDEX_EXTRACT_OR_FALLBACK))
     # крайняя ПЛАТНАЯ страховка: официальный DeepSeek flash→pro. Включается когда free-кап (1000/сутки) исчерпан или free-модели сыпятся.
     if deepseek_client is not None:
         routes.append(("deepseek", deepseek_client, INDEX_EXTRACT_MODEL))
@@ -8150,8 +8168,8 @@ async def _index_extract(system: str, user: str, max_tokens: int = INDEX_EXTRACT
     for ri, (provider, llm_client, model) in enumerate(routes):
         if provider == "deepseek" and not warned_paid:  # дошли до платной страховки → free не справились: видно СРАЗУ
             warned_paid = True
-            log("INDEX", f"⚠️ Экстракция: free-модели OpenRouter не сработали на этом блоке → платный DeepSeek {model} "
-                         f"(free-кап 1000/сутки исчерпан или сбой; страховка платная)")
+            log("INDEX", f"⚠️ Экстракция: free-модели (Cerebras/OpenRouter) не сработали на этом блоке → платный DeepSeek {model} "
+                         f"(free-капы исчерпаны или сбой; страховка платная)")
         for attempt in range(1, INDEX_EXTRACT_RETRIES + 1):
             try:
                 mt = min(max_tokens, INDEX_MODEL_MAX_OUT.get(model, max_tokens))  # кламп под реальный лимит модели
@@ -8162,15 +8180,15 @@ async def _index_extract(system: str, user: str, max_tokens: int = INDEX_EXTRACT
                     "messages": [{"role": "system", "content": system}, {"role": "user", "content": user}],
                     "timeout": 400,  # блок ~96k → генерится за <400с; таймаут ловит реальный затык (мёртвый сокет) → фолбэк на след. маршрут
                 }
-                if model != INDEX_EXTRACT_OR_FALLBACK:  # laguna НЕ поддерживает response_format → JSON только промпт-инструкцией
-                    kwargs["response_format"] = {"type": "json_object"}
+                kwargs["response_format"] = {"type": "json_object"}  # cerebras/nemotron/deepseek — все поддерживают JSON-mode
                 if provider == "deepseek":
                     # Официальный DeepSeek: extraction должен возвращать JSON, поэтому thinking выключаем
                     # и не тратим output budget на reasoning_content.
                     kwargs["extra_body"] = {"thinking": {"type": "disabled"}}
-                else:
+                elif provider == "openrouter":
                     # OpenRouter принимает reasoning как провайдерский параметр в теле запроса.
                     kwargs["extra_body"] = {"reasoning": {"enabled": False}}
+                # cerebras: НИКАКОГО extra_body — Gemma не reasoning-модель, а параметр 'reasoning' даёт 400 (wrong_api_format)
                 _t0 = time.monotonic()
                 # wall-clock стена ВНЕ http-клиента: SDK "timeout" — read-timeout между чанками, дегенеративный/keepalive-стрим
                 # его сбрасывает → вызов крутится десятки минут (30k вход → 1985с, 384k ток., finish=length). asyncio.wait_for
@@ -8215,11 +8233,14 @@ async def _index_extract(system: str, user: str, max_tokens: int = INDEX_EXTRACT
                     timed_out = True
                     log("INDEX", f"Экстракция {provider}/{model}: таймаут — перехожу на следующий маршрут (не дроблю блок)")
                     break
-                if code == 429:  # rate-limit. Free OpenRouter: ставим кулдаун (не долбим free каждый вызов) и сразу на след. маршрут (DeepSeek).
-                    if provider == "openrouter":
+                if code == 429:  # rate-limit. Ставим кулдаун на исчерпанный free-провайдер и сразу на след. маршрут.
+                    if provider == "cerebras":  # TPM/req-квант Cerebras исчерпан → пауза на окно минуты (свой кулдаун, nemotron не трогаем)
+                        _INDEX_CEREBRAS_COOLDOWN_UNTIL = time.monotonic() + INDEX_CEREBRAS_COOLDOWN
+                    elif provider == "openrouter":
                         _INDEX_FREE_COOLDOWN_UNTIL = time.monotonic() + INDEX_FREE_COOLDOWN
                     log("INDEX", f"Экстракция {provider}/{model}: 429 rate-limit — след. маршрут"
-                                 + (f" (free на паузе {INDEX_FREE_COOLDOWN}с → DeepSeek)" if provider == "openrouter" else ""))
+                                 + (f" (Cerebras на паузе {INDEX_CEREBRAS_COOLDOWN}с)" if provider == "cerebras"
+                                    else f" (free на паузе {INDEX_FREE_COOLDOWN}с → DeepSeek)" if provider == "openrouter" else ""))
                     break
                 if code in (401, 402):  # ключ/квота — фатально, НЕ poison: стопим стадию (иначе весь чат уйдёт в ложные skip)
                     raise IndexTransientError(f"{provider}/{model}: config {code} (ключ/квота недоступны) — стоп, не poison: {e}")
