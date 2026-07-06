@@ -154,10 +154,16 @@ INDEX_STAGE1_MICRO_TOKENS = 96_000     # stage 1: размер блока экс
 #   выигрыш «меньше блоков = быстрее» съедается провалами. 96k ≈ 1400 сообщ, генерится за <400с → таймаут ловит реальный затык, а не долгую печать.
 #   Таймаут БОЛЬШЕ НЕ дробит блок (это был ложный сигнал «блок плотный»): _index_extract на таймауте фолбэкает на след. маршрут (OpenRouter — иной сетевой путь).
 INDEX_STAGE1_TIMEOUT_STRIKES = 2        # stage 1: столько all-route-таймаутов подряд на ОДНОМ курсоре → статус blocked (watchdog не крутит впустую; ручной /index go)
-INDEX_EXTRACT_MAX_TOKENS = 384_000      # ПОТОЛОК ВЫВОДА = максимум модели (official DeepSeek V4 = 384k) → фактически БЕЗ лимита:
-#   модель сама останавливается на finish=stop, бесконечно писать не может. Платим только за реально сгенерированные токены,
-#   поэтому высокий потолок бесплатен — он лишь убирает искусственную обрезку (раньше 64k → finish=length → дробление блока).
+INDEX_EXTRACT_MAX_TOKENS = 96_000       # ПОТОЛОК ВЫВОДА Stage 1 досье. Раньше был 384k «безлимит» (81aa197) на ошибочной посылке
+#   «модель сама встанет на finish=stop» — по логам модель УХОДИТ В ЦИКЛ и генерит ДО потолка (finish=length): 30k вход → 1985с (33 мин!)
+#   и 384k выходных токенов на ОДИН вызов. SDK-таймаут (read между чанками) это НЕ ловит — keepalive/непрерывный стрим его сбрасывает.
+#   96k щедро для легит-досье, но рубит дегенерацию в ~разы. Реальная граница времени — INDEX_EXTRACT_HARD_TIMEOUT (wall-clock) ниже.
 #   Клампится под реальный лимит модели в _index_extract (min с INDEX_MODEL_MAX_OUT). thinking выключаем для JSON.
+INDEX_EXTRACT_HARD_TIMEOUT = 300        # wall-clock таймаут ОДНОГО extract-вызова (asyncio.wait_for ВНЕ http-клиента). SDK "timeout"
+#   ниже — read-timeout между чанками, дегенеративный/keepalive-стрим его сбрасывает и вызов крутится десятки минут. Этот — жёсткая
+#   стена: сработал → как транспортный таймаут (фолбэк на след. маршрут; leaked-поток сам добьётся и результат отбросится).
+INDEX_REL_MAX_TOKENS = 16_000           # ПОТОЛОК ВЫВОДА Stage 2 (связи ОДНОЙ сцены): столько связей сцене не нужно. Дегенерация упрётся
+#   в finish=length за ~2 мин → штатное дробление→скип (а не 33 мин), + дешевле в 24× vs 384k. Кламп теми же INDEX_MODEL_MAX_OUT.
 INDEX_MODEL_MAX_OUT = {                  # per-model кламп потолка вывода; OpenRouter-fallback может быть ниже official DeepSeek
     "deepseek-v4-flash": 384_000,
     "deepseek-v4-pro": 384_000,
@@ -8127,11 +8133,18 @@ async def _index_extract(system: str, user: str, max_tokens: int = INDEX_EXTRACT
                     # OpenRouter принимает reasoning как провайдерский параметр в теле запроса.
                     kwargs["extra_body"] = {"reasoning": {"enabled": False}}
                 _t0 = time.monotonic()
-                resp = await asyncio.to_thread(
-                    # max_retries=0: гасим ВНУТРЕННИЕ ретраи SDK (дефолт 2) — иначе таймаут крутится ~3×timeout внутри клиента
-                    # ДО всплытия наружу. Ретраи/фолбэк — наш уровень. with_options не трогает /ask (свой клиент).
-                    llm_client.with_options(max_retries=0).chat.completions.create,
-                    **kwargs,
+                # wall-clock стена ВНЕ http-клиента: SDK "timeout" — read-timeout между чанками, дегенеративный/keepalive-стрим
+                # его сбрасывает → вызов крутится десятки минут (30k вход → 1985с, 384k ток., finish=length). asyncio.wait_for
+                # рубит по реальному времени; TimeoutError ловится ниже как транспортный таймаут → фолбэк на след. маршрут.
+                # Отменённый to_thread оставляет поток дописываться в фоне (SDK-timeout его добьёт) — результат отбрасывается.
+                resp = await asyncio.wait_for(
+                    asyncio.to_thread(
+                        # max_retries=0: гасим ВНУТРЕННИЕ ретраи SDK (дефолт 2) — иначе таймаут крутится ~3×timeout внутри клиента
+                        # ДО всплытия наружу. Ретраи/фолбэк — наш уровень. with_options не трогает /ask (свой клиент).
+                        llm_client.with_options(max_retries=0).chat.completions.create,
+                        **kwargs,
+                    ),
+                    timeout=INDEX_EXTRACT_HARD_TIMEOUT,
                 )
                 _dt = time.monotonic() - _t0
                 got_response = True
@@ -9093,7 +9106,7 @@ async def _index_stage2_graph(chat_id: int, progress_cb=None):
         failed = False
         scene_summary = None
         if scene_text.strip():
-            data = await _index_extract(_INDEX_REL_SYSTEM + "\n\nСПРАВОЧНИК:\n" + registry, _recent_block() + "СЦЕНА:\n" + scene_text)
+            data = await _index_extract(_INDEX_REL_SYSTEM + "\n\nСПРАВОЧНИК:\n" + registry, _recent_block() + "СЦЕНА:\n" + scene_text, max_tokens=INDEX_REL_MAX_TOKENS)
             if data is None or not isinstance(data.get("relations"), list):
                 if len(sc) > 1:
                     mid = max(1, len(sc) // 2)
@@ -9127,7 +9140,7 @@ async def _index_stage2_graph(chat_id: int, progress_cb=None):
             scene_msg_range=(sc[0]["msg_id"], sc[-1]["msg_id"]))
         data = None
         if scene_text.strip():
-            data = await _index_extract(_INDEX_REL_SYSTEM + "\n\nСПРАВОЧНИК:\n" + registry, _recent_block() + "СЦЕНА:\n" + scene_text)
+            data = await _index_extract(_INDEX_REL_SYSTEM + "\n\nСПРАВОЧНИК:\n" + registry, _recent_block() + "СЦЕНА:\n" + scene_text, max_tokens=INDEX_REL_MAX_TOKENS)
         return scene_text, name2id, data, s_date
 
     async def _apply_scene(sc, scene_text, name2id, data, s_date):
