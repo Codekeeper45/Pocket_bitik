@@ -548,6 +548,17 @@ for _glid, _glapi, _gllabel in [
     ("gloy-2", "gloy_2.0", "Gloy AI 2.0"),
 ]:
     MODEL_REGISTRY[_glid] = ("gloy", _glapi, _gllabel, 128000, 1.15)
+# Cerebras Inference (api.cerebras.ai/v1, OpenAI-совместимый, прямой Bearer + браузерный UA от CF). Клиент — общий
+# cerebras_clients[0] (те же ключи ротации, что /index-экстракция). free-tier 30k TPM/ключ → окно держим скромным (32k),
+# чтобы обычный /ask влезал в бюджет. Проверено вживую (2026-07): gemma-4-31b — текст, БЕЗ reasoning, ~0.6с, инструменты
+# нативны; gpt-oss-120b / zai-glm-4.7 — reasoning в ОТДЕЛЬНОМ поле (контент чист), инструменты ок. Vision нет. НЕ
+# reasoning-managed (сырой клиент, без reasoning_effort-инжекта) — параметр reasoning gemma отвергает (400 wrong_api_format).
+for _cbslug, _cbid, _cblabel in [
+    ("cb-gemma",   "gemma-4-31b",  "Gemma 4 31B (CB)"),
+    ("cb-gpt-oss", "gpt-oss-120b", "GPT-OSS 120B (CB)"),
+    ("cb-glm",     "zai-glm-4.7",  "GLM-4.7 (CB)"),
+]:
+    MODEL_REGISTRY[_cbslug] = ("cerebras", _cbid, _cblabel, 32768, 1.30)
 # Уровни глубины размышлений (reasoning_effort) OpenAI-моделей, от мощного к слабому.
 # API жёстко валидирует значение ПО МОДЕЛИ (неподдерживаемое → 400): gpt-5.4/5.5 принимают
 # none/low/medium/high/xhigh, o3 — только low/medium/high. Дефолты: 5.5 → medium, 5.4 → none, o3 → medium.
@@ -1642,6 +1653,8 @@ def _client_for_provider(provider):
         return sakana_client
     if provider == "gloy":
         return gloy_client
+    if provider == "cerebras":
+        return cerebras_clients[0] if cerebras_clients else None  # общий клиент ротации (браузерный UA внутри); None → нет ключей
     if provider == "opencode":
         return opencode_reasoning_client  # путь ответов с инжектом reasoning_effort
     return opencode_client  # неизвестный провайдер — сырой клиент (фоллбэк)
@@ -6438,6 +6451,7 @@ async def model_command(event):
                          "fireworks": "━━ Fireworks ━━",
                          "sakana": "━━ Sakana AI (Fugu) ━━",
                          "gloy": "━━ LLM API FUN (Gloy AI) ━━",
+                         "cerebras": "━━ Cerebras ━━",
                          "openrouter": "━━ OpenRouter (кастом) ━━"}.get(provider, f"━━ {provider} ━━")
                 lines.append(f"\n{title}")
             mark = f"▶{i}." if slug == ACTIVE_MODEL else f"{i}."
@@ -6468,7 +6482,7 @@ async def model_command(event):
         tested = 0
         for slug in slugs:
             provider, mid, _label, _ctx, _safety = MODEL_REGISTRY[slug]
-            if provider in ("oc_anthropic", "openai", "google", "zai", "fireworks", "sakana", "gloy"):
+            if provider in ("oc_anthropic", "openai", "google", "zai", "fireworks", "sakana", "gloy", "cerebras"):
                 continue  # qwen3.7-max / gpt-5.x / o3 / Gemini / Fireworks / Sakana / Gloy: tools работают на auto, но forced пробник врёт (Sakana/Gloy отдают не tool_call) — флаг учится на лету в реальном /ask
             cl = _client_for_provider(provider)
             if cl is None:
@@ -7581,8 +7595,9 @@ async def status_command(event):
     L.append(f"⭐ **Избранное:** {len(FISH_FAVORITES)} Fish-голос(ов) · {len(CUSTOM_MODELS)} кастомных моделей")
     # — ключи —
     keys = []
-    for p, nm in [("deepseek", "DeepSeek"), ("openrouter", "OpenRouter"), ("opencode", "OpenCode"), ("modelgate", "Claude/ModelGate"), ("openai", "OpenAI"), ("google", "Google Gemini"), ("zai", "z.ai (GLM)"), ("fireworks", "Fireworks")]:
+    for p, nm in [("deepseek", "DeepSeek"), ("openrouter", "OpenRouter"), ("opencode", "OpenCode"), ("modelgate", "Claude/ModelGate"), ("openai", "OpenAI"), ("google", "Google Gemini"), ("zai", "z.ai (GLM)"), ("fireworks", "Fireworks"), ("cerebras", "Cerebras")]:
         keys.append(f"{nm} {'✅' if _client_for_provider(p) is not None else '❌'}")
+    keys[-1] += f"×{len(cerebras_clients)}" if cerebras_clients else ""  # число ключей ротации Cerebras
     keys.append(f"Tavily {'✅' if tavily_api_key else '❌'}")
     keys.append(f"Google TTS {'✅' if tts_available else '❌'}")
     keys.append(f"Fish {'✅' if fish_available else '❌'}")
