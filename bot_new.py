@@ -1011,6 +1011,16 @@ Why am I alone now? (I don't know)"""
 # Клиенты
 client = TelegramClient("session_name", api_id, api_hash)
 openrouter_client = OpenAI(api_key=openrouter_api_key, base_url=OPENROUTER_BASE_URL) if openrouter_api_key else None
+# grok-4.5 и пр. модели, что xAI гео-блочит → пробуем через ТОТ ЖЕ «чистый» прокси, что и Sakana (SAKANA_PROXY).
+# NB честно: блок стоит на хопе OpenRouter→xAI, а прокси меняет лишь bot→OpenRouter → может НЕ снять регион-блок;
+# страховка — region-403 fallback в _llm_create. Слуги через OPENROUTER_PROXY_SLUGS (дефолт grok-4.5).
+openrouter_proxy_client = None
+if openrouter_api_key and sakana_proxy:
+    import httpx as _httpx_or
+    openrouter_proxy_client = OpenAI(api_key=openrouter_api_key, base_url=OPENROUTER_BASE_URL,
+                                     http_client=_httpx_or.Client(proxy=sakana_proxy, timeout=_httpx_or.Timeout(600.0, connect=30.0)))
+OPENROUTER_PROXY_SLUGS = set(s.strip() for s in (os.getenv("OPENROUTER_PROXY_SLUGS") or "x-ai/grok-4.5").split(",") if s.strip())
+ASK_REGION_FALLBACK = os.getenv("ASK_REGION_FALLBACK", "gemini-3.5-flash")  # запасная модель при гео/permission-403 активной
 deepseek_client = OpenAI(api_key=deepseek_api_key, base_url=DEEPSEEK_BASE_URL) if deepseek_api_key else None
 cerebras_clients = [OpenAI(api_key=k, base_url=CEREBRAS_BASE_URL, default_headers={"User-Agent": BROWSER_UA})
                     for k in cerebras_api_keys]  # по клиенту на ключ (ротация); браузерный UA — страховка от CF-пробы
@@ -1635,10 +1645,17 @@ GEN_IMAGE_RES = _model_state.get("gen_image_res") or []  # поддержива�
 GEN_IMAGE_INPUT = bool(_model_state.get("gen_image_input", True))  # принимает ли ген-модель картинки на вход (реф/правка); дефолт gpt-image-2 — да
 
 
+def _proxied_or(client_obj, provider, model_id):
+    """grok и пр. слуги из OPENROUTER_PROXY_SLUGS гоним через прокси-клиент OpenRouter (чистый IP), если он поднят."""
+    if provider == "openrouter" and openrouter_proxy_client is not None and model_id in OPENROUTER_PROXY_SLUGS:
+        return openrouter_proxy_client
+    return client_obj
+
+
 def get_active_model():
     """Возвращает (client, api_model_id, label) для активной модели. client=None если провайдер не настроен."""
     provider, model_id, label, _ctx, _safety = MODEL_REGISTRY.get(ACTIVE_MODEL, MODEL_REGISTRY["deepseek-pro"])
-    client_obj = _client_for_provider(provider)
+    client_obj = _proxied_or(_client_for_provider(provider), provider, model_id)
     return client_obj, model_id, label
 
 
@@ -2146,6 +2163,18 @@ def _is_context_overflow(exc) -> bool:
         or "context size" in s and "exceed" in s
         or "reduce the length" in s
         or "prompt is too long" in s
+    )
+
+
+def _is_region_block(exc) -> bool:
+    """Модель недоступна из региона/по правам (напр. grok-4.5: xAI отдаёт permission-denied) — 403.
+    На такой ошибке ретрай той же модели бесполезен → фоллбэк на запасную модель."""
+    s = str(exc).lower()
+    return (
+        "not available in your region" in s
+        or "permission-denied" in s
+        or "unsupported_country_region_territory" in s
+        or ("region" in s and ("403" in s or "permission" in s))
     )
 
 
@@ -3312,6 +3341,7 @@ async def _llm_create(messages: list, max_tokens: int = 4096, temperature: float
     log("AI", f"Запрос {label} model={model_id} max_tokens={max_tokens} temp={temperature}")
 
     _rtok = _REASONING_OVERRIDE.set(reasoning) if reasoning is not _NO_REASONING_OVERRIDE else None
+    _fell_back = False
     try:
         for attempt in range(2):
             try:
@@ -3343,6 +3373,15 @@ async def _llm_create(messages: list, max_tokens: int = 4096, temperature: float
                 # Переполнение окна — не глотаем, кидаем наверх, чтобы ask_command мог ретрайнуть с агрессивной обрезкой
                 if _is_context_overflow(e):
                     raise ContextOverflowError(str(e)) from e
+                # Гео/permission-блок активной модели (напр. grok-4.5 не в регионе) → разово уходим на запасную и ретраим
+                if _is_region_block(e) and not _fell_back and ASK_REGION_FALLBACK in MODEL_REGISTRY:
+                    _fp, _fmid, _flabel, _fc, _fs = MODEL_REGISTRY[ASK_REGION_FALLBACK]
+                    _fcli = _client_for_provider(_fp)
+                    if _fcli is not None and _fmid != model_id:
+                        _fell_back = True
+                        log("AI", f"{label} недоступна в регионе → фоллбэк на {_flabel}")
+                        client_obj, model_id, label = _fcli, _fmid, f"{_flabel} (регион-фолбэк)"
+                        continue
                 if attempt == 1:
                     traceback.print_exc()
                 await asyncio.sleep(1)
@@ -4370,7 +4409,22 @@ async def _render_album_segment(group, text_only: bool, anchor_id=None, vision_m
     caption = next((m.raw_text.strip() for m in group if (m.raw_text or "").strip()), "")
     photos = [m for m in group if getattr(m, "photo", None)]
     others = [m for m in group if not getattr(m, "photo", None)]
-    tags = [f"[{_media_tag(m)}]" for m in others if _media_tag(m)]
+    # голос/аудио/видеокружок ВНУТРИ альбома: транскрибируем (не только тег) — иначе теряем сказанное.
+    # -g (inline_ids) и text_only оставляем как теги (там фото-путь свой / медиа не разбираем).
+    tags = []
+    for m in others:
+        tag = _media_tag(m)
+        if not tag:
+            continue
+        if not text_only and inline_ids is None and _needs_media(m):
+            try:
+                pm = await process_media_cached(m, vision_model, detail=detail, mstats=mstats, photo_mode=photo_mode)
+            except Exception as e:
+                log("MEDIA", f"альбом: медиа {getattr(m, 'id', '?')} не обработалось: {e}")
+                pm = None
+            tags.append(pm if pm else f"[{tag}]")
+        else:
+            tags.append(f"[{tag}]")
 
     if inline_ids is not None:
         # direct-vision (/ask -g): собираем фото альбома сами, без описания
@@ -4556,7 +4610,9 @@ async def assemble_context(messages, text_only: bool, anchor_id=None, progress_c
     blocks = []
     for u in units:
         if not u["body"]:
-            continue
+            if not u.get("is_anchor"):
+                continue
+            u["body"] = "[медиа без текста]"  # якорь reply-/ask (стикер/медиа-без-текста) НЕ выкидываем: иначе пин «← ВОПРОС ОБ ЭТОМ» теряется
         if blocks and not u["marked"] and not blocks[-1]["marked"] and blocks[-1]["akey"] == u["akey"]:
             blocks[-1]["lines"].append(_line(u))
         else:
