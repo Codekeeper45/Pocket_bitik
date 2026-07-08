@@ -1510,8 +1510,8 @@ class _GoogleGeminiClient:
                 tcs.append(SimpleNamespace(id=cid, type="function",
                                            function=SimpleNamespace(name=fc.get("name"),
                                                                     arguments=json.dumps(fc.get("args") or {}, ensure_ascii=False))))
-                if len(self._raw) > 500:  # ограничение роста кэша
-                    self._raw.clear()
+                if len(self._raw) >= 500:  # FIFO-выселение старейшей подписи (НЕ clear(): иначе теряем подписи
+                    self._raw.pop(next(iter(self._raw)), None)  # активного диалога → 400 → tools ошибочно отключаются)
                 self._raw[cid] = content  # сырой model-ход с thoughtSignature — для следующего хода
         fr_map = {"STOP": "stop", "MAX_TOKENS": "length", "SAFETY": "stop", "RECITATION": "stop"}
         fr = "tool_calls" if tcs else fr_map.get(cand.get("finishReason"), "stop")
@@ -3781,6 +3781,11 @@ async def ask_agentic(context: str, question: str, must_search: bool = False, ca
         # Если нет tool_calls — это финальный ответ
         if not msg.tool_calls:
             content = _extract_content(msg)
+            # Обрезанный CoT (finish=length, видимого content нет) — НЕ ответ; сырой reasoning наружу не выдаём.
+            _from_reasoning = bool(content) and not (getattr(msg, "content", None) or "").strip()
+            if _from_reasoning and choice.finish_reason == "length":
+                log("ASK", "Agentic: только обрезанный reasoning без ответа — не выдаём CoT, fallback")
+                content = ""
             if content:
                 log("ASK", f"Agentic ответ (итерация {iteration + 1}, без поиска)")
                 _log_search_summary()
@@ -3810,7 +3815,7 @@ async def ask_agentic(context: str, question: str, must_search: bool = False, ca
             assistant_dict["reasoning_content"] = _reasoning
         messages.append(assistant_dict)
 
-        for tool_call in msg.tool_calls:
+        async def _handle_tool(tool_call):
             tname = tool_call.function.name
             try:
                 args = json.loads(tool_call.function.arguments or "{}")
@@ -3831,22 +3836,26 @@ async def ask_agentic(context: str, question: str, must_search: bool = False, ca
                     "tool_call_id": tool_call.id,
                     "content": web_result,
                 })
-                continue
+                return
 
             # — адресный реплай на сообщения истории (отправляем сразу, тредами) —
             if tname == "reply_to_messages":
                 res = await _run_reply_tool(args, chat_id, msg_by_id, reply_sent)
                 sstats["replies"] = reply_sent[0]
                 messages.append({"role": "tool", "tool_call_id": tool_call.id, "content": res})
-                continue
+                return
 
             # — GraphRAG-память /index —
             if tname in ("memory_search", "memory_connections", "memory_entity", "memory_media", "memory_overview"):
                 sstats["memory"] = sstats.get("memory", 0) + 1
                 paid = tname in ("memory_search", "memory_overview", "memory_media")  # эти платят embed/rerank
+                try:
+                    _ck_cnt = int(args.get("count") or 1)  # для memory_media: count в ключе — иначе повтор с бОльшим count отдал бы урезанный кэш
+                except (ValueError, TypeError):
+                    _ck_cnt = 1
                 # дедуп в рамках ОДНОГО /ask: тот же (инструмент, аргументы) → отдаём из кэша, 0 платных вызовов
                 ck = (tname, _index_norm_name(str(args.get("query") or args.get("topic") or args.get("name") or args.get("entity") or "")),
-                      str(args.get("kind") or "all"), str(args.get("category") or ""), str(args.get("polarity") or ""), bool(args.get("visual")))
+                      str(args.get("kind") or "all"), str(args.get("category") or ""), str(args.get("polarity") or ""), bool(args.get("visual")), _ck_cnt)
                 mem_cache = sstats.setdefault("_mem_cache", {})
                 ready, note = await _index_memory_ready(chat_id, tname)
                 if not ready:
@@ -3857,8 +3866,6 @@ async def ask_agentic(context: str, question: str, must_search: bool = False, ca
                     res = ("Достаточно поисков по памяти на этот вопрос — отвечай по уже собранному контексту; "
                            "если данных не хватает, честно так и скажи.")
                 else:
-                    if paid:
-                        sstats["mem_paid"] = sstats.get("mem_paid", 0) + 1
                     if tname == "memory_search":
                         res = await _index_tool_search(chat_id, args.get("query", ""), args.get("kind", "all"))
                     elif tname == "memory_connections":
@@ -3875,10 +3882,12 @@ async def ask_agentic(context: str, question: str, must_search: bool = False, ca
                         q_img = images[0]["bytes"] if images else None  # приложенная картинка → визуальный поиск
                         res = await _index_tool_media(chat_id, args.get("query", ""), cnt,
                                                       visual=bool(args.get("visual")), query_image=q_img)
+                    if paid:  # счётчик бюджета инкрементим ТОЛЬКО после успешного вызова (сбойный не жжёт слот)
+                        sstats["mem_paid"] = sstats.get("mem_paid", 0) + 1
                     mem_cache[ck] = res
                 log("ASK", f"Память /index {tname}: {_idx_snip(args.get('query') or args.get('topic') or args.get('name') or args.get('entity') or args.get('category'), 80)} → {len(res)} симв")
                 messages.append({"role": "tool", "tool_call_id": tool_call.id, "content": res})
-                continue
+                return
 
             if tname != "telegram_search":
                 messages.append({
@@ -3886,7 +3895,7 @@ async def ask_agentic(context: str, question: str, must_search: bool = False, ca
                     "tool_call_id": tool_call.id,
                     "content": f"Неизвестный инструмент: {tname}"
                 })
-                continue
+                return
 
             sstats["calls"] += 1
             query = (args.get("query") or "").strip()
@@ -3903,7 +3912,7 @@ async def ask_agentic(context: str, question: str, must_search: bool = False, ca
                     "tool_call_id": tool_call.id,
                     "content": "Ошибка: пустой поисковый запрос"
                 })
-                continue
+                return
 
             log("ASK", f"DeepSeek ищет: \"{query}\"" + (f" (за {days} дн.)" if days else ""))
 
@@ -3930,6 +3939,17 @@ async def ask_agentic(context: str, question: str, must_search: bool = False, ca
                 "content": search_result,
             })
 
+        for tool_call in msg.tool_calls:
+            # Один упавший инструмент НЕ должен рушить весь /ask: изолируем и отдаём ошибку как tool-сообщение
+            # (иначе исключение уносит всю собранную выдачу и юзер получает общий сбой). Каждый tool_call
+            # ОБЯЗАН получить ответное tool-сообщение, иначе следующий вызов API упадёт на 400.
+            try:
+                await _handle_tool(tool_call)
+            except Exception as e:
+                log("ASK", f"Инструмент {getattr(tool_call.function, 'name', '?')} упал: {e}")
+                messages.append({"role": "tool", "tool_call_id": tool_call.id,
+                                 "content": f"Ошибка инструмента (пропускаю): {e}"})
+
     # Лимит итераций — запрашиваем финальный ответ без инструментов
     log("ASK", "Достигнут лимит итераций, запрашиваю финальный ответ")
     try:
@@ -3940,7 +3960,12 @@ async def ask_agentic(context: str, question: str, must_search: bool = False, ca
             max_tokens=ASK_MAX_TOKENS,
             temperature=1.0,
         )
-        content = _extract_content(response.choices[0].message)
+        _fchoice = response.choices[0]
+        _fmsg = _fchoice.message
+        content = _extract_content(_fmsg)
+        # Тот же гейт: обрезанный reasoning без видимого ответа наружу не отдаём.
+        if content and not (getattr(_fmsg, "content", None) or "").strip() and _fchoice.finish_reason == "length":
+            content = ""
         if content:
             _log_search_summary()
             return content
@@ -7656,8 +7681,28 @@ async def help_command(event):
                 chunk += piece
         if chunk:
             buf.append(chunk)
-        await event.edit(buf[0])
-        for extra in buf[1:]:
+        # Раздел /gen (~6.4k) и /index (~5.4k) сами по себе длиннее лимита Telegram (4096) — дорезаем по строкам,
+        # иначе event.respond на таком чанке кидает MessageTooLongError и половина справки не доходит.
+        out = []
+        for c in buf:
+            if len(c) <= 4096:
+                out.append(c)
+                continue
+            sub = ""
+            for line in c.split("\n"):
+                if len(sub) + len(line) + 1 > 3900:
+                    if sub:
+                        out.append(sub)
+                    sub = line
+                else:
+                    sub = (sub + "\n" + line) if sub else line
+            if sub:
+                out.append(sub)
+        out = [c for c in out if c.strip()]  # первый раздел >3900 даёт ведущий пустой чанк → event.edit("") упал бы
+        if not out:
+            return
+        await event.edit(out[0])
+        for extra in out[1:]:
             await event.respond(extra)
         return
 
@@ -9162,15 +9207,18 @@ async def _index_download_media(msg, thumb: bool = False):
 
 
 async def _index_process_media(chat_id: int, image_msgs: list, scene_text: str, registry: str, name2id: dict, reverify_mids=None):
-    """Распознаёт картинки сцены медиа-моделью → media_assets + visual-факты сущностям. Возвращает число обработанных.
+    """Распознаёт картинки сцены медиа-моделью → media_assets + visual-факты сущностям.
+    Возвращает (done, failed_msg_ids): failed — картинки, что пытались обработать, но строку не создали
+    (скачивание/vision сбойнули) → вызывающий их фиксирует, а не теряет молча на чекпоинте чанка.
     reverify_mids (E2): множество msg_id уже-описанных фото, которым нужен точечный ре-verify под новый seeker-контекст —
     гоним vision заново ТОЛЬКО ради распознавания персонажей (старое описание сохраняем)."""
     model = get_active_media_model()
     mclient = _client_for_media_model(model)
     if not mclient:
-        return 0
+        return 0, []
     reverify_mids = reverify_mids or set()
     done = 0
+    failed = []
     for msg in image_msgs:
         exists = await db_read(
             "SELECT image_description, visual_description, entity_ids, emb_image FROM media_assets WHERE chat_id=%s AND msg_id=%s",
@@ -9182,6 +9230,7 @@ async def _index_process_media(chat_id: int, image_msgs: list, scene_text: str, 
             continue
         raw = await _index_download_media(msg)
         if not raw:
+            failed.append(msg.id)  # скачивание сбойнуло (таймаут/FloodWait-исчерпание) — не теряем молча
             continue
         desc = (old.get("image_description") or "").strip()
         visual_desc = (old.get("visual_description") or "").strip()
@@ -9200,6 +9249,7 @@ async def _index_process_media(chat_id: int, image_msgs: list, scene_text: str, 
             log("INDEX", f"Медиа-описание id={msg.id} не удалось: {e}")
             data = None
         if not desc and not isinstance(data, dict):
+            failed.append(msg.id)  # vision не дал распознавания и старого описания нет → строку не пишем, но фиксируем на ретрай
             continue
         if isinstance(data, dict) and not desc:  # desc ставим ТОЛЬКО если его не было (E2 ре-verify не переписывает описание)
             desc = (data.get("description") or "").strip()
@@ -9253,7 +9303,7 @@ async def _index_process_media(chat_id: int, image_msgs: list, scene_text: str, 
             (chat_id, msg.id, uid, desc, visual_desc, json.dumps(ent_ids, ensure_ascii=False), emb_img))
         _index_invalidate(chat_id, "media_text", "media_image")
         done += 1
-    return done
+    return done, failed
 
 
 def _index_entity_embedding_text(r) -> str:
@@ -9694,8 +9744,10 @@ async def _index_vectorize_loop(chat_id, table, key_col, emb_col, textfn, progre
     return "done", done
 
 
-async def _index_vectorize_missing_images(chat_id: int, progress_cb=None):
-    """Дозаполняет emb_image для media_assets, если Stage 2 временно не получил image embedding."""
+async def _index_vectorize_missing_images(chat_id: int, progress_cb=None, stage: int = 3):
+    """Дозаполняет emb_image для media_assets, если Stage 2 временно не получил image embedding.
+    stage — чью idx_state-строку помечать error при сбое (вызов из Stage 5 НЕ должен ронять Stage 3,
+    иначе сбой одной картинки гейтит memory_search, завязанный на Stage 3 == done)."""
     cur, done, failed = 0, 0, []
     while True:
         if _INDEX_CONTROL.get(chat_id) == "pause":
@@ -9729,8 +9781,8 @@ async def _index_vectorize_missing_images(chat_id: int, progress_cb=None):
         if progress_cb:
             await progress_cb(f"🔢 Вектора картинок: {done}…")
     if failed:
-        await _idx_set_state(chat_id, 3, stats={"failed_image_msg_ids": failed[:50]}, status="error")
-        log("INDEX", f"Stage3 image embeddings: {len(failed)} картинок остались без emb_image")
+        await _idx_set_state(chat_id, stage, stats={"failed_image_msg_ids": failed[:50]}, status="error")
+        log("INDEX", f"Stage{stage} image embeddings: {len(failed)} картинок остались без emb_image")
         return "error", done
     if done:
         _index_invalidate(chat_id, "media_image")
@@ -9765,6 +9817,7 @@ async def _index_stage3_vectors(chat_id: int, progress_cb=None):
         if n and kind:
             _index_invalidate(chat_id, kind)
         if res == "paused":
+            await _idx_set_state(chat_id, 3, status="paused")  # иначе watchdog видит running без живой задачи и авто-возобновляет (обходя /index stop)
             return "paused"
         if res == "error":
             await _idx_set_state(chat_id, 3, stats={"failed_label": label}, status="error")
@@ -9772,6 +9825,7 @@ async def _index_stage3_vectors(chat_id: int, progress_cb=None):
         log("INDEX", f"Stage3 {label}: {n} векторов")
     res_img, n_img = await _index_vectorize_missing_images(chat_id, progress_cb)
     if res_img == "paused":
+        await _idx_set_state(chat_id, 3, status="paused")
         return "paused"
     if res_img == "error":
         return "error"
@@ -9903,6 +9957,11 @@ async def _index_stage5_media(chat_id: int, progress_cb=None):
     cursor = int(st["cursor"].get("last_chunk_id", 0))
     done = int(st["stats"].get("photos", 0))
     await _idx_set_state(chat_id, 5, status="running")
+    # медиа-модель недоступна (нет клиента) → НЕ прочёсываем весь чат вхолостую, помечая done: это стоп с ошибкой
+    if not _client_for_media_model(get_active_media_model()):
+        await _idx_set_state(chat_id, 5, status="error")
+        log("INDEX", f"Stage5 чата {chat_id}: медиа-модель {get_active_media_model()} без клиента — стоп (не помечаю done молча)")
+        return "error"
     total_ph = (await db_read("SELECT COUNT(*) c FROM messages WHERE chat_id=%s AND media_kind IN (1,2)", (chat_id,)))[0]["c"]
     log("INDEX", f"Stage5 фото чата {chat_id}: с chunk_id>{cursor} (всего фото ~{total_ph})")
     while True:
@@ -9926,15 +9985,23 @@ async def _index_stage5_media(chat_id: int, progress_cb=None):
                     for i in range(0, len(img_ids), 100):
                         msgs = await client.get_messages(chat_id, ids=img_ids[i:i + 100])
                         image_msgs += [m for m in msgs if _index_is_image_msg(m)]
-                    done += await _index_process_media(chat_id, image_msgs, scene_text, registry, name2id)
+                    dproc, fproc = await _index_process_media(chat_id, image_msgs, scene_text, registry, name2id)
+                    done += dproc
+                    if fproc:  # часть фото не скачалась/не распозналась → фиксируем как skipped-диапазон (видно в /index failed, ретрай — /index update)
+                        await _index_record_failed_range(chat_id, 5, "media", min(fproc), max(fproc),
+                                                          f"{len(fproc)} фото не обработаны (скачивание/vision)", payload={"msg_ids": fproc[:200]})
                 except Exception as e:
                     log("INDEX", f"Stage5: медиа сцены {ch['id']} не обработалось: {e}")
+                    try:
+                        await _index_record_failed_range(chat_id, 5, "media", ch["start_msg_id"], ch["end_msg_id"], f"сцена {ch['id']}: {e}")
+                    except Exception:
+                        pass
             cursor = ch["id"]
             await _idx_set_state(chat_id, 5, cursor={"last_chunk_id": cursor}, stats={"photos": done})
             if progress_cb:
                 await progress_cb(f"🖼 Фото: обработано {done}/~{total_ph}…")
     # добиваем emb_image, что не получились инлайн в process_media (Stage 3 их не застал — медиа теперь после него)
-    res_img, n_img = await _index_vectorize_missing_images(chat_id, progress_cb)
+    res_img, n_img = await _index_vectorize_missing_images(chat_id, progress_cb, stage=5)  # сбой картинки → error в Stage 5, НЕ Stage 3
     if n_img:
         _index_invalidate(chat_id, "media_image")
     if res_img == "paused":
@@ -9953,6 +10020,20 @@ async def _index_stage5_media(chat_id: int, progress_cb=None):
     if res == "error" or res_img == "error":
         await _idx_set_state(chat_id, 5, status="error")
         return "error"
+    # reconcile retry-учёта Stage 5 (у неё нет курсор-resolve, как у 1/2): skipped-диапазон, где ВСЕ картинки
+    # его пролёта теперь описаны → resolved; иначе остаётся skipped (виден в /index failed, добор на /index update).
+    try:
+        for rr in await db_read("SELECT id, start_msg_id, end_msg_id FROM index_failed_ranges "
+                                "WHERE chat_id=%s AND stage=5 AND status IN ('skipped','retrying')", (chat_id,)):
+            tot = (await db_read("SELECT COUNT(*) c FROM messages WHERE chat_id=%s AND msg_id BETWEEN %s AND %s AND media_kind IN (1,2)",
+                                 (chat_id, rr["start_msg_id"], rr["end_msg_id"])))[0]["c"]
+            got = (await db_read("SELECT COUNT(*) c FROM media_assets WHERE chat_id=%s AND msg_id BETWEEN %s AND %s "
+                                 "AND image_description IS NOT NULL AND image_description<>''",
+                                 (chat_id, rr["start_msg_id"], rr["end_msg_id"])))[0]["c"]
+            await db_write("UPDATE index_failed_ranges SET status=%s WHERE id=%s",
+                           ("resolved" if tot and int(got) >= int(tot) else "skipped", rr["id"]))
+    except Exception as e:
+        log("INDEX", f"Stage5 reconcile failed-ranges: {e}")
     await _idx_set_state(chat_id, 5, status="done", stats={"photos": done})
     log("INDEX", f"Stage5 чата {chat_id}: готово, фото {done}")
     return "done"
@@ -10001,7 +10082,8 @@ async def _index_describe_msg_ids(chat_id: int, msg_ids, seekers_by_mid: dict = 
             for i in range(0, len(mids), 100):
                 msgs = await client.get_messages(chat_id, ids=mids[i:i + 100])
                 image_msgs += [m for m in msgs if _index_is_image_msg(m)]
-            done += await _index_process_media(chat_id, image_msgs, scene_text, registry, name2id, reverify_mids=reverify_mids)
+            dproc, _fproc = await _index_process_media(chat_id, image_msgs, scene_text, registry, name2id, reverify_mids=reverify_mids)
+            done += dproc  # в галерейном доборе провалы best-effort (кандидаты добираются на следующем /index update)
         except Exception as e:
             log("INDEX", f"Gallery: описание пачки фото не удалось: {e}")
         if progress_cb:
@@ -11151,7 +11233,7 @@ async def _index_tool_search(chat_id: int, query: str, kind: str = "all") -> str
     order = None
     if len(cands) > INDEX_RERANK_MIN_POOL:
         order = await _index_rerank(query, [c["doc"] for c in cands], top_n=INDEX_RERANK_TOPN)
-    if order is not None:
+    if order:  # непустой результат rerank; пустой список (сбой провайдера) → косинус-фолбэк, а не «ничего нет»
         kept = [(cands[i], rel) for i, rel in order
                 if 0 <= i < len(cands) and (rel >= INDEX_RERANK_MIN or cands[i].get("direct"))]
         best = order[0][1] if order else 0.0
@@ -11349,15 +11431,20 @@ async def _index_tool_media(chat_id: int, query: str, count: int = 1, visual: bo
         best = max((h["score"] for h in all_hits), default=0.0)
         hits = None
         order = None
-        if len(all_hits) > INDEX_RERANK_MIN_POOL:  # мелкий пул → не жжём платный rerank, ниже hybrid-score фолбэк
-            docs = []
-            for h in all_hits:
-                visual_desc = h.get("visual_description") or ""
-                context_desc = h.get("image_description") or ""
-                docs.append(("visual: " + visual_desc + "\ncontext: " + context_desc).strip() or "изображение")
+        docs = []
+        has_text = False  # частичная галерея: emb_image есть, но описаний нет → все docs = «изображение»
+        for h in all_hits:
+            visual_desc = h.get("visual_description") or ""
+            context_desc = h.get("image_description") or ""
+            if visual_desc.strip() or context_desc.strip():
+                has_text = True
+            docs.append(("visual: " + visual_desc + "\ncontext: " + context_desc).strip() or "изображение")
+        # rerank только если есть РЕАЛЬНЫЕ описания и пул не мелкий; иначе cohere ранжирует по идентичным
+        # заглушкам «изображение» → мусор/пустота, теряя сильные cross-modal хиты → идём hybrid-score фолбэком
+        if has_text and len(all_hits) > INDEX_RERANK_MIN_POOL:
             order = await _index_rerank(query, docs, top_n=count)
-        if order is not None:
-            best = order[0][1] if order else 0.0
+        if order:  # непустой результат rerank (пустой список трактуем как сбой → фолбэк, а не «ничего нет»)
+            best = order[0][1]
             hits = [all_hits[i] for i, rel in order if 0 <= i < len(all_hits) and rel >= INDEX_RERANK_MIN][:count]
         if hits is None:  # фолбэк без rerank — hybrid score
             hits = [h for h in all_hits if h["score"] >= _index_norm_score(INDEX_SEARCH_FLOOR)][:count]
@@ -12344,6 +12431,9 @@ async def index_reindex_command(event):
     # Умер посреди — watchdog возобновит running-стадии; повтор `/index reindex` идемпотентен (NULL-фильтр).
     if mode == "scenes":
         await _idx_set_state(chat_id, 2, cursor={"last_msg_id": 0}, stats={}, status="running")
+        # Stage 2 экстрагируется с нуля → древние poison-диапазоны связей/сцен реально перечёсываются;
+        # помечаем retrying, чтобы resolve-хук Stage 2 закрыл их (иначе так и висели бы skipped, хоть данные есть)
+        await db_write("UPDATE index_failed_ranges SET status='retrying' WHERE chat_id=%s AND stage=2 AND status='skipped'", (chat_id,))
         # Stage 5 галерею тоже пересобрать: сцены/сущности изменились → членство галерей (cold-start кандидаты,
         # E2 ре-verify) устарело. 5a NULL-фильтр (не перекачивает), 5c скипает описанные (vision заново НЕ гоняем) —
         # переигрывается только дешёвое членство. В режиме text пайплайн сразу вернёт stage 5 в done.
@@ -12483,22 +12573,38 @@ async def index_command(event):
         # ре-экстрагировал ВЕСЬ чат каждый update. Древние — отложены (добить: `/index reindex scenes`).
         overlap_cur = await _index_update_rewind_cursor(chat_id)
         rewind_floor = max(0, overlap_cur - INDEX_UPDATE_FAILED_REWIND_CAP)
+        # ТЕКСТОВЫЕ poison-диапазоны (Stage 1/2) В ОКНЕ → откатываем текстовый курсор ровно до них.
+        # Медиа (Stage 5) считаем ОТДЕЛЬНО: иначе одно не скачавшееся фото тянуло бы текстовый курсор назад.
         frow = await db_read(
             "SELECT MIN(start_msg_id) ms, COUNT(*) c FROM index_failed_ranges "
-            "WHERE chat_id=%s AND status='skipped' AND start_msg_id>=%s", (chat_id, rewind_floor))
+            "WHERE chat_id=%s AND stage IN (1,2) AND status='skipped' AND start_msg_id>=%s", (chat_id, rewind_floor))
         min_failed, n_failed = frow[0]["ms"], int(frow[0]["c"] or 0)
         drow = await db_read(
-            "SELECT COUNT(*) c FROM index_failed_ranges WHERE chat_id=%s AND status='skipped' AND start_msg_id<%s",
+            "SELECT stage, COUNT(*) c FROM index_failed_ranges "
+            "WHERE chat_id=%s AND stage IN (1,2) AND status='skipped' AND start_msg_id<%s GROUP BY stage",
             (chat_id, rewind_floor))
-        n_deferred = int(drow[0]["c"] or 0)
+        deferred_by_stage = {int(r["stage"]): int(r["c"]) for r in drow}
+        n_deferred = sum(deferred_by_stage.values())
+        # Stage 5 (фото не скачались/не распознались) — ретраим независимо от текста, перечёсывая чанки (exists-скип
+        # делает это дёшево). Кап attempts≤3: намертво мёртвое медиа (удалённое) не грайндим на каждом update.
+        # Статус НЕ трогаем (у Stage 5 нет курсор-resolve → 'retrying' залипал бы); закрытие — reconcile в конце
+        # _index_stage5_media. Считаем и 'retrying' (залипшие от прерванного прошлого апдейта) — их тоже добираем.
+        media_failed = int((await db_read(
+            "SELECT COUNT(*) c FROM index_failed_ranges WHERE chat_id=%s AND stage=5 AND status IN ('skipped','retrying') AND attempts<=3",
+            (chat_id,)))[0]["c"] or 0)
         rewind_failed = None
         if min_failed is not None:
             await db_write("UPDATE index_failed_ranges SET status='retrying' "
-                           "WHERE chat_id=%s AND status='skipped' AND start_msg_id>=%s", (chat_id, rewind_floor))
+                           "WHERE chat_id=%s AND stage IN (1,2) AND status='skipped' AND start_msg_id>=%s", (chat_id, rewind_floor))
             rewind_failed = max(0, int(min_failed) - 1)
         if n_deferred:
-            log("INDEX", f"/index update чат {chat_id}: {n_deferred} древних failed-диапазонов отложены "
-                         f"(за окном {INDEX_UPDATE_FAILED_REWIND_CAP} от курсора) — не ре-экстрагируем весь чат; добить `/index reindex scenes`")
+            tips = []
+            if deferred_by_stage.get(2):
+                tips.append(f"{deferred_by_stage[2]} в сценах/связях → добить `/index reindex scenes`")
+            if deferred_by_stage.get(1):
+                tips.append(f"{deferred_by_stage[1]} в досье (Stage 1) → форс-повтор только полной переиндексацией с начала — авто-ретрай гонял бы весь чат")
+            log("INDEX", f"/index update чат {chat_id}: {n_deferred} древних poison-диапазонов отложены "
+                         f"(за окном {INDEX_UPDATE_FAILED_REWIND_CAP} от курсора; осмотр — `/index failed`): " + "; ".join(tips))
         for stg in (0, 1, 2, 3, 4, 5):
             s = await _idx_get_state(chat_id, stg)
             if s["status"] == "done":
@@ -12507,12 +12613,17 @@ async def index_command(event):
                     if rewind_failed is not None:
                         rewind = min(rewind, rewind_failed)  # failed-диапазоны В ОКНЕ (rewind_failed ≥ rewind_floor → не глубже окна)
                     await _idx_set_state(chat_id, stg, cursor={"last_msg_id": rewind}, status="running")
-                elif stg == 5 and rewind_failed is not None:
-                    await _idx_set_state(chat_id, stg, cursor={"last_chunk_id": 0}, status="running")  # перечесать чанки для реассоциации фото (как делал retry failed)
+                elif stg == 5 and (rewind_failed is not None or media_failed):
+                    await _idx_set_state(chat_id, stg, cursor={"last_chunk_id": 0}, status="running")  # перечесать чанки: реассоциация фото + повтор не скачавшихся
                 else:
                     await _idx_set_state(chat_id, stg, status="running")
         _INDEX_CONTROL[chat_id] = "run"
-        note = f" + повтор {n_failed} пропущенных" if rewind_failed is not None else ""
+        _np = []
+        if rewind_failed is not None:
+            _np.append(f"повтор {n_failed} текстовых пропущенных")
+        if media_failed:
+            _np.append(f"добор {media_failed} фото-диапазонов")
+        note = (" + " + " + ".join(_np)) if _np else ""
         status_msg = await event.reply(f"🔄 Догоняю новые сообщения (досье · граф · вектора){note}… `/index status` — прогресс.")
         _INDEX_TASKS[chat_id] = asyncio.create_task(_index_pipeline(chat_id, status_msg))
         return
