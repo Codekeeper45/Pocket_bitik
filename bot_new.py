@@ -10804,7 +10804,10 @@ async def _index_memory_ready(chat_id: int, tool_name: str) -> tuple:
     # эмбеддинги используются сразу, без доиндексации остатка. Помечаем ответ как частичный (⚠️ЧАСТИЧНО).
     if tool_name == "memory_media" and status.get(req) != "done":
         try:
-            n_media = await _index_count_ok(chat_id, "media_text")
+            # media_image — визуальный поиск (attached-фото) И кросс-модальный текст→image (работает БЕЗ описаний);
+            # media_text — поиск по описаниям. Достаточно любого пространства: галерея 5a (image) дешева и идёт первой,
+            # описания (5b, дорогой vision) могут быть ещё в нуле — но по image фото уже искомы.
+            n_media = await _index_count_ok(chat_id, "media_image") + await _index_count_ok(chat_id, "media_text")
         except Exception:
             n_media = 0
         if n_media >= INDEX_MEDIA_PARTIAL_MIN:
