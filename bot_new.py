@@ -229,6 +229,9 @@ INDEX_REGISTRY_FALLBACK_LIMIT = 300
 INDEX_MEDIA_PAUSE = (2.0, 4.0)  # stage 5: пауза между скачиваниями фото (анти-FloodWait юзербота)
 INDEX_MEDIA_PAUSE_THUMB = (0.8, 1.6)  # gallery 5a: thumbnail-запросы легче — пауза короче (осторожно, семафор тот же)
 INDEX_MEDIA_DL_TIMEOUT = 60     # stage 5: таймаут на одно скачивание фото — зависшая картинка не морозит стадию
+INDEX_MEDIA_PARTIAL_MIN = 20    # memory_media на НЕзавершённом Stage 5: столько готовых медиа-векторов достаточно, чтобы
+#   включить поиск по УЖЕ обработанным фото (частичная галерея). Уже посчитанные эмбеддинги искомы, полнота не нужна —
+#   ответ просто помечается «частично». Экономит доиндексацию: не платим за остаток фото, чтобы пользоваться готовым.
 INDEX_MODE_DEFAULT = "gallery"  # /index go без аргумента; для чатов, начатых до режимов, легаси-дефолт full
 INDEX_GALLERY_POOL = 40         # gallery 5b: кандидатов на сущность из одного сид-источника
 # Пороги откалиброваны на живых emb_image (2745 фото, 2026-07-04): text→image свои 0.50–0.56 / медиана шума 0.36;
@@ -10796,6 +10799,17 @@ async def _index_memory_ready(chat_id: int, tool_name: str) -> tuple:
     status = {int(r["stage"]): r["status"] for r in rows}
     if status.get(req) == "done":
         return True, f"{tool_name}: готово (Stage {req}=done)."
+    # Частичная галерея: memory_media работает по УЖЕ обработанным фото, даже если Stage 5 не завершён
+    # (идёт/на паузе/error). Уже посчитанные media-вектора искомы — полнота не требуется. Так уже оплаченные
+    # эмбеддинги используются сразу, без доиндексации остатка. Помечаем ответ как частичный (⚠️ЧАСТИЧНО).
+    if tool_name == "memory_media" and status.get(req) != "done":
+        try:
+            n_media = await _index_count_ok(chat_id, "media_text")
+        except Exception:
+            n_media = 0
+        if n_media >= INDEX_MEDIA_PARTIAL_MIN:
+            return True, (f"⚠️ЧАСТИЧНО memory_media: галерея неполна (Stage 5 не завершён) — "
+                          f"ищу по {n_media} уже обработанным фото; свежие могут быть ещё не проиндексированы.")
     done = [s for s in (3, 4, 5) if status.get(s) == "done"]
     available = []
     if 3 in done:
@@ -11268,6 +11282,7 @@ async def _index_tool_media(chat_id: int, query: str, count: int = 1, visual: bo
     ready, note = await _index_memory_ready(chat_id, "memory_media")
     if not ready:
         return note
+    partial = note.startswith("⚠️ЧАСТИЧНО")  # частичная галерея → при пустом результате не выдавать «нет фото» за факт
     count = max(1, min(3, count))
     if visual and query_image:
         qv = await _index_embed_query_image(query_image)
@@ -11298,7 +11313,8 @@ async def _index_tool_media(chat_id: int, query: str, count: int = 1, visual: bo
             hits = [h for h in all_hits if h["score"] >= _index_norm_score(INDEX_SEARCH_FLOOR)][:count]
     if not hits:
         note = f" (лучшее {best:.2f})" if best else ""
-        return f"Подходящих фото в памяти не нашёл{note}. Опиши искомое иначе — что на фото, кто, какое событие."
+        warn = " ⚠️ Галерея этого чата проиндексирована ЧАСТИЧНО (Stage 5 не завершён) — возможно, фото есть, но ещё не обработано." if partial else ""
+        return f"Подходящих фото в памяти не нашёл{note}.{warn} Опиши искомое иначе — что на фото, кто, какое событие."
     msg_ids = [h["msg_id"] for h in hits]
     try:
         await client.forward_messages(chat_id, msg_ids, chat_id)
