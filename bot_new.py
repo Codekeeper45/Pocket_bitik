@@ -216,6 +216,9 @@ INDEX_STAGE1_MICRO_MESSAGES = 1500      # верхняя граница сооб
 INDEX_STAGE1_BLOCK_TOKENS = INDEX_STAGE1_MICRO_TOKENS  # legacy alias для старых комментариев/логов
 INDEX_FAILED_MIN_MESSAGES = 1
 INDEX_UPDATE_OVERLAP_MESSAGES = 300
+INDEX_UPDATE_FAILED_REWIND_CAP = 5000  # /index update: НЕ отматывать курсор Stage 1/2 к failed-диапазонам дальше этого окна
+#   от overlap-курсора. Иначе один древний poison-диапазон (у начала чата) ре-экстрагировал бы ВЕСЬ чат каждый update.
+#   Более старые skipped-диапазоны остаются 'skipped' и добираются явным `/index update` повторно по мере приближения курсора.
 INDEX_UPDATE_OVERLAP_HOURS = 24
 INDEX_SUMMARY_CLAIM_BATCH = 160     # synthesis досье: клеймов на map-вызов (80→160: меньше вызовов на популярную сущность)
 INDEX_SUMMARY_TOKEN_BATCH = 16_000  # synthesis досье: токенов на map-чанк (8k→16k: меньше чанков)
@@ -240,7 +243,10 @@ INDEX_GALLERY_POOL = 40         # gallery 5b: кандидатов на сущн
 INDEX_GALLERY_SEED_MIN = 0.55   # gallery: image→image порог сид-совпадения (аватарка → фото чата)
 INDEX_GALLERY_TEXT_MIN = 0.45   # gallery: text→image порог (канон-описание внешности → фото) — в зазоре шум/сигнал
 INDEX_GALLERY_GROW_MIN = 0.60   # gallery 5c: image→image порог роста от подтверждённых якорей (строже сида)
-INDEX_GALLERY_GROW_ROUNDS = 2   # gallery 5c: раундов verified growth (описание→подтверждение→новые якоря)
+INDEX_GALLERY_GROW_ROUNDS = 1   # gallery 5c: раундов verified growth (2→1: экономия vision; косинус уже ранжирует кандидатов)
+INDEX_GALLERY_VERIFY_CAP = 8    # gallery 5c: СКОЛЬКО топ-кандидатов по косinusу на сущность реально гоним через vision-верификацию
+#   за раунд (главный рычаг расхода: было — весь пул до POOL=40 × раунды; стало — топ-VERIFY_CAP). Косинус сортирует,
+#   vision подтверждает только лучших → расход vision ↓ ×3-5, теряем лишь хвост слабых кандидатов галереи.
 INDEX_GALLERY_MAX_PER_ENTITY = 30  # gallery: кап фото в галерее сущности за прогон
 INDEX_GALLERY_SCENE_CAP = 12    # gallery 5b: кап фото-кандидатов из сцен с упоминанием сущности (recall-приор)
 INDEX_GALLERY_COLDSTART_MIN = 3 # gallery 5b: cold-start запускаем, если СИЛЬНЫХ хитов (аватарка/внешность) меньше N —
@@ -267,6 +273,8 @@ INDEX_RERANK_POOL = 24        # кандидатов на kind достаём в
 INDEX_RERANK_TOPN = 20        # финальная выдача после rerank (12→20: больше памяти доходит до ответа)
 INDEX_RERANK_MIN = 0.08       # rel-score ниже — не показываем (у v4-pro мусор ~0.12, точный ~0.9)
 INDEX_RERANK_CONFIDENT = 0.35 # ниже — «слабое» совпадение (Corrective-гейт по rerank-score)
+INDEX_RERANK_MIN_POOL = 6     # cohere-rerank ПЛАТНЫЙ: на пуле ≤ этого переупорядочивать нечего → косинус-порядок (экономия /ask)
+INDEX_ASK_MEMORY_BUDGET = 10  # /ask: потолок ПЛАТНЫХ memory-поисков (search/overview/media) на один вопрос — обрубает runaway agentic-loop
 INDEX_EVAL_CASES_PATH = "index_eval_cases.json"
 INDEX_REL_CATEGORIES = ("romantic", "friend", "family", "rival", "professional", "mentor", "acquaintance", "group")
 INDEX_REL_CATEGORY_SET = set(INDEX_REL_CATEGORIES)
@@ -3835,25 +3843,39 @@ async def ask_agentic(context: str, question: str, must_search: bool = False, ca
             # — GraphRAG-память /index —
             if tname in ("memory_search", "memory_connections", "memory_entity", "memory_media", "memory_overview"):
                 sstats["memory"] = sstats.get("memory", 0) + 1
+                paid = tname in ("memory_search", "memory_overview", "memory_media")  # эти платят embed/rerank
+                # дедуп в рамках ОДНОГО /ask: тот же (инструмент, аргументы) → отдаём из кэша, 0 платных вызовов
+                ck = (tname, _index_norm_name(str(args.get("query") or args.get("topic") or args.get("name") or args.get("entity") or "")),
+                      str(args.get("kind") or "all"), str(args.get("category") or ""), str(args.get("polarity") or ""), bool(args.get("visual")))
+                mem_cache = sstats.setdefault("_mem_cache", {})
                 ready, note = await _index_memory_ready(chat_id, tname)
                 if not ready:
                     res = note
-                elif tname == "memory_search":
-                    res = await _index_tool_search(chat_id, args.get("query", ""), args.get("kind", "all"))
-                elif tname == "memory_connections":
-                    res = await _index_tool_connections(chat_id, args.get("entity"), args.get("category"), args.get("polarity"))
-                elif tname == "memory_overview":
-                    res = await _index_tool_overview(chat_id, args.get("topic", ""))
-                elif tname == "memory_entity":
-                    res = await _index_tool_entity(chat_id, args.get("name", ""))
+                elif ck in mem_cache:
+                    res = mem_cache[ck]  # повтор того же поиска в этом /ask → без API (и без повторной пересылки фото)
+                elif paid and sstats.get("mem_paid", 0) >= INDEX_ASK_MEMORY_BUDGET:
+                    res = ("Достаточно поисков по памяти на этот вопрос — отвечай по уже собранному контексту; "
+                           "если данных не хватает, честно так и скажи.")
                 else:
-                    try:
-                        cnt = int(args.get("count", 1) or 1)
-                    except (ValueError, TypeError):
-                        cnt = 1
-                    q_img = images[0]["bytes"] if images else None  # приложенная картинка → визуальный поиск
-                    res = await _index_tool_media(chat_id, args.get("query", ""), cnt,
-                                                  visual=bool(args.get("visual")), query_image=q_img)
+                    if paid:
+                        sstats["mem_paid"] = sstats.get("mem_paid", 0) + 1
+                    if tname == "memory_search":
+                        res = await _index_tool_search(chat_id, args.get("query", ""), args.get("kind", "all"))
+                    elif tname == "memory_connections":
+                        res = await _index_tool_connections(chat_id, args.get("entity"), args.get("category"), args.get("polarity"))
+                    elif tname == "memory_overview":
+                        res = await _index_tool_overview(chat_id, args.get("topic", ""))
+                    elif tname == "memory_entity":
+                        res = await _index_tool_entity(chat_id, args.get("name", ""))
+                    else:
+                        try:
+                            cnt = int(args.get("count", 1) or 1)
+                        except (ValueError, TypeError):
+                            cnt = 1
+                        q_img = images[0]["bytes"] if images else None  # приложенная картинка → визуальный поиск
+                        res = await _index_tool_media(chat_id, args.get("query", ""), cnt,
+                                                      visual=bool(args.get("visual")), query_image=q_img)
+                    mem_cache[ck] = res
                 log("ASK", f"Память /index {tname}: {_idx_snip(args.get('query') or args.get('topic') or args.get('name') or args.get('entity') or args.get('category'), 80)} → {len(res)} симв")
                 messages.append({"role": "tool", "tool_call_id": tool_call.id, "content": res})
                 continue
@@ -8931,6 +8953,8 @@ _INDEX_MEDIA_SYSTEM = (
     "Ты описываешь изображение из чата для базы знаний. Даны СПРАВОЧНИК персонажей и контекст сцены вокруг фото. "
     "Верни СТРОГО JSON:\n"
     '{"description":"<насыщенное фактами описание: что и кто изображён, что происходит, связь со сценой>",'
+    ' "visual_description":"<ЧИСТО визуальное описание кадра: люди, объекты, фон, стиль, цвета — БЕЗ привязки к чату'
+    ' и без имён, для поиска похожих изображений>",'
     ' "characters":[{"name":"<имя из справочника, если узнан>","appearance":"<внешность/визуальные приметы>"}]}\n'
     "Узнавай персонажей из справочника по контексту сцены и подписям. Если узнаваемых нет — characters пустой. "
     "Не выдумывай имена не из справочника."
@@ -9179,7 +9203,9 @@ async def _index_process_media(chat_id: int, image_msgs: list, scene_text: str, 
             continue
         if isinstance(data, dict) and not desc:  # desc ставим ТОЛЬКО если его не было (E2 ре-verify не переписывает описание)
             desc = (data.get("description") or "").strip()
-        if not visual_desc:
+        if not visual_desc and isinstance(data, dict):
+            visual_desc = (data.get("visual_description") or "").strip()  # из Call A — второй vision-вызов не нужен
+        if not visual_desc:  # фолбэк: Call A не запускался (фото уже описано ранее) или не дал поле → отдельный vision
             try:
                 thumb = await _downscale_img(raw)
                 vd = await describe_image(thumb, caption="", prompt=_GEN_DESC_PROMPT)
@@ -9601,10 +9627,18 @@ async def _index_embed_image(raw: bytes):
         return None
 
 
+_INDEX_QEMB_CACHE = {}          # процесс-level кэш эмбеддингов ЗАПРОСА: тот же текст не платит повторно (сбрасывается на рестарт)
+_INDEX_QEMB_CACHE_MAX = 512     # эмбеддинг детерминирован → идентичные memory_search/overview/media в /ask перестают жечь /embeddings
+
+
 async def _index_embed_query(text: str, image_space: bool = False):
-    """Текст запроса → нормированный np-вектор в нужном пространстве (qwen3 текст или gemini картинки)."""
+    """Текст запроса → нормированный np-вектор в нужном пространстве (qwen3 текст или gemini картинки).
+    Кэшируем по (image_space, текст): в одном /ask модель шлёт околодубли запросов — платим за эмбеддинг раз."""
     model = INDEX_EMBED_IMAGE_MODEL if image_space else INDEX_EMBED_TEXT_MODEL
     dim = INDEX_EMBED_IMAGE_DIM if image_space else INDEX_EMBED_TEXT_DIM
+    ck = (bool(image_space), (text or "").strip())
+    if ck[1] and ck in _INDEX_QEMB_CACHE:
+        return _INDEX_QEMB_CACHE[ck]  # повтор запроса → 0 обращений к /embeddings
 
     def _op():
         body = {"model": model, "input": [text]}
@@ -9617,7 +9651,12 @@ async def _index_embed_query(text: str, image_space: bool = False):
         return resp.json()["data"][0]["embedding"]
     try:
         v = await asyncio.to_thread(_op)
-        return _vec_unpack(_vec_pack(v, dim))  # та же нормировка/усечение, что у хранимых
+        out = _vec_unpack(_vec_pack(v, dim))  # та же нормировка/усечение, что у хранимых
+        if ck[1]:
+            _INDEX_QEMB_CACHE[ck] = out
+            if len(_INDEX_QEMB_CACHE) > _INDEX_QEMB_CACHE_MAX:
+                _INDEX_QEMB_CACHE.pop(next(iter(_INDEX_QEMB_CACHE)))  # FIFO-выселение старейшего
+        return out
     except Exception as e:
         log("INDEX", f"Эмбеддинг запроса не удался: {e}")
         return None
@@ -9791,21 +9830,22 @@ async def _index_stage4_rollups(chat_id: int, progress_cb=None):
             await _idx_set_state(chat_id, 4, status="paused")
             return "paused"
         ym = m["ym"]
-        # сигнатура месяца = count + MAX(chunk id): на update чанки удаляются+пересоздаются с новыми id →
-        # изменившийся текст сцены (даже при том же числе) даёт другой maxid → пересбор (не только по count).
-        sig = f"{int(m['c'])}:{int(m['maxid'] or 0)}"
+        rows = await db_read(
+            "SELECT enriched_text FROM chat_chunks WHERE chat_id=%s AND DATE_FORMAT(scene_date,'%%Y-%%m')=%s "
+            "ORDER BY start_msg_id", (chat_id, ym))
+        texts = [r["enriched_text"] or "" for r in rows]
+        # сигнатура месяца по КОНТЕНТУ (хэш текстов), НЕ по MAX(chunk id): на /index update чанки пересоздаются
+        # с новыми id при том же тексте → id-сигнатура ложно триггерила пересбор (лишний map-reduce LLM). Хэш стабилен.
+        sig = f"{len(texts)}:{hashlib.md5(chr(10).join(texts).encode('utf-8')).hexdigest()}"
         prev = await db_read("SELECT meta FROM time_rollups WHERE chat_id=%s AND level=1 AND bucket_key=%s", (chat_id, ym))
         if prev:
             try:
                 if (json.loads(prev[0]["meta"]) if prev[0]["meta"] else {}).get("sig") == sig:
-                    continue  # месяц не изменился — пропускаем
+                    continue  # месяц не изменился по КОНТЕНТУ — пропускаем
             except Exception:
                 pass
-        rows = await db_read(
-            "SELECT enriched_text FROM chat_chunks WHERE chat_id=%s AND DATE_FORMAT(scene_date,'%%Y-%%m')=%s "
-            "ORDER BY start_msg_id", (chat_id, ym))
         try:
-            summ = await _index_summarize_texts([r["enriched_text"] for r in rows], f"месяц {ym}")
+            summ = await _index_summarize_texts(texts, f"месяц {ym}")
         except IndexTransientError as e:
             await _idx_set_state(chat_id, 4, status="error")
             log("INDEX", f"Stage4 транзиентный сбой на {ym}: {e} — стадия в error")
@@ -10170,7 +10210,12 @@ async def _index_stage5_gallery(chat_id: int, progress_cb=None):
         if _INDEX_CONTROL.get(chat_id) == "pause":
             await _idx_set_state(chat_id, 5, status="paused")
             return "paused"
-        all_mids = sorted({m for eid, d in cand.items() for m in d if len(galleries[eid]) < INDEX_GALLERY_MAX_PER_ENTITY})
+        # vision-верификация только ТОП-VERIFY_CAP кандидатов на сущность по косинусу (главный рычаг экономии):
+        # косинус уже отранжировал пул — гоним через модель лучших, слабый хвост не описываем
+        all_mids = sorted({
+            m for eid, d in cand.items() if len(galleries[eid]) < INDEX_GALLERY_MAX_PER_ENTITY
+            for m in sorted(d, key=lambda x: -d[x])[:INDEX_GALLERY_VERIFY_CAP]
+        })
         if not all_mids:
             break
         desc_rows = await _media_rows_chunked(
@@ -11101,8 +11146,11 @@ async def _index_tool_search(chat_id: int, query: str, kind: str = "all") -> str
     if not cands:
         return ("В памяти ничего не нашёл. Переформулируй запрос другими словами (конкретнее: имена, о чём "
                 "именно спор/событие) или, если вопрос про внешний мир, используй web_search.")
-    # 3) cohere-rerank переупорядочивает пул по истинной релевантности; при сбое — косинус-порядок
-    order = await _index_rerank(query, [c["doc"] for c in cands], top_n=INDEX_RERANK_TOPN)
+    # 3) cohere-rerank переупорядочивает пул по истинной релевантности; при сбое — косинус-порядок.
+    #    На мелком пуле (≤ MIN_POOL) переупорядочивать нечего → пропускаем ПЛАТНЫЙ rerank, идём косинусом.
+    order = None
+    if len(cands) > INDEX_RERANK_MIN_POOL:
+        order = await _index_rerank(query, [c["doc"] for c in cands], top_n=INDEX_RERANK_TOPN)
     if order is not None:
         kept = [(cands[i], rel) for i, rel in order
                 if 0 <= i < len(cands) and (rel >= INDEX_RERANK_MIN or cands[i].get("direct"))]
@@ -11300,15 +11348,14 @@ async def _index_tool_media(chat_id: int, query: str, count: int = 1, visual: bo
         all_hits = await _index_media_hybrid_hits(chat_id, query, max(INDEX_RERANK_POOL, count * 4))
         best = max((h["score"] for h in all_hits), default=0.0)
         hits = None
-        if all_hits:
+        order = None
+        if len(all_hits) > INDEX_RERANK_MIN_POOL:  # мелкий пул → не жжём платный rerank, ниже hybrid-score фолбэк
             docs = []
             for h in all_hits:
                 visual_desc = h.get("visual_description") or ""
                 context_desc = h.get("image_description") or ""
                 docs.append(("visual: " + visual_desc + "\ncontext: " + context_desc).strip() or "изображение")
             order = await _index_rerank(query, docs, top_n=count)
-        else:
-            order = None
         if order is not None:
             best = order[0][1] if order else 0.0
             hits = [all_hits[i] for i, rel in order if 0 <= i < len(all_hits) and rel >= INDEX_RERANK_MIN][:count]
@@ -12431,22 +12478,34 @@ async def index_command(event):
         if st0["status"] is None:
             await event.reply("📭 Чат ещё не индексировался. Запусти `/index go`.")
             return
-        # заодно повторяем ВСЕ пропущенные poison-диапазоны (влитый retry failed). Берём ИСТИННЫЙ MIN(start_msg_id)
-        # по всем skipped (не сэмпл 500!) — иначе строки за пределами сэмпла ушли бы в retrying и зависли навсегда.
+        # повторяем пропущенные poison-диапазоны, НО только В ПРЕДЕЛАХ окна rewind_floor от overlap-курсора:
+        # иначе один древний skipped-диапазон (у начала чата) отматывал курсор Stage 1/2 почти к msg 0 и
+        # ре-экстрагировал ВЕСЬ чат каждый update. Древние — отложены (добить: `/index reindex scenes`).
+        overlap_cur = await _index_update_rewind_cursor(chat_id)
+        rewind_floor = max(0, overlap_cur - INDEX_UPDATE_FAILED_REWIND_CAP)
         frow = await db_read(
-            "SELECT MIN(start_msg_id) ms, COUNT(*) c FROM index_failed_ranges WHERE chat_id=%s AND status='skipped'", (chat_id,))
+            "SELECT MIN(start_msg_id) ms, COUNT(*) c FROM index_failed_ranges "
+            "WHERE chat_id=%s AND status='skipped' AND start_msg_id>=%s", (chat_id, rewind_floor))
         min_failed, n_failed = frow[0]["ms"], int(frow[0]["c"] or 0)
+        drow = await db_read(
+            "SELECT COUNT(*) c FROM index_failed_ranges WHERE chat_id=%s AND status='skipped' AND start_msg_id<%s",
+            (chat_id, rewind_floor))
+        n_deferred = int(drow[0]["c"] or 0)
         rewind_failed = None
         if min_failed is not None:
-            await db_write("UPDATE index_failed_ranges SET status='retrying' WHERE chat_id=%s AND status='skipped'", (chat_id,))
+            await db_write("UPDATE index_failed_ranges SET status='retrying' "
+                           "WHERE chat_id=%s AND status='skipped' AND start_msg_id>=%s", (chat_id, rewind_floor))
             rewind_failed = max(0, int(min_failed) - 1)
+        if n_deferred:
+            log("INDEX", f"/index update чат {chat_id}: {n_deferred} древних failed-диапазонов отложены "
+                         f"(за окном {INDEX_UPDATE_FAILED_REWIND_CAP} от курсора) — не ре-экстрагируем весь чат; добить `/index reindex scenes`")
         for stg in (0, 1, 2, 3, 4, 5):
             s = await _idx_get_state(chat_id, stg)
             if s["status"] == "done":
                 if stg in (1, 2):
-                    rewind = await _index_update_rewind_cursor(chat_id)
+                    rewind = overlap_cur
                     if rewind_failed is not None:
-                        rewind = min(rewind, rewind_failed)  # захватить и failed-диапазоны, если они раньше overlap-окна
+                        rewind = min(rewind, rewind_failed)  # failed-диапазоны В ОКНЕ (rewind_failed ≥ rewind_floor → не глубже окна)
                     await _idx_set_state(chat_id, stg, cursor={"last_msg_id": rewind}, status="running")
                 elif stg == 5 and rewind_failed is not None:
                     await _idx_set_state(chat_id, stg, cursor={"last_chunk_id": 0}, status="running")  # перечесать чанки для реассоциации фото (как делал retry failed)
