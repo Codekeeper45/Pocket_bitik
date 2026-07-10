@@ -495,10 +495,14 @@ for _cid, _clabel in [
     ("claude-haiku-4-5",  "Claude Haiku 4.5"),
 ]:
     MODEL_REGISTRY[_cid] = ("modelgate", _cid, _clabel, 200000, 1.2)
-# OpenAI (официальный API). Окна сверены с официальными страницами моделей (2026-06-12):
-# gpt-5.4/5.5 — 1,050,000 (флагманы 5.4+ получили ~1M окно), gpt-5.4-mini — 400k,
-# o3/o4-mini — 200k. safety 1.1 — токенизатор o200k почти совпадает с tiktoken бота.
+# OpenAI (официальный API). Окна сверены с официальными страницами моделей (2026-07-10):
+# gpt-5.6 (Sol/Terra/Luna) — семейство от 2026-07-09; все три ~1,05M окно (Terra подтв. 1.05M/128k out,
+# Sol/Luna OpenRouter округляет до 1M). Слаги = точные API-id (голый gpt-5.6 → sol). gpt-5.4/5.5 —
+# 1,050,000, gpt-5.4-mini — 400k, o3/o4-mini — 200k. safety 1.1 — токенизатор o200k ≈ tiktoken бота.
 for _oid, _olabel, _octx in [
+    ("gpt-5.6-sol",   "GPT-5.6 Sol",   1050000),
+    ("gpt-5.6-terra", "GPT-5.6 Terra", 1050000),
+    ("gpt-5.6-luna",  "GPT-5.6 Luna",  1050000),
     ("gpt-5.5", "GPT-5.5", 1050000),
     ("gpt-5.4", "GPT-5.4", 1050000),
     ("o3",      "OpenAI o3", 200000),
@@ -573,7 +577,12 @@ for _cbslug, _cbid, _cblabel in [
 # Уровни глубины размышлений (reasoning_effort) OpenAI-моделей, от мощного к слабому.
 # API жёстко валидирует значение ПО МОДЕЛИ (неподдерживаемое → 400): gpt-5.4/5.5 принимают
 # none/low/medium/high/xhigh, o3 — только low/medium/high. Дефолты: 5.5 → medium, 5.4 → none, o3 → medium.
+# gpt-5.6 (Sol/Terra/Luna) — none/low/medium/high/xhigh + новый max (выше xhigh); max отдаём через глобальный
+# xhigh (как xhigh→max у DeepSeek/Sakana — см. OPENAI_MAX_REASONING), поэтому в списке рунгов держим до xhigh.
 OPENAI_REASONING_LEVELS = {
+    "gpt-5.6-sol":   ["xhigh", "high", "medium", "low", "none"],
+    "gpt-5.6-terra": ["xhigh", "high", "medium", "low", "none"],
+    "gpt-5.6-luna":  ["xhigh", "high", "medium", "low", "none"],
     "gpt-5.5": ["xhigh", "high", "medium", "low", "none"],
     "gpt-5.4": ["xhigh", "high", "medium", "low", "none"],
     "o3":      ["high", "medium", "low"],
@@ -581,7 +590,10 @@ OPENAI_REASONING_LEVELS = {
     "o4-mini": ["xhigh", "high", "medium", "low"],               # none не принимает (зонд)
 }
 OPENAI_REASONING_DEFAULTS = {"gpt-5.5": "medium", "gpt-5.4": "none", "o3": "medium",
-                             "gpt-5.4-mini": "none", "o4-mini": "medium"}  # что применяет API без параметра
+                             "gpt-5.4-mini": "none", "o4-mini": "medium",
+                             # 5.6-дефолты не подтверждены зондом (только для показа в /status): sol — medium,
+                             # terra/luna — low (лёгкие тиры для объёма/скорости).
+                             "gpt-5.6-sol": "medium", "gpt-5.6-terra": "low", "gpt-5.6-luna": "low"}
 # Gemini 3.x: глубина размышлений — thinkingLevel (minimal|low|medium|high), полного off нет.
 # Единый глобальный REASONING_EFFORT (шкала xhigh..none) мапим на уровни Gemini.
 GEMINI_THINKING_MAP = {"xhigh": "high", "high": "high", "medium": "medium", "low": "low", "none": "minimal"}
@@ -609,12 +621,14 @@ DEEPSEEK_REASONING_LEVELS = ["xhigh", "high", "none"]
 # Off нет, «пол» = high. Два уровня для N.M: xhigh(→max) и high. Инжектим только при high/xhigh (ниже — дефолт).
 SAKANA_REASONING_LEVELS = ["xhigh", "high"]
 # Бесплатные дневные квоты OpenAI по программе data sharing (Tier 1-2, сброс в 00:00 UTC):
-# 250k/день на основные модели (gpt-5.x/o3) и ОТДЕЛЬНЫЕ 2.5M/день на mini-группу.
-# Счётчик бота — ориентир: внешние запросы организации он не видит, а граничный
-# запрос OpenAI биллит целиком.
+# 250k/день на основные модели (gpt-5.x/o3, вкл. gpt-5.6-sol) и ОТДЕЛЬНЫЕ 2.5M/день на mini-группу.
+# GPT-5.6 внесены в акцию (обновлённый help-article OpenAI, подтв. в dev-community 2026-07): sol → 250k-корзина,
+# terra + luna → 2.5M-корзина (мини). Счётчик бота — ориентир: внешние запросы организации он не видит,
+# а граничный запрос OpenAI биллит целиком.
 OPENAI_FREE_DAILY_LARGE = 250_000
 OPENAI_FREE_DAILY_MINI = 2_500_000
-OPENAI_MINI_MODELS = {"gpt-5.4-mini", "o4-mini"}  # модели mini-группы квоты
+OPENAI_MINI_MODELS = {"gpt-5.4-mini", "o4-mini", "gpt-5.6-terra", "gpt-5.6-luna"}  # mini-корзина квоты (+5.6 terra/luna)
+OPENAI_MAX_REASONING = {"gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna"}  # gpt-5.6: reasoning_effort=max (глоб. xhigh→max)
 
 
 def _cached_tokens(usage) -> int:
@@ -658,6 +672,8 @@ def _clamp_reasoning(model_id: str, effort: str, provider: str = None) -> str:
         return "max" if effort == "xhigh" else "high"
     if provider == "sakana":
         return "max" if effort == "xhigh" else "high"  # Sakana: только high/xhigh→max (off/low/medium нет)
+    if model_id in OPENAI_MAX_REASONING and effort == "xhigh":
+        return "max"  # gpt-5.6: топ-ступень max выше глобального xhigh (как xhigh→max у DeepSeek/Sakana)
     levels = OPENAI_REASONING_LEVELS.get(model_id)
     if not levels:
         return effort if effort in ("low", "medium", "high") else "medium"
@@ -1055,7 +1071,7 @@ class _OpenAIReasoningClient:
         # Ризонинг-токены СЧИТАЮТСЯ в max_completion_tokens, но невидимы. На medium+ цепочка
         # может съесть весь потолок → finish=length и ПУСТОЙ видимый ответ. Поднимаем потолок
         # так, чтобы после размышлений гарантированно оставалось место на текст.
-        _floor = {"medium": 24000, "high": 40000, "xhigh": 64000}.get(kwargs.get("reasoning_effort"))
+        _floor = {"medium": 24000, "high": 40000, "xhigh": 64000, "max": 96000}.get(kwargs.get("reasoning_effort"))
         if _floor and int(kwargs.get("max_completion_tokens") or 0) < _floor:
             kwargs["max_completion_tokens"] = _floor
         if kwargs.get("reasoning_effort") and kwargs.get("tools") and model not in OPENAI_TOOLS_EFFORT_CHAT_OK:
