@@ -2194,6 +2194,20 @@ def _is_region_block(exc) -> bool:
     )
 
 
+def _is_model_unavailable(exc) -> bool:
+    """Активная модель недоступна ЭТОМУ аккаунту: limited preview без доступа либо закрытый/неверный
+    слаг (404 model_not_found). Ретрай той же модели бесполезен → фоллбэк на запасную (как _is_region_block).
+    Напр. gpt-5.6 в limited preview: 'is in limited preview and is not available on this account' /
+    'does not exist or you do not have access to it'."""
+    s = str(exc).lower()
+    return (
+        "model_not_found" in s
+        or "limited preview" in s
+        or "does not exist or you do not have access" in s
+        or "is not available on this account" in s
+    )
+
+
 def _is_thinking_mode_quirk(exc) -> bool:
     """Quirk-ошибки thinking-моделей (DeepSeek reasoner, Kimi K2.x, MiMo и др.).
     Эти ошибки НЕ значат «модель без tools» — у них особое API: либо не умеют
@@ -3389,14 +3403,18 @@ async def _llm_create(messages: list, max_tokens: int = 4096, temperature: float
                 # Переполнение окна — не глотаем, кидаем наверх, чтобы ask_command мог ретрайнуть с агрессивной обрезкой
                 if _is_context_overflow(e):
                     raise ContextOverflowError(str(e)) from e
-                # Гео/permission-блок активной модели (напр. grok-4.5 не в регионе) → разово уходим на запасную и ретраим
-                if _is_region_block(e) and not _fell_back and ASK_REGION_FALLBACK in MODEL_REGISTRY:
+                # Активная модель недоступна: гео/permission-блок (grok-4.5 не в регионе) ИЛИ нет доступа
+                # аккаунту (gpt-5.6 limited preview / 404 model_not_found) → разово уходим на запасную и ретраим
+                _region = _is_region_block(e)
+                if (_region or _is_model_unavailable(e)) and not _fell_back and ASK_REGION_FALLBACK in MODEL_REGISTRY:
                     _fp, _fmid, _flabel, _fc, _fs = MODEL_REGISTRY[ASK_REGION_FALLBACK]
                     _fcli = _client_for_provider(_fp)
                     if _fcli is not None and _fmid != model_id:
                         _fell_back = True
-                        log("AI", f"{label} недоступна в регионе → фоллбэк на {_flabel}")
-                        client_obj, model_id, label = _fcli, _fmid, f"{_flabel} (регион-фолбэк)"
+                        _why = "недоступна в регионе" if _region else "недоступна аккаунту (preview/not_found)"
+                        _tag = "регион" if _region else "нет доступа"
+                        log("AI", f"{label} {_why} → фоллбэк на {_flabel}")
+                        client_obj, model_id, label = _fcli, _fmid, f"{_flabel} (фолбэк: {_tag})"
                         continue
                 if attempt == 1:
                     traceback.print_exc()
