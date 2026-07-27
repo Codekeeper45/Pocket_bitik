@@ -1,5 +1,5 @@
 from telethon import TelegramClient, events, utils
-from telethon.errors.rpcerrorlist import MessageNotModifiedError, FloodWaitError
+from telethon.errors.rpcerrorlist import AuthKeyDuplicatedError, MessageNotModifiedError, FloodWaitError
 from telethon.extensions import html as tl_html
 from telethon.helpers import add_surrogate
 from telethon.tl.types import MessageEntityBlockquote, MessageEntityPre, MessageMediaWebPage, InputReplyToMessage, InputMessagesFilterPhotos
@@ -104,6 +104,12 @@ index_db_url = os.getenv("INDEX_DB_URL")  # MariaDB для /index (GraphRAG-па
 llama_cloud_api_key = os.getenv("LLAMA_CLOUD_API_KEY")  # OCR фото (LlamaParse); без него фото идут через vision
 index_memory_for_guests = (os.getenv("INDEX_MEMORY_FOR_GUESTS") or "").lower() in ("1", "true", "yes", "on")
 index_use_hnsw = (os.getenv("INDEX_USE_HNSW") or "").lower() in ("1", "true", "yes", "on")
+# У каждой машины/контейнера должна быть своя Telethon-сессия. Не копировать
+# один и тот же .session между разными IP: Telegram аннулирует её auth key.
+telegram_session = os.getenv("TELEGRAM_SESSION") or "session_name"
+telegram_session_file = (
+    telegram_session if telegram_session.endswith(".session") else f"{telegram_session}.session"
+)
 
 
 def _collect_google_tts_keys() -> list:
@@ -352,7 +358,7 @@ GEMINI_TTS_OPENROUTER_MODEL = os.getenv("GEMINI_TTS_OPENROUTER_MODEL", "google/g
 OPENROUTER_TTS_URL = "https://openrouter.ai/api/v1/audio/speech"
 TTS_DEFAULT_VOICE = "Leda"     # дефолтный голос (см. VOICE_PROFILES)
 TTS_PCM_RATE = 24000           # Gemini TTS отдаёт PCM s16le 24kHz mono
-TTS_VOICE_CHAR_CAP = 5000      # потолок длины озвучиваемого текста (~4–5 мин речи). Fish s2-pro
+TTS_VOICE_CHAR_CAP = 5000      # потолок длины озвучиваемого текста (~4–5 мин речи). Fish S2.1 Pro
                                # тянет это легко (проверено до 7000). Длиннее — режем. NB: при фолбэке
                                # на Gemini TTS очень длинный текст может дать 400 — тогда сработает обрезка/ретрай.
 VOICE_SAMPLES_DIR = "voice_samples"  # кэш озвученных примеров голосов: voice_samples/<Имя>.ogg
@@ -363,7 +369,9 @@ fish_audio_api_key = os.getenv("FISH_AUDIO_API_KEY")
 fish_available = bool(fish_audio_api_key)
 FISH_TTS_URL = "https://api.fish.audio/v1/tts"
 FISH_MODELS_URL = "https://api.fish.audio/model"   # поиск/список голосов: GET ?title=&sort_by=score
-FISH_TTS_MODEL = os.getenv("FISH_TTS_MODEL", "s1")  # заголовок model: s1 / speech-1.5 / s2-pro
+# S2.1 Pro Free — актуальная модель Fish для developer-tier. Старые s1/s2-pro
+# остаются допустимыми через FISH_TTS_MODEL для осознанного отката.
+FISH_TTS_MODEL = os.getenv("FISH_TTS_MODEL", "s2.1-pro-free")
 
 # 30 встроенных голосов Gemini TTS (порт из Bot_opekyn/src/voice/tts.ts).
 # Каждый: name (для API), tone, pitch, personality (рус.), gender, emoji.
@@ -930,7 +938,7 @@ AUTO_REPLY_SYSTEM_PROMPT = """Ты — собеседник в личной пе
 
 Входящие сообщения даны в формате [время автор]: текст. Метки: «↩ автор» — ответ на чьё-то сообщение, «⤷ из X» — переслано. [Фото: …]/[Аудио: …] — содержимое медиа."""
 
-# Стиль голосового ответа зависит от активного TTS-движка: у Gemini и Fish-S2 разметка
+# Стиль голосового ответа зависит от активного TTS-движка: у Gemini и Fish S2+ разметка
 # интонации — [квадратные скобки], у Fish-S1 — (круглые) из фикс-набора. См. _voice_style_text.
 _VOICE_STYLE_COMMON = (
     "\n\n━━ РЕЖИМ ГОЛОСОВОГО ОТВЕТА ━━\n"
@@ -953,13 +961,13 @@ def _voice_style_text(engine: str = "gemini", fish_model: str = "") -> str:
             "- Пример: «(excited) Получилось! (laughing) Ха-ха… (soft tone) я очень рад за тебя.»"
         )
     if engine == "fish":
-        # Fish S2 / s2-pro — [квадратные скобки] со СВОБОДНЫМИ описаниями подачи. Теги — на АНГЛИЙСКОМ
+        # Fish S2+ (включая S2.1 Pro) — [квадратные скобки] со свободными описаниями подачи.
         # (словарь эмоций Fish английский → так надёжнее), сам текст реплики — на русском.
         return _VOICE_STYLE_COMMON + (
             "- Управляй интонацией пометками в КВАДРАТНЫХ скобках на АНГЛИЙСКОМ (так Fish надёжнее их понимает),\n"
             "  а сами слова реплики — на русском. Скобки НЕ произносятся. Примеры тегов: [soft] [whispering]\n"
             "  [excited] [sad] [happy] [serious] [sarcastic] [laughing] [chuckling] [sighing] [emphasis]\n"
-            "  [breathy] [pause] [shouting] [tender]. Fish s2 принимает ЛЮБЫЕ английские описания подачи —\n"
+            "  [breathy] [pause] [shouting] [tender]. Fish S2.1 принимает ЛЮБЫЕ английские описания подачи —\n"
             "  будь выразительной, комбинируй, ставь тег перед нужной фразой.\n"
             "- Пример: «[soft] Эй… [whispering] да ладно тебе… [laughing] не переживай об этом, [breathy] я рядом.»"
         )
@@ -1025,7 +1033,7 @@ Why am I alone now? (I don't know)
 Why am I alone now? (I don't know)"""
 
 # Клиенты
-client = TelegramClient("session_name", api_id, api_hash)
+client = TelegramClient(telegram_session, api_id, api_hash)
 openrouter_client = OpenAI(api_key=openrouter_api_key, base_url=OPENROUTER_BASE_URL) if openrouter_api_key else None
 # grok-4.5 и пр. модели, что xAI гео-блочит → пробуем через ТОТ ЖЕ «чистый» прокси, что и Sakana (SAKANA_PROXY).
 # NB честно: блок стоит на хопе OpenRouter→xAI, а прокси меняет лишь bot→OpenRouter → может НЕ снять регион-блок;
@@ -7363,7 +7371,7 @@ _HELP_SECTIONS = {
         "   `/voice fish <N|id>` — выбрать голос (номер из избранного ИЛИ прямой id).\n"
         "   `/voice fish remove <N|id>` — убрать из избранного; `/voice fish test [текст]` — прослушать.\n"
         "   Голоса берутся с fish.audio (id = reference_id). Нужен `FISH_AUDIO_API_KEY`.\n"
-        "   🎭 Разметку интонации модель ставит САМА под движок: Gemini — `[теги]` (рус.), Fish s2-pro —\n"
+        "   🎭 Разметку интонации модель ставит САМА под движок: Gemini — `[теги]` (рус.), Fish S2.1 —\n"
         "      `[english]` описания подачи (`[soft]`,`[whispering]`,`[laughing]`), Fish s1 — `(round)` из набора.\n"
         "      Текст реплики при этом на русском; теги не произносятся. Тебе делать ничего не нужно.\n"
         "\n"
@@ -13320,6 +13328,16 @@ if __name__ == "__main__":
             log("BOOT", "Клиент отключён. Переподключение через 10 секунд...")
         except (KeyboardInterrupt, SystemExit):
             raise
+        except AuthKeyDuplicatedError:
+            log(
+                "BOOT",
+                "Telegram аннулировал ключ сессии из-за одновременного использования с разных IP. "
+                "Остановите все копии бота с этой сессией, задайте в .env новое уникальное "
+                "TELEGRAM_SESSION и запустите бот для новой авторизации. Старый файл "
+                f"{telegram_session_file} можно оставить как резервную копию, но не использовать. "
+                "Для разных машин задавайте разные TELEGRAM_SESSION.",
+            )
+            raise SystemExit(2)
         except Exception as e:
             log("BOOT", f"Ошибка главного цикла: {e}")
             traceback.print_exc()
