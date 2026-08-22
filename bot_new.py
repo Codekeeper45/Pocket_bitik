@@ -99,6 +99,8 @@ fireworks_api_key = os.getenv("FIREWORKS_API_KEY")  # Fireworks AI — serverles
 sakana_api_key = os.getenv("SAKANA_API_KEY")  # Sakana AI — Fugu (оркестратор поверх фронтир-LLM, OpenAI-совместимый, прямой Bearer)
 sakana_proxy = os.getenv("SAKANA_PROXY")  # необяз. прокси для Sakana (WAF режет IP датацентров; формат http(s)://[user:pass@]host:port или socks5://…)
 gloy_api_key = os.getenv("GLOY_API_KEY")  # LLM API FUN (Gloy AI) — OpenAI-совместимый, прямой Bearer
+nanogpt_api_key = os.getenv("NANOGPT_API_KEY") or os.getenv("NANO_API_KEY")  # NanoGPT API (Gemma/Qwen uncensored)
+NANOGPT_BASE_URL = "https://nano-gpt.com/api/v1"
 tavily_api_key = os.getenv("TAVILY_API_KEY")  # веб-поиск/извлечение страниц для /ask (tavily.com); без ключа веб-инструменты выключены
 index_db_url = os.getenv("INDEX_DB_URL")  # MariaDB для /index (GraphRAG-память): mysql://user:pass@host:port/db (pass URL-encoded)
 llama_cloud_api_key = os.getenv("LLAMA_CLOUD_API_KEY")  # OCR фото (LlamaParse); без него фото идут через vision
@@ -582,6 +584,14 @@ for _cbslug, _cbid, _cblabel in [
     ("cb-glm",     "zai-glm-4.7",  "GLM-4.7 (CB)"),
 ]:
     MODEL_REGISTRY[_cbslug] = ("cerebras", _cbid, _cblabel, 32768, 1.30)
+# NanoGPT (nano-gpt.com, OpenAI-совместимый API, прямой Bearer).
+# Только uncensored модели: Gemma 4 31B Heretic, Gemma 4 26B Heretic, Qwen 3.8 27B Uncensored.
+for _ngslug, _ngid, _nglabel, _ngctx, _ngsafe in [
+    ("gemma-4-31b-heretic", "Gemma-4-31B-Gembrain-uncensored-heretic", "Gemma 4 31B Uncensored Heretic", 262144, 1.30),
+    ("gemma-4-26b-uncensored", "TEE/gemma-4-26b-a4b-uncensored", "Gemma 4 26B Uncensored Heretic", 262144, 1.30),
+    ("qwen-3.8-27b-uncensored", "qwen/qwen3.8-27b-uncensored", "Qwen 3.8 27B Uncensored", 262144, 1.15),
+]:
+    MODEL_REGISTRY[_ngslug] = ("nanogpt", _ngid, _nglabel, _ngctx, _ngsafe)
 # Уровни глубины размышлений (reasoning_effort) OpenAI-моделей, от мощного к слабому.
 # API жёстко валидирует значение ПО МОДЕЛИ (неподдерживаемое → 400): gpt-5.4/5.5 принимают
 # none/low/medium/high/xhigh, o3 — только low/medium/high. Дефолты: 5.5 → medium, 5.4 → none, o3 → medium.
@@ -1562,6 +1572,7 @@ zai_client = OpenAI(api_key=zai_api_key, base_url=ZAI_BASE_URL) if zai_api_key e
 fireworks_client = _FireworksReasoningClient(fireworks_api_key) if fireworks_api_key else None  # Fireworks (OpenAI-совместимый, с управляемым reasoning_effort)
 sakana_client = _SakanaReasoningClient(sakana_api_key) if sakana_api_key else None  # Sakana AI (Fugu, OpenAI-совместимый, reasoning high/xhigh/max)
 gloy_client = _GloyClient(gloy_api_key) if gloy_api_key else None  # LLM API FUN (Gloy AI, OpenAI-совместимый; клампит max_tokens≤8192, без reasoning-параметра и без tools-натива)
+nanogpt_client = OpenAI(api_key=nanogpt_api_key, base_url=NANOGPT_BASE_URL) if nanogpt_api_key else None  # NanoGPT API (Gemma/Qwen uncensored)
 
 AUTO_REPLY_BUFFERS: dict = {}
 AUTO_REPLY_TASKS: dict = {}
@@ -1707,6 +1718,8 @@ def _client_for_provider(provider):
         return gloy_client
     if provider == "cerebras":
         return cerebras_clients[0] if cerebras_clients else None  # общий клиент ротации (браузерный UA внутри); None → нет ключей
+    if provider == "nanogpt":
+        return nanogpt_client
     if provider == "opencode":
         return opencode_reasoning_client  # путь ответов с инжектом reasoning_effort
     return opencode_client  # неизвестный провайдер — сырой клиент (фоллбэк)
@@ -6600,6 +6613,7 @@ async def model_command(event):
                          "sakana": "━━ Sakana AI (Fugu) ━━",
                          "gloy": "━━ LLM API FUN (Gloy AI) ━━",
                          "cerebras": "━━ Cerebras ━━",
+                         "nanogpt": "━━ NanoGPT (Uncensored) ━━",
                          "openrouter": "━━ OpenRouter (кастом) ━━"}.get(provider, f"━━ {provider} ━━")
                 lines.append(f"\n{title}")
             mark = f"▶{i}." if slug == ACTIVE_MODEL else f"{i}."
@@ -6630,7 +6644,7 @@ async def model_command(event):
         tested = 0
         for slug in slugs:
             provider, mid, _label, _ctx, _safety = MODEL_REGISTRY[slug]
-            if provider in ("oc_anthropic", "openai", "google", "zai", "fireworks", "sakana", "gloy", "cerebras"):
+            if provider in ("oc_anthropic", "openai", "google", "zai", "fireworks", "sakana", "gloy", "cerebras", "nanogpt"):
                 continue  # qwen3.7-max / gpt-5.x / o3 / Gemini / Fireworks / Sakana / Gloy: tools работают на auto, но forced пробник врёт (Sakana/Gloy отдают не tool_call) — флаг учится на лету в реальном /ask
             cl = _client_for_provider(provider)
             if cl is None:
@@ -7675,9 +7689,10 @@ async def status_command(event):
     # — модель ответов —
     provider, _mid, label, ctx, _ = MODEL_REGISTRY.get(ACTIVE_MODEL, MODEL_REGISTRY["deepseek-pro"])
     prov_name = {"deepseek": "DeepSeek", "openrouter": "OpenRouter", "opencode": "OpenCode Go",
-                 "oc_anthropic": "OpenCode (нативный)", "modelgate": "ModelGate (Claude)",
+                 "oc_anthropic": "OpenCode Go (нативный)", "modelgate": "Claude/ModelGate",
                  "openai": "OpenAI", "google": "Google Gemini", "zai": "z.ai (GLM)", "fireworks": "Fireworks",
-                 "sakana": "Sakana AI (Fugu)", "gloy": "LLM API FUN (Gloy AI)"}.get(provider, provider)
+                 "sakana": "Sakana AI (Fugu)", "gloy": "LLM API FUN (Gloy AI)", "cerebras": "Cerebras",
+                 "nanogpt": "NanoGPT"}.get(provider, provider)
     ts = MODEL_TOOLS_SUPPORT.get(ACTIVE_MODEL)
     search_mark = "🔧 есть" if ts is True else ("🚫 нет" if ts is False else "❔ не проверен")
     sv = active_model_supports_vision()
@@ -7743,7 +7758,7 @@ async def status_command(event):
     L.append(f"⭐ **Избранное:** {len(FISH_FAVORITES)} Fish-голос(ов) · {len(CUSTOM_MODELS)} кастомных моделей")
     # — ключи —
     keys = []
-    for p, nm in [("deepseek", "DeepSeek"), ("openrouter", "OpenRouter"), ("opencode", "OpenCode"), ("modelgate", "Claude/ModelGate"), ("openai", "OpenAI"), ("google", "Google Gemini"), ("zai", "z.ai (GLM)"), ("fireworks", "Fireworks"), ("cerebras", "Cerebras")]:
+    for p, nm in [("deepseek", "DeepSeek"), ("openrouter", "OpenRouter"), ("opencode", "OpenCode"), ("modelgate", "Claude/ModelGate"), ("openai", "OpenAI"), ("google", "Google Gemini"), ("zai", "z.ai (GLM)"), ("fireworks", "Fireworks"), ("cerebras", "Cerebras"), ("nanogpt", "NanoGPT")]:
         keys.append(f"{nm} {'✅' if _client_for_provider(p) is not None else '❌'}")
     keys[-1] += f"×{len(cerebras_clients)}" if cerebras_clients else ""  # число ключей ротации Cerebras
     keys.append(f"Tavily {'✅' if tavily_api_key else '❌'}")
