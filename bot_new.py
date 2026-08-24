@@ -101,8 +101,6 @@ sakana_proxy = os.getenv("SAKANA_PROXY")  # необяз. прокси для Sa
 gloy_api_key = os.getenv("GLOY_API_KEY")  # LLM API FUN (Gloy AI) — OpenAI-совместимый, прямой Bearer
 nanogpt_api_key = os.getenv("NANOGPT_API_KEY") or os.getenv("NANO_API_KEY")  # NanoGPT API (Gemma/Qwen uncensored)
 NANOGPT_BASE_URL = "https://nano-gpt.com/api/v1"
-nvidia_nim_api_keys = [k.strip() for k in (os.getenv("NVIDIA_NIM_API_KEY") or os.getenv("NVIDIA_NIM_API_KEYS") or os.getenv("NVIDIA_API_KEY") or "").split(",") if k.strip()]
-NVIDIA_NIM_BASE_URL = os.getenv("NVIDIA_NIM_BASE_URL") or "https://integrate.api.nvidia.com/v1"
 tavily_api_key = os.getenv("TAVILY_API_KEY")  # веб-поиск/извлечение страниц для /ask (tavily.com); без ключа веб-инструменты выключены
 index_db_url = os.getenv("INDEX_DB_URL")  # MariaDB для /index (GraphRAG-память): mysql://user:pass@host:port/db (pass URL-encoded)
 llama_cloud_api_key = os.getenv("LLAMA_CLOUD_API_KEY")  # OCR фото (LlamaParse); без него фото идут через vision
@@ -594,15 +592,6 @@ for _ngslug, _ngid, _nglabel, _ngctx, _ngsafe in [
     ("qwen-3.8-27b-uncensored", "qwen/qwen3.8-27b-uncensored", "Qwen 3.8 27B Uncensored", 262144, 1.15),
 ]:
     MODEL_REGISTRY[_ngslug] = ("nanogpt", _ngid, _nglabel, _ngctx, _ngsafe)
-# NVIDIA NIM (integrate.api.nvidia.com, OpenAI-совместимый API, Bearer).
-# Kimi K3 (#1 китайский open-weight, 1M контекст), MiniMax M3 и др.
-for _nvslug, _nvid, _nvlabel, _nvctx, _nvsafe in [
-    ("kimi-k3", "moonshotai/kimi-k3", "Kimi K3 (NIM)", 1000000, 2.50),
-    ("nim-minimax-m3", "minimaxai/minimax-m3", "MiniMax M3 (NIM)", 1000000, 1.30),
-    ("nim-llama-3.3-70b", "meta/llama-3.3-70b-instruct", "Llama 3.3 70B (NIM)", 131072, 1.15),
-    ("nim-gpt-oss-120b", "openai/gpt-oss-120b", "GPT-OSS 120B (NIM)", 131072, 1.15),
-]:
-    MODEL_REGISTRY[_nvslug] = ("nvidia", _nvid, _nvlabel, _nvctx, _nvsafe)
 # Уровни глубины размышлений (reasoning_effort) OpenAI-моделей, от мощного к слабому.
 # API жёстко валидирует значение ПО МОДЕЛИ (неподдерживаемое → 400): gpt-5.4/5.5 принимают
 # none/low/medium/high/xhigh, o3 — только low/medium/high. Дефолты: 5.5 → medium, 5.4 → none, o3 → medium.
@@ -1583,43 +1572,6 @@ zai_client = OpenAI(api_key=zai_api_key, base_url=ZAI_BASE_URL) if zai_api_key e
 fireworks_client = _FireworksReasoningClient(fireworks_api_key) if fireworks_api_key else None  # Fireworks (OpenAI-совместимый, с управляемым reasoning_effort)
 sakana_client = _SakanaReasoningClient(sakana_api_key) if sakana_api_key else None  # Sakana AI (Fugu, OpenAI-совместимый, reasoning high/xhigh/max)
 gloy_client = _GloyClient(gloy_api_key) if gloy_api_key else None  # LLM API FUN (Gloy AI, OpenAI-совместимый; клампит max_tokens≤8192, без reasoning-параметра и без tools-натива)
-class _NvidiaClient:
-    """Клиент для NVIDIA NIM API (integrate.api.nvidia.com) с поддержкой пула ключей и авто-ротацией при 429."""
-    def __init__(self, api_keys, base_url=NVIDIA_NIM_BASE_URL):
-        self.keys = api_keys if isinstance(api_keys, list) else [api_keys]
-        self.base_url = base_url
-        self._idx = 0
-        self.clients = [OpenAI(api_key=k, base_url=base_url) for k in self.keys]
-        self.chat = SimpleNamespace(completions=SimpleNamespace(create=self._create))
-
-    def _create(self, **kwargs):
-        if not self.clients:
-            raise RuntimeError("NVIDIA NIM API keys not configured")
-        n = len(self.clients)
-        last_err = None
-        for attempt in range(n):
-            idx = (self._idx + attempt) % n
-            cl = self.clients[idx]
-            try:
-                resp = cl.chat.completions.create(**kwargs)
-                self._idx = idx
-                if resp and resp.choices and resp.choices[0].message:
-                    msg = resp.choices[0].message
-                    if not msg.content and hasattr(msg, "reasoning_content") and msg.reasoning_content:
-                        msg.content = msg.reasoning_content
-                return resp
-            except Exception as e:
-                last_err = e
-                err_str = str(e)
-                if "429" in err_str or "rate" in err_str.lower() or "limit" in err_str.lower() or "too many" in err_str.lower():
-                    log("NVIDIA", f"Key #{idx+1} hit rate limit (429), rotating to next key...")
-                    continue
-                raise
-        if last_err:
-            raise last_err
-
-
-nvidia_client = _NvidiaClient(nvidia_nim_api_keys, NVIDIA_NIM_BASE_URL) if nvidia_nim_api_keys else None
 nanogpt_client = OpenAI(api_key=nanogpt_api_key, base_url=NANOGPT_BASE_URL) if nanogpt_api_key else None  # NanoGPT API (Gemma/Qwen uncensored)
 
 AUTO_REPLY_BUFFERS: dict = {}
@@ -1768,8 +1720,6 @@ def _client_for_provider(provider):
         return cerebras_clients[0] if cerebras_clients else None  # общий клиент ротации (браузерный UA внутри); None → нет ключей
     if provider == "nanogpt":
         return nanogpt_client
-    if provider == "nvidia":
-        return nvidia_client
     if provider == "opencode":
         return opencode_reasoning_client  # путь ответов с инжектом reasoning_effort
     return opencode_client  # неизвестный провайдер — сырой клиент (фоллбэк)
@@ -1823,8 +1773,6 @@ def _model_supports_vision(slug):
         return slug in FIREWORKS_VISION  # на Fireworks картинки принимают minimax-m3 и kimi-k2.6
     if provider == "sakana":
         return slug in SAKANA_VISION  # обе модели Sakana (fugu/fugu-ultra) принимают картинки
-    if provider == "nvidia":
-        return slug in ("kimi-k3", "nim-minimax-m3")
     return False  # DeepSeek и прочие текстовые
 
 
@@ -6666,7 +6614,6 @@ async def model_command(event):
                          "gloy": "━━ LLM API FUN (Gloy AI) ━━",
                          "cerebras": "━━ Cerebras ━━",
                          "nanogpt": "━━ NanoGPT (Uncensored) ━━",
-                         "nvidia": "━━ NVIDIA NIM (Kimi K3 / Free) ━━",
                          "openrouter": "━━ OpenRouter (кастом) ━━"}.get(provider, f"━━ {provider} ━━")
                 lines.append(f"\n{title}")
             mark = f"▶{i}." if slug == ACTIVE_MODEL else f"{i}."
@@ -6697,8 +6644,8 @@ async def model_command(event):
         tested = 0
         for slug in slugs:
             provider, mid, _label, _ctx, _safety = MODEL_REGISTRY[slug]
-            if provider in ("oc_anthropic", "openai", "google", "zai", "fireworks", "sakana", "gloy", "cerebras", "nanogpt", "nvidia"):
-                continue  # qwen3.7-max / gpt-5.x / o3 / Gemini / Fireworks / Sakana / Gloy / NIM: tools работают на auto, но forced пробник врёт (Sakana/Gloy отдают не tool_call) — флаг учится на лету в реальном /ask
+            if provider in ("oc_anthropic", "openai", "google", "zai", "fireworks", "sakana", "gloy", "cerebras", "nanogpt"):
+                continue  # qwen3.7-max / gpt-5.x / o3 / Gemini / Fireworks / Sakana / Gloy: tools работают на auto, но forced пробник врёт (Sakana/Gloy отдают не tool_call) — флаг учится на лету в реальном /ask
             cl = _client_for_provider(provider)
             if cl is None:
                 continue
@@ -7745,7 +7692,7 @@ async def status_command(event):
                  "oc_anthropic": "OpenCode Go (нативный)", "modelgate": "Claude/ModelGate",
                  "openai": "OpenAI", "google": "Google Gemini", "zai": "z.ai (GLM)", "fireworks": "Fireworks",
                  "sakana": "Sakana AI (Fugu)", "gloy": "LLM API FUN (Gloy AI)", "cerebras": "Cerebras",
-                 "nanogpt": "NanoGPT", "nvidia": "NVIDIA NIM"}.get(provider, provider)
+                 "nanogpt": "NanoGPT"}.get(provider, provider)
     ts = MODEL_TOOLS_SUPPORT.get(ACTIVE_MODEL)
     search_mark = "🔧 есть" if ts is True else ("🚫 нет" if ts is False else "❔ не проверен")
     sv = active_model_supports_vision()
@@ -7811,10 +7758,8 @@ async def status_command(event):
     L.append(f"⭐ **Избранное:** {len(FISH_FAVORITES)} Fish-голос(ов) · {len(CUSTOM_MODELS)} кастомных моделей")
     # — ключи —
     keys = []
-    for p, nm in [("deepseek", "DeepSeek"), ("openrouter", "OpenRouter"), ("opencode", "OpenCode"), ("modelgate", "Claude/ModelGate"), ("openai", "OpenAI"), ("google", "Google Gemini"), ("zai", "z.ai (GLM)"), ("fireworks", "Fireworks"), ("cerebras", "Cerebras"), ("nanogpt", "NanoGPT"), ("nvidia", "NVIDIA NIM")]:
+    for p, nm in [("deepseek", "DeepSeek"), ("openrouter", "OpenRouter"), ("opencode", "OpenCode"), ("modelgate", "Claude/ModelGate"), ("openai", "OpenAI"), ("google", "Google Gemini"), ("zai", "z.ai (GLM)"), ("fireworks", "Fireworks"), ("cerebras", "Cerebras"), ("nanogpt", "NanoGPT")]:
         keys.append(f"{nm} {'✅' if _client_for_provider(p) is not None else '❌'}")
-    if nvidia_nim_api_keys:
-        keys[-1] += f"×{len(nvidia_nim_api_keys)}"
     keys[-1] += f"×{len(cerebras_clients)}" if cerebras_clients else ""  # число ключей ротации Cerebras
     keys.append(f"Tavily {'✅' if tavily_api_key else '❌'}")
     keys.append(f"Google TTS {'✅' if tts_available else '❌'}")
