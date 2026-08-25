@@ -585,11 +585,14 @@ for _cbslug, _cbid, _cblabel in [
 ]:
     MODEL_REGISTRY[_cbslug] = ("cerebras", _cbid, _cblabel, 32768, 1.30)
 # NanoGPT (nano-gpt.com, OpenAI-совместимый API, прямой Bearer).
-# Только uncensored модели: Gemma 4 31B Heretic, Gemma 4 26B Heretic, Qwen 3.8 27B Uncensored.
+# ERNIE 5.1 и его отдельный thinking-вариант — актуальные id из каталога NanoGPT (25.08.2026).
+# Thinking имеет 119k контекст / 64k output; отдельная модель, мышление включается самим id, а не reason-effort.
 for _ngslug, _ngid, _nglabel, _ngctx, _ngsafe in [
     ("gemma-4-31b-heretic", "Gemma-4-31B-Gembrain-uncensored-heretic", "Gemma 4 31B Uncensored Heretic", 262144, 1.30),
     ("gemma-4-26b-uncensored", "TEE/gemma-4-26b-a4b-uncensored", "Gemma 4 26B Uncensored Heretic", 262144, 1.30),
     ("qwen-3.8-27b-uncensored", "qwen/qwen3.8-27b-uncensored", "Qwen 3.8 27B Uncensored", 262144, 1.15),
+    ("ernie-5.1", "ernie-5.1", "ERNIE 5.1", 119000, 1.15),
+    ("ernie-5.1-thinking", "ernie-5.1:thinking", "ERNIE 5.1 Thinking", 119000, 1.15),
 ]:
     MODEL_REGISTRY[_ngslug] = ("nanogpt", _ngid, _nglabel, _ngctx, _ngsafe)
 # Уровни глубины размышлений (reasoning_effort) OpenAI-моделей, от мощного к слабому.
