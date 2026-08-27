@@ -585,14 +585,20 @@ for _cbslug, _cbid, _cblabel in [
 ]:
     MODEL_REGISTRY[_cbslug] = ("cerebras", _cbid, _cblabel, 32768, 1.30)
 # NanoGPT (nano-gpt.com, OpenAI-совместимый API, прямой Bearer).
-# ERNIE 5.1 и его отдельный thinking-вариант — актуальные id из каталога NanoGPT (25.08.2026).
-# Thinking имеет 119k контекст / 64k output; отдельная модель, мышление включается самим id, а не reason-effort.
+# ID ниже сверены с авторизованным каталогом NanoGPT и реальными completion-запросами (27.08.2026).
+# DeepSeek V4 и GLM-5.3 имеют окно 1M; суффикс :thinking — отдельный upstream-маршрут NanoGPT.
 for _ngslug, _ngid, _nglabel, _ngctx, _ngsafe in [
     ("gemma-4-31b-heretic", "Gemma-4-31B-Gembrain-uncensored-heretic", "Gemma 4 31B Uncensored Heretic", 262144, 1.30),
     ("gemma-4-26b-uncensored", "TEE/gemma-4-26b-a4b-uncensored", "Gemma 4 26B Uncensored Heretic", 262144, 1.30),
     ("qwen-3.8-27b-uncensored", "qwen/qwen3.8-27b-uncensored", "Qwen 3.8 27B Uncensored", 262144, 1.15),
     ("ernie-5.1", "ernie-5.1", "ERNIE 5.1", 119000, 1.15),
     ("ernie-5.1-thinking", "ernie-5.1:thinking", "ERNIE 5.1 Thinking", 119000, 1.15),
+    ("ng-deepseek-v4-pro-0813", "deepseek/deepseek-v4-pro-0813", "DeepSeek V4 Pro 0813 (NanoGPT)", 1000000, 1.15),
+    ("ng-deepseek-v4-pro-0813-thinking", "deepseek/deepseek-v4-pro-0813:thinking", "DeepSeek V4 Pro 0813 Thinking (NanoGPT)", 1000000, 1.15),
+    ("ng-deepseek-v4-flash-latest", "deepseek/deepseek-v4-flash-latest", "DeepSeek V4 Flash Latest (NanoGPT)", 1000000, 1.15),
+    ("ng-deepseek-v4-flash-thinking", "deepseek/deepseek-v4-flash:thinking", "DeepSeek V4 Flash Thinking (NanoGPT)", 1000000, 1.15),
+    ("ng-glm-5.3", "zai-org/glm-5.3", "GLM-5.3 (NanoGPT)", 1048576, 1.30),
+    ("ng-glm-5.3-thinking", "zai-org/glm-5.3:thinking", "GLM-5.3 Thinking (NanoGPT)", 1048576, 1.30),
 ]:
     MODEL_REGISTRY[_ngslug] = ("nanogpt", _ngid, _nglabel, _ngctx, _ngsafe)
 # Уровни глубины размышлений (reasoning_effort) OpenAI-моделей, от мощного к слабому.
@@ -6616,7 +6622,7 @@ async def model_command(event):
                          "sakana": "━━ Sakana AI (Fugu) ━━",
                          "gloy": "━━ LLM API FUN (Gloy AI) ━━",
                          "cerebras": "━━ Cerebras ━━",
-                         "nanogpt": "━━ NanoGPT (Uncensored) ━━",
+                         "nanogpt": "━━ NanoGPT ━━",
                          "openrouter": "━━ OpenRouter (кастом) ━━"}.get(provider, f"━━ {provider} ━━")
                 lines.append(f"\n{title}")
             mark = f"▶{i}." if slug == ACTIVE_MODEL else f"{i}."
