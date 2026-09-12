@@ -934,6 +934,101 @@ REPLY_TOOL = {
     }
 }
 
+# --- Инструменты поиска и чтения в текущем чате (серверный поиск Telegram + чтение контекста + Vision фото) ---
+CHAT_SEARCH_TOOL = {
+    "type": "function",
+    "function": {
+        "name": "chat_search",
+        "description": (
+            "Ищет сообщения в ТЕКУЩЕМ чате по ключевым словам через серверный поиск Telegram. "
+            "Находит любые реплики за всю историю чата (даже за месяцы и годы назад, "
+            "которые не попали в исходную выборку N сообщений или базу /index). "
+            "Возвращает список найденных сообщений: дата, автор, #id сообщения, текст и пометку о медиа (фото/видео/файл)."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "query": {
+                    "type": "string",
+                    "description": "Слова или фраза для поиска в текущем чате (как в строке поиска Telegram)."
+                },
+                "filter": {
+                    "type": "string",
+                    "enum": ["all", "photo", "document", "voice", "video"],
+                    "description": "Фильтр медиа: all — любые сообщения (по умолчанию); photo — только сообщения с фотографиями; document — с документами/файлами; voice — с голосовыми; video — с видео."
+                },
+                "from_user": {
+                    "type": "string",
+                    "description": "Опционально: username или имя автора (@username или имя), чьи сообщения искать."
+                },
+                "limit": {
+                    "type": "integer",
+                    "description": "Сколько сообщений найти (1–15, по умолчанию 8)."
+                }
+            },
+            "required": ["query"]
+        }
+    }
+}
+
+CHAT_READ_CONTEXT_TOOL = {
+    "type": "function",
+    "function": {
+        "name": "chat_read_context",
+        "description": (
+            "Считывает сообщения ВОКРУГ конкретного сообщения (по его #id) в текущем чате. "
+            "Используй после chat_search, чтобы прочитать непрерывный диалог до и после найденного сообщения "
+            "и восстановить полный контекст ситуации, кто кому отвечал и о чём спорили."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "message_id": {
+                    "type": "integer",
+                    "description": "#id сообщения, вокруг которого нужно прочитать переписку."
+                },
+                "before": {
+                    "type": "integer",
+                    "description": "Сколько сообщений прочитать ДО него (1–15, по умолчанию 5)."
+                },
+                "after": {
+                    "type": "integer",
+                    "description": "Сколько сообщений прочитать ПОСЛЕ него (1–15, по умолчанию 5)."
+                }
+            },
+            "required": ["message_id"]
+        }
+    }
+}
+
+CHAT_INSPECT_IMAGE_TOOL = {
+    "type": "function",
+    "function": {
+        "name": "chat_inspect_image",
+        "description": (
+            "Скачивает и детально рассматривает фотографию/изображение из сообщения чата по его #id. "
+            "Возвращает точное визуальное описание того, что изображено на картинке (текст, объекты, цвета, мем, скриншот). "
+            "Используй, когда в chat_search или в переписке есть сообщение с фото, и нужно понять, что на нём изображено."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "message_id": {
+                    "type": "integer",
+                    "description": "#id сообщения с картинкой или фотографией."
+                },
+                "question": {
+                    "type": "string",
+                    "description": "Опционально: что конкретно нужно разглядеть на изображении (например, 'прочитай текст', 'что за мем?')."
+                }
+            },
+            "required": ["message_id"]
+        }
+    }
+}
+
+CHAT_TOOLS = [CHAT_SEARCH_TOOL, CHAT_READ_CONTEXT_TOOL, CHAT_INSPECT_IMAGE_TOOL]
+
 ASK_SYSTEM_PROMPT = """Ты — {model}, ИИ с характером и собственной точкой зрения. Не нейтральный ассистент, а собеседник с позицией.
 
 Правила:
@@ -3787,6 +3882,265 @@ async def _run_reply_tool(args: dict, chat_id, msg_by_id: dict, reply_sent: list
     return " ".join(parts)
 
 
+async def _run_chat_search(chat_id, args: dict, msg_by_id: dict = None) -> str:
+    """Исполняет chat_search: серверный поиск Telegram по ключевым словам в текущем чате."""
+    if not chat_id:
+        return "Ошибка: нет ID текущего чата."
+    query = (args.get("query") or "").strip()
+    if not query:
+        return "Ошибка: поисковый запрос не может быть пустым."
+
+    fl = (args.get("filter") or "all").lower()
+    from_user = args.get("from_user")
+    limit = max(1, min(int(args.get("limit") or 8), 15))
+
+    filter_obj = None
+    if fl == "photo":
+        from telethon.tl.types import InputMessagesFilterPhotos
+        filter_obj = InputMessagesFilterPhotos()
+    elif fl == "document":
+        from telethon.tl.types import InputMessagesFilterDocument
+        filter_obj = InputMessagesFilterDocument()
+    elif fl == "voice":
+        from telethon.tl.types import InputMessagesFilterVoice
+        filter_obj = InputMessagesFilterVoice()
+    elif fl == "video":
+        from telethon.tl.types import InputMessagesFilterVideo
+        filter_obj = InputMessagesFilterVideo()
+
+    user_ent = None
+    if from_user:
+        fu_clean = str(from_user).strip()
+        if fu_clean.lstrip("-").isdigit():
+            try:
+                user_ent = int(fu_clean)
+            except ValueError:
+                user_ent = None
+        elif fu_clean.startswith("@"):
+            try:
+                user_ent = await client.get_entity(fu_clean)
+            except Exception as e:
+                log("ASK", f"chat_search: get_entity('{fu_clean}') failed: {e}")
+                user_ent = None
+        else:
+            try:
+                user_ent = await client.get_entity(fu_clean)
+            except Exception:
+                user_ent = None
+
+    kwargs = {"limit": limit, "search": query}
+    if filter_obj:
+        kwargs["filter"] = filter_obj
+    if user_ent:
+        kwargs["from_user"] = user_ent
+
+    results = []
+    try:
+        async for m in client.iter_messages(chat_id, **kwargs):
+            if m:
+                results.append(m)
+    except Exception as e:
+        log("ASK", f"chat_search failed: {e}")
+        return f"Ошибка при поиске в чате: {e}"
+
+    if from_user and not user_ent and results:
+        # фильтрация по имени в python если get_entity не нашел аккаунт
+        fu_low = str(from_user).lower().lstrip("@")
+        filtered = []
+        for m in results:
+            snd = m.sender if m.sender else None
+            snd_label = _label_for(m, snd).lower()
+            if fu_low in snd_label:
+                filtered.append(m)
+        if filtered:
+            results = filtered
+
+    if not results:
+        f_note = f" (фильтр: {fl})" if fl != "all" else ""
+        u_note = f" (от: {from_user})" if from_user else ""
+        return f"По запросу «{query}»{f_note}{u_note} в истории этого чата ничего не найдено."
+
+    lines = [f"Найдено {len(results)} сообщений по запросу «{query}» в этом чате (от новых к старым):"]
+    for m in results:
+        if msg_by_id is not None:
+            msg_by_id[m.id] = m
+        sender = None
+        if not m.out:
+            try:
+                sender = m.sender or await m.get_sender()
+            except Exception:
+                sender = None
+        author = _label_for(m, sender)
+        dt_str = _fmt_date(m.date)
+        mtag = _media_tag(m)
+        media_str = f" [{mtag}]" if mtag else ""
+
+        ckey = f"{chat_id}:{m.id}"
+        cached_desc = MEDIA_CACHE.get(ckey)
+        if cached_desc:
+            media_str += f" (в кэше: {_preview(cached_desc, 60)})"
+
+        txt = (m.raw_text or "").replace("\n", " ").strip()
+        preview = _preview(txt, 250) if txt else "(без текста)"
+        lines.append(f"• #{m.id} [{dt_str}] {author}{media_str}: {preview}")
+
+    lines.append("\n💡 Доступные действия:")
+    lines.append("- Чтобы прочитать непрерывный диалог вокруг найденного сообщения: `chat_read_context(message_id=...)`")
+    lines.append("- Чтобы посмотреть фото или картинку из сообщения: `chat_inspect_image(message_id=...)`")
+    return "\n".join(lines)
+
+
+async def _run_chat_read_context(chat_id, args: dict, msg_by_id: dict = None) -> str:
+    """Исполняет chat_read_context: считывает сообщения до и после message_id."""
+    if not chat_id:
+        return "Ошибка: нет ID текущего чата."
+    try:
+        mid = int(args.get("message_id") or 0)
+    except (ValueError, TypeError):
+        return "Ошибка: укажи корректный message_id (целое число)."
+    if not mid:
+        return "Ошибка: укажи message_id."
+
+    before = max(1, min(int(args.get("before") or 5), 15))
+    after = max(1, min(int(args.get("after") or 5), 15))
+
+    before_msgs = []
+    target_msg = None
+    after_msgs = []
+
+    try:
+        # Сообщения ДО mid (старше mid): offset_id=mid в Telethon отдаёт id < mid
+        async for m in client.iter_messages(chat_id, offset_id=mid, limit=before):
+            before_msgs.append(m)
+
+        if msg_by_id and mid in msg_by_id:
+            target_msg = msg_by_id[mid]
+        else:
+            target_msg = await client.get_messages(chat_id, ids=mid)
+
+        # Сообщения ПОСЛЕ mid (новее mid): min_id=mid, reverse=True отдаёт id > mid хронологически
+        async for m in client.iter_messages(chat_id, min_id=mid, reverse=True, limit=after):
+            after_msgs.append(m)
+    except Exception as e:
+        log("ASK", f"chat_read_context failed: {e}")
+        return f"Ошибка при чтении переписки вокруг #{mid}: {e}"
+
+    all_msgs = list(reversed(before_msgs)) + ([target_msg] if target_msg else []) + after_msgs
+    if not all_msgs:
+        return f"Сообщение #{mid} не найдено в чате."
+
+    lines = [f"Контекст переписки вокруг сообщения #{mid} ({len(all_msgs)} сообщений):"]
+    for m in all_msgs:
+        if not m:
+            continue
+        if msg_by_id is not None:
+            msg_by_id[m.id] = m
+        sender = None
+        if not m.out:
+            try:
+                sender = m.sender or await m.get_sender()
+            except Exception:
+                sender = None
+        author = _label_for(m, sender)
+        dt_str = _fmt_date(m.date)
+        mtag = _media_tag(m)
+        media_str = f" [{mtag}]" if mtag else ""
+
+        ckey = f"{chat_id}:{m.id}"
+        cached_desc = MEDIA_CACHE.get(ckey)
+        if cached_desc:
+            media_str += f" (описание: {_preview(cached_desc, 60)})"
+
+        txt = (m.raw_text or "").replace("\n", " ").strip()
+        mark = "▶ " if m.id == mid else "  "
+        lines.append(f"{mark}#{m.id} [{dt_str}] {author}{media_str}: {txt or '(без текста)'}")
+
+    return "\n".join(lines)
+
+
+async def _run_chat_inspect_image(chat_id, args: dict, msg_by_id: dict = None) -> str:
+    """Исполняет chat_inspect_image: скачивает изображение по message_id и анализирует через Vision-модель."""
+    if not chat_id:
+        return "Ошибка: нет ID текущего чата."
+    try:
+        mid = int(args.get("message_id") or 0)
+    except (ValueError, TypeError):
+        return "Ошибка: укажи корректный message_id (целое число)."
+    if not mid:
+        return "Ошибка: укажи message_id."
+
+    question = (args.get("question") or "").strip()
+
+    m = None
+    if msg_by_id and mid in msg_by_id:
+        m = msg_by_id[mid]
+    if not m:
+        try:
+            m = await client.get_messages(chat_id, ids=mid)
+        except Exception as e:
+            return f"Ошибка при получении сообщения #{mid}: {e}"
+
+    if not m:
+        return f"Сообщение #{mid} не найдено в чате."
+
+    if msg_by_id is not None:
+        msg_by_id[m.id] = m
+
+    is_photo = bool(m.photo) or (m.document and m.file and (m.file.mime_type or "").startswith("image/"))
+    if not is_photo:
+        return f"Сообщение #{mid} не содержит фото или картинок (медиа: {_media_tag(m) or 'нет'})."
+
+    ckey = f"{chat_id}:{mid}"
+    cached = MEDIA_CACHE.get(ckey)
+    if cached and not question:
+        return f"📷 Описание фото из #{mid} (из кэша):\n{cached}"
+
+    try:
+        img_bytes = await client.download_media(m, file=bytes)
+    except Exception as e:
+        log("MEDIA", f"chat_inspect_image download failed for #{mid}: {e}")
+        return f"Не удалось скачать фото из сообщения #{mid}: {e}"
+
+    if not img_bytes:
+        return f"Не удалось получить байты изображения из сообщения #{mid}."
+
+    prompt = question if question else "Опиши подробно, что изображено на картинке. Если есть текст — прочитай и процитируй его."
+
+    desc = None
+    spec = MODEL_REGISTRY.get(ACTIVE_MODEL)
+    provider = spec[0] if spec else None
+    if _model_supports_vision(ACTIVE_MODEL):
+        cl = _client_for_provider(provider)
+        if cl:
+            mid_model = spec[1]
+            b64 = base64.b64encode(img_bytes).decode("utf-8")
+            p_text = f"{prompt}\nПодпись к фото: \"{m.raw_text}\"" if m.raw_text else prompt
+            try:
+                resp = await asyncio.to_thread(
+                    cl.chat.completions.create,
+                    model=mid_model,
+                    messages=[{"role": "user", "content": [
+                        {"type": "text", "text": p_text},
+                        {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{b64}", "detail": "high"}}
+                    ]}],
+                    max_tokens=2048,
+                    timeout=60
+                )
+                desc = _extract_content(resp.choices[0].message)
+            except Exception as e:
+                log("MEDIA", f"chat_inspect_image active model vision error: {e}")
+
+    if not desc:
+        desc = await describe_image(img_bytes, caption=m.raw_text or "", detail="high", prompt=prompt)
+
+    if desc and desc != "[изображение]":
+        MEDIA_CACHE[ckey] = desc
+        save_media_cache()
+        return f"📷 Визуальный анализ фото из #{mid} ({_fmt_date(m.date)}):\n{desc}"
+
+    return f"Не удалось распознать изображение из #{mid}."
+
+
 async def ask_agentic(context: str, question: str, must_search: bool = False, caller: str = None, ctx_tokens_est: int = None, voice_mode: str = "off", images: list = None, chat_id=None, msg_by_id: dict = None, memory_allowed: bool = True, asker_id=None) -> str:
     """Agentic ask: модель сама решает, искать ли информацию в каналах.
     ctx_tokens_est — tiktoken-оценка контекста (для логирования Δ с реальным API).
@@ -3810,13 +4164,26 @@ async def ask_agentic(context: str, question: str, must_search: bool = False, ca
             has_memory = bool(memory_ready_tools)
         except Exception as e:
             log("ASK", f"Проверка памяти /index не удалась: {e}")
-    has_tools = has_channels or has_web or has_reply or has_memory
+    has_chat = chat_id is not None
+    has_tools = has_channels or has_web or has_reply or has_memory or has_chat
 
     now_str = datetime.now(MSK).strftime("%d.%m.%Y %H:%M")
 
     # ВАЖНО для prompt-кэша: системный промпт ДОЛЖЕН быть статичным (без даты/времени),
     # иначе летучая строка в начале рушит префиксный кэш. Дата уезжает в КОНЕЦ user-контента.
     system_prompt = ASK_SYSTEM_PROMPT.replace("{model}", label)
+    if has_chat:
+        system_prompt += ("\n\n━━ ПОИСК И ЧТЕНИЕ В ИСТОРИИ ТЕКУЩЕГО ЧАТА ━━\n"
+                          "У тебя есть инструменты прямого доступа ко всей истории ТЕКУЩЕГО чата:\n"
+                          "1. `chat_search`: нативный серверный поиск Telegram во ВСЕЙ истории этого чата по ключевым словам. "
+                          "Находит любые сообщения (даже за месяцы и годы назад), которые не попали в переданный лог N сообщений. "
+                          "Параметр filter: 'all' (по умолчанию), 'photo' (только сообщения с картинками/фото), 'document' (файлы), 'voice' (голосовые), 'video' (видео/кружки). "
+                          "Параметр from_user: поиск сообщений конкретного автора (@username или имя).\n"
+                          "2. `chat_read_context`: считывает переписку ДО и ПОСЛЕ конкретного сообщения по его #id (before/after по 5-15 сообщ.). "
+                          "Используй его после chat_search, чтобы восстановить полный контекст диалога, увидеть реплики других участников вокруг найденного момента.\n"
+                          "3. `chat_inspect_image`: детально рассматривает фотографию/картинку из сообщения по его #id (распознаёт объекты, текст, мемы, скриншоты). "
+                          "Используй, когда в результатах chat_search или в переписке есть фото, и нужно понять, что на нём изображено.\n"
+                          "АКТИВНО используй chat_search, chat_read_context и chat_inspect_image, если вопрос касается событий, старых разговоров, решений, файлов или фото в этом чате.")
     if has_channels:
         system_prompt += "\n\nУ тебя есть доступ к инструменту telegram_search для поиска в Telegram-каналах. Используй его если вопрос требует актуальной информации, которой нет в контексте переписки. Формулируй точные поисковые запросы. Для свежих новостей указывай параметр days."
     if has_web:
@@ -3896,15 +4263,21 @@ async def ask_agentic(context: str, question: str, must_search: bool = False, ca
     memory_tools_list = []
     if has_memory:
         memory_tools_list = [t for t in INDEX_MEMORY_TOOLS if t["function"]["name"] in memory_ready_tools]
-    tools_list = (([TELEGRAM_SEARCH_TOOL] if has_channels else []) + (WEB_TOOLS if has_web else [])
+    chat_tools_list = CHAT_TOOLS if has_chat else []
+    tools_list = (([TELEGRAM_SEARCH_TOOL] if has_channels else []) + chat_tools_list + (WEB_TOOLS if has_web else [])
                   + ([REPLY_TOOL] if has_reply else []) + memory_tools_list)
     reply_sent = [0]  # счётчик отправленных реплаев (анти-спам, лимит REPLY_MAX)
-    sstats = {"iters": 0, "calls": 0, "posts": 0, "web": 0, "replies": 0, "memory": 0}  # сводка (-c)
+    sstats = {"iters": 0, "calls": 0, "posts": 0, "web": 0, "replies": 0, "memory": 0, "chat_search": 0, "chat_context": 0, "chat_images": 0}  # сводка (-c)
 
     def _log_search_summary():
         if sstats["iters"]:
+            c_info = []
+            if sstats.get("chat_search"): c_info.append(f"чат-поиск {sstats['chat_search']}")
+            if sstats.get("chat_context"): c_info.append(f"контекст {sstats['chat_context']}")
+            if sstats.get("chat_images"): c_info.append(f"фото {sstats['chat_images']}")
+            c_str = (", " + ", ".join(c_info)) if c_info else ""
             log("ASK", f"Поиск: {sstats['iters']} итер., {sstats['calls']} запросов к каналам, найдено {sstats['posts']} постов, "
-                       f"веб-вызовов {sstats['web']}, память /index {sstats['memory']}")
+                       f"веб-вызовов {sstats['web']}, память /index {sstats['memory']}{c_str}")
 
     for iteration in range(max_iterations):
         log("ASK", f"Agentic итерация {iteration + 1}/{max_iterations}")
@@ -4097,6 +4470,28 @@ async def ask_agentic(context: str, question: str, must_search: bool = False, ca
                         sstats["mem_paid"] = sstats.get("mem_paid", 0) + 1
                     mem_cache[ck] = res
                 log("ASK", f"Память /index {tname}: {_idx_snip(args.get('query') or args.get('topic') or args.get('name') or args.get('entity') or args.get('category'), 80)} → {len(res)} симв")
+                messages.append({"role": "tool", "tool_call_id": tool_call.id, "content": res})
+                return
+
+            # — инструменты поиска и чтения в текущем чате —
+            if tname == "chat_search":
+                sstats["chat_search"] = sstats.get("chat_search", 0) + 1
+                res = await _run_chat_search(chat_id, args, msg_by_id)
+                log("ASK", f"Поиск в чате chat_search: '{args.get('query')}' (filter={args.get('filter')}) → {len(res)} симв")
+                messages.append({"role": "tool", "tool_call_id": tool_call.id, "content": res})
+                return
+
+            if tname == "chat_read_context":
+                sstats["chat_context"] = sstats.get("chat_context", 0) + 1
+                res = await _run_chat_read_context(chat_id, args, msg_by_id)
+                log("ASK", f"Контекст чата chat_read_context #{args.get('message_id')} → {len(res)} симв")
+                messages.append({"role": "tool", "tool_call_id": tool_call.id, "content": res})
+                return
+
+            if tname == "chat_inspect_image":
+                sstats["chat_images"] = sstats.get("chat_images", 0) + 1
+                res = await _run_chat_inspect_image(chat_id, args, msg_by_id)
+                log("ASK", f"Осмотр фото chat_inspect_image #{args.get('message_id')} → {len(res)} симв")
                 messages.append({"role": "tool", "tool_call_id": tool_call.id, "content": res})
                 return
 
