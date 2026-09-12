@@ -701,6 +701,10 @@ def _clamp_reasoning(model_id: str, effort: str, provider: str = None) -> str:
         return "max" if effort == "xhigh" else "high"
     if provider == "sakana":
         return "max" if effort == "xhigh" else "high"  # Sakana: только high/xhigh→max (off/low/medium нет)
+    if provider == "nanogpt":
+        if effort == "xhigh":
+            return "high"
+        return effort if effort in ("low", "medium", "high", "none") else "medium"
     if model_id in OPENAI_MAX_REASONING and effort == "xhigh":
         return "max"  # gpt-5.6: топ-ступень max выше глобального xhigh (как xhigh→max у DeepSeek/Sakana)
     levels = OPENAI_REASONING_LEVELS.get(model_id)
@@ -727,8 +731,8 @@ def _fmt_rlevel(model_id: str, lv: str, provider: str) -> str:
 
 
 def _supports_reasoning(provider: str) -> bool:
-    """Провайдеры с управляемой глубиной размышлений (/model reason): OpenAI, Google Gemini, Fireworks, opencode, DeepSeek, Sakana."""
-    return provider in ("openai", "google", "fireworks", "opencode", "deepseek", "sakana")
+    """Провайдеры с управляемой глубиной размышлений (/model reason): OpenAI, Google Gemini, Fireworks, opencode, DeepSeek, Sakana, NanoGPT."""
+    return provider in ("openai", "google", "fireworks", "opencode", "deepseek", "sakana", "nanogpt")
 
 
 # Task-локальный оверрайд глубины размышлений для утилитарных вызовов (дайджест): обёртки читают
@@ -761,6 +765,11 @@ def _reasoning_levels(slug: str):
         return DEEPSEEK_REASONING_LEVELS  # xhigh(→max)/high/none(→off)
     if spec[0] == "sakana":
         return SAKANA_REASONING_LEVELS  # xhigh(→max)/high — off нет
+    if spec[0] == "nanogpt":
+        mid = spec[1].lower()
+        if ":thinking" in mid:
+            return ["high", "medium", "low"]
+        return ["high", "medium", "low", "none"]
     return None
 
 
@@ -1578,12 +1587,41 @@ class _GoogleGeminiClient:
         return SimpleNamespace(choices=[SimpleNamespace(message=msg, finish_reason=fr)], usage=usage)
 
 
+class _NanogptReasoningClient:
+    """Адаптер для NanoGPT (nano-gpt.com, OpenAI-совместимый).
+    Поддерживает reasoning_effort (low/medium/high/none) для DeepSeek V4.x и других reasoning-моделей.
+    При 400 (неподдерживаемый параметр reasoning_effort у non-reasoning моделей или GLM-5.3)
+    автоматически ретраит запрос без параметра reasoning_effort."""
+
+    def __init__(self, api_key):
+        self._c = OpenAI(api_key=api_key, base_url=NANOGPT_BASE_URL)
+        self.chat = SimpleNamespace(completions=SimpleNamespace(create=self._create))
+
+    def _create(self, **kwargs):
+        _eff = _effective_reasoning()
+        model = kwargs.get("model", "")
+        if _eff:
+            eff = _clamp_reasoning(model, _eff, "nanogpt")
+            kwargs.setdefault("reasoning_effort", eff)
+            _floor = {"medium": 24000, "high": 40000, "xhigh": 64000, "max": 64000}.get(kwargs.get("reasoning_effort"))
+            if _floor and int(kwargs.get("max_tokens") or 0) < _floor:
+                kwargs["max_tokens"] = _floor
+        try:
+            return self._c.chat.completions.create(**kwargs)
+        except Exception as e:
+            if getattr(e, "status_code", None) == 400 and any(k in str(e).lower() for k in ("reasoning", "effort", "deserialize", "bad request")):
+                log("MODEL", f"NanoGPT {model}: reasoning_effort отвергнут — ретрай без него")
+                kwargs.pop("reasoning_effort", None)
+                return self._c.chat.completions.create(**kwargs)
+            raise
+
+
 google_client = _GoogleGeminiClient(GOOGLE_TTS_KEYS) if GOOGLE_TTS_KEYS else None
 zai_client = OpenAI(api_key=zai_api_key, base_url=ZAI_BASE_URL) if zai_api_key else None  # z.ai GLM (OpenAI-совместимый)
 fireworks_client = _FireworksReasoningClient(fireworks_api_key) if fireworks_api_key else None  # Fireworks (OpenAI-совместимый, с управляемым reasoning_effort)
 sakana_client = _SakanaReasoningClient(sakana_api_key) if sakana_api_key else None  # Sakana AI (Fugu, OpenAI-совместимый, reasoning high/xhigh/max)
 gloy_client = _GloyClient(gloy_api_key) if gloy_api_key else None  # LLM API FUN (Gloy AI, OpenAI-совместимый; клампит max_tokens≤8192, без reasoning-параметра и без tools-натива)
-nanogpt_client = OpenAI(api_key=nanogpt_api_key, base_url=NANOGPT_BASE_URL) if nanogpt_api_key else None  # NanoGPT API (Gemma/Qwen uncensored)
+nanogpt_client = _NanogptReasoningClient(nanogpt_api_key) if nanogpt_api_key else None  # NanoGPT API с управляемым reasoning_effort
 
 AUTO_REPLY_BUFFERS: dict = {}
 AUTO_REPLY_TASKS: dict = {}
