@@ -1815,7 +1815,12 @@ def _model_supports_vision(slug):
         return True  # vision-слуги OpenCode (kimi/glm/qwen/mimo)
     spec = MODEL_REGISTRY.get(slug)
     provider = spec[0] if spec else None
-    if provider in ("openrouter", "nanogpt"):
+    if provider == "nanogpt":
+        mid = (spec[1] if spec else "").lower()
+        if "deepseek-v4.1-flash" in mid or "vision" in mid or "-vl" in mid or "omni" in mid:
+            return True
+        return CUSTOM_MODELS.get(slug, {}).get("vision", False)
+    if provider == "openrouter":
         return CUSTOM_MODELS.get(slug, {}).get("vision")  # bool или None если не сохранено
     if provider == "modelgate":
         return False  # шлюз ModelGate НЕ доставляет картинки до Claude (проверено: base64 и URL —
@@ -1889,7 +1894,7 @@ async def _nanogpt_model_info(model_id: str):
         for m in data:
             mid = m.get("id", "")
             if mid == clean_req or mid.lower() == clean_req_low:
-                is_vision = any(x in mid.lower() for x in ("vision", "-vl", "omni", "gpt-4o", "gemini", "claude"))
+                is_vision = any(x in mid.lower() for x in ("vision", "-vl", "omni", "gpt-4o", "gemini", "claude", "v4.1-flash"))
                 if any(x in mid.lower() for x in ("deepseek-v4", "glm-5", "gemini-3", "gemini-2.5", "fugu")):
                     ctx = 1000000
                 elif any(x in mid.lower() for x in ("qwen3", "gemma-4", "llama-3")):
