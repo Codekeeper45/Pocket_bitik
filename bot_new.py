@@ -1051,7 +1051,13 @@ ASK_SYSTEM_PROMPT = """Ты — {model}, ИИ с характером и соб�
 
 Лог переписки (контекст/фон) идёт ПЕРВЫМ, а сам твой вопрос (помечен ❓) и текущее время — в САМОМ КОНЦЕ, после лога. Выполняй именно ❓-вопрос: если он просит ответить на сообщения или вопросы из переписки — делай это по контексту.
 
-Формат контекста: это лог чата. Каждое сообщение — отдельный блок, блоки разделены пустой строкой. Заголовок в квадратных скобках: [время автор]: текст. Метки в заголовке: «↩ автор: «цитата»» — это ответ на сообщение указанного автора; «⤷ из X» — сообщение переслано из источника X. В тексте: [Фото: …]/[Аудио: …]/[Речь: …] — распознанное содержимое медиа, [Файл «имя»: …] — содержимое текстового файла; [Видео]/[GIF] — медиа без распознавания."""
+Формат контекста: это лог чата. Сообщения сгруппированы в блоки, разделённые пустой строкой. Заголовок в квадратных скобках указывает автора и время: [время Автор]: текст. 
+СТРОГИЕ ПРАВИЛА АВТОРСТВА:
+- Если под одним заголовком [время Автор] подряд идёт несколько строк с номерами #ID — ВСЕ эти реплики написаны исключительно этим Автором из заголовка! Не приписывай их другим людям.
+- Пересылки «⤷ из X» или «⤷ переслано от X»: означают, что исходный текст написал X, а отправитель лишь переслал чужие слова.
+- Реплаи «↩ автор: «цитата»» или «(в ответ #id Автор)»: указывают, КОМУ отвечают. Цитата принадлежит тому, кому отвечают, а сам ответ — автору сообщения. Не путай автора реплики с тем, кому он возражает или поддакивает!
+- В поиске chat_search: ветки выстроены ступеньками с точным указанием автора каждого шага и того, на чьё сообщение дан ответ. Всегда внимательно проверяй автора перед тем, как делать выводы!
+В тексте: [Фото: …]/[Аудио: …]/[Речь: …] — распознанное содержимое медиа, [Файл «имя»: …] — содержимое текстового файла; [Видео]/[GIF] — медиа без распознавания."""
 AUTO_REPLY_SYSTEM_PROMPT = """Ты — собеседник в личной переписке. Отвечай от первого лица, как живой человек.
 
 Правила:
@@ -1749,9 +1755,19 @@ def _owner_label() -> str:
     return _fmt_identity(OWNER_USERNAME, OWNER_NAME, "Я")
 
 
-def _user_label(user) -> str:
-    name = getattr(user, "first_name", None) or getattr(user, "title", None)
-    return _fmt_identity(getattr(user, "username", None), name, "Собеседник")
+def _user_label(user, sender_id=None) -> str:
+    if user is None:
+        return f"User_{sender_id}" if sender_id else "Собеседник"
+    fn = getattr(user, "first_name", None)
+    ln = getattr(user, "last_name", None)
+    title = getattr(user, "title", None)
+    if fn and ln:
+        name = f"{fn} {ln}".strip()
+    else:
+        name = fn or title or ln
+    uid = getattr(user, "id", None) or sender_id
+    fallback = f"User_{uid}" if uid else "Собеседник"
+    return _fmt_identity(getattr(user, "username", None), name, fallback)
 
 
 def log(prefix, message):
@@ -4094,20 +4110,22 @@ async def _run_chat_search(chat_id, args: dict, msg_by_id: dict = None) -> str:
 
     visited = set()
 
-    async def _render_node(m, depth=0):
+    async def _render_node(m, depth=0, parent=None):
         if m.id in visited:
             return
         visited.add(m.id)
 
-        sender = None
-        if not m.out:
-            sender = getattr(m, "sender", None)
-            if not sender:
-                try:
-                    sender = await m.get_sender()
-                except Exception:
-                    sender = None
+        sender = getattr(m, "sender", None)
+        if not sender and not m.out:
+            try:
+                sender = await m.get_sender()
+            except Exception:
+                sender = None
         author = _label_for(m, sender)
+        fwd = _forward_src(m)
+        if fwd:
+            author += f" ⤷ переслано от {fwd}"
+
         dt_str = _fmt_date(m.date)
         mtag = _media_tag(m)
         media_str = f" [{mtag}]" if mtag else ""
@@ -4126,13 +4144,19 @@ async def _run_chat_search(chat_id, args: dict, msg_by_id: dict = None) -> str:
         prefix = "• " if depth == 0 else "↳ "
         hit_mark = " 🎯 [НАЙДЕНО ПО ЗАПРОСУ]" if m.id in hit_ids else ""
 
-        lines.append(f"{indent}{prefix}#{m.id}{link_part} [{dt_str}] {author}{media_str}{hit_mark}: {preview}")
+        reply_target_str = ""
+        if depth > 0 and parent is not None:
+            p_sender = getattr(parent, "sender", None)
+            p_author = _label_for(parent, p_sender)
+            reply_target_str = f" (в ответ #{parent.id} {p_author})"
+
+        lines.append(f"{indent}{prefix}#{m.id}{link_part} [{dt_str}] {author}{reply_target_str}{media_str}{hit_mark}: {preview}")
 
         for child in children_map.get(m.id, []):
-            await _render_node(child, depth + 1)
+            await _render_node(child, depth + 1, parent=m)
 
     for root in roots:
-        await _render_node(root, 0)
+        await _render_node(root, 0, parent=None)
         lines.append("")
 
     lines.append("💡 Доступные действия:")
@@ -4212,6 +4236,13 @@ async def _run_chat_read_context(chat_id, args: dict, msg_by_id: dict = None) ->
             except Exception:
                 sender = None
         author = _label_for(m, sender)
+        fwd = _forward_src(m)
+        if fwd:
+            author += f" ⤷ переслано от {fwd}"
+
+        rto_id = getattr(m, "reply_to_msg_id", None) or getattr(getattr(m, "reply_to", None), "reply_to_msg_id", None)
+        reply_part = f" ↩ #{rto_id}" if rto_id else ""
+
         dt_str = _fmt_date(m.date)
         mtag = _media_tag(m)
         media_str = f" [{mtag}]" if mtag else ""
@@ -4225,7 +4256,7 @@ async def _run_chat_read_context(chat_id, args: dict, msg_by_id: dict = None) ->
         mark = "▶ " if m.id == mid else "  "
         link_str = _make_msg_link(m.id)
         link_part = f" ({link_str})" if link_str else ""
-        lines.append(f"{mark}#{m.id}{link_part} [{dt_str}] {author}{media_str}: {txt or '(без текста)'}")
+        lines.append(f"{mark}#{m.id}{link_part} [{dt_str}] {author}{reply_part}{media_str}: {txt or '(без текста)'}")
 
     return "\n".join(lines)
 
@@ -5029,9 +5060,10 @@ def _media_tag(msg) -> str:
 
 
 def _label_for(msg, sender) -> str:
-    if msg.out:
+    if getattr(msg, "out", False):
         return _owner_label()
-    return _user_label(sender)
+    sid = getattr(msg, "sender_id", None)
+    return _user_label(sender, sender_id=sid)
 
 
 def _fmt_ts(dt) -> str:
@@ -5132,9 +5164,9 @@ def _assemble_body(msg, media_body) -> str:
 
 async def _render_unit(msg, text_only: bool, anchor_id=None, vision_model: str = None, detail: str = "high", mstats: dict = None, by_id: dict = None, net_budget: dict = None, rep_stats: dict = None, inline_ids: set = None, inline_images: list = None, photo_mode: str = "ocr") -> dict:
     """Рендерит одно сообщение в части для последующей сборки блоков."""
-    sender = None if msg.out else (msg.sender if text_only else (msg.sender or await msg.get_sender()))
+    sender = None if msg.out else (getattr(msg, "sender", None) or await msg.get_sender())
     label = _label_for(msg, sender)
-    akey = "me" if msg.out else (getattr(sender, "username", None) or getattr(sender, "id", None) or "?")
+    akey = "me" if msg.out else (getattr(sender, "username", None) or getattr(sender, "id", None) or getattr(msg, "sender_id", None) or "?")
 
     marked = False  # есть метки (reply/forward/якорь) — такие блоки не склеиваем
     fwd = _forward_src(msg)
@@ -5194,9 +5226,9 @@ def _group_segments(messages):
 async def _render_album_segment(group, text_only: bool, anchor_id=None, vision_model: str = None, detail: str = "high", mstats: dict = None, by_id: dict = None, net_budget: dict = None, rep_stats: dict = None, inline_ids: set = None, inline_images: list = None, photo_mode: str = "ocr") -> dict:
     """Альбом (несколько сообщений с общим grouped_id) → один юнит, фото описываются одним запросом."""
     first = group[0]
-    sender = None if first.out else (first.sender if text_only else (first.sender or await first.get_sender()))
+    sender = None if first.out else (getattr(first, "sender", None) or await first.get_sender())
     label = _label_for(first, sender)
-    akey = "me" if first.out else (getattr(sender, "username", None) or getattr(sender, "id", None) or "?")
+    akey = "me" if first.out else (getattr(sender, "username", None) or getattr(sender, "id", None) or getattr(first, "sender_id", None) or "?")
 
     marked = False
     fwd = _forward_src(first)
