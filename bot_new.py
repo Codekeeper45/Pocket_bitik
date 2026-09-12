@@ -1040,7 +1040,7 @@ ASK_SYSTEM_PROMPT = """Ты — {model}, ИИ с характером и соб�
 - Не извиняйся, не используй эмоджи-заглушки.
 - Проактивный фактчекинг и поиск: если в вопросе или переписке есть факты, новости, споры, цифры или сомнения — не гадай по памяти, а проверяй информацию через веб-поиск. Ищи свежие данные, альтернативные решения и опыт людей.
 - Если в контексте медиа — опирайся на описание, реагируй конкретно.
-- Если используешь информацию из поиска — указывай источник ссылкой через тег <a href="…">.
+- Ссылки на источники и сообщения: если используешь информацию из веба или ссылаешься на сообщения в чате — ВСЕГДА указывай кликабельные ссылки через HTML-тег <a href="…">. Никогда не оставляй сырой номер сообщения '#12345' голым текстом без ссылки — оформляй его как <a href="URL">#12345</a> или <a href="URL">сообщение [Имя]</a>!
 
 Форматирование ответа — строго Telegram-HTML (ответ парсится как HTML):
 - Разрешены ТОЛЬКО теги: <b>, <i>, <u>, <s>, <code>, <pre>, <a href="URL">, <blockquote>. Других тегов не используй (никаких <p>, <br>, <div>, <h1>, <ul>, <ol>, <li>, <table>).
@@ -3997,6 +3997,25 @@ async def _run_chat_search(chat_id, args: dict, msg_by_id: dict = None) -> str:
         u_note = f" (от: {from_user})" if from_user else ""
         return f"По запросу «{query}»{f_note}{u_note} в истории этого чата ничего не найдено."
 
+    try:
+        chat_ent = await client.get_entity(chat_id)
+    except Exception:
+        chat_ent = None
+
+    def _make_msg_link(mid):
+        if chat_ent is None:
+            return ""
+        from telethon.tl.types import User
+        if isinstance(chat_ent, User):
+            return ""
+        u = getattr(chat_ent, "username", None)
+        if u:
+            return f"https://t.me/{u}/{mid}"
+        raw_id = str(getattr(chat_ent, "id", chat_id)).lstrip("-")
+        if raw_id.startswith("100"):
+            raw_id = raw_id[3:]
+        return f"https://t.me/c/{raw_id}/{mid}"
+
     lines = [f"Найдено {len(results)} сообщений по запросу «{query}» в этом чате (от новых к старым):"]
     for m in results:
         if msg_by_id is not None:
@@ -4019,7 +4038,9 @@ async def _run_chat_search(chat_id, args: dict, msg_by_id: dict = None) -> str:
 
         txt = (m.raw_text or "").replace("\n", " ").strip()
         preview = _preview(txt, 250) if txt else "(без текста)"
-        lines.append(f"• #{m.id} [{dt_str}] {author}{media_str}: {preview}")
+        link_str = _make_msg_link(m.id)
+        link_part = f" ({link_str})" if link_str else ""
+        lines.append(f"• #{m.id}{link_part} [{dt_str}] {author}{media_str}: {preview}")
 
     lines.append("\n💡 Доступные действия:")
     lines.append("- Чтобы прочитать непрерывный диалог вокруг найденного сообщения: `chat_read_context(message_id=...)`")
@@ -4066,6 +4087,25 @@ async def _run_chat_read_context(chat_id, args: dict, msg_by_id: dict = None) ->
     if not all_msgs:
         return f"Сообщение #{mid} не найдено в чате."
 
+    try:
+        chat_ent = await client.get_entity(chat_id)
+    except Exception:
+        chat_ent = None
+
+    def _make_msg_link(mid):
+        if chat_ent is None:
+            return ""
+        from telethon.tl.types import User
+        if isinstance(chat_ent, User):
+            return ""
+        u = getattr(chat_ent, "username", None)
+        if u:
+            return f"https://t.me/{u}/{mid}"
+        raw_id = str(getattr(chat_ent, "id", chat_id)).lstrip("-")
+        if raw_id.startswith("100"):
+            raw_id = raw_id[3:]
+        return f"https://t.me/c/{raw_id}/{mid}"
+
     lines = [f"Контекст переписки вокруг сообщения #{mid} ({len(all_msgs)} сообщений):"]
     for m in all_msgs:
         if not m:
@@ -4090,7 +4130,9 @@ async def _run_chat_read_context(chat_id, args: dict, msg_by_id: dict = None) ->
 
         txt = (m.raw_text or "").replace("\n", " ").strip()
         mark = "▶ " if m.id == mid else "  "
-        lines.append(f"{mark}#{m.id} [{dt_str}] {author}{media_str}: {txt or '(без текста)'}")
+        link_str = _make_msg_link(m.id)
+        link_part = f" ({link_str})" if link_str else ""
+        lines.append(f"{mark}#{m.id}{link_part} [{dt_str}] {author}{media_str}: {txt or '(без текста)'}")
 
     return "\n".join(lines)
 
@@ -4210,6 +4252,36 @@ async def ask_agentic(context: str, question: str, must_search: bool = False, ca
     # иначе летучая строка в начале рушит префиксный кэш. Дата уезжает в КОНЕЦ user-контента.
     system_prompt = ASK_SYSTEM_PROMPT.replace("{model}", label)
     if has_chat:
+        chat_link_base = None
+        try:
+            _chat_ent = await client.get_entity(chat_id)
+            from telethon.tl.types import User
+            if not isinstance(_chat_ent, User):
+                _u = getattr(_chat_ent, "username", None)
+                if _u:
+                    chat_link_base = f"https://t.me/{_u}/"
+                else:
+                    _raw = str(getattr(_chat_ent, "id", chat_id)).lstrip("-")
+                    if _raw.startswith("100"):
+                        _raw = _raw[3:]
+                    chat_link_base = f"https://t.me/c/{_raw}/"
+        except Exception:
+            _raw = str(chat_id).lstrip("-")
+            if _raw.startswith("100"):
+                _raw = _raw[3:]
+            chat_link_base = f"https://t.me/c/{_raw}/"
+
+        links_instruction = ""
+        if chat_link_base:
+            links_instruction = (
+                f"\n\n━━ ПРЯМЫЕ ССЫЛКИ НА СООБЩЕНИЯ В ЭТОМ ЧАТЕ ━━\n"
+                f"Базовый адрес для ссылок на сообщения в этом чате: {chat_link_base}<ID>\n"
+                f"Все сообщения в переданном логе N сообщений и в результатах поиска помечены своим `#ID`.\n"
+                f"ОБЯЗАТЕЛЬНОЕ ПРАВИЛО: когда ты упоминаешь цитаты, факты, чьи-то слова, решения или фото — "
+                f"ВСЕГДА делай на них кликабельные HTML-ссылки: <a href=\"{chat_link_base}ID\">#ID</a> или <a href=\"{chat_link_base}ID\">сообщение [Автора]</a>.\n"
+                f"НИКОГДА не оставляй голый номер '#12345' без ссылки — пользователь должен кликнуть и сразу перейти к сообщению!"
+            )
+
         system_prompt += ("\n\n━━ ПОИСК И ЧТЕНИЕ В ИСТОРИИ ТЕКУЩЕГО ЧАТА ━━\n"
                           "У тебя есть инструменты прямого доступа ко всей истории ТЕКУЩЕГО чата:\n"
                           "1. `chat_search`: нативный серверный поиск Telegram во ВСЕЙ истории этого чата по ключевым словам. "
@@ -4220,7 +4292,8 @@ async def ask_agentic(context: str, question: str, must_search: bool = False, ca
                           "Используй его после chat_search, чтобы восстановить полный контекст диалога, увидеть реплики других участников вокруг найденного момента.\n"
                           "3. `chat_inspect_image`: детально рассматривает фотографию/картинку из сообщения по его #id (распознаёт объекты, текст, мемы, скриншоты). "
                           "Используй, когда в результатах chat_search или в переписке есть фото, и нужно понять, что на нём изображено.\n"
-                          "АКТИВНО используй chat_search, chat_read_context и chat_inspect_image, если вопрос касается событий, старых разговоров, решений, файлов или фото в этом чате.")
+                          "АКТИВНО используй chat_search, chat_read_context и chat_inspect_image, если вопрос касается событий, старых разговоров, решений, файлов или фото в этом чате."
+                          + links_instruction)
     if has_channels:
         system_prompt += "\n\nУ тебя есть доступ к инструменту telegram_search для поиска в Telegram-каналах. Используй его если вопрос требует актуальной информации, которой нет в контексте переписки. Формулируй точные поисковые запросы. Для свежих новостей указывай параметр days."
     if has_web:
