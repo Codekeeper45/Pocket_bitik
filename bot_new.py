@@ -4016,16 +4016,97 @@ async def _run_chat_search(chat_id, args: dict, msg_by_id: dict = None) -> str:
             raw_id = raw_id[3:]
         return f"https://t.me/c/{raw_id}/{mid}"
 
-    lines = [f"Найдено {len(results)} сообщений по запросу «{query}» в этом чате (от новых к старым):"]
-    for m in results:
-        if msg_by_id is not None:
+    hit_ids = set(m.id for m in results)
+    all_by_id = {m.id: m for m in results}
+    if msg_by_id is not None:
+        for m in results:
             msg_by_id[m.id] = m
+
+    # Рекурсивный сбор ВСЕХ сообщений, на которые ссылаются реплаи (вся глубина цепочки).
+    # Родительские сообщения подтягиваются полностью и НЕ вычитаются из лимита поиска.
+    attempted_ids = set(all_by_id.keys())
+    while True:
+        missing_ids = set()
+        for m in list(all_by_id.values()):
+            rto_id = getattr(m, "reply_to_msg_id", None) or getattr(getattr(m, "reply_to", None), "reply_to_msg_id", None)
+            if rto_id and rto_id not in attempted_ids:
+                missing_ids.add(rto_id)
+        if not missing_ids:
+            break
+
+        missing_list = list(missing_ids)
+        attempted_ids.update(missing_list)
+        fetched_any = False
+        for i in range(0, len(missing_list), 100):
+            chunk = missing_list[i:i + 100]
+            try:
+                fetched_msgs = await client.get_messages(chat_id, ids=chunk)
+                for fm in (fetched_msgs or []):
+                    if fm is not None and getattr(fm, "id", None) is not None:
+                        all_by_id[fm.id] = fm
+                        if msg_by_id is not None:
+                            msg_by_id[fm.id] = fm
+                        fetched_any = True
+            except Exception as e:
+                log("ASK", f"chat_search fetch reply chain error: {e}")
+                break
+        if not fetched_any:
+            break
+
+    # Строим карту детей для отображения веток реплаев «по ступенькам»
+    children_map = {}
+    for m in all_by_id.values():
+        rto_id = getattr(m, "reply_to_msg_id", None) or getattr(getattr(m, "reply_to", None), "reply_to_msg_id", None)
+        if rto_id and rto_id in all_by_id:
+            children_map.setdefault(rto_id, []).append(m)
+
+    def _msg_ts(m_obj):
+        dt = getattr(m_obj, "date", None)
+        if isinstance(dt, datetime):
+            return dt.timestamp()
+        return float(getattr(m_obj, "id", 0) or 0)
+
+    # Сортируем реплики внутри ветки хронологически (от старых к новым)
+    for pid in children_map:
+        children_map[pid].sort(key=_msg_ts)
+
+    # Корни — сообщения, у которых нет родителей внутри собранной выборки
+    roots = []
+    for m in all_by_id.values():
+        rto_id = getattr(m, "reply_to_msg_id", None) or getattr(getattr(m, "reply_to", None), "reply_to_msg_id", None)
+        if not rto_id or rto_id not in all_by_id:
+            roots.append(m)
+
+    # Корни сортируем от новых к старым (по дате последнего сообщения в их ветке)
+    def _tree_latest_ts(m_obj):
+        ts = _msg_ts(m_obj)
+        for ch in children_map.get(m_obj.id, []):
+            ch_ts = _tree_latest_ts(ch)
+            if ch_ts > ts:
+                ts = ch_ts
+        return ts
+
+    roots.sort(key=_tree_latest_ts, reverse=True)
+
+    parents_count = len(all_by_id) - len(hit_ids)
+    p_note = f" (+{parents_count} родительских сообщений в ветках реплаев)" if parents_count > 0 else ""
+    lines = [f"Найдено {len(results)} сообщений по запросу «{query}» в этом чате{p_note} (ветки от новых к старым):"]
+
+    visited = set()
+
+    async def _render_node(m, depth=0):
+        if m.id in visited:
+            return
+        visited.add(m.id)
+
         sender = None
         if not m.out:
-            try:
-                sender = m.sender or await m.get_sender()
-            except Exception:
-                sender = None
+            sender = getattr(m, "sender", None)
+            if not sender:
+                try:
+                    sender = await m.get_sender()
+                except Exception:
+                    sender = None
         author = _label_for(m, sender)
         dt_str = _fmt_date(m.date)
         mtag = _media_tag(m)
@@ -4040,9 +4121,21 @@ async def _run_chat_search(chat_id, args: dict, msg_by_id: dict = None) -> str:
         preview = _preview(txt, 250) if txt else "(без текста)"
         link_str = _make_msg_link(m.id)
         link_part = f" ({link_str})" if link_str else ""
-        lines.append(f"• #{m.id}{link_part} [{dt_str}] {author}{media_str}: {preview}")
 
-    lines.append("\n💡 Доступные действия:")
+        indent = "    " * depth
+        prefix = "• " if depth == 0 else "↳ "
+        hit_mark = " 🎯 [НАЙДЕНО ПО ЗАПРОСУ]" if m.id in hit_ids else ""
+
+        lines.append(f"{indent}{prefix}#{m.id}{link_part} [{dt_str}] {author}{media_str}{hit_mark}: {preview}")
+
+        for child in children_map.get(m.id, []):
+            await _render_node(child, depth + 1)
+
+    for root in roots:
+        await _render_node(root, 0)
+        lines.append("")
+
+    lines.append("💡 Доступные действия:")
     lines.append("- Чтобы прочитать непрерывный диалог вокруг найденного сообщения: `chat_read_context(message_id=...)`")
     lines.append("- Чтобы посмотреть фото или картинку из сообщения: `chat_inspect_image(message_id=...)`")
     return "\n".join(lines)
