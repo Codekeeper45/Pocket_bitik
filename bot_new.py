@@ -597,6 +597,8 @@ for _ngslug, _ngid, _nglabel, _ngctx, _ngsafe in [
     ("ng-deepseek-v4-pro-0813-thinking", "deepseek/deepseek-v4-pro-0813:thinking", "DeepSeek V4 Pro 0813 Thinking (NanoGPT)", 1000000, 1.15),
     ("ng-deepseek-v4-flash-latest", "deepseek/deepseek-v4-flash-latest", "DeepSeek V4 Flash Latest (NanoGPT)", 1000000, 1.15),
     ("ng-deepseek-v4-flash-thinking", "deepseek/deepseek-v4-flash:thinking", "DeepSeek V4 Flash Thinking (NanoGPT)", 1000000, 1.15),
+    ("ng-deepseek-v4.1-flash", "deepseek/deepseek-v4.1-flash", "DeepSeek V4.1 Flash (NanoGPT)", 1000000, 1.15),
+    ("ng-deepseek-v4.1-flash-thinking", "deepseek/deepseek-v4.1-flash:thinking", "DeepSeek V4.1 Flash Thinking (NanoGPT)", 1000000, 1.15),
     ("ng-glm-5.3", "zai-org/glm-5.3", "GLM-5.3 (NanoGPT)", 1048576, 1.30),
     ("ng-glm-5.3-thinking", "zai-org/glm-5.3:thinking", "GLM-5.3 Thinking (NanoGPT)", 1048576, 1.30),
 ]:
@@ -1655,11 +1657,18 @@ def save_tracked(lst):
 # --- Выбор модели для ответов ---
 
 _model_state = load_json(MODEL_STATE_PATH, {})
-# Кастомные OpenRouter-модели для ответов (заданы через /model <vendor/model>) — восстанавливаем в реестр,
-# чтобы они стали полноценными записями (провайдер "openrouter") и пережили рестарт.
-CUSTOM_MODELS = _model_state.get("custom_models", {})  # {id: {"label","ctx","safety"}}
+# Кастомные модели для ответов (OpenRouter / NanoGPT, заданы через /model) — восстанавливаем в реестр,
+# чтобы они стали полноценными записями и пережили рестарт.
+CUSTOM_MODELS = _model_state.get("custom_models", {})  # {id: {"provider", "label", "ctx", "safety", "vision"}}
 for _cid, _ci in CUSTOM_MODELS.items():
-    MODEL_REGISTRY[_cid] = ("openrouter", _cid, (_ci.get("label") or _cid), int(_ci.get("ctx") or 128000), float(_ci.get("safety") or 1.3))
+    _c_prov = _ci.get("provider") or ("nanogpt" if _ci.get("nanogpt") else "openrouter")
+    MODEL_REGISTRY[_cid] = (
+        _c_prov,
+        _cid,
+        (_ci.get("label") or _cid),
+        int(_ci.get("ctx") or 128000),
+        float(_ci.get("safety") or (1.15 if _c_prov == "nanogpt" else 1.3))
+    )
 ACTIVE_MODEL = _model_state.get("active", "deepseek-pro")
 if ACTIVE_MODEL not in MODEL_REGISTRY:
     ACTIVE_MODEL = "deepseek-pro"
@@ -1767,7 +1776,7 @@ def _model_supports_vision(slug):
         return True  # vision-слуги OpenCode (kimi/glm/qwen/mimo)
     spec = MODEL_REGISTRY.get(slug)
     provider = spec[0] if spec else None
-    if provider == "openrouter":
+    if provider in ("openrouter", "nanogpt"):
         return CUSTOM_MODELS.get(slug, {}).get("vision")  # bool или None если не сохранено
     if provider == "modelgate":
         return False  # шлюз ModelGate НЕ доставляет картинки до Claude (проверено: base64 и URL —
@@ -1809,6 +1818,53 @@ async def _openrouter_model_info(model_id: str):
     except Exception as e:
         log("MODEL", f"Проверка {model_id} в OpenRouter: {e}")
         return None, False, 0, None
+
+
+_NANOGPT_MODELS_CACHE = {"ts": 0.0, "data": None}
+_NANOGPT_MODELS_TTL = 600  # 10 мин — кэш списка моделей NanoGPT
+
+
+async def _nanogpt_model_info(model_id: str):
+    """Проверяет модель в NanoGPT (GET /models). Возвращает (exists, supports_image, context_length, name, canonical_id).
+    exists=None если не удалось проверить (сеть)."""
+    now = time.monotonic()
+
+    def _fetch():
+        headers = {"Authorization": f"Bearer {nanogpt_api_key}"} if nanogpt_api_key else {}
+        headers["User-Agent"] = "Mozilla/5.0"
+        r = requests.get(f"{NANOGPT_BASE_URL}/models", headers=headers, timeout=20)
+        r.raise_for_status()
+        return r.json().get("data", [])
+
+    try:
+        if _NANOGPT_MODELS_CACHE["data"] is not None and (now - _NANOGPT_MODELS_CACHE["ts"]) < _NANOGPT_MODELS_TTL:
+            data = _NANOGPT_MODELS_CACHE["data"]
+        else:
+            data = await asyncio.to_thread(_fetch)
+            _NANOGPT_MODELS_CACHE["data"] = data
+            _NANOGPT_MODELS_CACHE["ts"] = now
+
+        clean_req = model_id.strip()
+        clean_req_low = clean_req.lower()
+
+        for m in data:
+            mid = m.get("id", "")
+            if mid == clean_req or mid.lower() == clean_req_low:
+                is_vision = any(x in mid.lower() for x in ("vision", "-vl", "omni", "gpt-4o", "gemini", "claude"))
+                if any(x in mid.lower() for x in ("deepseek-v4", "glm-5", "gemini-3", "gemini-2.5", "fugu")):
+                    ctx = 1000000
+                elif any(x in mid.lower() for x in ("qwen3", "gemma-4", "llama-3")):
+                    ctx = 262144
+                elif "ernie-5.1" in mid.lower():
+                    ctx = 119000
+                else:
+                    ctx = 128000
+                label = f"{mid} (NanoGPT)"
+                return True, is_vision, ctx, label, mid
+        return False, False, 0, None, None
+    except Exception as e:
+        log("MODEL", f"Проверка {model_id} в NanoGPT: {e}")
+        return None, False, 0, None, None
 
 
 _IMAGE_MODELS_CACHE = {"ts": 0.0, "data": None}  # кэш списка ген-моделей OpenRouter в процессе
@@ -3350,11 +3406,11 @@ def _strip_think(text: str) -> str:
 
 
 def _extract_content(message) -> str:
-    # Финальный ответ в .content; у reasoning-моделей при пустом .content берём .reasoning_content
+    # Финальный ответ в .content; у reasoning-моделей при пустом .content берём .reasoning_content / .reasoning
     content = _strip_think((getattr(message, "content", None) or "").strip())
     if content:
         return content
-    return (getattr(message, "reasoning_content", None) or "").strip()
+    return (getattr(message, "reasoning_content", None) or getattr(message, "reasoning", None) or "").strip()
 
 
 async def _llm_create(messages: list, max_tokens: int = 4096, temperature: float = 1.0,
@@ -6504,18 +6560,20 @@ async def model_command(event):
         await event.edit(f"✅ Ген-модель `/gen`: **{name}**\n`{mid}` · разрешения: {rtag}\nФолбэк остаётся `{OPENROUTER_IMAGE_FALLBACK}`.{warn}")
         return
 
-    # --- избранное (кастомные OpenRouter-модели): /model fav ---
+    # --- избранное (кастомные модели OpenRouter / NanoGPT): /model fav ---
     if arg.lower() in ("fav", "favorites", "избранное"):
         if not CUSTOM_MODELS:
-            await event.edit("⭐ Избранное (кастомные OpenRouter-модели) пусто.\nДобавь: `/model vendor/model` (напр. `/model openai/gpt-4o`).")
+            await event.edit("⭐ Избранное (кастомные модели) пусто.\nДобавь: `/model vendor/model` (OpenRouter) или `/model ng <id>` (NanoGPT).")
             return
-        lines = ["⭐ **Избранные OpenRouter-модели:**"]
+        lines = ["⭐ **Избранные кастомные модели:**"]
         for i, (mid, ci) in enumerate(CUSTOM_MODELS.items(), 1):
             mk = "▶" if mid == ACTIVE_MODEL else " "
             n = slugs.index(mid) + 1 if mid in slugs else None  # номер в общем списке /model
             num = f" · быстрый выбор `/model {n}`" if n else ""
-            lines.append(f"{mk}{i}. {ci.get('label') or mid} — `{mid}`{num}")
-        lines.append("\n`/model N` — выбрать по номеру из общего списка · `/model <vendor/model>` — добавить · `/model remove <N|id>` — удалить")
+            c_prov = ci.get("provider") or ("nanogpt" if ci.get("nanogpt") else "openrouter")
+            ptag = "NanoGPT" if c_prov == "nanogpt" else "OpenRouter"
+            lines.append(f"{mk}{i}. [{ptag}] {ci.get('label') or mid} — `{mid}`{num}")
+        lines.append("\n`/model N` — выбрать по номеру · `/model <id>` / `/model ng <id>` — добавить · `/model remove <N|id>` — удалить")
         await event.edit("\n".join(lines)[:4000])
         return
 
@@ -6610,8 +6668,9 @@ async def model_command(event):
         cur_provider = None
         for i, slug in enumerate(slugs, 1):
             provider, _mid, label, ctx, _safety = MODEL_REGISTRY[slug]
-            if provider != cur_provider:
-                cur_provider = provider
+            header_key = f"{provider}_custom" if slug in CUSTOM_MODELS else provider
+            if header_key != cur_provider:
+                cur_provider = header_key
                 title = {"deepseek": "━━ Прямой API ━━", "opencode": "━━ OpenCode Go ━━",
                          "oc_anthropic": "━━ OpenCode Go (нативный) ━━",
                          "modelgate": "━━ Claude (ModelGate) ━━",
@@ -6623,7 +6682,9 @@ async def model_command(event):
                          "gloy": "━━ LLM API FUN (Gloy AI) ━━",
                          "cerebras": "━━ Cerebras ━━",
                          "nanogpt": "━━ NanoGPT ━━",
-                         "openrouter": "━━ OpenRouter (кастом) ━━"}.get(provider, f"━━ {provider} ━━")
+                         "nanogpt_custom": "━━ NanoGPT (кастом) ━━",
+                         "openrouter": "━━ OpenRouter ━━",
+                         "openrouter_custom": "━━ OpenRouter (кастом) ━━"}.get(header_key, f"━━ {provider} ━━")
                 lines.append(f"\n{title}")
             mark = f"▶{i}." if slug == ACTIVE_MODEL else f"{i}."
             warn = " ⚠️нет ключа" if not is_available(provider) else ""
@@ -6643,8 +6704,8 @@ async def model_command(event):
         lines.append("`/model N` / `/model <slug>` — выбрать · `/model probe` — проверить поиск (❔→🔧/🚫)")
         reff = f"`{REASONING_EFFORT}`" if REASONING_EFFORT else "авто"
         lines.append(f"🤔 — модель умеет менять глубину размышлений. `/model N.M`: M — сила (`.1` максимум → дальше слабее → последний мин/выкл). Лесенки всех моделей с тап-чипами: `/model reason` (сейчас: {reff})")
-        lines.append("`/model vendor/model` — добавить ЛЮБУЮ модель OpenRouter по id (напр. `/model openai/gpt-4o`)")
-        lines.append("`/model fav` — избранные OR-модели · `/model remove <N|id>` — удалить кастомную")
+        lines.append("`/model vendor/model` — добавить модель OpenRouter · `/model ng <id>` — любую модель NanoGPT (напр. `/model ng deepseek/deepseek-v4.1-flash`)")
+        lines.append("`/model fav` — избранные кастомные модели · `/model remove <N|id>` — удалить кастомную")
         await event.edit("\n".join(lines)[:4000])
         return
 
@@ -6714,30 +6775,187 @@ async def model_command(event):
             chosen = slugs[idx]
     elif arg in MODEL_REGISTRY:
         chosen = arg
+    else:
+        # Проверяем совпадение с точным api_id модели в реестре (например, deepseek/deepseek-v4.1-flash)
+        for s, entry in MODEL_REGISTRY.items():
+            if entry[1].lower() == arg.lower():
+                chosen = s
+                break
+
     if not chosen:
-        # Не номер и не известный slug → пробуем как id модели OpenRouter (vendor/model, с валидацией)
-        if "/" in arg:
-            await event.edit(f"🔎 Проверяю `{arg}` в OpenRouter…")
-            exists, supports_img, ctx_len, name = await _openrouter_model_info(arg)
-            if exists is None:
-                await event.edit(f"⚠️ Не удалось проверить `{arg}` (OpenRouter недоступен). Модель не изменена.")
+        low_arg = arg.lower()
+        is_ng_explicit = False
+        target_arg = arg
+        if low_arg.startswith(("ng ", "nanogpt ", "nano ")):
+            is_ng_explicit = True
+            target_arg = arg.split(None, 1)[1].strip()
+        elif low_arg.startswith(("ng/", "nanogpt/", "nano/")):
+            is_ng_explicit = True
+            target_arg = arg.split("/", 1)[1].strip()
+        elif low_arg.startswith(("ng:", "nanogpt:", "nano:")):
+            is_ng_explicit = True
+            target_arg = arg.split(":", 1)[1].strip()
+
+        is_or_explicit = False
+        if low_arg.startswith(("or ", "openrouter ")):
+            is_or_explicit = True
+            target_arg = arg.split(None, 1)[1].strip()
+        elif low_arg.startswith(("or/", "openrouter/")):
+            is_or_explicit = True
+            target_arg = arg.split("/", 1)[1].strip()
+        elif low_arg.startswith(("or:", "openrouter:")):
+            is_or_explicit = True
+            target_arg = arg.split(":", 1)[1].strip()
+
+        if is_ng_explicit and not target_arg:
+            await event.edit("Укажи id модели NanoGPT: `/model ng <id>` (напр. `/model ng deepseek/deepseek-v4.1-flash`).\nКаталог: https://nano-gpt.com")
+            return
+
+        if is_or_explicit and not target_arg:
+            await event.edit("Укажи id модели OpenRouter: `/model or <vendor/model>` (напр. `/model or openai/gpt-4o`).\nКаталог: https://openrouter.ai/models")
+            return
+
+        # Если указан префикс NanoGPT, но модель уже есть в MODEL_REGISTRY (по api_id или slug):
+        if is_ng_explicit:
+            for s, entry in MODEL_REGISTRY.items():
+                if entry[0] == "nanogpt" and (s.lower() == target_arg.lower() or entry[1].lower() == target_arg.lower()):
+                    chosen = s
+                    break
+            if chosen:
+                provider, _mid, label, ctx, _safety = MODEL_REGISTRY[chosen]
+                if not is_available(provider):
+                    await event.edit(f"Модель «{label}» недоступна — нет ключа провайдера ({provider}).")
+                    return
+                ACTIVE_MODEL = chosen
+                _save_model_state()
+                log("MODEL", f"Активная модель: {chosen} ({label})")
+                rtag = ""
+                if _supports_reasoning(provider):
+                    rtag = f" · 🤔 ризонинг: `{_clamp_reasoning(_mid, REASONING_EFFORT, provider)}`" if REASONING_EFFORT else " · 🤔 ризонинг: авто (`/model reason`)"
+                await event.edit(f"✅ Модель ответов: {label} (окно {_fmt_ctx(ctx)}){rtag}")
                 return
-            if not exists:
-                await event.edit(f"❌ Модель `{arg}` не найдена в OpenRouter. Проверь точный id (см. openrouter.ai/models).")
+
+            await event.edit(f"🔎 Проверяю `{target_arg}` в NanoGPT…")
+            ng_exists, ng_img, ng_ctx, ng_name, ng_canon = await _nanogpt_model_info(target_arg)
+            if ng_exists is None:
+                await event.edit(f"⚠️ Не удалось проверить `{target_arg}` (NanoGPT недоступен). Модель не изменена.")
+                return
+            if not ng_exists:
+                await event.edit(f"❌ Модель `{target_arg}` не найдена в NanoGPT. Проверь точный id на nano-gpt.com.")
+                return
+            if not nanogpt_client:
+                await event.edit("Модель найдена в NanoGPT, но нет ключа — добавь NANOGPT_API_KEY в .env.")
+                return
+            model_id = ng_canon or target_arg
+            ctx = int(ng_ctx or 128000)
+            label = ng_name or f"{model_id} (NanoGPT)"
+            CUSTOM_MODELS[model_id] = {"provider": "nanogpt", "label": label, "ctx": ctx, "safety": 1.15, "vision": bool(ng_img)}
+            MODEL_REGISTRY[model_id] = ("nanogpt", model_id, label, ctx, 1.15)
+            ACTIVE_MODEL = model_id
+            _save_model_state()
+            log("MODEL", f"Активная модель (кастомная NanoGPT): {model_id}, окно {ctx}")
+            await event.edit(f"✅ Модель ответов: {label} (`{model_id}`, NanoGPT, окно {_fmt_ctx(ctx)})")
+            return
+
+        # Если явно указан OpenRouter:
+        if is_or_explicit:
+            await event.edit(f"🔎 Проверяю `{target_arg}` в OpenRouter…")
+            or_exists, or_img, or_ctx, or_name = await _openrouter_model_info(target_arg)
+            if or_exists is None:
+                await event.edit(f"⚠️ Не удалось проверить `{target_arg}` (OpenRouter недоступен). Модель не изменена.")
+                return
+            if not or_exists:
+                await event.edit(f"❌ Модель `{target_arg}` не найдена в OpenRouter. Проверь точный id (см. openrouter.ai/models).")
                 return
             if not openrouter_client:
-                await event.edit("Модель найдена, но нет ключа OpenRouter — добавь OPENROUTER_API_KEY в .env.")
+                await event.edit("Модель найдена в OpenRouter, но нет ключа — добавь OPENROUTER_API_KEY в .env.")
                 return
-            ctx = int(ctx_len or 128000)
-            label = name or arg
-            CUSTOM_MODELS[arg] = {"label": label, "ctx": ctx, "safety": 1.3, "vision": bool(supports_img)}  # vision — для /ask -g
-            MODEL_REGISTRY[arg] = ("openrouter", arg, label, ctx, 1.3)
-            ACTIVE_MODEL = arg
+            ctx = int(or_ctx or 128000)
+            label = or_name or target_arg
+            CUSTOM_MODELS[target_arg] = {"provider": "openrouter", "label": label, "ctx": ctx, "safety": 1.3, "vision": bool(or_img)}
+            MODEL_REGISTRY[target_arg] = ("openrouter", target_arg, label, ctx, 1.3)
+            ACTIVE_MODEL = target_arg
             _save_model_state()
-            log("MODEL", f"Активная модель (кастомная OpenRouter): {arg}, окно {ctx}")
-            await event.edit(f"✅ Модель ответов: {label} (`{arg}`, OpenRouter, окно {_fmt_ctx(ctx)})")
+            log("MODEL", f"Активная модель (кастомная OpenRouter): {target_arg}, окно {ctx}")
+            await event.edit(f"✅ Модель ответов: {label} (`{target_arg}`, OpenRouter, окно {_fmt_ctx(ctx)})")
             return
-        await event.edit(f"Нет такой модели: {arg}. `/model` — список, либо укажи id модели OpenRouter (vendor/model).")
+
+        # Без явного префикса:
+        # Если есть "/", проверяем OpenRouter и NanoGPT параллельно
+        if "/" in arg:
+            await event.edit(f"🔎 Проверяю `{arg}` в OpenRouter и NanoGPT…")
+            or_task = asyncio.create_task(_openrouter_model_info(arg))
+            ng_task = asyncio.create_task(_nanogpt_model_info(arg))
+            (or_exists, or_img, or_ctx, or_name), (ng_exists, ng_img, ng_ctx, ng_name, ng_canon) = await asyncio.gather(or_task, ng_task)
+
+            # Если найдена в OpenRouter:
+            if or_exists:
+                if not openrouter_client:
+                    if ng_exists and nanogpt_client:
+                        model_id = ng_canon or arg
+                        ctx = int(ng_ctx or 128000)
+                        label = ng_name or f"{model_id} (NanoGPT)"
+                        CUSTOM_MODELS[model_id] = {"provider": "nanogpt", "label": label, "ctx": ctx, "safety": 1.15, "vision": bool(ng_img)}
+                        MODEL_REGISTRY[model_id] = ("nanogpt", model_id, label, ctx, 1.15)
+                        ACTIVE_MODEL = model_id
+                        _save_model_state()
+                        log("MODEL", f"Активная модель (кастомная NanoGPT): {model_id}, окно {ctx}")
+                        await event.edit(f"✅ Модель ответов: {label} (`{model_id}`, NanoGPT, окно {_fmt_ctx(ctx)})")
+                        return
+                    await event.edit("Модель найдена в OpenRouter, но нет ключа — добавь OPENROUTER_API_KEY в .env.")
+                    return
+                ctx = int(or_ctx or 128000)
+                label = or_name or arg
+                CUSTOM_MODELS[arg] = {"provider": "openrouter", "label": label, "ctx": ctx, "safety": 1.3, "vision": bool(or_img)}
+                MODEL_REGISTRY[arg] = ("openrouter", arg, label, ctx, 1.3)
+                ACTIVE_MODEL = arg
+                _save_model_state()
+                log("MODEL", f"Активная модель (кастомная OpenRouter): {arg}, окно {ctx}")
+                ng_hint = f"\n💡 Чтобы использовать через NanoGPT: `/model ng {arg}`" if ng_exists else ""
+                await event.edit(f"✅ Модель ответов: {label} (`{arg}`, OpenRouter, окно {_fmt_ctx(ctx)}){ng_hint}")
+                return
+
+            # Если в OpenRouter нет, но есть в NanoGPT:
+            if ng_exists:
+                if not nanogpt_client:
+                    await event.edit("Модель найдена в NanoGPT, но нет ключа — добавь NANOGPT_API_KEY в .env.")
+                    return
+                model_id = ng_canon or arg
+                ctx = int(ng_ctx or 128000)
+                label = ng_name or f"{model_id} (NanoGPT)"
+                CUSTOM_MODELS[model_id] = {"provider": "nanogpt", "label": label, "ctx": ctx, "safety": 1.15, "vision": bool(ng_img)}
+                MODEL_REGISTRY[model_id] = ("nanogpt", model_id, label, ctx, 1.15)
+                ACTIVE_MODEL = model_id
+                _save_model_state()
+                log("MODEL", f"Активная модель (кастомная NanoGPT): {model_id}, окно {ctx}")
+                await event.edit(f"✅ Модель ответов: {label} (`{model_id}`, NanoGPT, окно {_fmt_ctx(ctx)})")
+                return
+
+            if or_exists is None and ng_exists is None:
+                await event.edit(f"⚠️ Не удалось связаться с OpenRouter и NanoGPT для проверки `{arg}`.")
+                return
+            await event.edit(f"❌ Модель `{arg}` не найдена ни в OpenRouter, ни в NanoGPT.\nПроверь id на openrouter.ai/models или nano-gpt.com.")
+            return
+
+        # Без "/", проверяем NanoGPT (у многих моделей NanoGPT id без слэша)
+        await event.edit(f"🔎 Проверяю `{arg}` в NanoGPT…")
+        ng_exists, ng_img, ng_ctx, ng_name, ng_canon = await _nanogpt_model_info(arg)
+        if ng_exists:
+            if not nanogpt_client:
+                await event.edit("Модель найдена в NanoGPT, но нет ключа — добавь NANOGPT_API_KEY в .env.")
+                return
+            model_id = ng_canon or arg
+            ctx = int(ng_ctx or 128000)
+            label = ng_name or f"{model_id} (NanoGPT)"
+            CUSTOM_MODELS[model_id] = {"provider": "nanogpt", "label": label, "ctx": ctx, "safety": 1.15, "vision": bool(ng_img)}
+            MODEL_REGISTRY[model_id] = ("nanogpt", model_id, label, ctx, 1.15)
+            ACTIVE_MODEL = model_id
+            _save_model_state()
+            log("MODEL", f"Активная модель (кастомная NanoGPT): {model_id}, окно {ctx}")
+            await event.edit(f"✅ Модель ответов: {label} (`{model_id}`, NanoGPT, окно {_fmt_ctx(ctx)})")
+            return
+
+        await event.edit(f"Нет такой модели: `{arg}`. `/model` — список, либо укажи id модели (`vendor/model` для OpenRouter или `/model ng <id>` для NanoGPT).")
         return
 
     provider, _mid, label, ctx, _safety = MODEL_REGISTRY[chosen]
