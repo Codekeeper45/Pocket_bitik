@@ -4219,7 +4219,8 @@ async def ask_agentic(context: str, question: str, must_search: bool = False, ca
                           "memory_connections обходит граф связей SQL-запросом и даёт обзор отношений по сущности "
                           "или категории; "
                           "memory_entity даёт полное досье сущности; memory_overview даёт высокоуровневую картину по "
-                          "сжатым периодам/досье/связям; memory_media находит и пересылает фото из истории. "
+                          "сжатым периодам/досье/связям; memory_media находит фото из истории и возвращает ссылки — "
+                          "обязательно включай эти ссылки в свой ответ! "
                           "Используй доступные tools для вопросов про историю чата, лор, персонажей, прошлые споры и "
                           "события, а также старые фото. Имена и прозвища разрешаются автоматически. "
                           "Для вопросов «кто с кем встречается», «кто дружит», «кто во вражде», «связи X», "
@@ -11386,10 +11387,10 @@ INDEX_MEMORY_TOOLS = [
             "name": {"type": "string", "description": "Имя или прозвище персонажа/участника."}}, "required": ["name"]}}},
     {"type": "function", "function": {
         "name": "memory_media",
-        "description": "Находит и ПЕРЕСЫЛАЕТ в чат фото из истории. Два режима: по текстовому описанию (напр. «та "
-                       "картинка со спора про меч», «арт с Заей»), либо ПО ВИЗУАЛЬНОМУ СХОДСТВУ с приложенной "
-                       "картинкой (visual=true — «найди похожие арты на это фото», работает если к запросу приложено "
-                       "изображение). Используй, когда просят скинуть/найти картинку/фото/арт из прошлого или похожие на данную.",
+        "description": "Находит фото из истории чата по текстовому описанию (напр. «та картинка со спора про меч», «арт с Заей»), либо ПО ВИЗУАЛЬНОМУ СХОДСТВУ с приложенной "
+                       "картинкой (visual=true — «найди похожие арты на это фото»). "
+                       "Возвращает ссылки на найденные фото — обязательно упоминай их в ответе, чтобы участники могли перейти. "
+                       "Используй, когда просят найти/вспомнить картинку/фото/арт из прошлого.",
         "parameters": {"type": "object", "properties": {
             "query": {"type": "string", "description": "Описание искомого фото своими словами (для текстового поиска)."},
             "visual": {"type": "boolean", "description": "true — искать по СХОДСТВУ с приложенной к запросу картинкой, а не по тексту."},
@@ -12244,10 +12245,24 @@ async def _index_tool_media(chat_id: int, query: str, count: int = 1, visual: bo
         warn = " ⚠️ Галерея этого чата проиндексирована ЧАСТИЧНО (Stage 5 не завершён) — возможно, фото есть, но ещё не обработано." if partial else ""
         return f"Подходящих фото в памяти не нашёл{note}.{warn} Опиши искомое иначе — что на фото, кто, какое событие."
     msg_ids = [h["msg_id"] for h in hits]
+    # Стелс-режим: не пересылаем сообщения в чат, а возвращаем ссылки модели.
+    # Модель обязана упомянуть их в своём ответе, чтобы пользователь мог перейти.
     try:
-        await client.forward_messages(chat_id, msg_ids, chat_id)
-    except Exception as e:
-        return f"Нашёл фото (msg {msg_ids}), но не смог переслать: {e}"
+        chat_ent = await client.get_entity(chat_id)
+    except Exception:
+        chat_ent = None
+
+    def _make_link(msg_id):
+        if chat_ent is None:
+            return f"#{msg_id}"
+        username = getattr(chat_ent, "username", None)
+        if username:
+            return f"https://t.me/{username}/{msg_id}"
+        raw_id = str(chat_ent.id).lstrip("-")
+        if raw_id.startswith("100"):
+            raw_id = raw_id[3:]
+        return f"https://t.me/c/{raw_id}/{msg_id}"
+
     lines = []
     for h in hits:
         src = []
@@ -12258,9 +12273,11 @@ async def _index_tool_media(chat_id: int, query: str, count: int = 1, visual: bo
         visual_desc = _idx_snip(h.get("visual_description"), 110)
         context_desc = _idx_snip(h.get("image_description"), 110)
         score_label = ", ".join(src) if src else f"score {float(h.get('score') or 0.0):.2f}"
-        lines.append(f"msg_id={h.get('msg_id') or h.get('key')} ({score_label}): "
-                     f"visual={visual_desc or '—'}; context={context_desc or '—'}")
-    return "Переслал в чат:\n" + "\n".join(lines)
+        link = _make_link(h.get("msg_id") or h.get("key"))
+        lines.append(f"📸 Фото: {link} ({score_label})\n"
+                     f"   visual={visual_desc or '—'}; context={context_desc or '—'}")
+    return ("Нашёл фото (не переслано в чат, стелс-режим) — дай ссылки пользователю в ответе:\n"
+            + "\n".join(lines))
 
 
 async def _index_embed_query_image(raw: bytes):
