@@ -702,9 +702,10 @@ def _clamp_reasoning(model_id: str, effort: str, provider: str = None) -> str:
     if provider == "sakana":
         return "max" if effort == "xhigh" else "high"  # Sakana: только high/xhigh→max (off/low/medium нет)
     if provider == "nanogpt":
-        if effort == "xhigh":
-            return "high"
-        return effort if effort in ("low", "medium", "high", "none") else "medium"
+        mid = (model_id or "").lower()
+        if effort in ("xhigh", "max"):
+            return "max" if ("deepseek" in mid or ":thinking" in mid) else "high"
+        return effort if effort in ("low", "medium", "high", "none", "max") else "medium"
     if model_id in OPENAI_MAX_REASONING and effort == "xhigh":
         return "max"  # gpt-5.6: топ-ступень max выше глобального xhigh (как xhigh→max у DeepSeek/Sakana)
     levels = OPENAI_REASONING_LEVELS.get(model_id)
@@ -767,8 +768,8 @@ def _reasoning_levels(slug: str):
         return SAKANA_REASONING_LEVELS  # xhigh(→max)/high — off нет
     if spec[0] == "nanogpt":
         mid = spec[1].lower()
-        if ":thinking" in mid:
-            return ["high", "medium", "low"]
+        if "deepseek" in mid or ":thinking" in mid:
+            return ["xhigh", "high", "medium", "low", "none"] if ":thinking" not in mid else ["xhigh", "high", "medium", "low"]
         return ["high", "medium", "low", "none"]
     return None
 
