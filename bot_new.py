@@ -6674,7 +6674,11 @@ async def model_command(event):
             return
         if rarg.isdigit() and 1 <= int(rarg) <= len(_REASONING_RANK) + 1:
             rarg = (_REASONING_RANK + ["auto"])[int(rarg) - 1]
-        if rarg in ("auto", "сброс", "reset", "off", "default"):
+        if rarg in ("max", "макс"):
+            rarg = "xhigh"
+        if rarg in ("off", "выкл"):
+            rarg = "none"
+        if rarg in ("auto", "сброс", "reset", "default"):
             REASONING_EFFORT = None
             _save_model_state()
             log("MODEL", "Ризонинг: auto (дефолт модели)")
