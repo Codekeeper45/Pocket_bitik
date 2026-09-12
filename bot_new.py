@@ -3553,6 +3553,43 @@ def _extract_content(message) -> str:
     return (getattr(message, "reasoning_content", None) or getattr(message, "reasoning", None) or "").strip()
 
 
+def _parse_dsml_tool_calls(text: str):
+    """Парсит сырую разметку DSML (DeepSeek Markup Language), если шлюз/прокси не распарсил её в native tool_calls."""
+    if not text or ("DSML" not in text):
+        return []
+    invokes = re.findall(
+        r'<[|｜]{2}DSML[|｜]{2}\s+invoke\s+name=[\"\']([^\"\']+)[\"\']>(.*?)(?=<[|｜]{2}DSML[|｜]{2}\s+invoke|</[|｜]{2}DSML|$)',
+        text,
+        re.DOTALL | re.IGNORECASE
+    )
+    calls = []
+    for idx, (name, body) in enumerate(invokes):
+        params = {}
+        param_matches = re.findall(
+            r'<[|｜]{2}DSML[|｜]{2}\s+parameter\s+name=[\"\']([^\"\']+)[\"\'](?:\s+string=[\"\']([^\"\']+)[\"\'])?>(.*?)(?=<[|｜]{2}DSML[|｜]{2}\s+parameter|</[|｜]{2}DSML|$)',
+            body,
+            re.DOTALL | re.IGNORECASE
+        )
+        for pname, is_str, val in param_matches:
+            val = val.strip()
+            if (is_str or "").lower() == "false":
+                try:
+                    val = int(val) if val.isdigit() else float(val)
+                except ValueError:
+                    pass
+            params[pname] = val
+        call_id = f"call_dsml_{int(time.time())}_{idx}"
+        calls.append(SimpleNamespace(
+            id=call_id,
+            type="function",
+            function=SimpleNamespace(
+                name=name.strip(),
+                arguments=json.dumps(params, ensure_ascii=False)
+            )
+        ))
+    return calls
+
+
 async def _llm_create(messages: list, max_tokens: int = 4096, temperature: float = 1.0,
                       reasoning=_NO_REASONING_OVERRIDE, model_slug: str = None):
     """reasoning — оверрайд глубины размышлений на этот вызов (утилитарные задачи: дайджест шлёт 'none',
@@ -4258,7 +4295,7 @@ async def ask_agentic(context: str, question: str, must_search: bool = False, ca
         {"role": "user", "content": user_content},
     ]
 
-    max_iterations = 20
+    max_iterations = 500
     force_tool = must_search and (has_channels or has_web)  # принудительный поиск только для search-инструментов
     force_tool_name = "telegram_search" if has_channels else "web_search"
     memory_tools_list = []
@@ -4357,6 +4394,15 @@ async def ask_agentic(context: str, question: str, must_search: bool = False, ca
                 margin = (CTX_TOKEN_SAFETY - 1) * 100
                 covered = "покрыл" if abs(pct) <= margin else "НЕ покрыл"
                 log("ASK", f"Δ токенизаторов: tiktoken={ctx_tokens_est} vs API={usage.prompt_tokens} → tiktoken {verdict} на {abs(pct)}% (запас {int(margin)}% {covered})")
+
+        # Fallback для моделей (DeepSeek и др.), если шлюз вернул вызовы DSML в content, а не в tool_calls
+        if not getattr(msg, "tool_calls", None):
+            raw_c = getattr(msg, "content", None) or ""
+            dsml_calls = _parse_dsml_tool_calls(raw_c)
+            if dsml_calls:
+                log("ASK", f"DeepSeek DSML: распарсил {len(dsml_calls)} вызовов из сырого content")
+                msg.tool_calls = dsml_calls
+                msg.content = re.sub(r'<[|｜]{2}DSML[|｜]{2}.*?(?:$|(?=<[^|｜]))', '', raw_c, flags=re.DOTALL).strip() or None
 
         # Получили валидный ответ с инструментами — модель умеет tools
         if has_tools and msg.tool_calls:
@@ -4558,14 +4604,18 @@ async def ask_agentic(context: str, question: str, must_search: bool = False, ca
                                  "content": f"Ошибка инструмента (пропускаю): {e}"})
 
     # Лимит итераций — запрашиваем финальный ответ без инструментов
-    log("ASK", "Достигнут лимит итераций, запрашиваю финальный ответ")
+    log("ASK", f"Достигнут лимит итераций ({max_iterations}), запрашиваю финальный ответ")
+    messages.append({
+        "role": "user",
+        "content": "ВНИМАНИЕ: Поиск завершён, лимит вызовов исчерпан. Больше НЕ вызывай инструменты и не используй служебную разметку вызова функций. Напиши структурированный, развёрнутый финальный ответ на русском языке на исходный вопрос пользователя на основе всей собранной выше информации."
+    })
     try:
         response = await asyncio.to_thread(
             llm.chat.completions.create,
             model=model_id,
             messages=messages,
             max_tokens=ASK_MAX_TOKENS,
-            temperature=1.0,
+            temperature=0.7,
         )
         _fchoice = response.choices[0]
         _fmsg = _fchoice.message
@@ -4573,6 +4623,25 @@ async def ask_agentic(context: str, question: str, must_search: bool = False, ca
         # Тот же гейт: обрезанный reasoning без видимого ответа наружу не отдаём.
         if content and not (getattr(_fmsg, "content", None) or "").strip() and _fchoice.finish_reason == "length":
             content = ""
+        # Если модель всё равно попыталась выдать сырой DSML в финале — запрашиваем чистый человеческий ответ
+        if content and ("<｜｜DSML" in content or "<||DSML" in content or "DSML" in content):
+            log("ASK", "Финальный ответ содержал DSML — запрашиваю повторный чистый текст")
+            messages.append({"role": "assistant", "content": content})
+            messages.append({
+                "role": "user",
+                "content": "Ты выдал служебные теги вызова функций вместо текста ответа. Инструменты отключены! Напиши человеческий ответ обычным текстом по собранной информации."
+            })
+            try:
+                response2 = await asyncio.to_thread(
+                    llm.chat.completions.create,
+                    model=model_id,
+                    messages=messages,
+                    max_tokens=ASK_MAX_TOKENS,
+                    temperature=0.7,
+                )
+                content = _extract_content(response2.choices[0].message)
+            except Exception as e:
+                log("ASK", f"Ошибка повторного запроса без DSML: {e}")
         if content:
             _log_search_summary()
             return content
