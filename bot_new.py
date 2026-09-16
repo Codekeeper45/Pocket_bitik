@@ -101,6 +101,8 @@ sakana_proxy = os.getenv("SAKANA_PROXY")  # необяз. прокси для Sa
 gloy_api_key = os.getenv("GLOY_API_KEY")  # LLM API FUN (Gloy AI) — OpenAI-совместимый, прямой Bearer
 nanogpt_api_key = os.getenv("NANOGPT_API_KEY") or os.getenv("NANO_API_KEY")  # NanoGPT API (Gemma/Qwen uncensored)
 NANOGPT_BASE_URL = "https://nano-gpt.com/api/v1"
+seekai_api_key = os.getenv("SEEKAI_API_KEY")  # SeekAI API (seekai.cc)
+SEEKAI_BASE_URL = os.getenv("SEEKAI_BASE_URL", "https://seekai.cc/v1")
 tavily_api_key = os.getenv("TAVILY_API_KEY")  # веб-поиск/извлечение страниц для /ask (tavily.com); без ключа веб-инструменты выключены
 index_db_url = os.getenv("INDEX_DB_URL")  # MariaDB для /index (GraphRAG-память): mysql://user:pass@host:port/db (pass URL-encoded)
 llama_cloud_api_key = os.getenv("LLAMA_CLOUD_API_KEY")  # OCR фото (LlamaParse); без него фото идут через vision
@@ -603,6 +605,23 @@ for _ngslug, _ngid, _nglabel, _ngctx, _ngsafe in [
     ("ng-glm-5.3-thinking", "zai-org/glm-5.3:thinking", "GLM-5.3 Thinking (NanoGPT)", 1048576, 1.30),
 ]:
     MODEL_REGISTRY[_ngslug] = ("nanogpt", _ngid, _nglabel, _ngctx, _ngsafe)
+# SeekAI (seekai.cc, OpenAI-совместимый API, прямой Bearer).
+# Каталог моделей актуализирован и протестирован живыми вызовами (16.09.2026).
+for _skslug, _skid, _sklabel, _skctx, _sksafe in [
+    ("seek-deepseek-flash", "DeepSeek-V4-Flash", "DeepSeek V4 Flash (SeekAI)", 1000000, 1.15),
+    ("seek-deepseek-v4.1-flash", "deepseek-v4.1-flash", "DeepSeek V4.1 Flash (SeekAI)", 1000000, 1.15),
+    ("seek-deepseek-v4-pro", "deepseek-v4-pro", "DeepSeek V4 Pro (SeekAI)", 1000000, 1.15),
+    ("seek-glm-5.3-flash", "glm-5.3-flash", "GLM 5.3 Flash (SeekAI)", 1048576, 1.30),
+    ("seek-glm-5.3", "glm-5.3", "GLM 5.3 (SeekAI)", 1048576, 1.30),
+    ("seek-gpt-5.6-luna", "gpt-5.6-luna", "GPT-5.6 Luna (SeekAI)", 262144, 1.15),
+    ("seek-gpt-5.6-sol", "gpt-5.6-sol", "GPT-5.6 Sol (SeekAI)", 262144, 1.15),
+    ("seek-gemini-3.8-flash", "gemini-3.8-flash", "Gemini 3.8 Flash (SeekAI)", 1000000, 1.15),
+    ("seek-qwen-3.8-flash", "qwen3.8-flash", "Qwen 3.8 Flash (SeekAI)", 262144, 1.15),
+    ("seek-kimi-k3", "kimi-k3", "Kimi K3 (SeekAI)", 262144, 1.15),
+    ("seek-minimax-m3", "MiniMax-M3", "MiniMax M3 (SeekAI)", 1000000, 1.15),
+    ("seek-gemma-4-31b", "gemma-4-31b", "Gemma 4 31B (SeekAI)", 262144, 1.30),
+]:
+    MODEL_REGISTRY[_skslug] = ("seekai", _skid, _sklabel, _skctx, _sksafe)
 # Уровни глубины размышлений (reasoning_effort) OpenAI-моделей, от мощного к слабому.
 # API жёстко валидирует значение ПО МОДЕЛИ (неподдерживаемое → 400): gpt-5.4/5.5 принимают
 # none/low/medium/high/xhigh, o3 — только low/medium/high. Дефолты: 5.5 → medium, 5.4 → none, o3 → medium.
@@ -701,10 +720,10 @@ def _clamp_reasoning(model_id: str, effort: str, provider: str = None) -> str:
         return "max" if effort == "xhigh" else "high"
     if provider == "sakana":
         return "max" if effort == "xhigh" else "high"  # Sakana: только high/xhigh→max (off/low/medium нет)
-    if provider == "nanogpt":
+    if provider in ("nanogpt", "seekai"):
         mid = (model_id or "").lower()
         if effort in ("xhigh", "max"):
-            return "max" if ("deepseek" in mid or ":thinking" in mid) else "high"
+            return "max" if ("deepseek" in mid or ":thinking" in mid or "glm" in mid or "qwen" in mid) else "high"
         return effort if effort in ("low", "medium", "high", "none", "max") else "medium"
     if model_id in OPENAI_MAX_REASONING and effort == "xhigh":
         return "max"  # gpt-5.6: топ-ступень max выше глобального xhigh (как xhigh→max у DeepSeek/Sakana)
@@ -732,8 +751,8 @@ def _fmt_rlevel(model_id: str, lv: str, provider: str) -> str:
 
 
 def _supports_reasoning(provider: str) -> bool:
-    """Провайдеры с управляемой глубиной размышлений (/model reason): OpenAI, Google Gemini, Fireworks, opencode, DeepSeek, Sakana, NanoGPT."""
-    return provider in ("openai", "google", "fireworks", "opencode", "deepseek", "sakana", "nanogpt")
+    """Провайдеры с управляемой глубиной размышлений (/model reason): OpenAI, Google Gemini, Fireworks, opencode, DeepSeek, Sakana, NanoGPT, SeekAI."""
+    return provider in ("openai", "google", "fireworks", "opencode", "deepseek", "sakana", "nanogpt", "seekai")
 
 
 # Task-локальный оверрайд глубины размышлений для утилитарных вызовов (дайджест): обёртки читают
@@ -766,9 +785,9 @@ def _reasoning_levels(slug: str):
         return DEEPSEEK_REASONING_LEVELS  # xhigh(→max)/high/none(→off)
     if spec[0] == "sakana":
         return SAKANA_REASONING_LEVELS  # xhigh(→max)/high — off нет
-    if spec[0] == "nanogpt":
+    if spec[0] in ("nanogpt", "seekai"):
         mid = spec[1].lower()
-        if "deepseek" in mid or ":thinking" in mid:
+        if "deepseek" in mid or ":thinking" in mid or "glm" in mid or "qwen" in mid:
             return ["xhigh", "high", "medium", "low", "none"] if ":thinking" not in mid else ["xhigh", "high", "medium", "low"]
         return ["high", "medium", "low", "none"]
     return None
@@ -1719,12 +1738,45 @@ class _NanogptReasoningClient:
             raise
 
 
+class _SeekaiReasoningClient:
+    """Адаптер для SeekAI (seekai.cc, OpenAI-совместимый API с reasoning-полями).
+    При 400 (неподдерживаемый параметр reasoning_effort у non-reasoning моделей)
+    автоматически ретраит запрос без параметра reasoning_effort."""
+
+    def __init__(self, api_key):
+        self._c = OpenAI(
+            api_key=api_key,
+            base_url=SEEKAI_BASE_URL,
+            default_headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
+        )
+        self.chat = SimpleNamespace(completions=SimpleNamespace(create=self._create))
+
+    def _create(self, **kwargs):
+        _eff = _effective_reasoning()
+        model = kwargs.get("model", "")
+        if _eff:
+            eff = _clamp_reasoning(model, _eff, "seekai")
+            kwargs.setdefault("reasoning_effort", eff)
+            _floor = {"medium": 24000, "high": 40000, "xhigh": 64000, "max": 64000}.get(kwargs.get("reasoning_effort"))
+            if _floor and int(kwargs.get("max_tokens") or 0) < _floor:
+                kwargs["max_tokens"] = _floor
+        try:
+            return self._c.chat.completions.create(**kwargs)
+        except Exception as e:
+            if getattr(e, "status_code", None) == 400 and any(k in str(e).lower() for k in ("reasoning", "effort", "deserialize", "bad request")):
+                log("MODEL", f"SeekAI {model}: reasoning_effort отвергнут — ретрай без него")
+                kwargs.pop("reasoning_effort", None)
+                return self._c.chat.completions.create(**kwargs)
+            raise
+
+
 google_client = _GoogleGeminiClient(GOOGLE_TTS_KEYS) if GOOGLE_TTS_KEYS else None
 zai_client = OpenAI(api_key=zai_api_key, base_url=ZAI_BASE_URL) if zai_api_key else None  # z.ai GLM (OpenAI-совместимый)
 fireworks_client = _FireworksReasoningClient(fireworks_api_key) if fireworks_api_key else None  # Fireworks (OpenAI-совместимый, с управляемым reasoning_effort)
 sakana_client = _SakanaReasoningClient(sakana_api_key) if sakana_api_key else None  # Sakana AI (Fugu, OpenAI-совместимый, reasoning high/xhigh/max)
 gloy_client = _GloyClient(gloy_api_key) if gloy_api_key else None  # LLM API FUN (Gloy AI, OpenAI-совместимый; клампит max_tokens≤8192, без reasoning-параметра и без tools-натива)
 nanogpt_client = _NanogptReasoningClient(nanogpt_api_key) if nanogpt_api_key else None  # NanoGPT API с управляемым reasoning_effort
+seekai_client = _SeekaiReasoningClient(seekai_api_key) if seekai_api_key else None  # SeekAI API с управляемым reasoning_effort
 
 AUTO_REPLY_BUFFERS: dict = {}
 AUTO_REPLY_TASKS: dict = {}
@@ -1812,13 +1864,13 @@ _model_state = load_json(MODEL_STATE_PATH, {})
 # чтобы они стали полноценными записями и пережили рестарт.
 CUSTOM_MODELS = _model_state.get("custom_models", {})  # {id: {"provider", "label", "ctx", "safety", "vision"}}
 for _cid, _ci in CUSTOM_MODELS.items():
-    _c_prov = _ci.get("provider") or ("nanogpt" if _ci.get("nanogpt") else "openrouter")
+    _c_prov = _ci.get("provider") or ("nanogpt" if _ci.get("nanogpt") else ("seekai" if _ci.get("seekai") else "openrouter"))
     MODEL_REGISTRY[_cid] = (
         _c_prov,
         _cid,
         (_ci.get("label") or _cid),
         int(_ci.get("ctx") or 128000),
-        float(_ci.get("safety") or (1.15 if _c_prov == "nanogpt" else 1.3))
+        float(_ci.get("safety") or (1.15 if _c_prov in ("nanogpt", "seekai") else 1.3))
     )
 ACTIVE_MODEL = _model_state.get("active", "deepseek-pro")
 if ACTIVE_MODEL not in MODEL_REGISTRY:
@@ -1889,6 +1941,8 @@ def _client_for_provider(provider):
         return cerebras_clients[0] if cerebras_clients else None  # общий клиент ротации (браузерный UA внутри); None → нет ключей
     if provider == "nanogpt":
         return nanogpt_client
+    if provider == "seekai":
+        return seekai_client
     if provider == "opencode":
         return opencode_reasoning_client  # путь ответов с инжектом reasoning_effort
     return opencode_client  # неизвестный провайдер — сырой клиент (фоллбэк)
@@ -1927,9 +1981,9 @@ def _model_supports_vision(slug):
         return True  # vision-слуги OpenCode (kimi/glm/qwen/mimo)
     spec = MODEL_REGISTRY.get(slug)
     provider = spec[0] if spec else None
-    if provider == "nanogpt":
+    if provider in ("nanogpt", "seekai"):
         mid = (spec[1] if spec else "").lower()
-        if "deepseek-v4.1-flash" in mid or "vision" in mid or "-vl" in mid or "omni" in mid:
+        if "deepseek-v4.1-flash" in mid or "vision" in mid or "-vl" in mid or "omni" in mid or "gemini" in mid:
             return True
         return CUSTOM_MODELS.get(slug, {}).get("vision", False)
     if provider == "openrouter":
@@ -2020,6 +2074,51 @@ async def _nanogpt_model_info(model_id: str):
         return False, False, 0, None, None
     except Exception as e:
         log("MODEL", f"Проверка {model_id} в NanoGPT: {e}")
+        return None, False, 0, None, None
+
+
+_SEEKAI_MODELS_CACHE = {"ts": 0.0, "data": None}
+_SEEKAI_MODELS_TTL = 600  # 10 мин — кэш списка моделей SeekAI
+
+
+async def _seekai_model_info(model_id: str):
+    """Проверяет модель в SeekAI (GET /models). Возвращает (exists, supports_image, context_length, name, canonical_id).
+    exists=None если не удалось проверить (сеть)."""
+    now = time.monotonic()
+
+    def _fetch():
+        headers = {"Authorization": f"Bearer {seekai_api_key}"} if seekai_api_key else {}
+        headers["User-Agent"] = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
+        r = requests.get(f"{SEEKAI_BASE_URL}/models", headers=headers, timeout=20)
+        r.raise_for_status()
+        return r.json().get("data", [])
+
+    try:
+        if _SEEKAI_MODELS_CACHE["data"] is not None and (now - _SEEKAI_MODELS_CACHE["ts"]) < _SEEKAI_MODELS_TTL:
+            data = _SEEKAI_MODELS_CACHE["data"]
+        else:
+            data = await asyncio.to_thread(_fetch)
+            _SEEKAI_MODELS_CACHE["data"] = data
+            _SEEKAI_MODELS_CACHE["ts"] = now
+
+        clean_req = model_id.strip()
+        clean_req_low = clean_req.lower()
+
+        for m in data:
+            mid = m.get("id", "")
+            if mid == clean_req or mid.lower() == clean_req_low:
+                is_vision = any(x in mid.lower() for x in ("vision", "-vl", "omni", "gpt-4o", "gemini", "claude", "v4.1-flash"))
+                if any(x in mid.lower() for x in ("deepseek-v4", "glm-5", "gemini-3", "minimax-m3")):
+                    ctx = 1000000
+                elif any(x in mid.lower() for x in ("qwen3", "gemma-4", "gpt-5.6", "kimi-k3")):
+                    ctx = 262144
+                else:
+                    ctx = 128000
+                label = f"{mid} (SeekAI)"
+                return True, is_vision, ctx, label, mid
+        return False, False, 0, None, None
+    except Exception as e:
+        log("MODEL", f"Проверка {model_id} в SeekAI: {e}")
         return None, False, 0, None, None
 
 
@@ -7285,8 +7384,8 @@ async def model_command(event):
             mk = "▶" if mid == ACTIVE_MODEL else " "
             n = slugs.index(mid) + 1 if mid in slugs else None  # номер в общем списке /model
             num = f" · быстрый выбор `/model {n}`" if n else ""
-            c_prov = ci.get("provider") or ("nanogpt" if ci.get("nanogpt") else "openrouter")
-            ptag = "NanoGPT" if c_prov == "nanogpt" else "OpenRouter"
+            c_prov = ci.get("provider") or ("nanogpt" if ci.get("nanogpt") else ("seekai" if ci.get("seekai") else "openrouter"))
+            ptag = "SeekAI" if c_prov == "seekai" else ("NanoGPT" if c_prov == "nanogpt" else "OpenRouter")
             lines.append(f"{mk}{i}. [{ptag}] {ci.get('label') or mid} — `{mid}`{num}")
         lines.append("\n`/model N` — выбрать по номеру · `/model <id>` / `/model ng <id>` — добавить · `/model remove <N|id>` — удалить")
         await event.edit("\n".join(lines)[:4000])
@@ -7402,6 +7501,8 @@ async def model_command(event):
                          "cerebras": "━━ Cerebras ━━",
                          "nanogpt": "━━ NanoGPT ━━",
                          "nanogpt_custom": "━━ NanoGPT (кастом) ━━",
+                         "seekai": "━━ SeekAI ━━",
+                         "seekai_custom": "━━ SeekAI (кастом) ━━",
                          "openrouter": "━━ OpenRouter ━━",
                          "openrouter_custom": "━━ OpenRouter (кастом) ━━"}.get(header_key, f"━━ {provider} ━━")
                 lines.append(f"\n{title}")
@@ -7423,7 +7524,7 @@ async def model_command(event):
         lines.append("`/model N` / `/model <slug>` — выбрать · `/model probe` — проверить поиск (❔→🔧/🚫)")
         reff = f"`{REASONING_EFFORT}`" if REASONING_EFFORT else "авто"
         lines.append(f"🤔 — модель умеет менять глубину размышлений. `/model N.M`: M — сила (`.1` максимум → дальше слабее → последний мин/выкл). Лесенки всех моделей с тап-чипами: `/model reason` (сейчас: {reff})")
-        lines.append("`/model vendor/model` — добавить модель OpenRouter · `/model ng <id>` — любую модель NanoGPT (напр. `/model ng deepseek/deepseek-v4.1-flash`)")
+        lines.append("`/model vendor/model` — добавить модель OpenRouter · `/model ng <id>` — NanoGPT · `/model seek <id>` — SeekAI")
         lines.append("`/model fav` — избранные кастомные модели · `/model remove <N|id>` — удалить кастомную")
         await event.edit("\n".join(lines)[:4000])
         return
@@ -7433,8 +7534,8 @@ async def model_command(event):
         tested = 0
         for slug in slugs:
             provider, mid, _label, _ctx, _safety = MODEL_REGISTRY[slug]
-            if provider in ("oc_anthropic", "openai", "google", "zai", "fireworks", "sakana", "gloy", "cerebras", "nanogpt"):
-                continue  # qwen3.7-max / gpt-5.x / o3 / Gemini / Fireworks / Sakana / Gloy: tools работают на auto, но forced пробник врёт (Sakana/Gloy отдают не tool_call) — флаг учится на лету в реальном /ask
+            if provider in ("oc_anthropic", "openai", "google", "zai", "fireworks", "sakana", "gloy", "cerebras", "nanogpt", "seekai"):
+                continue  # qwen3.7-max / gpt-5.x / o3 / Gemini / Fireworks / Sakana / Gloy / NanoGPT / SeekAI: tools работают на auto, но forced пробник врёт (Sakana/Gloy отдают не tool_call) — флаг учится на лету в реальном /ask
             cl = _client_for_provider(provider)
             if cl is None:
                 continue
@@ -7526,8 +7627,23 @@ async def model_command(event):
             is_or_explicit = True
             target_arg = arg.split(":", 1)[1].strip()
 
+        is_seek_explicit = False
+        if low_arg.startswith(("seek ", "seekai ")):
+            is_seek_explicit = True
+            target_arg = arg.split(None, 1)[1].strip()
+        elif low_arg.startswith(("seek/", "seekai/")):
+            is_seek_explicit = True
+            target_arg = arg.split("/", 1)[1].strip()
+        elif low_arg.startswith(("seek:", "seekai:")):
+            is_seek_explicit = True
+            target_arg = arg.split(":", 1)[1].strip()
+
         if is_ng_explicit and not target_arg:
             await event.edit("Укажи id модели NanoGPT: `/model ng <id>` (напр. `/model ng deepseek/deepseek-v4.1-flash`).\nКаталог: https://nano-gpt.com")
+            return
+
+        if is_seek_explicit and not target_arg:
+            await event.edit("Укажи id модели SeekAI: `/model seek <id>` (напр. `/model seek DeepSeek-V4-Flash`).\nКаталог: https://seekai.cc")
             return
 
         if is_or_explicit and not target_arg:
@@ -7574,6 +7690,48 @@ async def model_command(event):
             _save_model_state()
             log("MODEL", f"Активная модель (кастомная NanoGPT): {model_id}, окно {ctx}")
             await event.edit(f"✅ Модель ответов: {label} (`{model_id}`, NanoGPT, окно {_fmt_ctx(ctx)})")
+            return
+
+        # Если явно указан SeekAI:
+        if is_seek_explicit:
+            for s, entry in MODEL_REGISTRY.items():
+                if entry[0] == "seekai" and (s.lower() == target_arg.lower() or entry[1].lower() == target_arg.lower()):
+                    chosen = s
+                    break
+            if chosen:
+                provider, _mid, label, ctx, _safety = MODEL_REGISTRY[chosen]
+                if not is_available(provider):
+                    await event.edit(f"Модель «{label}» недоступна — нет ключа провайдера ({provider}).")
+                    return
+                ACTIVE_MODEL = chosen
+                _save_model_state()
+                log("MODEL", f"Активная модель: {chosen} ({label})")
+                rtag = ""
+                if _supports_reasoning(provider):
+                    rtag = f" · 🤔 ризонинг: `{_clamp_reasoning(_mid, REASONING_EFFORT, provider)}`" if REASONING_EFFORT else " · 🤔 ризонинг: авто (`/model reason`)"
+                await event.edit(f"✅ Модель ответов: {label} (окно {_fmt_ctx(ctx)}){rtag}")
+                return
+
+            await event.edit(f"🔎 Проверяю `{target_arg}` в SeekAI…")
+            sk_exists, sk_img, sk_ctx, sk_name, sk_canon = await _seekai_model_info(target_arg)
+            if sk_exists is None:
+                await event.edit(f"⚠️ Не удалось проверить `{target_arg}` (SeekAI недоступен). Модель не изменена.")
+                return
+            if not sk_exists:
+                await event.edit(f"❌ Модель `{target_arg}` не найдена в SeekAI. Проверь точный id на seekai.cc.")
+                return
+            if not seekai_client:
+                await event.edit("Модель найдена в SeekAI, но нет ключа — добавь SEEKAI_API_KEY в .env.")
+                return
+            model_id = sk_canon or target_arg
+            ctx = int(sk_ctx or 128000)
+            label = sk_name or f"{model_id} (SeekAI)"
+            CUSTOM_MODELS[model_id] = {"provider": "seekai", "label": label, "ctx": ctx, "safety": 1.15, "vision": bool(sk_img)}
+            MODEL_REGISTRY[model_id] = ("seekai", model_id, label, ctx, 1.15)
+            ACTIVE_MODEL = model_id
+            _save_model_state()
+            log("MODEL", f"Активная модель (кастомная SeekAI): {model_id}, окно {ctx}")
+            await event.edit(f"✅ Модель ответов: {label} (`{model_id}`, SeekAI, окно {_fmt_ctx(ctx)})")
             return
 
         # Если явно указан OpenRouter:
@@ -7656,9 +7814,11 @@ async def model_command(event):
             await event.edit(f"❌ Модель `{arg}` не найдена ни в OpenRouter, ни в NanoGPT.\nПроверь id на openrouter.ai/models или nano-gpt.com.")
             return
 
-        # Без "/", проверяем NanoGPT (у многих моделей NanoGPT id без слэша)
-        await event.edit(f"🔎 Проверяю `{arg}` в NanoGPT…")
-        ng_exists, ng_img, ng_ctx, ng_name, ng_canon = await _nanogpt_model_info(arg)
+        # Без "/", проверяем NanoGPT и SeekAI
+        await event.edit(f"🔎 Проверяю `{arg}` в NanoGPT и SeekAI…")
+        ng_task = asyncio.create_task(_nanogpt_model_info(arg))
+        sk_task = asyncio.create_task(_seekai_model_info(arg))
+        (ng_exists, ng_img, ng_ctx, ng_name, ng_canon), (sk_exists, sk_img, sk_ctx, sk_name, sk_canon) = await asyncio.gather(ng_task, sk_task)
         if ng_exists:
             if not nanogpt_client:
                 await event.edit("Модель найдена в NanoGPT, но нет ключа — добавь NANOGPT_API_KEY в .env.")
@@ -7673,8 +7833,22 @@ async def model_command(event):
             log("MODEL", f"Активная модель (кастомная NanoGPT): {model_id}, окно {ctx}")
             await event.edit(f"✅ Модель ответов: {label} (`{model_id}`, NanoGPT, окно {_fmt_ctx(ctx)})")
             return
+        if sk_exists:
+            if not seekai_client:
+                await event.edit("Модель найдена в SeekAI, но нет ключа — добавь SEEKAI_API_KEY в .env.")
+                return
+            model_id = sk_canon or arg
+            ctx = int(sk_ctx or 128000)
+            label = sk_name or f"{model_id} (SeekAI)"
+            CUSTOM_MODELS[model_id] = {"provider": "seekai", "label": label, "ctx": ctx, "safety": 1.15, "vision": bool(sk_img)}
+            MODEL_REGISTRY[model_id] = ("seekai", model_id, label, ctx, 1.15)
+            ACTIVE_MODEL = model_id
+            _save_model_state()
+            log("MODEL", f"Активная модель (кастомная SeekAI): {model_id}, окно {ctx}")
+            await event.edit(f"✅ Модель ответов: {label} (`{model_id}`, SeekAI, окно {_fmt_ctx(ctx)})")
+            return
 
-        await event.edit(f"Нет такой модели: `{arg}`. `/model` — список, либо укажи id модели (`vendor/model` для OpenRouter или `/model ng <id>` для NanoGPT).")
+        await event.edit(f"Нет такой модели: `{arg}`. `/model` — список, либо укажи id модели (`vendor/model` для OpenRouter, `/model ng <id>` для NanoGPT или `/model seek <id>` для SeekAI).")
         return
 
     provider, _mid, label, ctx, _safety = MODEL_REGISTRY[chosen]
@@ -8638,7 +8812,7 @@ async def status_command(event):
                  "oc_anthropic": "OpenCode Go (нативный)", "modelgate": "Claude/ModelGate",
                  "openai": "OpenAI", "google": "Google Gemini", "zai": "z.ai (GLM)", "fireworks": "Fireworks",
                  "sakana": "Sakana AI (Fugu)", "gloy": "LLM API FUN (Gloy AI)", "cerebras": "Cerebras",
-                 "nanogpt": "NanoGPT"}.get(provider, provider)
+                 "nanogpt": "NanoGPT", "seekai": "SeekAI"}.get(provider, provider)
     ts = MODEL_TOOLS_SUPPORT.get(ACTIVE_MODEL)
     search_mark = "🔧 есть" if ts is True else ("🚫 нет" if ts is False else "❔ не проверен")
     sv = active_model_supports_vision()
@@ -8704,7 +8878,7 @@ async def status_command(event):
     L.append(f"⭐ **Избранное:** {len(FISH_FAVORITES)} Fish-голос(ов) · {len(CUSTOM_MODELS)} кастомных моделей")
     # — ключи —
     keys = []
-    for p, nm in [("deepseek", "DeepSeek"), ("openrouter", "OpenRouter"), ("opencode", "OpenCode"), ("modelgate", "Claude/ModelGate"), ("openai", "OpenAI"), ("google", "Google Gemini"), ("zai", "z.ai (GLM)"), ("fireworks", "Fireworks"), ("cerebras", "Cerebras"), ("nanogpt", "NanoGPT")]:
+    for p, nm in [("deepseek", "DeepSeek"), ("openrouter", "OpenRouter"), ("opencode", "OpenCode"), ("modelgate", "Claude/ModelGate"), ("openai", "OpenAI"), ("google", "Google Gemini"), ("zai", "z.ai (GLM)"), ("fireworks", "Fireworks"), ("cerebras", "Cerebras"), ("nanogpt", "NanoGPT"), ("seekai", "SeekAI")]:
         keys.append(f"{nm} {'✅' if _client_for_provider(p) is not None else '❌'}")
     keys[-1] += f"×{len(cerebras_clients)}" if cerebras_clients else ""  # число ключей ротации Cerebras
     keys.append(f"Tavily {'✅' if tavily_api_key else '❌'}")
