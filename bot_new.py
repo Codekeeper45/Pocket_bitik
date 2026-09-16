@@ -1740,8 +1740,8 @@ class _NanogptReasoningClient:
 
 class _SeekaiReasoningClient:
     """Адаптер для SeekAI (seekai.cc, OpenAI-совместимый API с reasoning-полями).
-    При 400 (неподдерживаемый параметр reasoning_effort у non-reasoning моделей)
-    автоматически ретраит запрос без параметра reasoning_effort."""
+    При 400 (неподдерживаемый параметр reasoning_effort или tools у капризных апстримов)
+    автоматически ретраит запрос без проблемных параметров."""
 
     def __init__(self, api_key):
         self._c = OpenAI(
@@ -1754,19 +1754,34 @@ class _SeekaiReasoningClient:
     def _create(self, **kwargs):
         _eff = _effective_reasoning()
         model = kwargs.get("model", "")
+        had_effort = False
         if _eff:
             eff = _clamp_reasoning(model, _eff, "seekai")
             kwargs.setdefault("reasoning_effort", eff)
+            had_effort = True
             _floor = {"medium": 24000, "high": 40000, "xhigh": 64000, "max": 64000}.get(kwargs.get("reasoning_effort"))
             if _floor and int(kwargs.get("max_tokens") or 0) < _floor:
                 kwargs["max_tokens"] = _floor
         try:
             return self._c.chat.completions.create(**kwargs)
         except Exception as e:
-            if getattr(e, "status_code", None) == 400 and any(k in str(e).lower() for k in ("reasoning", "effort", "deserialize", "bad request")):
-                log("MODEL", f"SeekAI {model}: reasoning_effort отвергнут — ретрай без него")
-                kwargs.pop("reasoning_effort", None)
-                return self._c.chat.completions.create(**kwargs)
+            code = getattr(e, "status_code", None)
+            err_str = str(e).lower()
+            if code == 400 or "bad_request" in err_str or "parameters" in err_str:
+                if had_effort and "reasoning_effort" in kwargs:
+                    log("MODEL", f"SeekAI {model}: 400 ({e}) — ретрай без reasoning_effort")
+                    kwargs.pop("reasoning_effort", None)
+                    try:
+                        return self._c.chat.completions.create(**kwargs)
+                    except Exception as e2:
+                        e = e2
+                        code = getattr(e, "status_code", None)
+                        err_str = str(e).lower()
+                if kwargs.get("tools") and (code == 400 or "bad_request" in err_str or "parameters" in err_str):
+                    log("MODEL", f"SeekAI {model}: 400 ({e}) — ретрай без tools")
+                    kwargs.pop("tools", None)
+                    kwargs.pop("tool_choice", None)
+                    return self._c.chat.completions.create(**kwargs)
             raise
 
 
