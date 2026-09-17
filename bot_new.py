@@ -1,13 +1,20 @@
 from telethon import TelegramClient, events, utils
-from telethon.errors.rpcerrorlist import AuthKeyDuplicatedError, MessageNotModifiedError, FloodWaitError
+from telethon.errors.rpcerrorlist import AuthKeyDuplicatedError, MessageNotModifiedError, FloodWaitError, MediaCaptionTooLongError
 from telethon.extensions import html as tl_html
 from telethon.helpers import add_surrogate
-from telethon.tl.types import MessageEntityBlockquote, MessageEntityPre, MessageMediaWebPage, InputReplyToMessage, InputMessagesFilterPhotos
+from telethon.tl.types import (
+    MessageEntityBlockquote, MessageEntityPre, MessageMediaWebPage, InputReplyToMessage, InputMessagesFilterPhotos,
+    DocumentAttributeVideo, DocumentAttributeAudio, DocumentAttributeFilename, DocumentAttributeSticker, DocumentAttributeAnimated,
+    MessageMediaPoll, MessageMediaPhoto, MessageMediaDocument, User, Chat, Channel
+)
 from telethon.tl.functions.messages import SendMessageRequest
 from dotenv import load_dotenv, dotenv_values
 from openai import OpenAI
+import urllib.parse
 from urllib.parse import urlsplit, unquote
 import os
+import tempfile
+import shutil
 import re
 import io
 import asyncio
@@ -8353,11 +8360,13 @@ def _help_index(active_label):
         "   `allow`     👥 доступ к `/ask` для других\n"
         "   `status`    📊 все текущие настройки разом (`/status`)\n"
         "   `song`      🎵 печать с эффектом набора\n"
+        "   `cp`        📋 копирование сообщения по ссылке (в обход запретов)\n"
         "   `help`      ℹ️ как устроена сама эта команда\n"
         "   `all`       📖 показать ВСЁ сразу\n"
         "\n"
         "⚡ **Шпаргалка (самое частое):**\n"
         "   `/ask 200 о чём спорят?` — ответ по последним 200 сообщениям\n"
+        "   `/cp <ссылка>` — скопировать пост/медиа в этот чат (или реплаем)\n"
         "   `/ask 50 -t коротко` — без медиа (быстрее)\n"
         "   `/model` — сменить модель ответов · `/model media` — сменить «глаза»\n"
         "\n"
@@ -8812,7 +8821,502 @@ _HELP_SECTIONS = {
         "сколько каналов подключено и время дайджеста, а также какие API-ключи активны.\n"
         "Только для тебя (владельца). Ничего не меняет — просто сводка."
     ),
+    "cp": (
+        "📋 **`/cp` — копирование сообщения по ссылке**\n"
+        "\n"
+        "Скачивает сообщение из любого чата/канала (включая приватные и с защитой от сохранения/пересылки noforwards) "
+        "и отправляет его в текущий чат в точности как в оригинале (текст со всеми стилями, "
+        "фото, видео, кружочки, голосовые, файлы, стикеры, альбомы).\n"
+        "\n"
+        "📐 **СИНТАКСИС:**\n"
+        "• `/cp <ссылка>` — скопировать сообщение по ссылке в текущий чат.\n"
+        "• Ответь `/cp` на чужое сообщение со ссылкой — скачает и отправит реплаем на него.\n"
+        "• Ответь `/cp <ссылка>` на сообщение собеседника — отправит контент реплаем на его сообщение.\n"
+        "\n"
+        "🛡 **Ограничения групп:**\n"
+        "Если в целевой группе запрещены медиа или файлы, бот автоматически отфильтрует "
+        "запрещённый контент и доставит текст сообщения без ошибок."
+    ),
 }
+
+
+# ════════════════════════════════════════════════════════════════════════
+#  /cp — копирование любого сообщения из любого чата по его ссылке
+#  Скачивает контент (обход noforwards / save_restricted), сохраняет
+#  оригинальные стили/форматирование, учитывает и фильтрует медиа
+#  при наличии ограничений в целевой группе.
+# ════════════════════════════════════════════════════════════════════════
+
+def _parse_tg_message_link(text: str):
+    """
+    Парсит ссылку на сообщение Telegram.
+    Возвращает (peer, msg_id, is_single):
+      peer: int (-100...) для приватных супергрупп/каналов или str (username) для публичных.
+      msg_id: int ID сообщения.
+      is_single: bool (True, если в URL был флаг ?single).
+    """
+    if not text:
+        return None, None, False
+
+    text = text.strip()
+    url_match = re.search(r'(?:https?://)?(?:www\.)?(?:t(?:elegram)?\.me|tg://\S+)\S*', text)
+    if not url_match:
+        url_match = re.search(r't\.me/\S+', text)
+    if not url_match:
+        return None, None, False
+
+    raw_url = url_match.group(0)
+    is_single = 'single' in raw_url.lower()
+
+    if raw_url.startswith('tg://'):
+        m_resolve = re.search(r'tg://resolve\?domain=([A-Za-z0-9_]+)&post=(\d+)', raw_url)
+        if m_resolve:
+            return m_resolve.group(1), int(m_resolve.group(2)), is_single
+        m_priv = re.search(r'tg://privatepost\?channel=(\d+)&post=(\d+)', raw_url)
+        if m_priv:
+            return int("-100" + m_priv.group(1)), int(m_priv.group(2)), is_single
+        return None, None, False
+
+    parsed = urllib.parse.urlparse(raw_url if "://" in raw_url else f"https://{raw_url}")
+    path = parsed.path.strip("/")
+    parts = [p for p in path.split("/") if p]
+    if not parts:
+        return None, None, False
+
+    if parts[0].lower() == "c":
+        if len(parts) >= 3:
+            channel_id_str = parts[1]
+            try:
+                msg_id = int(parts[-1])
+                peer = int("-100" + channel_id_str) if not channel_id_str.startswith("-100") else int(channel_id_str)
+                return peer, msg_id, is_single
+            except ValueError:
+                return None, None, False
+        return None, None, False
+
+    if len(parts) >= 2:
+        username = parts[0]
+        try:
+            msg_id = int(parts[-1])
+            return username, msg_id, is_single
+        except ValueError:
+            return None, None, False
+
+    return None, None, False
+
+
+def _classify_message_media(msg) -> str:
+    """
+    Возвращает тип медиа:
+    'photo', 'video', 'roundvideo', 'voice', 'audio', 'sticker', 'gif', 'doc', 'poll', 'webpage', 'none'
+    """
+    if not getattr(msg, "media", None):
+        return "none"
+    if isinstance(msg.media, MessageMediaWebPage):
+        return "webpage"
+    if isinstance(msg.media, MessageMediaPoll):
+        return "poll"
+    if getattr(msg, "photo", None):
+        return "photo"
+    if getattr(msg, "voice", None):
+        return "voice"
+    if getattr(msg, "sticker", None):
+        return "sticker"
+    if getattr(msg, "gif", None):
+        return "gif"
+    if getattr(msg, "video", None):
+        doc = getattr(msg, "document", None)
+        attrs = getattr(doc, "attributes", []) if doc else []
+        for a in attrs:
+            if isinstance(a, DocumentAttributeVideo) and getattr(a, "round_message", False):
+                return "roundvideo"
+        return "video"
+    if getattr(msg, "audio", None):
+        return "audio"
+    if getattr(msg, "document", None):
+        return "doc"
+    return "other"
+
+
+def _check_media_permission(media_type: str, restrictions: dict) -> bool:
+    if media_type in ("none", "webpage"):
+        return True
+    if not restrictions.get("media", True) and media_type not in ("sticker", "gif", "poll"):
+        return False
+    if media_type == "photo":
+        return restrictions.get("photos", True)
+    if media_type == "video":
+        return restrictions.get("videos", True)
+    if media_type == "roundvideo":
+        return restrictions.get("roundvideos", True)
+    if media_type == "voice":
+        return restrictions.get("voices", True)
+    if media_type == "audio":
+        return restrictions.get("audios", True)
+    if media_type == "sticker":
+        return restrictions.get("stickers", True)
+    if media_type == "gif":
+        return restrictions.get("gifs", True)
+    if media_type == "doc":
+        return restrictions.get("docs", True)
+    if media_type == "poll":
+        return restrictions.get("polls", True)
+    return restrictions.get("media", True)
+
+
+@client.on(events.NewMessage(pattern=r"^[./]cp(?:\s+(.+))?$"))
+async def cp_command(event):
+    """
+    /cp <ссылка на сообщение> — скачивает сообщение из любого чата (включая приватные
+    и защищённые от сохранения/пересылки noforwards) и отправляет его в текущий чат
+    в точности как в оригинале (текст со всеми стилями, фото, видео, голосовые,
+    кружочки, документы, стикеры, альбомы). Если в группе ограничены медиа или файлы,
+    автоматически фильтрует их и доставляет текст сообщения.
+    """
+    if await _slash_for_other_bot(event):
+        return
+
+    is_owner = event.out
+    if not is_owner and event.sender_id not in ALLOWED_USERS:
+        return
+
+    arg = (event.pattern_match.group(1) or "").strip()
+    reply_msg = await event.get_reply_message() if getattr(event, "reply_to", None) else None
+
+    # Целевой reply_to в текущем чате:
+    reply_target_id = getattr(event, "reply_to_msg_id", None)
+
+    # Если ссылка не передана в аргументе, но есть reply_msg — ищем ссылку в тексте реплая
+    if not arg and reply_msg:
+        arg = reply_msg.raw_text or reply_msg.text or ""
+
+    peer, msg_id, is_single = _parse_tg_message_link(arg)
+    if not peer or not msg_id:
+        await event.edit("ℹ️ Использование: `/cp <ссылка на сообщение>` или ответь `/cp` на сообщение со ссылкой.")
+        return
+
+    # Получаем исходное сообщение по ссылке
+    try:
+        fetched = await client.get_messages(peer, ids=[msg_id])
+        target_msg = next((x for x in (fetched or []) if x is not None), None)
+    except Exception as e:
+        log("CP", f"Ошибка получения сообщения {peer}/{msg_id}: {e}")
+        await event.edit(f"❌ Не удалось получить сообщение: {e}")
+        return
+
+    if not target_msg:
+        await event.edit("❌ Сообщение по ссылке не найдено (удалено или нет доступа к чату).")
+        return
+
+    # Определяем ограничения целевого чата
+    dest_chat = await event.get_chat()
+    restrictions = {
+        "media": True, "photos": True, "videos": True, "roundvideos": True,
+        "audios": True, "voices": True, "docs": True, "stickers": True,
+        "gifs": True, "polls": True
+    }
+
+    is_dest_admin = False
+    perm = None
+    if getattr(dest_chat, "creator", False) or getattr(dest_chat, "admin_rights", None):
+        is_dest_admin = True
+    else:
+        try:
+            me = await client.get_me()
+            perm = await client.get_permissions(dest_chat, me)
+            if getattr(perm, "is_admin", False) or getattr(perm, "is_creator", False):
+                is_dest_admin = True
+        except Exception:
+            perm = None
+
+    if not is_dest_admin and not isinstance(dest_chat, User):
+        default_banned = getattr(dest_chat, "default_banned_rights", None)
+        user_banned = getattr(getattr(perm, "participant", None), "banned_rights", None) if perm else None
+        for banned in (default_banned, user_banned):
+            if not banned:
+                continue
+            if getattr(banned, "send_media", False) is True:
+                restrictions["media"] = False
+                restrictions["photos"] = False
+                restrictions["videos"] = False
+                restrictions["roundvideos"] = False
+                restrictions["audios"] = False
+                restrictions["voices"] = False
+                restrictions["docs"] = False
+            if getattr(banned, "send_photos", False) is True:
+                restrictions["photos"] = False
+            if getattr(banned, "send_videos", False) is True:
+                restrictions["videos"] = False
+            if getattr(banned, "send_roundvideos", False) is True:
+                restrictions["roundvideos"] = False
+            if getattr(banned, "send_audios", False) is True:
+                restrictions["audios"] = False
+            if getattr(banned, "send_voices", False) is True:
+                restrictions["voices"] = False
+            if getattr(banned, "send_docs", False) is True:
+                restrictions["docs"] = False
+            if getattr(banned, "send_stickers", False) is True:
+                restrictions["stickers"] = False
+            if getattr(banned, "send_gifs", False) is True:
+                restrictions["gifs"] = False
+            if getattr(banned, "send_polls", False) is True:
+                restrictions["polls"] = False
+
+    # Проверяем альбом
+    album_msgs = []
+    if getattr(target_msg, "grouped_id", None) and not is_single:
+        try:
+            async for m in client.iter_messages(peer, min_id=target_msg.id - 10, max_id=target_msg.id + 10):
+                if getattr(m, "grouped_id", None) == target_msg.grouped_id and m.media:
+                    album_msgs.append(m)
+            album_msgs.sort(key=lambda x: x.id)
+        except Exception as e:
+            log("CP", f"Не удалось собрать альбом: {e}")
+            album_msgs = []
+
+    is_album = len(album_msgs) > 1
+
+    media_type = _classify_message_media(target_msg)
+    media_allowed = _check_media_permission(media_type, restrictions)
+
+    if is_album:
+        album_types = [_classify_message_media(m) for m in album_msgs]
+        if any(not _check_media_permission(t, restrictions) for t in album_types):
+            media_allowed = False
+
+    # Если медиа запрещено настройками чата -> ФИЛЬТРУЕМ:
+    if getattr(target_msg, "media", None) and not isinstance(target_msg.media, MessageMediaWebPage) and not media_allowed:
+        log("CP", f"Медиа ({media_type}) отфильтровано из-за ограничений чата {getattr(dest_chat, 'id', event.chat_id)}")
+        text_to_send = target_msg.message or ""
+        entities_to_send = target_msg.entities
+
+        if not text_to_send.strip():
+            doc_name = None
+            if target_msg.file and target_msg.file.name:
+                doc_name = target_msg.file.name
+            if doc_name:
+                text_to_send = f"📎 _[Файл «{doc_name}» отфильтрован: в группе запрещена отправка файлов]_"
+            else:
+                text_to_send = f"📎 _[Медиа отфильтровано: в этой группе запрещена отправка файлов/медиа]_"
+            entities_to_send = None
+
+        await client.send_message(
+            event.chat_id,
+            text_to_send,
+            formatting_entities=entities_to_send,
+            reply_to=reply_target_id,
+            link_preview=False
+        )
+        if is_owner:
+            await event.delete()
+        return
+
+    # Скачивание и отправка контента
+    temp_dir = tempfile.mkdtemp(prefix="pocket_cp_")
+    try:
+        # Чисто текст или сообщение со ссылкой (веб-превью)
+        if media_type in ("none", "webpage"):
+            await client.send_message(
+                event.chat_id,
+                target_msg.message or "",
+                formatting_entities=target_msg.entities,
+                reply_to=reply_target_id,
+                link_preview=isinstance(target_msg.media, MessageMediaWebPage)
+            )
+            if is_owner:
+                await event.delete()
+            return
+
+        # Опрос (Poll)
+        if isinstance(target_msg.media, MessageMediaPoll):
+            try:
+                await client.send_message(
+                    event.chat_id,
+                    file=target_msg.media,
+                    reply_to=reply_target_id
+                )
+                if is_owner:
+                    await event.delete()
+                return
+            except Exception as e:
+                log("CP", f"Ошибка отправки опроса: {e}")
+
+        # Альбом
+        if is_album:
+            downloaded_paths = []
+            caption = None
+            caption_entities = None
+            for m in album_msgs:
+                if m.message and not caption:
+                    caption = m.message
+                    caption_entities = m.entities
+                p = await client.download_media(m, file=temp_dir)
+                if p:
+                    downloaded_paths.append(p)
+
+            if downloaded_paths:
+                try:
+                    await client.send_file(
+                        event.chat_id,
+                        file=downloaded_paths,
+                        caption=caption,
+                        formatting_entities=caption_entities,
+                        reply_to=reply_target_id
+                    )
+                    if is_owner:
+                        await event.delete()
+                    return
+                except MediaCaptionTooLongError:
+                    await client.send_file(
+                        event.chat_id,
+                        file=downloaded_paths,
+                        reply_to=reply_target_id
+                    )
+                    if caption:
+                        await client.send_message(
+                            event.chat_id,
+                            caption,
+                            formatting_entities=caption_entities,
+                            reply_to=reply_target_id
+                        )
+                    if is_owner:
+                        await event.delete()
+                    return
+                except Exception as e:
+                    err_str = str(e).lower()
+                    if any(k in err_str for k in ["forbidden", "restricted", "admin_required", "right"]):
+                        log("CP", f"Runtime запрет медиа в группе ({e}), фильтруем альбом...")
+                        if caption:
+                            await client.send_message(event.chat_id, caption, formatting_entities=caption_entities, reply_to=reply_target_id)
+                        else:
+                            await client.send_message(event.chat_id, "📎 _[Альбом отфильтрован настройками группы]_", reply_to=reply_target_id)
+                        if is_owner:
+                            await event.delete()
+                        return
+                    raise
+
+        # Одиночное медиа
+        orig_filename = None
+        if target_msg.file and target_msg.file.name:
+            orig_filename = target_msg.file.name
+
+        target_path = os.path.join(temp_dir, orig_filename) if orig_filename else temp_dir
+        downloaded = await client.download_media(target_msg, file=target_path)
+        if not downloaded or not os.path.exists(downloaded):
+            if target_msg.message:
+                await client.send_message(event.chat_id, target_msg.message, formatting_entities=target_msg.entities, reply_to=reply_target_id)
+            if is_owner:
+                await event.delete()
+            return
+
+        caption = target_msg.message or ""
+        caption_entities = target_msg.entities
+        is_spoiler = getattr(target_msg.media, "spoiler", False) or False
+
+        try:
+            if media_type == "roundvideo":
+                await client.send_file(
+                    event.chat_id,
+                    file=downloaded,
+                    video_note=True,
+                    reply_to=reply_target_id
+                )
+            elif media_type == "voice":
+                await client.send_file(
+                    event.chat_id,
+                    file=downloaded,
+                    voice_note=True,
+                    caption=caption or None,
+                    formatting_entities=caption_entities if caption else None,
+                    reply_to=reply_target_id
+                )
+            elif media_type == "sticker":
+                await client.send_file(
+                    event.chat_id,
+                    file=downloaded,
+                    reply_to=reply_target_id
+                )
+            elif media_type == "video":
+                await client.send_file(
+                    event.chat_id,
+                    file=downloaded,
+                    caption=caption or None,
+                    formatting_entities=caption_entities if caption else None,
+                    reply_to=reply_target_id,
+                    supports_streaming=True,
+                    spoiler=is_spoiler
+                )
+            elif media_type == "photo":
+                await client.send_file(
+                    event.chat_id,
+                    file=downloaded,
+                    caption=caption or None,
+                    formatting_entities=caption_entities if caption else None,
+                    reply_to=reply_target_id,
+                    spoiler=is_spoiler
+                )
+            elif media_type == "audio":
+                attrs = getattr(getattr(target_msg, "document", None), "attributes", None)
+                await client.send_file(
+                    event.chat_id,
+                    file=downloaded,
+                    caption=caption or None,
+                    formatting_entities=caption_entities if caption else None,
+                    reply_to=reply_target_id,
+                    attributes=attrs
+                )
+            else:
+                attrs = getattr(getattr(target_msg, "document", None), "attributes", None)
+                await client.send_file(
+                    event.chat_id,
+                    file=downloaded,
+                    caption=caption or None,
+                    formatting_entities=caption_entities if caption else None,
+                    reply_to=reply_target_id,
+                    force_document=True,
+                    attributes=attrs
+                )
+        except MediaCaptionTooLongError:
+            sent_media = await client.send_file(
+                event.chat_id,
+                file=downloaded,
+                reply_to=reply_target_id,
+                spoiler=is_spoiler
+            )
+            if caption:
+                followup_reply = sent_media.id if sent_media else reply_target_id
+                await client.send_message(
+                    event.chat_id,
+                    caption,
+                    formatting_entities=caption_entities,
+                    reply_to=followup_reply
+                )
+        except Exception as e:
+            err_str = str(e).lower()
+            if any(k in err_str for k in ["forbidden", "restricted", "admin_required", "right"]):
+                log("CP", f"Runtime запрет медиа в группе ({e}), фильтруем медиа и шлём текст...")
+                text_to_send = caption
+                if not text_to_send.strip():
+                    doc_name = orig_filename or "файл"
+                    text_to_send = f"📎 _[Файл «{doc_name}» отфильтрован: в группе запрещена отправка файлов/медиа]_"
+                    caption_entities = None
+                await client.send_message(
+                    event.chat_id,
+                    text_to_send,
+                    formatting_entities=caption_entities,
+                    reply_to=reply_target_id
+                )
+            else:
+                raise
+
+        if is_owner:
+            await event.delete()
+
+    except Exception as e:
+        log("CP", f"Критическая ошибка /cp: {traceback.format_exc()}")
+        await event.edit(f"❌ Ошибка копирования: {e}")
+    finally:
+        shutil.rmtree(temp_dir, ignore_errors=True)
 
 
 @client.on(events.NewMessage(outgoing=True, pattern=r"^[./]status$", from_users="me"))
@@ -8916,7 +9420,7 @@ async def help_command(event):
         return
 
     if arg == "all":
-        order = ["ask", "model", "media", "voice", "gen", "index", "keys", "channels", "auto", "allow", "status", "song", "help"]
+        order = ["ask", "model", "media", "voice", "gen", "index", "keys", "channels", "auto", "allow", "status", "song", "cp", "help"]
         full = "\n\n━━━━━━━━━━━━━━━━━━━━━\n\n".join(_HELP_SECTIONS[k] for k in order)
         # Telegram лимит ~4096 на сообщение — режем безопасно по разделам.
         chunk, buf = "", []
