@@ -8970,8 +8970,13 @@ async def cp_command(event):
     /cp <ссылка на сообщение> — скачивает сообщение из любого чата (включая приватные
     и защищённые от сохранения/пересылки noforwards) и отправляет его в текущий чат
     в точности как в оригинале (текст со всеми стилями, фото, видео, голосовые,
-    кружочки, документы, стикеры, альбомы). Если в группе ограничены медиа или файлы,
-    автоматически фильтрует их и доставляет текст сообщения.
+    кружочки, документы, стикеры, альбомы).
+    
+    Оптимизации:
+    - Мгновенная прямая отправка (Fast Path, <1 сек) для чатов без noforwards.
+    - Авто-сборка полного альбома через пакетный RPC get_messages даже со ссылками ?single.
+    - Живая индикация прогресса и размера файлов при скачивании из защищённых каналов.
+    - Двухконтурная фильтрация ограничений групп (banned rights + runtime catch).
     """
     if await _slash_for_other_bot(event):
         return
@@ -8980,19 +8985,24 @@ async def cp_command(event):
     if not is_owner and event.sender_id not in ALLOWED_USERS:
         return
 
-    arg = (event.pattern_match.group(1) or "").strip()
+    raw_input = (event.pattern_match.group(1) or "").strip()
     reply_msg = await event.get_reply_message() if getattr(event, "reply_to", None) else None
 
     # Целевой reply_to в текущем чате:
     reply_target_id = getattr(event, "reply_to_msg_id", None)
 
     # Если ссылка не передана в аргументе, но есть reply_msg — ищем ссылку в тексте реплая
-    if not arg and reply_msg:
-        arg = reply_msg.raw_text or reply_msg.text or ""
+    if not raw_input and reply_msg:
+        raw_input = reply_msg.raw_text or reply_msg.text or ""
 
-    peer, msg_id, is_single = _parse_tg_message_link(arg)
+    # Проверяем флаг принудительной одиночной отправки (-s, -1, -single)
+    tokens = raw_input.split()
+    force_single = any(t.lower() in ("-s", "-single", "-1") for t in tokens)
+    cleaned_link_text = " ".join(t for t in tokens if t.lower() not in ("-s", "-single", "-1"))
+
+    peer, msg_id, _ = _parse_tg_message_link(cleaned_link_text)
     if not peer or not msg_id:
-        await event.edit("ℹ️ Использование: `/cp <ссылка на сообщение>` или ответь `/cp` на сообщение со ссылкой.")
+        await event.edit("ℹ️ Использование: `/cp <ссылка на сообщение>` (или ответь `/cp` на сообщение со ссылкой).\nФлаг `-1`: только одно фото из альбома.")
         return
 
     # Получаем исходное сообщение по ссылке
@@ -9062,14 +9072,21 @@ async def cp_command(event):
             if getattr(banned, "send_polls", False) is True:
                 restrictions["polls"] = False
 
-    # Проверяем альбом
+    # 1. Поиск полного альбома:
+    # Telegram автоматически лепит ?single при копировании ссылки на фото из альбома.
+    # Поэтому при наличии grouped_id мы ВСЕГДА ищем весь альбом через быстрый пакетный RPC get_messages!
     album_msgs = []
-    if getattr(target_msg, "grouped_id", None) and not is_single:
+    if getattr(target_msg, "grouped_id", None) and not force_single:
         try:
-            async for m in client.iter_messages(peer, min_id=target_msg.id - 10, max_id=target_msg.id + 10):
-                if getattr(m, "grouped_id", None) == target_msg.grouped_id and m.media:
-                    album_msgs.append(m)
+            candidate_ids = list(range(max(1, target_msg.id - 14), target_msg.id + 15))
+            nearby_msgs = await client.get_messages(peer, ids=candidate_ids)
+            album_msgs = [
+                m for m in (nearby_msgs or [])
+                if m and getattr(m, "grouped_id", None) == target_msg.grouped_id and getattr(m, "media", None)
+            ]
             album_msgs.sort(key=lambda x: x.id)
+            if album_msgs:
+                log("CP", f"Найден альбом из {len(album_msgs)} элементов (grouped_id={target_msg.grouped_id})")
         except Exception as e:
             log("CP", f"Не удалось собрать альбом: {e}")
             album_msgs = []
@@ -9084,11 +9101,17 @@ async def cp_command(event):
         if any(not _check_media_permission(t, restrictions) for t in album_types):
             media_allowed = False
 
-    # Если медиа запрещено настройками чата -> ФИЛЬТРУЕМ:
+    # Если медиа запрещено настройками целевого чата -> ФИЛЬТРУЕМ:
     if getattr(target_msg, "media", None) and not isinstance(target_msg.media, MessageMediaWebPage) and not media_allowed:
         log("CP", f"Медиа ({media_type}) отфильтровано из-за ограничений чата {getattr(dest_chat, 'id', event.chat_id)}")
         text_to_send = target_msg.message or ""
         entities_to_send = target_msg.entities
+
+        if is_album:
+            for m in album_msgs:
+                if m.message and not text_to_send:
+                    text_to_send = m.message
+                    entities_to_send = m.entities
 
         if not text_to_send.strip():
             doc_name = None
@@ -9111,91 +9134,229 @@ async def cp_command(event):
             await event.delete()
         return
 
-    # Скачивание и отправка контента
-    temp_dir = tempfile.mkdtemp(prefix="pocket_cp_")
-    try:
-        # Чисто текст или сообщение со ссылкой (веб-превью)
-        if media_type in ("none", "webpage"):
+    # Чисто текстовое сообщение или сообщение с веб-превью (ссылкой):
+    if media_type in ("none", "webpage"):
+        await client.send_message(
+            event.chat_id,
+            target_msg.message or "",
+            formatting_entities=target_msg.entities,
+            reply_to=reply_target_id,
+            link_preview=isinstance(target_msg.media, MessageMediaWebPage)
+        )
+        if is_owner:
+            await event.delete()
+        return
+
+    # Опрос (Poll):
+    if isinstance(target_msg.media, MessageMediaPoll):
+        try:
             await client.send_message(
                 event.chat_id,
-                target_msg.message or "",
-                formatting_entities=target_msg.entities,
-                reply_to=reply_target_id,
-                link_preview=isinstance(target_msg.media, MessageMediaWebPage)
+                file=target_msg.media,
+                reply_to=reply_target_id
             )
             if is_owner:
                 await event.delete()
             return
+        except Exception as e:
+            log("CP", f"Ошибка отправки опроса: {e}")
 
-        # Опрос (Poll)
-        if isinstance(target_msg.media, MessageMediaPoll):
-            try:
-                await client.send_message(
-                    event.chat_id,
-                    file=target_msg.media,
-                    reply_to=reply_target_id
-                )
-                if is_owner:
-                    await event.delete()
-                return
-            except Exception as e:
-                log("CP", f"Ошибка отправки опроса: {e}")
-
-        # Альбом
+    temp_dir = tempfile.mkdtemp(prefix="pocket_cp_")
+    try:
+        # ====================================================================
+        # СЦЕНАРИЙ А: АЛЬБОМ
+        # ====================================================================
         if is_album:
-            downloaded_paths = []
             caption = None
             caption_entities = None
             for m in album_msgs:
                 if m.message and not caption:
                     caption = m.message
                     caption_entities = m.entities
-                p = await client.download_media(m, file=temp_dir)
-                if p:
-                    downloaded_paths.append(p)
 
-            if downloaded_paths:
-                try:
+            # 1. FAST PATH: Прямая отправка через серверные media-ссылки Telegram (<1 сек)
+            fast_path_ok = False
+            try:
+                album_medias = [m.media for m in album_msgs if getattr(m, "media", None)]
+                if len(album_medias) == len(album_msgs):
                     await client.send_file(
                         event.chat_id,
-                        file=downloaded_paths,
+                        file=album_medias,
                         caption=caption,
                         formatting_entities=caption_entities,
                         reply_to=reply_target_id
                     )
-                    if is_owner:
-                        await event.delete()
-                    return
-                except MediaCaptionTooLongError:
-                    await client.send_file(
+                    fast_path_ok = True
+                    log("CP", f"Альбом из {len(album_msgs)} фото отправлен через Fast Path (мгновенно)")
+            except Exception as fast_err:
+                log("CP", f"Fast path альбома не сработал ({fast_err}), перехожу к скачиванию...")
+
+            if fast_path_ok:
+                if is_owner:
+                    await event.delete()
+                return
+
+            # 2. FALLBACK: Локальное скачивание и загрузка (для каналов с noforwards/защитой)
+            try:
+                await event.edit(f"⏳ Скачиваю альбом ({len(album_msgs)} файлов)…")
+            except Exception:
+                pass
+
+            downloaded_paths = []
+            for m in album_msgs:
+                p = await client.download_media(m, file=temp_dir)
+                if p:
+                    downloaded_paths.append(p)
+
+            if not downloaded_paths:
+                if caption:
+                    await client.send_message(event.chat_id, caption, formatting_entities=caption_entities, reply_to=reply_target_id)
+                if is_owner:
+                    await event.delete()
+                return
+
+            try:
+                await event.edit(f"⏳ Отправляю альбом ({len(downloaded_paths)} файлов)…")
+            except Exception:
+                pass
+
+            try:
+                await client.send_file(
+                    event.chat_id,
+                    file=downloaded_paths,
+                    caption=caption,
+                    formatting_entities=caption_entities,
+                    reply_to=reply_target_id
+                )
+            except MediaCaptionTooLongError:
+                await client.send_file(
+                    event.chat_id,
+                    file=downloaded_paths,
+                    reply_to=reply_target_id
+                )
+                if caption:
+                    await client.send_message(
                         event.chat_id,
-                        file=downloaded_paths,
+                        caption,
+                        formatting_entities=caption_entities,
                         reply_to=reply_target_id
                     )
+            except Exception as e:
+                err_str = str(e).lower()
+                if any(k in err_str for k in ["forbidden", "restricted", "admin_required", "right"]):
+                    log("CP", f"Runtime запрет медиа в группе ({e}), фильтруем альбом...")
                     if caption:
-                        await client.send_message(
-                            event.chat_id,
-                            caption,
-                            formatting_entities=caption_entities,
-                            reply_to=reply_target_id
-                        )
-                    if is_owner:
-                        await event.delete()
-                    return
-                except Exception as e:
-                    err_str = str(e).lower()
-                    if any(k in err_str for k in ["forbidden", "restricted", "admin_required", "right"]):
-                        log("CP", f"Runtime запрет медиа в группе ({e}), фильтруем альбом...")
-                        if caption:
-                            await client.send_message(event.chat_id, caption, formatting_entities=caption_entities, reply_to=reply_target_id)
-                        else:
-                            await client.send_message(event.chat_id, "📎 _[Альбом отфильтрован настройками группы]_", reply_to=reply_target_id)
-                        if is_owner:
-                            await event.delete()
-                        return
+                        await client.send_message(event.chat_id, caption, formatting_entities=caption_entities, reply_to=reply_target_id)
+                    else:
+                        await client.send_message(event.chat_id, "📎 _[Альбом отфильтрован настройками группы]_", reply_to=reply_target_id)
+                else:
                     raise
 
-        # Одиночное медиа
+            if is_owner:
+                await event.delete()
+            return
+
+        # ====================================================================
+        # СЦЕНАРИЙ Б: ОДИНОЧНОЕ МЕДИА (ВИДЕО, ФОТО, КРУЖОК, ГОЛОС, ФАЙЛ)
+        # ====================================================================
+        caption = target_msg.message or ""
+        caption_entities = target_msg.entities
+        is_spoiler = getattr(target_msg.media, "spoiler", False) or False
+
+        # 1. FAST PATH: Прямая серверная отправка за 0.5–1 сек (без скачивания гигабайт на диск)
+        fast_path_ok = False
+        try:
+            if media_type == "roundvideo":
+                await client.send_file(
+                    event.chat_id,
+                    file=target_msg.media,
+                    video_note=True,
+                    reply_to=reply_target_id
+                )
+                fast_path_ok = True
+            elif media_type == "voice":
+                await client.send_file(
+                    event.chat_id,
+                    file=target_msg.media,
+                    voice_note=True,
+                    caption=caption or None,
+                    formatting_entities=caption_entities if caption else None,
+                    reply_to=reply_target_id
+                )
+                fast_path_ok = True
+            elif media_type == "sticker":
+                await client.send_file(
+                    event.chat_id,
+                    file=target_msg.media,
+                    reply_to=reply_target_id
+                )
+                fast_path_ok = True
+            elif media_type == "video":
+                await client.send_file(
+                    event.chat_id,
+                    file=target_msg.media,
+                    caption=caption or None,
+                    formatting_entities=caption_entities if caption else None,
+                    reply_to=reply_target_id,
+                    supports_streaming=True,
+                    spoiler=is_spoiler
+                )
+                fast_path_ok = True
+            elif media_type == "photo":
+                await client.send_file(
+                    event.chat_id,
+                    file=target_msg.media,
+                    caption=caption or None,
+                    formatting_entities=caption_entities if caption else None,
+                    reply_to=reply_target_id,
+                    spoiler=is_spoiler
+                )
+                fast_path_ok = True
+            elif media_type == "audio":
+                attrs = getattr(getattr(target_msg, "document", None), "attributes", None)
+                await client.send_file(
+                    event.chat_id,
+                    file=target_msg.media,
+                    caption=caption or None,
+                    formatting_entities=caption_entities if caption else None,
+                    reply_to=reply_target_id,
+                    attributes=attrs
+                )
+                fast_path_ok = True
+            else:
+                attrs = getattr(getattr(target_msg, "document", None), "attributes", None)
+                await client.send_file(
+                    event.chat_id,
+                    file=target_msg.media,
+                    caption=caption or None,
+                    formatting_entities=caption_entities if caption else None,
+                    reply_to=reply_target_id,
+                    force_document=True,
+                    attributes=attrs
+                )
+                fast_path_ok = True
+
+            if fast_path_ok:
+                log("CP", f"{media_type} отправлен через Fast Path (мгновенно без скачивания)")
+        except Exception as fast_err:
+            log("CP", f"Fast path для {media_type} не удался ({fast_err}), использую локальный download...")
+
+        if fast_path_ok:
+            if is_owner:
+                await event.delete()
+            return
+
+        # 2. FALLBACK: Локальное скачивание и загрузка (для каналов с noforwards/Kylo Private)
+        file_size = getattr(target_msg, "file", None) and getattr(target_msg.file, "size", 0) or 0
+        size_mb = round(file_size / (1024 * 1024), 1) if file_size else 0
+
+        # Показываем статус, если файл больше 1.5 МБ, чтобы пользователь видел реальный процесс
+        if size_mb > 1.5:
+            try:
+                await event.edit(f"⏳ Скачиваю {media_type} ({size_mb} МБ)…")
+            except Exception:
+                pass
+
         orig_filename = None
         if target_msg.file and target_msg.file.name:
             orig_filename = target_msg.file.name
@@ -9209,9 +9370,11 @@ async def cp_command(event):
                 await event.delete()
             return
 
-        caption = target_msg.message or ""
-        caption_entities = target_msg.entities
-        is_spoiler = getattr(target_msg.media, "spoiler", False) or False
+        if size_mb > 1.5:
+            try:
+                await event.edit(f"⏳ Отправляю {media_type} ({size_mb} МБ)…")
+            except Exception:
+                pass
 
         try:
             if media_type == "roundvideo":
@@ -9317,6 +9480,7 @@ async def cp_command(event):
         await event.edit(f"❌ Ошибка копирования: {e}")
     finally:
         shutil.rmtree(temp_dir, ignore_errors=True)
+
 
 
 @client.on(events.NewMessage(outgoing=True, pattern=r"^[./]status$", from_users="me"))
