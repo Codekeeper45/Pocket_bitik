@@ -9005,7 +9005,7 @@ async def cp_command(event):
         await event.edit("ℹ️ Использование: `/cp <ссылка на сообщение>` (или ответь `/cp` на сообщение со ссылкой).\nФлаг `-1`: только одно фото из альбома.")
         return
 
-    # Получаем исходное сообщение по ссылке
+    # Получаем исходное сообщение по ссылке (с авто-детектом соседних постов пачки, если ID пустой)
     try:
         fetched = await client.get_messages(peer, ids=[msg_id])
         target_msg = next((x for x in (fetched or []) if x is not None), None)
@@ -9017,6 +9017,21 @@ async def cp_command(event):
     if not target_msg:
         await event.edit("❌ Сообщение по ссылке не найдено (удалено или нет доступа к чату).")
         return
+
+    # Защита от пустых сервисных слотов (в Telegram при массовой публикации клиент копирует ссылку на пустой ID):
+    if not (target_msg.message or "").strip() and not getattr(target_msg, "media", None):
+        try:
+            nearby_ids = list(range(msg_id + 1, msg_id + 6))
+            nearby_list = await client.get_messages(peer, ids=nearby_ids)
+            for cand in (nearby_list or []):
+                if cand and cand.sender_id == target_msg.sender_id:
+                    if (cand.message or "").strip() or getattr(cand, "media", None):
+                        log("CP", f"Слот #{msg_id} пустой. Авто-подхват сообщения пачки #{cand.id}")
+                        target_msg = cand
+                        msg_id = cand.id
+                        break
+        except Exception as scan_err:
+            log("CP", f"Ошибка поиска в пачке: {scan_err}")
 
     # Определяем ограничения целевого чата
     dest_chat = await event.get_chat()
@@ -9136,9 +9151,13 @@ async def cp_command(event):
 
     # Чисто текстовое сообщение или сообщение с веб-превью (ссылкой):
     if media_type in ("none", "webpage"):
+        text_content = target_msg.message or ""
+        if not text_content.strip():
+            await event.edit("⚠️ По этой ссылке пустое сообщение (нет текста и медиа).")
+            return
         await client.send_message(
             event.chat_id,
-            target_msg.message or "",
+            text_content,
             formatting_entities=target_msg.entities,
             reply_to=reply_target_id,
             link_preview=isinstance(target_msg.media, MessageMediaWebPage)
