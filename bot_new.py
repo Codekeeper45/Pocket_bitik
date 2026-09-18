@@ -8964,6 +8964,79 @@ def _check_media_permission(media_type: str, restrictions: dict) -> bool:
     return restrictions.get("media", True)
 
 
+def _parse_rich_text(text_obj) -> str:
+    """
+    Рекурсивно конвертирует дерево объектов текста Telegram RichMessage (Telegram 2026+)
+    в валидный HTML для отправки через telethon.extensions.html.parse.
+    """
+    if not text_obj:
+        return ""
+    tname = type(text_obj).__name__
+    if tname == "TextEmpty":
+        return ""
+    if tname == "TextPlain":
+        t = getattr(text_obj, "text", "")
+        return t.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+    if tname == "TextConcat":
+        return "".join(_parse_rich_text(t) for t in getattr(text_obj, "texts", []))
+    if tname == "TextBold":
+        sub = _parse_rich_text(getattr(text_obj, "text", ""))
+        return f"<b>{sub}</b>" if sub else ""
+    if tname == "TextItalic":
+        sub = _parse_rich_text(getattr(text_obj, "text", ""))
+        return f"<i>{sub}</i>" if sub else ""
+    if tname == "TextUnderline":
+        sub = _parse_rich_text(getattr(text_obj, "text", ""))
+        return f"<u>{sub}</u>" if sub else ""
+    if tname == "TextStrike":
+        sub = _parse_rich_text(getattr(text_obj, "text", ""))
+        return f"<s>{sub}</s>" if sub else ""
+    if tname == "TextFixed":
+        sub = _parse_rich_text(getattr(text_obj, "text", ""))
+        return f"<code>{sub}</code>" if sub else ""
+    if tname == "TextUrl":
+        sub = _parse_rich_text(getattr(text_obj, "text", ""))
+        url = getattr(text_obj, "url", "")
+        return f'<a href="{url}">{sub}</a>' if sub else url
+    if tname == "TextCustomEmoji":
+        return getattr(text_obj, "alt", "") or "✨"
+    if tname == "TextHashtag":
+        return _parse_rich_text(getattr(text_obj, "text", ""))
+    if hasattr(text_obj, "text"):
+        return _parse_rich_text(getattr(text_obj, "text"))
+    return ""
+
+
+def _extract_rich_message_data(target_msg):
+    """
+    Извлекает HTML-разметку и список фото/медиа из нового формата Telegram RichMessage.
+    """
+    rm = getattr(target_msg, "rich_message", None)
+    if not rm:
+        return None, None
+    html_parts = []
+    photos_found = []
+    blocks = getattr(rm, "blocks", [])
+    photos_map = {p.id: p for p in getattr(rm, "photos", [])}
+
+    for b in blocks:
+        bname = type(b).__name__
+        if bname in ("PageBlockParagraph", "PageBlockHeader", "PageBlockSubheader"):
+            t = _parse_rich_text(getattr(b, "text", None))
+            if t:
+                html_parts.append(t)
+        elif bname == "PageBlockPhoto":
+            pid = getattr(b, "photo_id", None)
+            if pid in photos_map:
+                photos_found.append(photos_map[pid])
+            caption = _parse_rich_text(getattr(getattr(b, "caption", None), "text", None))
+            if caption:
+                html_parts.append(caption)
+
+    full_html = "\n\n".join(html_parts).strip()
+    return full_html, photos_found
+
+
 @client.on(events.NewMessage(pattern=r"^[./]cp(?:\s+(.+))?$"))
 async def cp_command(event):
     """
@@ -9018,6 +9091,16 @@ async def cp_command(event):
         await event.edit("❌ Сообщение по ссылке не найдено (удалено или нет доступа к чату).")
         return
 
+    # Поддержка Telegram RichMessage (новинка Telegram 2026: статьи, посты каналов с блочной версткой):
+    rich_html, rich_photos = _extract_rich_message_data(target_msg)
+    if rich_html:
+        clean_text, rich_entities = tl_html.parse(rich_html)
+        target_msg.message = clean_text
+        target_msg.entities = rich_entities
+        if rich_photos and not getattr(target_msg, "media", None):
+            target_msg.media = rich_photos[0]
+            log("CP", f"Сообщение #{msg_id} распознано как RichMessage (текст {len(clean_text)} симв, фото={len(rich_photos)})")
+
     # Защита от пустых сервисных слотов (в Telegram при массовой публикации клиент копирует ссылку на пустой ID):
     if not (target_msg.message or "").strip() and not getattr(target_msg, "media", None):
         try:
@@ -9025,6 +9108,13 @@ async def cp_command(event):
             nearby_list = await client.get_messages(peer, ids=nearby_ids)
             for cand in (nearby_list or []):
                 if cand and cand.sender_id == target_msg.sender_id:
+                    c_html, c_photos = _extract_rich_message_data(cand)
+                    if c_html:
+                        c_clean, c_ent = tl_html.parse(c_html)
+                        cand.message = c_clean
+                        cand.entities = c_ent
+                        if c_photos and not getattr(cand, "media", None):
+                            cand.media = c_photos[0]
                     if (cand.message or "").strip() or getattr(cand, "media", None):
                         log("CP", f"Слот #{msg_id} пустой. Авто-подхват сообщения пачки #{cand.id}")
                         target_msg = cand
