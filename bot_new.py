@@ -8916,7 +8916,8 @@ def _classify_message_media(msg) -> str:
         return "webpage"
     if isinstance(msg.media, MessageMediaPoll):
         return "poll"
-    if getattr(msg, "photo", None):
+    # Поддержка как MessageMediaPhoto, так и чистого объекта Photo (из Telegram RichMessage):
+    if getattr(msg, "photo", None) or type(msg.media).__name__ in ("MessageMediaPhoto", "Photo"):
         return "photo"
     if getattr(msg, "voice", None):
         return "voice"
@@ -9471,7 +9472,9 @@ async def cp_command(event):
             orig_filename = target_msg.file.name
 
         target_path = os.path.join(temp_dir, orig_filename) if orig_filename else temp_dir
-        downloaded = await client.download_media(target_msg, file=target_path)
+        # Если media подставлено из RichMessage (объект Photo), скачиваем напрямую media:
+        media_to_download = target_msg.media if type(getattr(target_msg, "media", None)).__name__ == "Photo" else target_msg
+        downloaded = await client.download_media(media_to_download, file=target_path)
         if not downloaded or not os.path.exists(downloaded):
             if target_msg.message:
                 await client.send_message(event.chat_id, target_msg.message, formatting_entities=target_msg.entities, reply_to=reply_target_id)
