@@ -114,6 +114,24 @@ tokenharbor_api_key = os.getenv("TOKENHARBOR_API_KEY")  # Token Harbor API (toke
 TOKENHARBOR_BASE_URL = os.getenv("TOKENHARBOR_BASE_URL", "https://tokenharbor.ai/v1")
 atria_api_key = os.getenv("ATRIA_API_KEY")  # ATRIA API (api.atria-asi.ai)
 ATRIA_BASE_URL = os.getenv("ATRIA_BASE_URL", "https://api.atria-asi.ai/v1")
+
+
+def _collect_plusvibe_keys() -> list:
+    """Собирает ключи PlusVibe API из PLUSVIBE_API_KEY, PLUSVIBE_API_KEYS, PLUSVIBE_API_KEY_2."""
+    raw = []
+    for var in ("PLUSVIBE_API_KEY", "PLUSVIBE_API_KEYS", "PLUSVIBE_KEY_1", "PLUSVIBE_KEY_2", "PLUSVIBE_API_KEY_2"):
+        val = os.getenv(var) or ""
+        raw += [k.strip() for k in val.split(",") if k.strip()]
+    seen, out = set(), []
+    for k in raw:
+        if k not in seen:
+            seen.add(k)
+            out.append(k)
+    return out
+
+
+plusvibe_api_keys = _collect_plusvibe_keys()  # PlusVibe API (plusvibeapi.ru, ротация ключей)
+PLUSVIBE_BASE_URL = os.getenv("PLUSVIBE_BASE_URL", "https://plusvibeapi.ru/v1")
 tavily_api_key = os.getenv("TAVILY_API_KEY")  # веб-поиск/извлечение страниц для /ask (tavily.com); без ключа веб-инструменты выключены
 index_db_url = os.getenv("INDEX_DB_URL")  # MariaDB для /index (GraphRAG-память): mysql://user:pass@host:port/db (pass URL-encoded)
 llama_cloud_api_key = os.getenv("LLAMA_CLOUD_API_KEY")  # OCR фото (LlamaParse); без него фото идут через vision
@@ -500,6 +518,15 @@ for _atslug, _atid, _atlabel, _atctx, _atsafe in [
     ("atria-dawn", "Atria-Dawn-Preview", "Atria Dawn", 262144, 1.15),
 ]:
     MODEL_REGISTRY[_atslug] = ("atria", _atid, _atlabel, _atctx, _atsafe)
+# PlusVibe (plusvibeapi.ru, 30M free tokens, OpenAI-совместимый API с reasoning).
+for _pvslug, _pvid, _pvlabel, _pvctx, _pvsafe in [
+    ("deepseek-v4.1-flash", "deepseek-v4.1-flash:free", "DeepSeek V4.1 Flash (PlusVibe Free)", 1000000, 1.15),
+    ("pv-deepseek-v4.1-flash", "deepseek-v4.1-flash:free", "DeepSeek V4.1 Flash (PlusVibe Free)", 1000000, 1.15),
+    ("pv-deepseek-v4-flash", "deepseek-v4-flash-0731:free", "DeepSeek V4 Flash 0731 (PlusVibe Free)", 1000000, 1.15),
+    ("pv-minimax-m2.7", "minimax-m2.7:free", "MiniMax M2.7 (PlusVibe Free)", 200000, 1.30),
+    ("pv-glm-5.3-flash", "glm-5.3-flash:free", "GLM 5.3 Flash (PlusVibe Free)", 262144, 1.30),
+]:
+    MODEL_REGISTRY[_pvslug] = ("plusvibe", _pvid, _pvlabel, _pvctx, _pvsafe)
 # Реестр почищен (2026-06-14): оставлены только новейшие версии каждой модели на КАЖДОМ провайдере
 # (разный провайдер/транспорт — отдельная модель). Убраны устаревшие: glm-5/5.1 (на opencode появился
 # glm-5.2 — см. ниже), kimi-k2.5, minimax-m2.5/m2.7, qwen3.5/3.6-plus, mimo-v2.5/v2-pro.
@@ -745,7 +772,7 @@ def _clamp_reasoning(model_id: str, effort: str, provider: str = None) -> str:
         return "max" if effort == "xhigh" else "high"
     if provider == "sakana":
         return "max" if effort == "xhigh" else "high"  # Sakana: только high/xhigh→max (off/low/medium нет)
-    if provider in ("nanogpt", "seekai", "tokenharbor", "atria"):
+    if provider in ("nanogpt", "seekai", "tokenharbor", "atria", "plusvibe"):
         mid = (model_id or "").lower()
         if effort in ("xhigh", "max"):
             return "max" if ("deepseek" in mid or ":thinking" in mid or "glm" in mid or "qwen" in mid or "atria" in mid) else "high"
@@ -776,8 +803,8 @@ def _fmt_rlevel(model_id: str, lv: str, provider: str) -> str:
 
 
 def _supports_reasoning(provider: str) -> bool:
-    """Провайдеры с управляемой глубиной размышлений (/model reason): OpenAI, Google Gemini, Fireworks, opencode, DeepSeek, Sakana, NanoGPT, SeekAI, Token Harbor, ATRIA."""
-    return provider in ("openai", "google", "fireworks", "opencode", "deepseek", "sakana", "nanogpt", "seekai", "tokenharbor", "atria")
+    """Провайдеры с управляемой глубиной размышлений (/model reason): OpenAI, Google Gemini, Fireworks, opencode, DeepSeek, Sakana, NanoGPT, SeekAI, Token Harbor, ATRIA, PlusVibe."""
+    return provider in ("openai", "google", "fireworks", "opencode", "deepseek", "sakana", "nanogpt", "seekai", "tokenharbor", "atria", "plusvibe")
 
 
 # Task-локальный оверрайд глубины размышлений для утилитарных вызовов (дайджест): обёртки читают
@@ -810,7 +837,7 @@ def _reasoning_levels(slug: str):
         return DEEPSEEK_REASONING_LEVELS  # xhigh(→max)/high/none(→off)
     if spec[0] == "sakana":
         return SAKANA_REASONING_LEVELS  # xhigh(→max)/high — off нет
-    if spec[0] in ("nanogpt", "seekai", "tokenharbor", "atria"):
+    if spec[0] in ("nanogpt", "seekai", "tokenharbor", "atria", "plusvibe"):
         mid = spec[1].lower()
         if "deepseek" in mid or ":thinking" in mid or "glm" in mid or "qwen" in mid or "atria" in mid:
             return ["xhigh", "high", "medium", "low", "none"] if ":thinking" not in mid else ["xhigh", "high", "medium", "low"]
@@ -1916,6 +1943,74 @@ class _AtriaReasoningClient:
 
 atria_client = _AtriaReasoningClient(atria_api_key) if atria_api_key else None
 
+
+class _PlusvibeReasoningClient:
+    """Адаптер для PlusVibe (plusvibeapi.ru, OpenAI-совместимый API с reasoning и ротацией ключей).
+    Поддерживает reasoning_content, нативные tools и ротацию при исчерпании лимитов."""
+
+    def __init__(self, api_keys: list):
+        self._keys = list(api_keys)
+        self._clients = [
+            OpenAI(
+                api_key=k,
+                base_url=PLUSVIBE_BASE_URL,
+                default_headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
+            )
+            for k in self._keys
+        ]
+        self._idx = 0
+        self.chat = SimpleNamespace(completions=SimpleNamespace(create=self._create))
+
+    def _create(self, **kwargs):
+        if not self._clients:
+            raise RuntimeError("PlusVibe API keys are not configured")
+        _eff = _effective_reasoning()
+        model = kwargs.get("model", "")
+        had_effort = False
+        if _eff:
+            eff = _clamp_reasoning(model, _eff, "plusvibe")
+            kwargs.setdefault("reasoning_effort", eff)
+            had_effort = True
+            _floor = {"medium": 24000, "high": 40000, "xhigh": 64000, "max": 64000}.get(kwargs.get("reasoning_effort"))
+            if _floor and int(kwargs.get("max_tokens") or 0) < _floor:
+                kwargs["max_tokens"] = _floor
+
+        last_exc = None
+        attempts = len(self._clients)
+        for _ in range(attempts):
+            client = self._clients[self._idx % len(self._clients)]
+            try:
+                return client.chat.completions.create(**kwargs)
+            except Exception as e:
+                last_exc = e
+                code = getattr(e, "status_code", None)
+                err_str = str(e).lower()
+                if code in (429, 401, 402, 403) or "quota" in err_str or "rate limit" in err_str or "balance" in err_str:
+                    log("MODEL", f"PlusVibe ключ #{self._idx % len(self._clients)} вернул {code} ({e}) — переключаем на следующий ключ")
+                    self._idx += 1
+                    continue
+                if code == 400 or "bad_request" in err_str or "parameters" in err_str:
+                    if had_effort and "reasoning_effort" in kwargs:
+                        log("MODEL", f"PlusVibe {model}: 400 ({e}) — ретрай без reasoning_effort")
+                        kwargs.pop("reasoning_effort", None)
+                        try:
+                            return client.chat.completions.create(**kwargs)
+                        except Exception as e2:
+                            e = e2
+                            code = getattr(e, "status_code", None)
+                            err_str = str(e).lower()
+                    if kwargs.get("tools") and (code == 400 or "bad_request" in err_str or "parameters" in err_str):
+                        log("MODEL", f"PlusVibe {model}: 400 ({e}) — ретрай без tools")
+                        kwargs.pop("tools", None)
+                        kwargs.pop("tool_choice", None)
+                        return client.chat.completions.create(**kwargs)
+                raise
+        if last_exc:
+            raise last_exc
+
+
+plusvibe_client = _PlusvibeReasoningClient(plusvibe_api_keys) if plusvibe_api_keys else None
+
 AUTO_REPLY_BUFFERS: dict = {}
 AUTO_REPLY_TASKS: dict = {}
 AUTO_REPLY_BUSY: set = set()     # чаты в фазе LLM/отправки — не отменяем их таску (иначе теряем сообщения)
@@ -2002,13 +2097,13 @@ _model_state = load_json(MODEL_STATE_PATH, {})
 # чтобы они стали полноценными записями и пережили рестарт.
 CUSTOM_MODELS = _model_state.get("custom_models", {})  # {id: {"provider", "label", "ctx", "safety", "vision"}}
 for _cid, _ci in CUSTOM_MODELS.items():
-    _c_prov = _ci.get("provider") or ("nanogpt" if _ci.get("nanogpt") else ("seekai" if _ci.get("seekai") else ("tokenharbor" if _ci.get("tokenharbor") else ("atria" if _ci.get("atria") else "openrouter"))))
+    _c_prov = _ci.get("provider") or ("nanogpt" if _ci.get("nanogpt") else ("seekai" if _ci.get("seekai") else ("tokenharbor" if _ci.get("tokenharbor") else ("atria" if _ci.get("atria") else ("plusvibe" if _ci.get("plusvibe") else "openrouter")))))
     MODEL_REGISTRY[_cid] = (
         _c_prov,
         _cid,
         (_ci.get("label") or _cid),
         int(_ci.get("ctx") or 128000),
-        float(_ci.get("safety") or (1.15 if _c_prov in ("nanogpt", "seekai", "tokenharbor", "atria") else 1.3))
+        float(_ci.get("safety") or (1.15 if _c_prov in ("nanogpt", "seekai", "tokenharbor", "atria", "plusvibe") else 1.3))
     )
 ACTIVE_MODEL = _model_state.get("active", "deepseek-pro")
 if ACTIVE_MODEL not in MODEL_REGISTRY:
@@ -2085,6 +2180,8 @@ def _client_for_provider(provider):
         return tokenharbor_client
     if provider == "atria":
         return atria_client
+    if provider == "plusvibe":
+        return plusvibe_client
     if provider == "opencode":
         return opencode_reasoning_client  # путь ответов с инжектом reasoning_effort
     return opencode_client  # неизвестный провайдер — сырой клиент (фоллбэк)
@@ -2123,7 +2220,7 @@ def _model_supports_vision(slug):
         return True  # vision-слуги OpenCode (kimi/glm/qwen/mimo)
     spec = MODEL_REGISTRY.get(slug)
     provider = spec[0] if spec else None
-    if provider in ("nanogpt", "seekai", "tokenharbor", "atria"):
+    if provider in ("nanogpt", "seekai", "tokenharbor", "atria", "plusvibe"):
         mid = (spec[1] if spec else "").lower()
         if "deepseek-v4.1-flash" in mid or "vision" in mid or "-vl" in mid or "omni" in mid or "gemini" in mid:
             return True
@@ -2301,6 +2398,51 @@ async def _atria_model_info(model_id: str):
         return False, False, 0, None, None
     except Exception as e:
         log("MODEL", f"Проверка {model_id} в ATRIA: {e}")
+        return None, False, 0, None, None
+
+
+_PLUSVIBE_MODELS_CACHE = {"ts": 0.0, "data": None}
+_PLUSVIBE_MODELS_TTL = 600  # 10 мин — кэш списка моделей PlusVibe
+
+
+async def _plusvibe_model_info(model_id: str):
+    """Проверяет модель в PlusVibe (GET /models). Возвращает (exists, supports_image, context_length, name, canonical_id)."""
+    now = time.monotonic()
+
+    def _fetch():
+        headers = {"Authorization": f"Bearer {plusvibe_api_keys[0]}"} if plusvibe_api_keys else {}
+        headers["User-Agent"] = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
+        r = requests.get(f"{PLUSVIBE_BASE_URL}/models", headers=headers, timeout=20)
+        r.raise_for_status()
+        return r.json().get("data", [])
+
+    try:
+        if _PLUSVIBE_MODELS_CACHE["data"] is not None and (now - _PLUSVIBE_MODELS_CACHE["ts"]) < _PLUSVIBE_MODELS_TTL:
+            data = _PLUSVIBE_MODELS_CACHE["data"]
+        else:
+            data = await asyncio.to_thread(_fetch)
+            _PLUSVIBE_MODELS_CACHE["data"] = data
+            _PLUSVIBE_MODELS_CACHE["ts"] = now
+
+        clean_req = model_id.strip()
+        clean_req_low = clean_req.lower()
+
+        for m in data:
+            mid = m.get("id", "")
+            lbl = m.get("label", mid)
+            if mid == clean_req or mid.lower() == clean_req_low or clean_req_low in (mid.lower(), mid.lower().replace(":free", "")):
+                is_vision = any(x in mid.lower() for x in ("vision", "-vl", "omni", "gemini", "claude", "v4.1-flash"))
+                if any(x in mid.lower() for x in ("deepseek-v4", "glm-5", "gemini-3", "minimax")):
+                    ctx = 1000000
+                elif any(x in mid.lower() for x in ("qwen3", "gemma-4", "gpt-5.6", "kimi")):
+                    ctx = 262144
+                else:
+                    ctx = 128000
+                label = f"{lbl} (PlusVibe)"
+                return True, is_vision, ctx, label, mid
+        return False, False, 0, None, None
+    except Exception as e:
+        log("MODEL", f"Проверка {model_id} в PlusVibe: {e}")
         return None, False, 0, None, None
 
 
@@ -7611,8 +7753,8 @@ async def model_command(event):
             mk = "▶" if mid == ACTIVE_MODEL else " "
             n = slugs.index(mid) + 1 if mid in slugs else None  # номер в общем списке /model
             num = f" · быстрый выбор `/model {n}`" if n else ""
-            c_prov = ci.get("provider") or ("nanogpt" if ci.get("nanogpt") else ("seekai" if ci.get("seekai") else ("tokenharbor" if ci.get("tokenharbor") else ("atria" if ci.get("atria") else "openrouter"))))
-            ptag = "ATRIA" if c_prov == "atria" else ("TokenHarbor" if c_prov == "tokenharbor" else ("SeekAI" if c_prov == "seekai" else ("NanoGPT" if c_prov == "nanogpt" else "OpenRouter")))
+            c_prov = ci.get("provider") or ("nanogpt" if ci.get("nanogpt") else ("seekai" if ci.get("seekai") else ("tokenharbor" if ci.get("tokenharbor") else ("atria" if ci.get("atria") else ("plusvibe" if ci.get("plusvibe") else "openrouter")))))
+            ptag = "PlusVibe" if c_prov == "plusvibe" else ("ATRIA" if c_prov == "atria" else ("TokenHarbor" if c_prov == "tokenharbor" else ("SeekAI" if c_prov == "seekai" else ("NanoGPT" if c_prov == "nanogpt" else "OpenRouter"))))
             lines.append(f"{mk}{i}. [{ptag}] {ci.get('label') or mid} — `{mid}`{num}")
         lines.append("\n`/model N` — выбрать по номеру · `/model <id>` / `/model ng <id>` — добавить · `/model remove <N|id>` — удалить")
         await event.edit("\n".join(lines)[:4000])
@@ -7734,6 +7876,8 @@ async def model_command(event):
                          "seekai_custom": "━━ SeekAI (кастом) ━━",
                          "atria": "━━ ATRIA ━━",
                          "atria_custom": "━━ ATRIA (кастом) ━━",
+                         "plusvibe": "━━ PlusVibe ━━",
+                         "plusvibe_custom": "━━ PlusVibe (кастом) ━━",
                          "openrouter": "━━ OpenRouter ━━",
                          "openrouter_custom": "━━ OpenRouter (кастом) ━━"}.get(header_key, f"━━ {provider} ━━")
                 lines.append(f"\n{title}")
@@ -7755,7 +7899,7 @@ async def model_command(event):
         lines.append("`/model N` / `/model <slug>` — выбрать · `/model probe` — проверить поиск (❔→🔧/🚫)")
         reff = f"`{REASONING_EFFORT}`" if REASONING_EFFORT else "авто"
         lines.append(f"🤔 — модель умеет менять глубину размышлений. `/model N.M`: M — сила (`.1` максимум → дальше слабее → последний мин/выкл). Лесенки всех моделей с тап-чипами: `/model reason` (сейчас: {reff})")
-        lines.append("`/model vendor/model` — добавить модель OpenRouter · `/model ng <id>` — NanoGPT · `/model seek <id>` — SeekAI · `/model th <id>` — Token Harbor · `/model atr <id>` — ATRIA")
+        lines.append("`/model vendor/model` — добавить модель OpenRouter · `/model ng <id>` — NanoGPT · `/model seek <id>` — SeekAI · `/model th <id>` — Token Harbor · `/model atr <id>` — ATRIA · `/model pv <id>` — PlusVibe")
         lines.append("`/model fav` — избранные кастомные модели · `/model remove <N|id>` — удалить кастомную")
         await event.edit("\n".join(lines)[:4000])
         return
@@ -7765,7 +7909,7 @@ async def model_command(event):
         tested = 0
         for slug in slugs:
             provider, mid, _label, _ctx, _safety = MODEL_REGISTRY[slug]
-            if provider in ("oc_anthropic", "openai", "google", "zai", "fireworks", "sakana", "gloy", "cerebras", "nanogpt", "seekai", "tokenharbor", "atria"):
+            if provider in ("oc_anthropic", "openai", "google", "zai", "fireworks", "sakana", "gloy", "cerebras", "nanogpt", "seekai", "tokenharbor", "atria", "plusvibe"):
                 continue  # qwen3.7-max / gpt-5.x / o3 / Gemini / Fireworks / Sakana / Gloy / NanoGPT / SeekAI: tools работают на auto, но forced пробник врёт (Sakana/Gloy отдают не tool_call) — флаг учится на лету в реальном /ask
             cl = _client_for_provider(provider)
             if cl is None:
@@ -7880,6 +8024,17 @@ async def model_command(event):
             is_atria_explicit = True
             target_arg = arg.split(":", 1)[1].strip()
 
+        is_pv_explicit = False
+        if low_arg.startswith(("pv ", "plusvibe ")):
+            is_pv_explicit = True
+            target_arg = arg.split(None, 1)[1].strip()
+        elif low_arg.startswith(("pv/", "plusvibe/")):
+            is_pv_explicit = True
+            target_arg = arg.split("/", 1)[1].strip()
+        elif low_arg.startswith(("pv:", "plusvibe:")):
+            is_pv_explicit = True
+            target_arg = arg.split(":", 1)[1].strip()
+
         is_seek_explicit = False
         if low_arg.startswith(("seek ", "seekai ")):
             is_seek_explicit = True
@@ -7901,6 +8056,10 @@ async def model_command(event):
 
         if is_atria_explicit and not target_arg:
             await event.edit("Укажи id модели ATRIA: `/model atr <id>` (напр. `/model atr Atria-Dawn-Preview`).\nКаталог: https://api.atria-asi.ai")
+            return
+
+        if is_pv_explicit and not target_arg:
+            await event.edit("Укажи id модели PlusVibe: `/model pv <id>` (напр. `/model pv deepseek-v4.1-flash:free`).\nКаталог: https://plusvibeapi.ru/models")
             return
 
         if is_seek_explicit and not target_arg:
@@ -8035,6 +8194,48 @@ async def model_command(event):
             _save_model_state()
             log("MODEL", f"Активная модель (кастомная ATRIA): {model_id}, окно {ctx}")
             await event.edit(f"✅ Модель ответов: {label} (`{model_id}`, ATRIA, окно {_fmt_ctx(ctx)})")
+            return
+
+        # Если явно указан PlusVibe:
+        if is_pv_explicit:
+            for s, entry in MODEL_REGISTRY.items():
+                if entry[0] == "plusvibe" and (s.lower() == target_arg.lower() or entry[1].lower() == target_arg.lower()):
+                    chosen = s
+                    break
+            if chosen:
+                provider, _mid, label, ctx, _safety = MODEL_REGISTRY[chosen]
+                if not is_available(provider):
+                    await event.edit(f"Модель «{label}» недоступна — нет ключа провайдера ({provider}).")
+                    return
+                ACTIVE_MODEL = chosen
+                _save_model_state()
+                log("MODEL", f"Активная модель: {chosen} ({label})")
+                rtag = ""
+                if _supports_reasoning(provider):
+                    rtag = f" · 🤔 ризонинг: `{_clamp_reasoning(_mid, REASONING_EFFORT, provider)}`" if REASONING_EFFORT else " · 🤔 ризонинг: авто (`/model reason`)"
+                await event.edit(f"✅ Модель ответов: {label} (окно {_fmt_ctx(ctx)}){rtag}")
+                return
+
+            await event.edit(f"🔎 Проверяю `{target_arg}` в PlusVibe…")
+            pv_exists, pv_img, pv_ctx, pv_name, pv_canon = await _plusvibe_model_info(target_arg)
+            if pv_exists is None:
+                await event.edit(f"⚠️ Не удалось проверить `{target_arg}` (PlusVibe недоступен). Модель не изменена.")
+                return
+            if not pv_exists:
+                await event.edit(f"❌ Модель `{target_arg}` не найдена в PlusVibe. Проверь точный id на plusvibeapi.ru/models.")
+                return
+            if not plusvibe_client:
+                await event.edit("Модель найдена в PlusVibe, но нет ключа — добавь PLUSVIBE_API_KEY в .env.")
+                return
+            model_id = pv_canon or target_arg
+            ctx = int(pv_ctx or 1000000)
+            label = pv_name or f"{model_id} (PlusVibe)"
+            CUSTOM_MODELS[model_id] = {"provider": "plusvibe", "label": label, "ctx": ctx, "safety": 1.15, "vision": bool(pv_img)}
+            MODEL_REGISTRY[model_id] = ("plusvibe", model_id, label, ctx, 1.15)
+            ACTIVE_MODEL = model_id
+            _save_model_state()
+            log("MODEL", f"Активная модель (кастомная PlusVibe): {model_id}, окно {ctx}")
+            await event.edit(f"✅ Модель ответов: {label} (`{model_id}`, PlusVibe, окно {_fmt_ctx(ctx)})")
             return
 
         # Если явно указан SeekAI:
@@ -9930,7 +10131,7 @@ async def status_command(event):
                  "oc_anthropic": "OpenCode Go (нативный)", "modelgate": "Claude/ModelGate",
                  "openai": "OpenAI", "google": "Google Gemini", "zai": "z.ai (GLM)", "fireworks": "Fireworks",
                  "sakana": "Sakana AI (Fugu)", "gloy": "LLM API FUN (Gloy AI)", "cerebras": "Cerebras",
-                 "nanogpt": "NanoGPT", "seekai": "SeekAI", "tokenharbor": "Token Harbor", "atria": "ATRIA"}.get(provider, provider)
+                 "nanogpt": "NanoGPT", "seekai": "SeekAI", "tokenharbor": "Token Harbor", "atria": "ATRIA", "plusvibe": "PlusVibe"}.get(provider, provider)
     ts = MODEL_TOOLS_SUPPORT.get(ACTIVE_MODEL)
     search_mark = "🔧 есть" if ts is True else ("🚫 нет" if ts is False else "❔ не проверен")
     sv = active_model_supports_vision()
@@ -9996,9 +10197,13 @@ async def status_command(event):
     L.append(f"⭐ **Избранное:** {len(FISH_FAVORITES)} Fish-голос(ов) · {len(CUSTOM_MODELS)} кастомных моделей")
     # — ключи —
     keys = []
-    for p, nm in [("deepseek", "DeepSeek"), ("openrouter", "OpenRouter"), ("opencode", "OpenCode"), ("modelgate", "Claude/ModelGate"), ("openai", "OpenAI"), ("google", "Google Gemini"), ("zai", "z.ai (GLM)"), ("fireworks", "Fireworks"), ("cerebras", "Cerebras"), ("nanogpt", "NanoGPT"), ("seekai", "SeekAI"), ("tokenharbor", "Token Harbor"), ("atria", "ATRIA")]:
-        keys.append(f"{nm} {'✅' if _client_for_provider(p) is not None else '❌'}")
-    keys[-1] += f"×{len(cerebras_clients)}" if cerebras_clients else ""  # число ключей ротации Cerebras
+    for p, nm in [("deepseek", "DeepSeek"), ("openrouter", "OpenRouter"), ("opencode", "OpenCode"), ("modelgate", "Claude/ModelGate"), ("openai", "OpenAI"), ("google", "Google Gemini"), ("zai", "z.ai (GLM)"), ("fireworks", "Fireworks"), ("cerebras", "Cerebras"), ("nanogpt", "NanoGPT"), ("seekai", "SeekAI"), ("tokenharbor", "Token Harbor"), ("atria", "ATRIA"), ("plusvibe", "PlusVibe")]:
+        cnt = ""
+        if p == "cerebras" and cerebras_clients:
+            cnt = f"×{len(cerebras_clients)}"
+        elif p == "plusvibe" and plusvibe_api_keys:
+            cnt = f"×{len(plusvibe_api_keys)}"
+        keys.append(f"{nm} {'✅' if _client_for_provider(p) is not None else '❌'}{cnt}")
     keys.append(f"Tavily {'✅' if tavily_api_key else '❌'}")
     keys.append(f"Google TTS {'✅' if tts_available else '❌'}")
     keys.append(f"Fish {'✅' if fish_available else '❌'}")
