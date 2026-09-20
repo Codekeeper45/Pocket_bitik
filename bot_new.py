@@ -110,6 +110,10 @@ nanogpt_api_key = os.getenv("NANOGPT_API_KEY") or os.getenv("NANO_API_KEY")  # N
 NANOGPT_BASE_URL = "https://nano-gpt.com/api/v1"
 seekai_api_key = os.getenv("SEEKAI_API_KEY")  # SeekAI API (seekai.cc)
 SEEKAI_BASE_URL = os.getenv("SEEKAI_BASE_URL", "https://seekai.cc/v1")
+tokenharbor_api_key = os.getenv("TOKENHARBOR_API_KEY")  # Token Harbor API (tokenharbor.ai)
+TOKENHARBOR_BASE_URL = os.getenv("TOKENHARBOR_BASE_URL", "https://tokenharbor.ai/v1")
+atria_api_key = os.getenv("ATRIA_API_KEY")  # ATRIA API (api.atria-asi.ai)
+ATRIA_BASE_URL = os.getenv("ATRIA_BASE_URL", "https://api.atria-asi.ai/v1")
 tavily_api_key = os.getenv("TAVILY_API_KEY")  # веб-поиск/извлечение страниц для /ask (tavily.com); без ключа веб-инструменты выключены
 index_db_url = os.getenv("INDEX_DB_URL")  # MariaDB для /index (GraphRAG-память): mysql://user:pass@host:port/db (pass URL-encoded)
 llama_cloud_api_key = os.getenv("LLAMA_CLOUD_API_KEY")  # OCR фото (LlamaParse); без него фото идут через vision
@@ -482,6 +486,20 @@ MODEL_REGISTRY = {
     "deepseek-pro": ("deepseek", DEEPSEEK_MODEL, "DeepSeek V4 Pro", 1000000, 1.15),
     "deepseek-flash": ("deepseek", "deepseek-v4-flash", "DeepSeek V4 Flash", 1000000, 1.15),  # прямой API
 }
+# Token Harbor (tokenharbor.ai, OpenAI-совместимый API, бесплатный пул).
+for _thslug, _thid, _thlabel, _thctx, _thsafe in [
+    ("th-deepseek-v4.1-flash", "deepseek-v4.1-flash:free", "DeepSeek V4.1 Flash (TokenHarbor Free)", 1000000, 1.15),
+    ("th-deepseek-v4-flash", "deepseek-v4-flash:free", "DeepSeek V4 Flash (TokenHarbor Free)", 1000000, 1.15),
+    ("th-mimo-v2.5", "mimo-v2.5:free", "MiMo V2.5 (TokenHarbor Free)", 262144, 1.15),
+    ("th-orchestra", "th-orchestra", "TH Orchestra (TokenHarbor)", 128000, 1.15),
+]:
+    MODEL_REGISTRY[_thslug] = ("tokenharbor", _thid, _thlabel, _thctx, _thsafe)
+# ATRIA (api.atria-asi.ai, 100M free tokens, OpenAI-совместимый API с reasoning).
+for _atslug, _atid, _atlabel, _atctx, _atsafe in [
+    ("atria-dawn-preview", "Atria-Dawn-Preview", "Atria Dawn Preview", 262144, 1.15),
+    ("atria-dawn", "Atria-Dawn-Preview", "Atria Dawn", 262144, 1.15),
+]:
+    MODEL_REGISTRY[_atslug] = ("atria", _atid, _atlabel, _atctx, _atsafe)
 # Реестр почищен (2026-06-14): оставлены только новейшие версии каждой модели на КАЖДОМ провайдере
 # (разный провайдер/транспорт — отдельная модель). Убраны устаревшие: glm-5/5.1 (на opencode появился
 # glm-5.2 — см. ниже), kimi-k2.5, minimax-m2.5/m2.7, qwen3.5/3.6-plus, mimo-v2.5/v2-pro.
@@ -727,10 +745,10 @@ def _clamp_reasoning(model_id: str, effort: str, provider: str = None) -> str:
         return "max" if effort == "xhigh" else "high"
     if provider == "sakana":
         return "max" if effort == "xhigh" else "high"  # Sakana: только high/xhigh→max (off/low/medium нет)
-    if provider in ("nanogpt", "seekai"):
+    if provider in ("nanogpt", "seekai", "tokenharbor", "atria"):
         mid = (model_id or "").lower()
         if effort in ("xhigh", "max"):
-            return "max" if ("deepseek" in mid or ":thinking" in mid or "glm" in mid or "qwen" in mid) else "high"
+            return "max" if ("deepseek" in mid or ":thinking" in mid or "glm" in mid or "qwen" in mid or "atria" in mid) else "high"
         return effort if effort in ("low", "medium", "high", "none", "max") else "medium"
     if model_id in OPENAI_MAX_REASONING and effort == "xhigh":
         return "max"  # gpt-5.6: топ-ступень max выше глобального xhigh (как xhigh→max у DeepSeek/Sakana)
@@ -758,8 +776,8 @@ def _fmt_rlevel(model_id: str, lv: str, provider: str) -> str:
 
 
 def _supports_reasoning(provider: str) -> bool:
-    """Провайдеры с управляемой глубиной размышлений (/model reason): OpenAI, Google Gemini, Fireworks, opencode, DeepSeek, Sakana, NanoGPT, SeekAI."""
-    return provider in ("openai", "google", "fireworks", "opencode", "deepseek", "sakana", "nanogpt", "seekai")
+    """Провайдеры с управляемой глубиной размышлений (/model reason): OpenAI, Google Gemini, Fireworks, opencode, DeepSeek, Sakana, NanoGPT, SeekAI, Token Harbor, ATRIA."""
+    return provider in ("openai", "google", "fireworks", "opencode", "deepseek", "sakana", "nanogpt", "seekai", "tokenharbor", "atria")
 
 
 # Task-локальный оверрайд глубины размышлений для утилитарных вызовов (дайджест): обёртки читают
@@ -792,9 +810,9 @@ def _reasoning_levels(slug: str):
         return DEEPSEEK_REASONING_LEVELS  # xhigh(→max)/high/none(→off)
     if spec[0] == "sakana":
         return SAKANA_REASONING_LEVELS  # xhigh(→max)/high — off нет
-    if spec[0] in ("nanogpt", "seekai"):
+    if spec[0] in ("nanogpt", "seekai", "tokenharbor", "atria"):
         mid = spec[1].lower()
-        if "deepseek" in mid or ":thinking" in mid or "glm" in mid or "qwen" in mid:
+        if "deepseek" in mid or ":thinking" in mid or "glm" in mid or "qwen" in mid or "atria" in mid:
             return ["xhigh", "high", "medium", "low", "none"] if ":thinking" not in mid else ["xhigh", "high", "medium", "low"]
         return ["high", "medium", "low", "none"]
     return None
@@ -1800,6 +1818,104 @@ gloy_client = _GloyClient(gloy_api_key) if gloy_api_key else None  # LLM API FUN
 nanogpt_client = _NanogptReasoningClient(nanogpt_api_key) if nanogpt_api_key else None  # NanoGPT API с управляемым reasoning_effort
 seekai_client = _SeekaiReasoningClient(seekai_api_key) if seekai_api_key else None  # SeekAI API с управляемым reasoning_effort
 
+
+class _TokenharborReasoningClient:
+    """Адаптер для Token Harbor (tokenharbor.ai, OpenAI-совместимый API с reasoning-полями)."""
+
+    def __init__(self, api_key):
+        self._c = OpenAI(
+            api_key=api_key,
+            base_url=TOKENHARBOR_BASE_URL,
+            default_headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
+        )
+        self.chat = SimpleNamespace(completions=SimpleNamespace(create=self._create))
+
+    def _create(self, **kwargs):
+        _eff = _effective_reasoning()
+        model = kwargs.get("model", "")
+        had_effort = False
+        if _eff:
+            eff = _clamp_reasoning(model, _eff, "tokenharbor")
+            kwargs.setdefault("reasoning_effort", eff)
+            had_effort = True
+            _floor = {"medium": 24000, "high": 40000, "xhigh": 64000, "max": 64000}.get(kwargs.get("reasoning_effort"))
+            if _floor and int(kwargs.get("max_tokens") or 0) < _floor:
+                kwargs["max_tokens"] = _floor
+        try:
+            return self._c.chat.completions.create(**kwargs)
+        except Exception as e:
+            code = getattr(e, "status_code", None)
+            err_str = str(e).lower()
+            if code == 400 or "bad_request" in err_str or "parameters" in err_str:
+                if had_effort and "reasoning_effort" in kwargs:
+                    log("MODEL", f"TokenHarbor {model}: 400 ({e}) — ретрай без reasoning_effort")
+                    kwargs.pop("reasoning_effort", None)
+                    try:
+                        return self._c.chat.completions.create(**kwargs)
+                    except Exception as e2:
+                        e = e2
+                        code = getattr(e, "status_code", None)
+                        err_str = str(e).lower()
+                if kwargs.get("tools") and (code == 400 or "bad_request" in err_str or "parameters" in err_str):
+                    log("MODEL", f"TokenHarbor {model}: 400 ({e}) — ретрай без tools")
+                    kwargs.pop("tools", None)
+                    kwargs.pop("tool_choice", None)
+                    return self._c.chat.completions.create(**kwargs)
+            raise
+
+
+tokenharbor_client = _TokenharborReasoningClient(tokenharbor_api_key) if tokenharbor_api_key else None
+
+
+class _AtriaReasoningClient:
+    """Адаптер для ATRIA (api.atria-asi.ai, OpenAI-совместимый API с reasoning-полями).
+    Поддерживает reasoning_content и нативные tools.
+    При 400 автоматически ретраит запрос без проблемных параметров."""
+
+    def __init__(self, api_key):
+        self._c = OpenAI(
+            api_key=api_key,
+            base_url=ATRIA_BASE_URL,
+            default_headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
+        )
+        self.chat = SimpleNamespace(completions=SimpleNamespace(create=self._create))
+
+    def _create(self, **kwargs):
+        _eff = _effective_reasoning()
+        model = kwargs.get("model", "")
+        had_effort = False
+        if _eff:
+            eff = _clamp_reasoning(model, _eff, "atria")
+            kwargs.setdefault("reasoning_effort", eff)
+            had_effort = True
+            _floor = {"medium": 24000, "high": 40000, "xhigh": 64000, "max": 64000}.get(kwargs.get("reasoning_effort"))
+            if _floor and int(kwargs.get("max_tokens") or 0) < _floor:
+                kwargs["max_tokens"] = _floor
+        try:
+            return self._c.chat.completions.create(**kwargs)
+        except Exception as e:
+            code = getattr(e, "status_code", None)
+            err_str = str(e).lower()
+            if code == 400 or "bad_request" in err_str or "parameters" in err_str:
+                if had_effort and "reasoning_effort" in kwargs:
+                    log("MODEL", f"ATRIA {model}: 400 ({e}) — ретрай без reasoning_effort")
+                    kwargs.pop("reasoning_effort", None)
+                    try:
+                        return self._c.chat.completions.create(**kwargs)
+                    except Exception as e2:
+                        e = e2
+                        code = getattr(e, "status_code", None)
+                        err_str = str(e).lower()
+                if kwargs.get("tools") and (code == 400 or "bad_request" in err_str or "parameters" in err_str):
+                    log("MODEL", f"ATRIA {model}: 400 ({e}) — ретрай без tools")
+                    kwargs.pop("tools", None)
+                    kwargs.pop("tool_choice", None)
+                    return self._c.chat.completions.create(**kwargs)
+            raise
+
+
+atria_client = _AtriaReasoningClient(atria_api_key) if atria_api_key else None
+
 AUTO_REPLY_BUFFERS: dict = {}
 AUTO_REPLY_TASKS: dict = {}
 AUTO_REPLY_BUSY: set = set()     # чаты в фазе LLM/отправки — не отменяем их таску (иначе теряем сообщения)
@@ -1886,13 +2002,13 @@ _model_state = load_json(MODEL_STATE_PATH, {})
 # чтобы они стали полноценными записями и пережили рестарт.
 CUSTOM_MODELS = _model_state.get("custom_models", {})  # {id: {"provider", "label", "ctx", "safety", "vision"}}
 for _cid, _ci in CUSTOM_MODELS.items():
-    _c_prov = _ci.get("provider") or ("nanogpt" if _ci.get("nanogpt") else ("seekai" if _ci.get("seekai") else "openrouter"))
+    _c_prov = _ci.get("provider") or ("nanogpt" if _ci.get("nanogpt") else ("seekai" if _ci.get("seekai") else ("tokenharbor" if _ci.get("tokenharbor") else ("atria" if _ci.get("atria") else "openrouter"))))
     MODEL_REGISTRY[_cid] = (
         _c_prov,
         _cid,
         (_ci.get("label") or _cid),
         int(_ci.get("ctx") or 128000),
-        float(_ci.get("safety") or (1.15 if _c_prov in ("nanogpt", "seekai") else 1.3))
+        float(_ci.get("safety") or (1.15 if _c_prov in ("nanogpt", "seekai", "tokenharbor", "atria") else 1.3))
     )
 ACTIVE_MODEL = _model_state.get("active", "deepseek-pro")
 if ACTIVE_MODEL not in MODEL_REGISTRY:
@@ -1965,6 +2081,10 @@ def _client_for_provider(provider):
         return nanogpt_client
     if provider == "seekai":
         return seekai_client
+    if provider == "tokenharbor":
+        return tokenharbor_client
+    if provider == "atria":
+        return atria_client
     if provider == "opencode":
         return opencode_reasoning_client  # путь ответов с инжектом reasoning_effort
     return opencode_client  # неизвестный провайдер — сырой клиент (фоллбэк)
@@ -2003,7 +2123,7 @@ def _model_supports_vision(slug):
         return True  # vision-слуги OpenCode (kimi/glm/qwen/mimo)
     spec = MODEL_REGISTRY.get(slug)
     provider = spec[0] if spec else None
-    if provider in ("nanogpt", "seekai"):
+    if provider in ("nanogpt", "seekai", "tokenharbor", "atria"):
         mid = (spec[1] if spec else "").lower()
         if "deepseek-v4.1-flash" in mid or "vision" in mid or "-vl" in mid or "omni" in mid or "gemini" in mid:
             return True
@@ -2096,6 +2216,91 @@ async def _nanogpt_model_info(model_id: str):
         return False, False, 0, None, None
     except Exception as e:
         log("MODEL", f"Проверка {model_id} в NanoGPT: {e}")
+        return None, False, 0, None, None
+
+
+_TOKENHARBOR_MODELS_CACHE = {"ts": 0.0, "data": None}
+_TOKENHARBOR_MODELS_TTL = 600  # 10 мин — кэш списка моделей Token Harbor
+
+
+async def _tokenharbor_model_info(model_id: str):
+    """Проверяет модель в Token Harbor (GET /models). Возвращает (exists, supports_image, context_length, name, canonical_id)."""
+    now = time.monotonic()
+
+    def _fetch():
+        headers = {"Authorization": f"Bearer {tokenharbor_api_key}"} if tokenharbor_api_key else {}
+        headers["User-Agent"] = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
+        r = requests.get(f"{TOKENHARBOR_BASE_URL}/models", headers=headers, timeout=20)
+        r.raise_for_status()
+        return r.json().get("data", [])
+
+    try:
+        if _TOKENHARBOR_MODELS_CACHE["data"] is not None and (now - _TOKENHARBOR_MODELS_CACHE["ts"]) < _TOKENHARBOR_MODELS_TTL:
+            data = _TOKENHARBOR_MODELS_CACHE["data"]
+        else:
+            data = await asyncio.to_thread(_fetch)
+            _TOKENHARBOR_MODELS_CACHE["data"] = data
+            _TOKENHARBOR_MODELS_CACHE["ts"] = now
+
+        clean_req = model_id.strip()
+        clean_req_low = clean_req.lower()
+
+        for m in data:
+            mid = m.get("id", "")
+            lbl = m.get("label", mid)
+            if mid == clean_req or mid.lower() == clean_req_low or clean_req_low in (mid.lower(), mid.lower().replace(":free", "")):
+                is_vision = any(x in mid.lower() for x in ("vision", "-vl", "omni", "gemini", "claude", "v4.1-flash"))
+                if any(x in mid.lower() for x in ("deepseek-v4", "glm-5", "gemini-3", "minimax")):
+                    ctx = 1000000
+                elif any(x in mid.lower() for x in ("qwen3", "gemma-4", "gpt-5.6", "kimi")):
+                    ctx = 262144
+                else:
+                    ctx = 128000
+                label = f"{lbl} (TokenHarbor)"
+                return True, is_vision, ctx, label, mid
+        return False, False, 0, None, None
+    except Exception as e:
+        log("MODEL", f"Проверка {model_id} в Token Harbor: {e}")
+        return None, False, 0, None, None
+
+
+_ATRIA_MODELS_CACHE = {"ts": 0.0, "data": None}
+_ATRIA_MODELS_TTL = 600  # 10 мин — кэш списка моделей ATRIA
+
+
+async def _atria_model_info(model_id: str):
+    """Проверяет модель в ATRIA (GET /models). Возвращает (exists, supports_image, context_length, name, canonical_id)."""
+    now = time.monotonic()
+
+    def _fetch():
+        headers = {"Authorization": f"Bearer {atria_api_key}"} if atria_api_key else {}
+        headers["User-Agent"] = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
+        r = requests.get(f"{ATRIA_BASE_URL}/models", headers=headers, timeout=20)
+        r.raise_for_status()
+        return r.json().get("data", [])
+
+    try:
+        if _ATRIA_MODELS_CACHE["data"] is not None and (now - _ATRIA_MODELS_CACHE["ts"]) < _ATRIA_MODELS_TTL:
+            data = _ATRIA_MODELS_CACHE["data"]
+        else:
+            data = await asyncio.to_thread(_fetch)
+            _ATRIA_MODELS_CACHE["data"] = data
+            _ATRIA_MODELS_CACHE["ts"] = now
+
+        clean_req = model_id.strip()
+        clean_req_low = clean_req.lower()
+
+        for m in data:
+            mid = m.get("id", "")
+            lbl = m.get("label", mid)
+            if mid == clean_req or mid.lower() == clean_req_low or clean_req_low in mid.lower():
+                is_vision = False
+                ctx = 262144
+                label = f"{lbl} (ATRIA)"
+                return True, is_vision, ctx, label, mid
+        return False, False, 0, None, None
+    except Exception as e:
+        log("MODEL", f"Проверка {model_id} в ATRIA: {e}")
         return None, False, 0, None, None
 
 
@@ -7406,8 +7611,8 @@ async def model_command(event):
             mk = "▶" if mid == ACTIVE_MODEL else " "
             n = slugs.index(mid) + 1 if mid in slugs else None  # номер в общем списке /model
             num = f" · быстрый выбор `/model {n}`" if n else ""
-            c_prov = ci.get("provider") or ("nanogpt" if ci.get("nanogpt") else ("seekai" if ci.get("seekai") else "openrouter"))
-            ptag = "SeekAI" if c_prov == "seekai" else ("NanoGPT" if c_prov == "nanogpt" else "OpenRouter")
+            c_prov = ci.get("provider") or ("nanogpt" if ci.get("nanogpt") else ("seekai" if ci.get("seekai") else ("tokenharbor" if ci.get("tokenharbor") else ("atria" if ci.get("atria") else "openrouter"))))
+            ptag = "ATRIA" if c_prov == "atria" else ("TokenHarbor" if c_prov == "tokenharbor" else ("SeekAI" if c_prov == "seekai" else ("NanoGPT" if c_prov == "nanogpt" else "OpenRouter")))
             lines.append(f"{mk}{i}. [{ptag}] {ci.get('label') or mid} — `{mid}`{num}")
         lines.append("\n`/model N` — выбрать по номеру · `/model <id>` / `/model ng <id>` — добавить · `/model remove <N|id>` — удалить")
         await event.edit("\n".join(lines)[:4000])
@@ -7523,8 +7728,12 @@ async def model_command(event):
                          "cerebras": "━━ Cerebras ━━",
                          "nanogpt": "━━ NanoGPT ━━",
                          "nanogpt_custom": "━━ NanoGPT (кастом) ━━",
+                         "tokenharbor": "━━ Token Harbor ━━",
+                         "tokenharbor_custom": "━━ Token Harbor (кастом) ━━",
                          "seekai": "━━ SeekAI ━━",
                          "seekai_custom": "━━ SeekAI (кастом) ━━",
+                         "atria": "━━ ATRIA ━━",
+                         "atria_custom": "━━ ATRIA (кастом) ━━",
                          "openrouter": "━━ OpenRouter ━━",
                          "openrouter_custom": "━━ OpenRouter (кастом) ━━"}.get(header_key, f"━━ {provider} ━━")
                 lines.append(f"\n{title}")
@@ -7546,7 +7755,7 @@ async def model_command(event):
         lines.append("`/model N` / `/model <slug>` — выбрать · `/model probe` — проверить поиск (❔→🔧/🚫)")
         reff = f"`{REASONING_EFFORT}`" if REASONING_EFFORT else "авто"
         lines.append(f"🤔 — модель умеет менять глубину размышлений. `/model N.M`: M — сила (`.1` максимум → дальше слабее → последний мин/выкл). Лесенки всех моделей с тап-чипами: `/model reason` (сейчас: {reff})")
-        lines.append("`/model vendor/model` — добавить модель OpenRouter · `/model ng <id>` — NanoGPT · `/model seek <id>` — SeekAI")
+        lines.append("`/model vendor/model` — добавить модель OpenRouter · `/model ng <id>` — NanoGPT · `/model seek <id>` — SeekAI · `/model th <id>` — Token Harbor · `/model atr <id>` — ATRIA")
         lines.append("`/model fav` — избранные кастомные модели · `/model remove <N|id>` — удалить кастомную")
         await event.edit("\n".join(lines)[:4000])
         return
@@ -7556,7 +7765,7 @@ async def model_command(event):
         tested = 0
         for slug in slugs:
             provider, mid, _label, _ctx, _safety = MODEL_REGISTRY[slug]
-            if provider in ("oc_anthropic", "openai", "google", "zai", "fireworks", "sakana", "gloy", "cerebras", "nanogpt", "seekai"):
+            if provider in ("oc_anthropic", "openai", "google", "zai", "fireworks", "sakana", "gloy", "cerebras", "nanogpt", "seekai", "tokenharbor", "atria"):
                 continue  # qwen3.7-max / gpt-5.x / o3 / Gemini / Fireworks / Sakana / Gloy / NanoGPT / SeekAI: tools работают на auto, но forced пробник врёт (Sakana/Gloy отдают не tool_call) — флаг учится на лету в реальном /ask
             cl = _client_for_provider(provider)
             if cl is None:
@@ -7649,6 +7858,28 @@ async def model_command(event):
             is_or_explicit = True
             target_arg = arg.split(":", 1)[1].strip()
 
+        is_th_explicit = False
+        if low_arg.startswith(("th ", "tokenharbor ", "harbor ")):
+            is_th_explicit = True
+            target_arg = arg.split(None, 1)[1].strip()
+        elif low_arg.startswith(("th/", "tokenharbor/", "harbor/")):
+            is_th_explicit = True
+            target_arg = arg.split("/", 1)[1].strip()
+        elif low_arg.startswith(("th:", "tokenharbor:", "harbor:")):
+            is_th_explicit = True
+            target_arg = arg.split(":", 1)[1].strip()
+
+        is_atria_explicit = False
+        if low_arg.startswith(("atria ", "atr ")):
+            is_atria_explicit = True
+            target_arg = arg.split(None, 1)[1].strip()
+        elif low_arg.startswith(("atria/", "atr/")):
+            is_atria_explicit = True
+            target_arg = arg.split("/", 1)[1].strip()
+        elif low_arg.startswith(("atria:", "atr:")):
+            is_atria_explicit = True
+            target_arg = arg.split(":", 1)[1].strip()
+
         is_seek_explicit = False
         if low_arg.startswith(("seek ", "seekai ")):
             is_seek_explicit = True
@@ -7662,6 +7893,14 @@ async def model_command(event):
 
         if is_ng_explicit and not target_arg:
             await event.edit("Укажи id модели NanoGPT: `/model ng <id>` (напр. `/model ng deepseek/deepseek-v4.1-flash`).\nКаталог: https://nano-gpt.com")
+            return
+
+        if is_th_explicit and not target_arg:
+            await event.edit("Укажи id модели Token Harbor: `/model th <id>` (напр. `/model th deepseek-v4.1-flash:free`).\nКаталог: https://tokenharbor.ai")
+            return
+
+        if is_atria_explicit and not target_arg:
+            await event.edit("Укажи id модели ATRIA: `/model atr <id>` (напр. `/model atr Atria-Dawn-Preview`).\nКаталог: https://api.atria-asi.ai")
             return
 
         if is_seek_explicit and not target_arg:
@@ -7712,6 +7951,90 @@ async def model_command(event):
             _save_model_state()
             log("MODEL", f"Активная модель (кастомная NanoGPT): {model_id}, окно {ctx}")
             await event.edit(f"✅ Модель ответов: {label} (`{model_id}`, NanoGPT, окно {_fmt_ctx(ctx)})")
+            return
+
+        # Если явно указан Token Harbor:
+        if is_th_explicit:
+            for s, entry in MODEL_REGISTRY.items():
+                if entry[0] == "tokenharbor" and (s.lower() == target_arg.lower() or entry[1].lower() == target_arg.lower()):
+                    chosen = s
+                    break
+            if chosen:
+                provider, _mid, label, ctx, _safety = MODEL_REGISTRY[chosen]
+                if not is_available(provider):
+                    await event.edit(f"Модель «{label}» недоступна — нет ключа провайдера ({provider}).")
+                    return
+                ACTIVE_MODEL = chosen
+                _save_model_state()
+                log("MODEL", f"Активная модель: {chosen} ({label})")
+                rtag = ""
+                if _supports_reasoning(provider):
+                    rtag = f" · 🤔 ризонинг: `{_clamp_reasoning(_mid, REASONING_EFFORT, provider)}`" if REASONING_EFFORT else " · 🤔 ризонинг: авто (`/model reason`)"
+                await event.edit(f"✅ Модель ответов: {label} (окно {_fmt_ctx(ctx)}){rtag}")
+                return
+
+            await event.edit(f"🔎 Проверяю `{target_arg}` в Token Harbor…")
+            th_exists, th_img, th_ctx, th_name, th_canon = await _tokenharbor_model_info(target_arg)
+            if th_exists is None:
+                await event.edit(f"⚠️ Не удалось проверить `{target_arg}` (Token Harbor недоступен). Модель не изменена.")
+                return
+            if not th_exists:
+                await event.edit(f"❌ Модель `{target_arg}` не найдена в Token Harbor. Проверь точный id на tokenharbor.ai.")
+                return
+            if not tokenharbor_client:
+                await event.edit("Модель найдена в Token Harbor, но нет ключа — добавь TOKENHARBOR_API_KEY в .env.")
+                return
+            model_id = th_canon or target_arg
+            ctx = int(th_ctx or 128000)
+            label = th_name or f"{model_id} (TokenHarbor)"
+            CUSTOM_MODELS[model_id] = {"provider": "tokenharbor", "label": label, "ctx": ctx, "safety": 1.15, "vision": bool(th_img)}
+            MODEL_REGISTRY[model_id] = ("tokenharbor", model_id, label, ctx, 1.15)
+            ACTIVE_MODEL = model_id
+            _save_model_state()
+            log("MODEL", f"Активная модель (кастомная Token Harbor): {model_id}, окно {ctx}")
+            await event.edit(f"✅ Модель ответов: {label} (`{model_id}`, Token Harbor, окно {_fmt_ctx(ctx)})")
+            return
+
+        # Если явно указан ATRIA:
+        if is_atria_explicit:
+            for s, entry in MODEL_REGISTRY.items():
+                if entry[0] == "atria" and (s.lower() == target_arg.lower() or entry[1].lower() == target_arg.lower()):
+                    chosen = s
+                    break
+            if chosen:
+                provider, _mid, label, ctx, _safety = MODEL_REGISTRY[chosen]
+                if not is_available(provider):
+                    await event.edit(f"Модель «{label}» недоступна — нет ключа провайдера ({provider}).")
+                    return
+                ACTIVE_MODEL = chosen
+                _save_model_state()
+                log("MODEL", f"Активная модель: {chosen} ({label})")
+                rtag = ""
+                if _supports_reasoning(provider):
+                    rtag = f" · 🤔 ризонинг: `{_clamp_reasoning(_mid, REASONING_EFFORT, provider)}`" if REASONING_EFFORT else " · 🤔 ризонинг: авто (`/model reason`)"
+                await event.edit(f"✅ Модель ответов: {label} (окно {_fmt_ctx(ctx)}){rtag}")
+                return
+
+            await event.edit(f"🔎 Проверяю `{target_arg}` в ATRIA…")
+            at_exists, at_img, at_ctx, at_name, at_canon = await _atria_model_info(target_arg)
+            if at_exists is None:
+                await event.edit(f"⚠️ Не удалось проверить `{target_arg}` (ATRIA недоступна). Модель не изменена.")
+                return
+            if not at_exists:
+                await event.edit(f"❌ Модель `{target_arg}` не найдена в ATRIA. Проверь точный id на api.atria-asi.ai.")
+                return
+            if not atria_client:
+                await event.edit("Модель найдена в ATRIA, но нет ключа — добавь ATRIA_API_KEY в .env.")
+                return
+            model_id = at_canon or target_arg
+            ctx = int(at_ctx or 262144)
+            label = at_name or f"{model_id} (ATRIA)"
+            CUSTOM_MODELS[model_id] = {"provider": "atria", "label": label, "ctx": ctx, "safety": 1.15, "vision": bool(at_img)}
+            MODEL_REGISTRY[model_id] = ("atria", model_id, label, ctx, 1.15)
+            ACTIVE_MODEL = model_id
+            _save_model_state()
+            log("MODEL", f"Активная модель (кастомная ATRIA): {model_id}, окно {ctx}")
+            await event.edit(f"✅ Модель ответов: {label} (`{model_id}`, ATRIA, окно {_fmt_ctx(ctx)})")
             return
 
         # Если явно указан SeekAI:
@@ -9607,7 +9930,7 @@ async def status_command(event):
                  "oc_anthropic": "OpenCode Go (нативный)", "modelgate": "Claude/ModelGate",
                  "openai": "OpenAI", "google": "Google Gemini", "zai": "z.ai (GLM)", "fireworks": "Fireworks",
                  "sakana": "Sakana AI (Fugu)", "gloy": "LLM API FUN (Gloy AI)", "cerebras": "Cerebras",
-                 "nanogpt": "NanoGPT", "seekai": "SeekAI"}.get(provider, provider)
+                 "nanogpt": "NanoGPT", "seekai": "SeekAI", "tokenharbor": "Token Harbor", "atria": "ATRIA"}.get(provider, provider)
     ts = MODEL_TOOLS_SUPPORT.get(ACTIVE_MODEL)
     search_mark = "🔧 есть" if ts is True else ("🚫 нет" if ts is False else "❔ не проверен")
     sv = active_model_supports_vision()
@@ -9673,7 +9996,7 @@ async def status_command(event):
     L.append(f"⭐ **Избранное:** {len(FISH_FAVORITES)} Fish-голос(ов) · {len(CUSTOM_MODELS)} кастомных моделей")
     # — ключи —
     keys = []
-    for p, nm in [("deepseek", "DeepSeek"), ("openrouter", "OpenRouter"), ("opencode", "OpenCode"), ("modelgate", "Claude/ModelGate"), ("openai", "OpenAI"), ("google", "Google Gemini"), ("zai", "z.ai (GLM)"), ("fireworks", "Fireworks"), ("cerebras", "Cerebras"), ("nanogpt", "NanoGPT"), ("seekai", "SeekAI")]:
+    for p, nm in [("deepseek", "DeepSeek"), ("openrouter", "OpenRouter"), ("opencode", "OpenCode"), ("modelgate", "Claude/ModelGate"), ("openai", "OpenAI"), ("google", "Google Gemini"), ("zai", "z.ai (GLM)"), ("fireworks", "Fireworks"), ("cerebras", "Cerebras"), ("nanogpt", "NanoGPT"), ("seekai", "SeekAI"), ("tokenharbor", "Token Harbor"), ("atria", "ATRIA")]:
         keys.append(f"{nm} {'✅' if _client_for_provider(p) is not None else '❌'}")
     keys[-1] += f"×{len(cerebras_clients)}" if cerebras_clients else ""  # число ключей ротации Cerebras
     keys.append(f"Tavily {'✅' if tavily_api_key else '❌'}")
