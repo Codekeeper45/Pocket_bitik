@@ -2747,7 +2747,7 @@ async def send_long(chat_id, text, prefix="", parse_mode=_PARSE_UNSET, reply_to=
     _can_fallback = (parse_mode is _PARSE_UNSET) or bool(parse_mode)
 
     async def _send(msg):
-        rt = {"reply_to": reply_to} if (reply_to and first) else {}
+        rt = {"reply_to": reply_to} if reply_to else {}
         if collapse_threshold is not None and len(msg) > collapse_threshold:
             try:
                 clean, ents = _collapsed_entities(msg, parse_html=(parse_mode == "html"))
@@ -6015,7 +6015,7 @@ async def search_channels(query: str, per_channel: int = 5, total: int = 10, sin
     return results[:total]
 
 
-async def _collect_history_parallel(chat_id, n, base_offset_id, from_user=None):
+async def _collect_history_parallel(chat_id, n, base_offset_id, from_user=None, reply_to=None):
     """Собирает ~n сообщений старше base_offset_id (0=с конца) ПАРАЛЛЕЛЬНЫМИ окнами через add_offset
     (позиционный сдвиг — надёжен при дырках id от удалённых). Возвращает список Message (с возможными
     дублями на стыках окон — дедуп у вызывающего). FloodWait в окне → ждём и возвращаем частичное.
@@ -6027,8 +6027,11 @@ async def _collect_history_parallel(chat_id, n, base_offset_id, from_user=None):
     async def _window(k):
         out = []
         try:
+            kwargs = {}
+            if reply_to is not None:
+                kwargs["reply_to"] = reply_to
             async for m in client.iter_messages(chat_id, offset_id=base_offset_id,
-                                                 add_offset=k * per, limit=per, from_user=from_user):
+                                                 add_offset=k * per, limit=per, from_user=from_user, **kwargs):
                 out.append(m)
         except FloodWaitError as e:
             log("ASK", f"Сбор: окно {k} FloodWait {e.seconds}с — жду и возвращаю частичное ({len(out)})")
@@ -6041,6 +6044,41 @@ async def _collect_history_parallel(chat_id, n, base_offset_id, from_user=None):
     merged = [m for c in chunks for m in c]
     log("ASK", f"Параллельный сбор: воркеров={workers}, окно={per}, чанки={[len(c) for c in chunks]} → {len(merged)} (с дублями)")
     return workers, merged
+
+
+def _get_topic_id(event):
+    """Возвращает ID топика (forum topic root message ID), если сообщение внутри топика форума, иначе None."""
+    msg = getattr(event, "message", event)
+    reply_hdr = getattr(msg, "reply_to", None)
+    if not reply_hdr:
+        return None
+    top_id = getattr(reply_hdr, "reply_to_top_id", None)
+    if top_id:
+        return top_id
+    if getattr(reply_hdr, "forum_topic", False):
+        return getattr(reply_hdr, "reply_to_msg_id", None)
+    return None
+
+
+def _is_real_reply(event):
+    """
+    Проверяет, является ли сообщение осознанным ответом (реплаем) на другое сообщение:
+    - В обычном чате: любой reply_to_msg_id > 0.
+    - В топике форума: только если есть reply_to_top_id И reply_to_msg_id != reply_to_top_id
+      (т.е. ответ на конкретный пост, а не просто привязка к топику форума).
+    Возвращает (is_reply: bool, target_msg_id: int | None).
+    """
+    msg = getattr(event, "message", event)
+    reply_hdr = getattr(msg, "reply_to", None)
+    if not reply_hdr:
+        return False, None
+    msg_id = getattr(reply_hdr, "reply_to_msg_id", None)
+    top_id = getattr(reply_hdr, "reply_to_top_id", None)
+    if getattr(reply_hdr, "forum_topic", False):
+        if top_id and msg_id and msg_id != top_id:
+            return True, msg_id
+        return False, None
+    return (True, msg_id) if msg_id else (False, None)
 
 
 async def _slash_for_other_bot(event) -> bool:
@@ -6058,15 +6096,24 @@ async def _slash_for_other_bot(event) -> bool:
     return bool(getattr(chat, "bot", False))
 
 
-@client.on(events.NewMessage(pattern=r"^[./]ask\s+(\d+)((?:\s+-[tcdvgm]+)+)?((?:\s+!?@\w+)+)?\s+(.+)"))
+@client.on(events.NewMessage(pattern=r"^[./]ask(?:\s+(\d+))?((?:\s+-[tcdvgm]+)+)?((?:\s+!?@\w+)+)?(?:\s+(.+))?$"))
 async def ask_command(event):
     if await _slash_for_other_bot(event):
         return  # /команда в личке с ботом адресована ему, не юзерботу (используй .ask)
     is_owner = event.out
     if not is_owner and event.sender_id not in ALLOWED_USERS:
         return  # не владелец и не в списке разрешённых
-    n = int(event.pattern_match.group(1))
-    reply_target_id = getattr(event, "reply_to_msg_id", None)  # если /ask — ответ на сообщение, шлём ответ реплаем на него
+
+    topic_id = _get_topic_id(event)
+    is_reply, target_msg_id = _is_real_reply(event)
+    reply_target_id = target_msg_id or topic_id
+
+    n_raw = event.pattern_match.group(1)
+    if n_raw:
+        n = int(n_raw)
+    else:
+        n = 10 if is_reply else 20
+
     flags = event.pattern_match.group(2) or ""
     direct_vision = "g" in flags  # -g: отдать картинки напрямую отвечающей модели (её vision)
     text_only = "t" in flags and not direct_vision  # -g включает медиа-обработку для фото
@@ -6079,7 +6126,26 @@ async def ask_command(event):
     user_tokens = (event.pattern_match.group(3) or "").split()
     usernames = [t.lstrip("@") for t in user_tokens if not t.startswith("!")]
     exclude_users = [t.lstrip("!").lstrip("@") for t in user_tokens if t.startswith("!")]
-    question = event.pattern_match.group(4).strip()
+    question = (event.pattern_match.group(4) or "").strip()
+
+    if not question:
+        if is_reply:
+            question = "Объясни или кратко перескажи это сообщение и контекст вокруг него"
+        else:
+            hint = (
+                "ℹ️ **Использование команды `/ask`:**\n\n"
+                "`/ask [N] [-флаги] [@юзеры] <вопрос>`\n\n"
+                "**Примеры:**\n"
+                "• `/ask 20 о чём тут спорят?`\n"
+                "• `/ask 50 -t краткая выжимка` (только текст)\n"
+                "• Ответом на сообщение: `/ask что это значит?`"
+            )
+            try:
+                await client.send_message(event.chat_id, hint, reply_to=reply_target_id)
+            except Exception:
+                pass
+            return
+
     # Гостям: запрос > лимита → медиа НЕ режем, но vision-модель бесплатная (аудио — Parakeet как всегда)
     vision_model = None
     if not is_owner:
@@ -6118,24 +6184,43 @@ async def ask_command(event):
             except Exception:
                 sv = False
         if not sv:
-            await event.respond(
+            await client.send_message(
+                event.chat_id,
                 f"⚠️ Модель «{model_label}» не умеет смотреть картинки напрямую (флаг `-g`).\n"
                 f"Переключись на vision-модель через `/model` (например Qwen / Kimi / MiMo Omni, или vision-модель OpenRouter), либо убери `-g`.\n"
-                f"ℹ️ GLM-5/5.1 у этого провайдера — текстовые (картинки не принимают), поэтому для `-g` не подходят.")
+                f"ℹ️ GLM-5/5.1 у этого провайдера — текстовые (картинки не принимают), поэтому для `-g` не подходят.",
+                reply_to=reply_target_id
+            )
             if is_owner:
-                await event.delete()
+                try:
+                    await event.delete()
+                except Exception:
+                    pass
             return
 
-    if is_owner:
-        await event.delete()  # своё сообщение чистим; гостевой вопрос оставляем видимым
+    status = None
+    try:
+        status = await client.send_message(event.chat_id, "⏳ Собираю сообщения…", reply_to=reply_target_id)
+    except Exception as e:
+        log("ASK", f"Ошибка отправки статуса с reply_to={reply_target_id}: {e}")
+        try:
+            status = await client.send_message(event.chat_id, "⏳ Собираю сообщения…")
+        except Exception as e2:
+            log("ASK", f"Критическая ошибка отправки статуса: {e2}")
 
-    status = await client.send_message(event.chat_id, "⏳ Собираю сообщения…")
+    if is_owner:
+        try:
+            await event.delete()  # своё сообщение чистим только ПОСЛЕ отправки статуса
+        except Exception:
+            pass
 
     # Тайминги для финального лога (заполняются по ходу; если фаза не достигнута — остаётся t0)
     t0 = time.time()
     t_collected = t_ctx = t_llm = t_sent = t0
 
     async def set_status(text):
+        if not status:
+            return
         try:
             await status.edit(text)
         except (MessageNotModifiedError, FloodWaitError):
@@ -6182,7 +6267,7 @@ async def ask_command(event):
                 try:
                     # Параллельный сбор и под фильтром from_user (позиционные окна работают в messages.search). @me = я сам.
                     _fu = OWNER_ID if u.lower() in ("me", "self") else u
-                    _w, raw = await _collect_history_parallel(event.chat_id, n, 0, from_user=_fu)
+                    _w, raw = await _collect_history_parallel(event.chat_id, n, 0, from_user=_fu, reply_to=topic_id)
                     for m in raw:
                         by_id[m.id] = m
                 except Exception as e:
@@ -6199,8 +6284,13 @@ async def ask_command(event):
                 return
             log("ASK", f"Фильтр по {usernames}: собрано {len(messages)} сообщений" + (f", не найдены: {not_found}" if not_found else ""))
         else:
-            # E: если команда — ответ на сообщение, делаем его якорем (он + предыдущие для контекста)
-            anchor = await event.get_reply_message() if getattr(event, "reply_to", None) else None
+            # E: если команда — реальный ответ на сообщение, делаем его якорем (он + предыдущие для контекста)
+            anchor = None
+            if is_reply and target_msg_id:
+                try:
+                    anchor = await client.get_messages(event.chat_id, ids=target_msg_id)
+                except Exception as e:
+                    log("ASK", f"Не удалось получить якорное сообщение {target_msg_id}: {e}")
             messages = []
             if anchor is not None and not _is_excluded(anchor):
                 anchor_id = anchor.id
@@ -6232,7 +6322,7 @@ async def ask_command(event):
                 return True
 
             # Параллельный сбор позиционными окнами (быстрее последовательной пагинации Telegram).
-            workers, raw_msgs = await _collect_history_parallel(event.chat_id, n, offset)
+            workers, raw_msgs = await _collect_history_parallel(event.chat_id, n, offset, reply_to=topic_id)
             await set_status(f"📥 Тяну историю в {workers} {'поток' if workers == 1 else 'потока' if workers < 5 else 'потоков'}…")
             for m in raw_msgs:
                 _keep(m)
@@ -6240,7 +6330,8 @@ async def ask_command(event):
             # Страховка-добор: если из-за FloodWait/скипов собрали < n — добираем последовательно от старого края.
             if len(messages) < n:
                 tail_offset = min((m.id for m in messages), default=offset)
-                async for m in client.iter_messages(event.chat_id, offset_id=tail_offset, limit=(n - len(messages)) * 2 + 50):
+                kwargs = {"reply_to": topic_id} if topic_id is not None else {}
+                async for m in client.iter_messages(event.chat_id, offset_id=tail_offset, limit=(n - len(messages)) * 2 + 50, **kwargs):
                     if _keep(m) and len(messages) >= n:
                         break
                 messages.sort(key=lambda m: m.id, reverse=True)
@@ -6450,10 +6541,11 @@ async def ask_command(event):
                 bio.name = "voice.ogg"
                 await client.send_file(event.chat_id, bio, voice_note=True, reply_to=reply_target_id)
                 t_sent = time.time()
-                try:
-                    await status.delete()
-                except Exception:
-                    pass
+                if status:
+                    try:
+                        await status.delete()
+                    except Exception:
+                        pass
                 log("ASK", f"Голосовой ответ на '{question[:60]}' отправлен (voice={ACTIVE_VOICE}, mode={voice_mode})")
                 return
             notes.append("🔇 голос не сгенерировался")  # фолбэк на текст
@@ -6468,10 +6560,11 @@ async def ask_command(event):
         # Сначала отправляем ответ, потом удаляем статус — иначе сбой delete съест ответ.
         await send_long(event.chat_id, reply, prefix=prefix, parse_mode="html", reply_to=reply_target_id, collapse_threshold=700)
         t_sent = time.time()
-        try:
-            await status.delete()
-        except Exception:
-            pass
+        if status:
+            try:
+                await status.delete()
+            except Exception:
+                pass
         log("ASK", f"Ответ на '{question[:60]}' отправлен (model={ACTIVE_MODEL}, text_only={text_only}, must_search={must_search}, users={usernames or '—'}, anchor={anchor_id}, dropped={dropped}, failed={failed})")
     except Exception as e:
         log("ASK", f"Ошибка команды /ask: {e}")
@@ -6976,7 +7069,9 @@ async def gen_command(event):
     exclude_users = [t.lstrip("!").lstrip("@") for t in user_tokens if t.startswith("!")]
     user_prompt = event.pattern_match.group(4).strip()
     reply_msg = await event.get_reply_message() if getattr(event, "reply_to", None) else None
-    reply_target_id = getattr(event, "reply_to_msg_id", None)
+    topic_id = _get_topic_id(event)
+    is_reply, target_msg_id = _is_real_reply(event)
+    reply_target_id = target_msg_id or topic_id
     caller = _owner_label() if is_owner else _user_label(event.sender or await event.get_sender())
     # Ссылки-референсы: t.me-ссылки на сообщения в промпте → их фото на вход, ссылки из текста убираем.
     user_prompt, link_ref_msgs, link_not_found = await _gen_fetch_link_refs(event, user_prompt)
@@ -6995,12 +7090,25 @@ async def gen_command(event):
     if not input_b64s and not raw and not improve:
         creative = True
 
+    status = None
+    try:
+        status = await client.send_message(event.chat_id, "🎨 Готовлю генерацию…", reply_to=reply_target_id)
+    except Exception as e:
+        log("GEN", f"Ошибка отправки статуса (reply_to={reply_target_id}): {e}")
+        try:
+            status = await client.send_message(event.chat_id, "🎨 Готовлю генерацию…")
+        except Exception:
+            pass
+
     if is_owner and not (_is_attached_photo(event.message) or _is_attached_image_doc(event.message)):
-        await event.delete()  # чистим команду; ОСТАВЛЯЕМ только при реально приложенном фото/картинке-файле
-        # (веб-превью t.me-ссылки — не вложение, поэтому команду со ссылками тоже удаляем)
-    status = await client.send_message(event.chat_id, "🎨 Готовлю генерацию…")
+        try:
+            await event.delete()  # чистим команду; ОСТАВЛЯЕМ только при реально приложенном фото/картинке-файле
+        except Exception:
+            pass
 
     async def set_status(text):
+        if not status:
+            return
         try:
             await status.edit(text)
         except (MessageNotModifiedError, FloodWaitError):
@@ -7033,7 +7141,7 @@ async def gen_command(event):
                     log("GEN", f"Фильтр: не нашёл @{u}: {e}")
             if flt_failed:
                 await set_status(f"⚠️ Не нашёл для фильтра: {', '.join('@' + u for u in flt_failed)} — игнорирую.")
-            _, raw_msgs = await _collect_history_parallel(event.chat_id, n, 0)
+            _, raw_msgs = await _collect_history_parallel(event.chat_id, n, 0, reply_to=topic_id)
 
             def _ctx_keep(m):
                 if getattr(m, "id", None) is None or m.id == event.id or getattr(m, "action", None) is not None:
