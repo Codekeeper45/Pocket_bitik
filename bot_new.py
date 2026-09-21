@@ -535,21 +535,21 @@ for _pvslug, _pvid, _pvlabel, _pvctx, _pvsafe in [
 for _cpslug, _cpid, _cplabel, _cpctx, _cpsafe in [
     ("cp-gemini-3.8-flash-high", "gemini-3.8-flash-high", "Gemini 3.8 Flash High (Cliproxy)", 1048576, 1.15),
     ("cp-gemini-3.1-pro-high", "gemini-3.1-pro-high", "Gemini 3.1 Pro High (Cliproxy)", 1048576, 1.15),
-    ("cp-claude-4.6-sonnet", "claude-4.6-sonnet", "Claude 4.6 Sonnet (Cliproxy)", 200000, 1.20),
     ("cp-claude-4.6-sonnet-thinking", "claude-4.6-sonnet-thinking", "Claude 4.6 Sonnet Thinking (Cliproxy)", 200000, 1.20),
-    ("cp-claude-4.6-opus", "claude-4.6-opus", "Claude 4.6 Opus (Cliproxy)", 200000, 1.20),
     ("cp-claude-opus-4-6-thinking", "claude-opus-4-6-thinking", "Claude 4.6 Opus Thinking (Cliproxy)", 200000, 1.20),
     ("cp-grok-4.6", "grok-4.6", "Grok 4.6 (Cliproxy)", 131072, 1.20),
 ]:
     MODEL_REGISTRY[_cpslug] = ("cliproxy", _cpid, _cplabel, _cpctx, _cpsafe)
 
-# Алиасы для быстрого выбора
+# Алиасы для быстрого выбора (Claude Thinking по умолчанию)
 MODEL_REGISTRY["cp-gemini-flash"] = MODEL_REGISTRY["cp-gemini-3.8-flash-high"]
 MODEL_REGISTRY["cp-gemini-pro"] = MODEL_REGISTRY["cp-gemini-3.1-pro-high"]
-MODEL_REGISTRY["cp-claude-sonnet"] = MODEL_REGISTRY["cp-claude-4.6-sonnet"]
-MODEL_REGISTRY["cp-claude-opus"] = MODEL_REGISTRY["cp-claude-4.6-opus"]
-MODEL_REGISTRY["cp-sonnet"] = MODEL_REGISTRY["cp-claude-4.6-sonnet"]
-MODEL_REGISTRY["cp-opus"] = MODEL_REGISTRY["cp-claude-4.6-opus"]
+MODEL_REGISTRY["cp-claude-sonnet"] = MODEL_REGISTRY["cp-claude-4.6-sonnet-thinking"]
+MODEL_REGISTRY["cp-claude-4.6-sonnet"] = MODEL_REGISTRY["cp-claude-4.6-sonnet-thinking"]
+MODEL_REGISTRY["cp-sonnet"] = MODEL_REGISTRY["cp-claude-4.6-sonnet-thinking"]
+MODEL_REGISTRY["cp-claude-opus"] = MODEL_REGISTRY["cp-claude-opus-4-6-thinking"]
+MODEL_REGISTRY["cp-claude-4.6-opus"] = MODEL_REGISTRY["cp-claude-opus-4-6-thinking"]
+MODEL_REGISTRY["cp-opus"] = MODEL_REGISTRY["cp-claude-opus-4-6-thinking"]
 MODEL_REGISTRY["cp-grok"] = MODEL_REGISTRY["cp-grok-4.6"]
 # Реестр почищен (2026-06-14): оставлены только новейшие версии каждой модели на КАЖДОМ провайдере
 # (разный провайдер/транспорт — отдельная модель). Убраны устаревшие: glm-5/5.1 (на opencode появился
@@ -2034,11 +2034,54 @@ class _PlusvibeReasoningClient:
 
 
 plusvibe_client = _PlusvibeReasoningClient(plusvibe_api_keys) if plusvibe_api_keys else None
-cliproxy_client = OpenAI(
-    api_key=cliproxy_api_key,
-    base_url=CLIPROXY_BASE_URL,
-    default_headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
-) if cliproxy_api_key else None
+class _CliproxyReasoningClient:
+    """Адаптер для Cliproxy (локальный шлюз VPS с пулом Antigravity и xAI).
+    Поддерживает reasoning_effort, vision и нативные tools.
+    При 400 автоматически ретраит без проблемных параметров."""
+
+    def __init__(self, api_key):
+        self._c = OpenAI(
+            api_key=api_key,
+            base_url=CLIPROXY_BASE_URL,
+            default_headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
+        )
+        self.chat = SimpleNamespace(completions=SimpleNamespace(create=self._create))
+
+    def _create(self, **kwargs):
+        _eff = _effective_reasoning()
+        model = kwargs.get("model", "")
+        had_effort = False
+        if _eff:
+            eff = _clamp_reasoning(model, _eff, "cliproxy")
+            kwargs.setdefault("reasoning_effort", eff)
+            had_effort = True
+            _floor = {"medium": 24000, "high": 40000, "xhigh": 64000, "max": 64000}.get(kwargs.get("reasoning_effort"))
+            if _floor and int(kwargs.get("max_tokens") or 0) < _floor:
+                kwargs["max_tokens"] = _floor
+        try:
+            return self._c.chat.completions.create(**kwargs)
+        except Exception as e:
+            code = getattr(e, "status_code", None)
+            err_str = str(e).lower()
+            if code == 400 or "bad_request" in err_str or "parameters" in err_str:
+                if had_effort and "reasoning_effort" in kwargs:
+                    log("MODEL", f"Cliproxy {model}: 400 ({e}) — ретрай без reasoning_effort")
+                    kwargs.pop("reasoning_effort", None)
+                    try:
+                        return self._c.chat.completions.create(**kwargs)
+                    except Exception as e2:
+                        e = e2
+                        code = getattr(e, "status_code", None)
+                        err_str = str(e).lower()
+                if kwargs.get("tools") and (code == 400 or "bad_request" in err_str or "parameters" in err_str):
+                    log("MODEL", f"Cliproxy {model}: 400 ({e}) — ретрай без tools")
+                    kwargs.pop("tools", None)
+                    kwargs.pop("tool_choice", None)
+                    return self._c.chat.completions.create(**kwargs)
+            raise
+
+
+cliproxy_client = _CliproxyReasoningClient(cliproxy_api_key) if cliproxy_api_key else None
 
 AUTO_REPLY_BUFFERS: dict = {}
 AUTO_REPLY_TASKS: dict = {}
