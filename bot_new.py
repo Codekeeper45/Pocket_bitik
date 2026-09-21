@@ -827,8 +827,8 @@ def _fmt_rlevel(model_id: str, lv: str, provider: str) -> str:
 
 
 def _supports_reasoning(provider: str) -> bool:
-    """Провайдеры с управляемой глубиной размышлений (/model reason): OpenAI, Google Gemini, Fireworks, opencode, DeepSeek, Sakana, NanoGPT, SeekAI, Token Harbor, ATRIA, PlusVibe."""
-    return provider in ("openai", "google", "fireworks", "opencode", "deepseek", "sakana", "nanogpt", "seekai", "tokenharbor", "atria", "plusvibe")
+    """Провайдеры с управляемой глубиной размышлений (/model reason): OpenAI, Google Gemini, Fireworks, opencode, DeepSeek, Sakana, NanoGPT, SeekAI, Token Harbor, ATRIA, PlusVibe, Cliproxy."""
+    return provider in ("openai", "google", "fireworks", "opencode", "deepseek", "sakana", "nanogpt", "seekai", "tokenharbor", "atria", "plusvibe", "cliproxy")
 
 
 # Task-локальный оверрайд глубины размышлений для утилитарных вызовов (дайджест): обёртки читают
@@ -861,10 +861,10 @@ def _reasoning_levels(slug: str):
         return DEEPSEEK_REASONING_LEVELS  # xhigh(→max)/high/none(→off)
     if spec[0] == "sakana":
         return SAKANA_REASONING_LEVELS  # xhigh(→max)/high — off нет
-    if spec[0] in ("nanogpt", "seekai", "tokenharbor", "atria", "plusvibe"):
+    if spec[0] in ("nanogpt", "seekai", "tokenharbor", "atria", "plusvibe", "cliproxy"):
         mid = spec[1].lower()
-        if "deepseek" in mid or ":thinking" in mid or "glm" in mid or "qwen" in mid or "atria" in mid:
-            return ["xhigh", "high", "medium", "low", "none"] if ":thinking" not in mid else ["xhigh", "high", "medium", "low"]
+        if "deepseek" in mid or ":thinking" in mid or "-thinking" in mid or "glm" in mid or "qwen" in mid or "atria" in mid or "gemini" in mid or "claude" in mid:
+            return ["xhigh", "high", "medium", "low", "none"] if (":thinking" not in mid and "-thinking" not in mid) else ["xhigh", "high", "medium", "low"]
         return ["high", "medium", "low", "none"]
     return None
 
@@ -2517,6 +2517,53 @@ async def _plusvibe_model_info(model_id: str):
         return False, False, 0, None, None
     except Exception as e:
         log("MODEL", f"Проверка {model_id} в PlusVibe: {e}")
+        return None, False, 0, None, None
+
+
+_CLIPROXY_MODELS_CACHE = {"ts": 0.0, "data": None}
+_CLIPROXY_MODELS_TTL = 600  # 10 мин — кэш списка моделей Cliproxy
+
+
+async def _cliproxy_model_info(model_id: str):
+    """Проверяет модель в Cliproxy (GET /models). Возвращает (exists, supports_image, context_length, name, canonical_id)."""
+    now = time.monotonic()
+
+    def _fetch():
+        headers = {"Authorization": f"Bearer {cliproxy_api_key}"} if cliproxy_api_key else {}
+        headers["User-Agent"] = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
+        r = requests.get(f"{CLIPROXY_BASE_URL}/models", headers=headers, timeout=15)
+        r.raise_for_status()
+        return r.json().get("data", [])
+
+    try:
+        if _CLIPROXY_MODELS_CACHE["data"] is not None and (now - _CLIPROXY_MODELS_CACHE["ts"]) < _CLIPROXY_MODELS_TTL:
+            data = _CLIPROXY_MODELS_CACHE["data"]
+        else:
+            data = await asyncio.to_thread(_fetch)
+            _CLIPROXY_MODELS_CACHE["data"] = data
+            _CLIPROXY_MODELS_CACHE["ts"] = now
+
+        clean_req = model_id.strip()
+        clean_req_low = clean_req.lower()
+
+        for m in data:
+            mid = m.get("id", "")
+            lbl = m.get("label") or mid
+            if mid == clean_req or mid.lower() == clean_req_low or clean_req_low in mid.lower():
+                is_vision = any(x in mid.lower() for x in ("vision", "-vl", "omni", "gemini", "claude"))
+                if any(x in mid.lower() for x in ("gemini-3", "deepseek-v4", "glm-5", "minimax")):
+                    ctx = 1048576
+                elif any(x in mid.lower() for x in ("claude", "qwen", "gemma", "gpt-5")):
+                    ctx = 200000
+                elif "grok" in mid.lower():
+                    ctx = 131072
+                else:
+                    ctx = 128000
+                label = f"{lbl} (Cliproxy)"
+                return True, is_vision, ctx, label, mid
+        return False, False, 0, None, None
+    except Exception as e:
+        log("MODEL", f"Проверка {model_id} в Cliproxy: {e}")
         return None, False, 0, None, None
 
 
@@ -7944,8 +7991,8 @@ async def model_command(event):
             mk = "▶" if mid == ACTIVE_MODEL else " "
             n = slugs.index(mid) + 1 if mid in slugs else None  # номер в общем списке /model
             num = f" · быстрый выбор `/model {n}`" if n else ""
-            c_prov = ci.get("provider") or ("nanogpt" if ci.get("nanogpt") else ("seekai" if ci.get("seekai") else ("tokenharbor" if ci.get("tokenharbor") else ("atria" if ci.get("atria") else ("plusvibe" if ci.get("plusvibe") else "openrouter")))))
-            ptag = "PlusVibe" if c_prov == "plusvibe" else ("ATRIA" if c_prov == "atria" else ("TokenHarbor" if c_prov == "tokenharbor" else ("SeekAI" if c_prov == "seekai" else ("NanoGPT" if c_prov == "nanogpt" else "OpenRouter"))))
+            c_prov = ci.get("provider") or ("cliproxy" if ci.get("cliproxy") else ("nanogpt" if ci.get("nanogpt") else ("seekai" if ci.get("seekai") else ("tokenharbor" if ci.get("tokenharbor") else ("atria" if ci.get("atria") else ("plusvibe" if ci.get("plusvibe") else "openrouter"))))))
+            ptag = "Cliproxy" if c_prov == "cliproxy" else ("PlusVibe" if c_prov == "plusvibe" else ("ATRIA" if c_prov == "atria" else ("TokenHarbor" if c_prov == "tokenharbor" else ("SeekAI" if c_prov == "seekai" else ("NanoGPT" if c_prov == "nanogpt" else "OpenRouter")))))
             lines.append(f"{mk}{i}. [{ptag}] {ci.get('label') or mid} — `{mid}`{num}")
         lines.append("\n`/model N` — выбрать по номеру · `/model <id>` / `/model ng <id>` — добавить · `/model remove <N|id>` — удалить")
         await event.edit("\n".join(lines)[:4000])
@@ -8069,6 +8116,8 @@ async def model_command(event):
                          "atria_custom": "━━ ATRIA (кастом) ━━",
                          "plusvibe": "━━ PlusVibe ━━",
                          "plusvibe_custom": "━━ PlusVibe (кастом) ━━",
+                         "cliproxy": "━━ Cliproxy (Локальный VPS) ━━",
+                         "cliproxy_custom": "━━ Cliproxy (кастом) ━━",
                          "openrouter": "━━ OpenRouter ━━",
                          "openrouter_custom": "━━ OpenRouter (кастом) ━━"}.get(header_key, f"━━ {provider} ━━")
                 lines.append(f"\n{title}")
@@ -8090,7 +8139,7 @@ async def model_command(event):
         lines.append("`/model N` / `/model <slug>` — выбрать · `/model probe` — проверить поиск (❔→🔧/🚫)")
         reff = f"`{REASONING_EFFORT}`" if REASONING_EFFORT else "авто"
         lines.append(f"🤔 — модель умеет менять глубину размышлений. `/model N.M`: M — сила (`.1` максимум → дальше слабее → последний мин/выкл). Лесенки всех моделей с тап-чипами: `/model reason` (сейчас: {reff})")
-        lines.append("`/model vendor/model` — добавить модель OpenRouter · `/model ng <id>` — NanoGPT · `/model seek <id>` — SeekAI · `/model th <id>` — Token Harbor · `/model atr <id>` — ATRIA · `/model pv <id>` — PlusVibe")
+        lines.append("`/model vendor/model` — добавить модель OpenRouter · `/model cp <id>` — Cliproxy · `/model pv <id>` — PlusVibe · `/model atr <id>` — ATRIA · `/model th <id>` — Token Harbor · `/model ng <id>` — NanoGPT · `/model seek <id>` — SeekAI")
         lines.append("`/model fav` — избранные кастомные модели · `/model remove <N|id>` — удалить кастомную")
         await event.edit("\n".join(lines)[:4000])
         return
@@ -8236,6 +8285,21 @@ async def model_command(event):
         elif low_arg.startswith(("seek:", "seekai:")):
             is_seek_explicit = True
             target_arg = arg.split(":", 1)[1].strip()
+
+        is_cp_explicit = False
+        if low_arg.startswith(("cp ", "cliproxy ")):
+            is_cp_explicit = True
+            target_arg = arg.split(None, 1)[1].strip()
+        elif low_arg.startswith(("cp/", "cliproxy/")):
+            is_cp_explicit = True
+            target_arg = arg.split("/", 1)[1].strip()
+        elif low_arg.startswith(("cp:", "cliproxy:")):
+            is_cp_explicit = True
+            target_arg = arg.split(":", 1)[1].strip()
+
+        if is_cp_explicit and not target_arg:
+            await event.edit("Укажи id модели Cliproxy: `/model cp <id>` (напр. `/model cp claude-4.6-sonnet-thinking`).\\nПул моделей на VPS.")
+            return
 
         if is_ng_explicit and not target_arg:
             await event.edit("Укажи id модели NanoGPT: `/model ng <id>` (напр. `/model ng deepseek/deepseek-v4.1-flash`).\nКаталог: https://nano-gpt.com")
@@ -8469,6 +8533,48 @@ async def model_command(event):
             _save_model_state()
             log("MODEL", f"Активная модель (кастомная SeekAI): {model_id}, окно {ctx}")
             await event.edit(f"✅ Модель ответов: {label} (`{model_id}`, SeekAI, окно {_fmt_ctx(ctx)})")
+            return
+
+        # Если явно указан Cliproxy:
+        if is_cp_explicit:
+            for s, entry in MODEL_REGISTRY.items():
+                if entry[0] == "cliproxy" and (s.lower() == target_arg.lower() or entry[1].lower() == target_arg.lower()):
+                    chosen = s
+                    break
+            if chosen:
+                provider, _mid, label, ctx, _safety = MODEL_REGISTRY[chosen]
+                if not is_available(provider):
+                    await event.edit(f"Модель «{label}» недоступна — нет ключа провайдера ({provider}).")
+                    return
+                ACTIVE_MODEL = chosen
+                _save_model_state()
+                log("MODEL", f"Активная модель: {chosen} ({label})")
+                rtag = ""
+                if _supports_reasoning(provider):
+                    rtag = f" · 🤔 ризонинг: `{_clamp_reasoning(_mid, REASONING_EFFORT, provider)}`" if REASONING_EFFORT else " · 🤔 ризонинг: авто (`/model reason`)"
+                await event.edit(f"✅ Модель ответов: {label} (окно {_fmt_ctx(ctx)}){rtag}")
+                return
+
+            await event.edit(f"🔎 Проверяю `{target_arg}` в Cliproxy…")
+            cp_exists, cp_img, cp_ctx, cp_name, cp_canon = await _cliproxy_model_info(target_arg)
+            if cp_exists is None:
+                await event.edit(f"⚠️ Не удалось проверить `{target_arg}` (Cliproxy недоступен). Модель не изменена.")
+                return
+            if not cp_exists:
+                await event.edit(f"❌ Модель `{target_arg}` не найдена в Cliproxy.")
+                return
+            if not cliproxy_client:
+                await event.edit("Модель найдена в Cliproxy, но нет ключа — добавь CLIPROXY_API_KEY в .env.")
+                return
+            model_id = cp_canon or target_arg
+            ctx = int(cp_ctx or 200000)
+            label = cp_name or f"{model_id} (Cliproxy)"
+            CUSTOM_MODELS[model_id] = {"provider": "cliproxy", "label": label, "ctx": ctx, "safety": 1.15, "vision": bool(cp_img)}
+            MODEL_REGISTRY[model_id] = ("cliproxy", model_id, label, ctx, 1.15)
+            ACTIVE_MODEL = model_id
+            _save_model_state()
+            log("MODEL", f"Активная модель (кастомная Cliproxy): {model_id}, окно {ctx}")
+            await event.edit(f"✅ Модель ответов: {label} (`{model_id}`, Cliproxy, окно {_fmt_ctx(ctx)})")
             return
 
         # Если явно указан OpenRouter:
