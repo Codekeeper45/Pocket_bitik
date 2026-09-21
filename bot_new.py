@@ -534,11 +534,23 @@ for _pvslug, _pvid, _pvlabel, _pvctx, _pvsafe in [
 # Cliproxy (локальный шлюз VPS с пулом моделей Antigravity и xAI).
 for _cpslug, _cpid, _cplabel, _cpctx, _cpsafe in [
     ("cp-gemini-3.8-flash-high", "gemini-3.8-flash-high", "Gemini 3.8 Flash High (Cliproxy)", 1048576, 1.15),
+    ("cp-gemini-3.1-pro-high", "gemini-3.1-pro-high", "Gemini 3.1 Pro High (Cliproxy)", 1048576, 1.15),
     ("cp-claude-4.6-sonnet", "claude-4.6-sonnet", "Claude 4.6 Sonnet (Cliproxy)", 200000, 1.20),
+    ("cp-claude-4.6-sonnet-thinking", "claude-4.6-sonnet-thinking", "Claude 4.6 Sonnet Thinking (Cliproxy)", 200000, 1.20),
     ("cp-claude-4.6-opus", "claude-4.6-opus", "Claude 4.6 Opus (Cliproxy)", 200000, 1.20),
+    ("cp-claude-opus-4-6-thinking", "claude-opus-4-6-thinking", "Claude 4.6 Opus Thinking (Cliproxy)", 200000, 1.20),
     ("cp-grok-4.6", "grok-4.6", "Grok 4.6 (Cliproxy)", 131072, 1.20),
 ]:
     MODEL_REGISTRY[_cpslug] = ("cliproxy", _cpid, _cplabel, _cpctx, _cpsafe)
+
+# Алиасы для быстрого выбора
+MODEL_REGISTRY["cp-gemini-flash"] = MODEL_REGISTRY["cp-gemini-3.8-flash-high"]
+MODEL_REGISTRY["cp-gemini-pro"] = MODEL_REGISTRY["cp-gemini-3.1-pro-high"]
+MODEL_REGISTRY["cp-claude-sonnet"] = MODEL_REGISTRY["cp-claude-4.6-sonnet"]
+MODEL_REGISTRY["cp-claude-opus"] = MODEL_REGISTRY["cp-claude-4.6-opus"]
+MODEL_REGISTRY["cp-sonnet"] = MODEL_REGISTRY["cp-claude-4.6-sonnet"]
+MODEL_REGISTRY["cp-opus"] = MODEL_REGISTRY["cp-claude-4.6-opus"]
+MODEL_REGISTRY["cp-grok"] = MODEL_REGISTRY["cp-grok-4.6"]
 # Реестр почищен (2026-06-14): оставлены только новейшие версии каждой модели на КАЖДОМ провайдере
 # (разный провайдер/транспорт — отдельная модель). Убраны устаревшие: glm-5/5.1 (на opencode появился
 # glm-5.2 — см. ниже), kimi-k2.5, minimax-m2.5/m2.7, qwen3.5/3.6-plus, mimo-v2.5/v2-pro.
@@ -2241,7 +2253,7 @@ def _model_supports_vision(slug):
     provider = spec[0] if spec else None
     if provider in ("nanogpt", "seekai", "tokenharbor", "atria", "plusvibe", "cliproxy"):
         mid = (spec[1] if spec else "").lower()
-        if "deepseek-v4.1-flash" in mid or "vision" in mid or "-vl" in mid or "omni" in mid or "gemini" in mid:
+        if "deepseek-v4.1-flash" in mid or "vision" in mid or "-vl" in mid or "omni" in mid or "gemini" in mid or "claude" in mid:
             return True
         return CUSTOM_MODELS.get(slug, {}).get("vision", False)
     if provider == "openrouter":
