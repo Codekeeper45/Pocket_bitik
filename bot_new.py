@@ -520,11 +520,13 @@ for _atslug, _atid, _atlabel, _atctx, _atsafe in [
     MODEL_REGISTRY[_atslug] = ("atria", _atid, _atlabel, _atctx, _atsafe)
 # PlusVibe (plusvibeapi.ru, 30M free tokens, OpenAI-совместимый API с reasoning).
 for _pvslug, _pvid, _pvlabel, _pvctx, _pvsafe in [
+    ("pv-glm-5.3-flash", "glm-5.3-flash:free", "GLM 5.3 Flash (PlusVibe Free)", 1000000, 1.30),
+    ("glm-5.3-flash:free", "glm-5.3-flash:free", "GLM 5.3 Flash (PlusVibe Free)", 1000000, 1.30),
+    ("glm-5.3-flash", "glm-5.3-flash:free", "GLM 5.3 Flash (PlusVibe Free)", 1000000, 1.30),
     ("deepseek-v4.1-flash", "deepseek-v4.1-flash:free", "DeepSeek V4.1 Flash (PlusVibe Free)", 1000000, 1.15),
     ("pv-deepseek-v4.1-flash", "deepseek-v4.1-flash:free", "DeepSeek V4.1 Flash (PlusVibe Free)", 1000000, 1.15),
     ("pv-deepseek-v4-flash", "deepseek-v4-flash-0731:free", "DeepSeek V4 Flash 0731 (PlusVibe Free)", 1000000, 1.15),
     ("pv-minimax-m2.7", "minimax-m2.7:free", "MiniMax M2.7 (PlusVibe Free)", 200000, 1.30),
-    ("pv-glm-5.3-flash", "glm-5.3-flash:free", "GLM 5.3 Flash (PlusVibe Free)", 262144, 1.30),
 ]:
     MODEL_REGISTRY[_pvslug] = ("plusvibe", _pvid, _pvlabel, _pvctx, _pvsafe)
 # Реестр почищен (2026-06-14): оставлены только новейшие версии каждой модели на КАЖДОМ провайдере
