@@ -5342,13 +5342,14 @@ def _lyric_steps(text: str, chunk_size: int):
     return steps
 
 
-async def print_lyrics(chat_id, text, chunk_size=3):
+async def print_lyrics(chat_id, text, chunk_size=3, reply_to=None):
     text = text.replace("\r\n", "\n").replace("\r", "\n").strip()
     if not text:
         return
     steps = _lyric_steps(text, chunk_size)
     current_text = steps[0]
-    msg = await client.send_message(chat_id, current_text)
+    kwargs = {"reply_to": reply_to} if reply_to else {}
+    msg = await client.send_message(chat_id, current_text, **kwargs)
     for chunk in steps[1:]:
         await asyncio.sleep(0.8 if "\n" in chunk else 0.2)
         current_text += chunk
@@ -7492,8 +7493,16 @@ async def song_command(event):
         chunk_size = max(1, min(int(mnum.group(1)), 200))
         custom_text = (mnum.group(2) or "").strip()
     text_to_print = custom_text if custom_text else SONG_TEXT
-    await event.delete()
-    await print_lyrics(event.chat_id, text_to_print, chunk_size)
+
+    topic_id = _get_topic_id(event)
+    is_reply, target_msg_id = _is_real_reply(event)
+    reply_target_id = target_msg_id or topic_id
+
+    try:
+        await event.delete()
+    except Exception:
+        pass
+    await print_lyrics(event.chat_id, text_to_print, chunk_size, reply_to=reply_target_id)
 
 
 @client.on(events.NewMessage(outgoing=True, pattern=r"^[./]channels(?:\s+(\w+))?(?:\s+(.+))?$", from_users="me"))
