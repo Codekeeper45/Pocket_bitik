@@ -132,6 +132,8 @@ def _collect_plusvibe_keys() -> list:
 
 plusvibe_api_keys = _collect_plusvibe_keys()  # PlusVibe API (plusvibeapi.ru, ротация ключей)
 PLUSVIBE_BASE_URL = os.getenv("PLUSVIBE_BASE_URL", "https://plusvibeapi.ru/v1")
+cliproxy_api_key = os.getenv("CLIPROXY_API_KEY")  # Cliproxy API (локальный шлюз VPS с пулом моделей)
+CLIPROXY_BASE_URL = os.getenv("CLIPROXY_BASE_URL", "https://push-receive-meeting-backgrounds.trycloudflare.com/v1")
 tavily_api_key = os.getenv("TAVILY_API_KEY")  # веб-поиск/извлечение страниц для /ask (tavily.com); без ключа веб-инструменты выключены
 index_db_url = os.getenv("INDEX_DB_URL")  # MariaDB для /index (GraphRAG-память): mysql://user:pass@host:port/db (pass URL-encoded)
 llama_cloud_api_key = os.getenv("LLAMA_CLOUD_API_KEY")  # OCR фото (LlamaParse); без него фото идут через vision
@@ -529,6 +531,14 @@ for _pvslug, _pvid, _pvlabel, _pvctx, _pvsafe in [
     ("pv-minimax-m2.7", "minimax-m2.7:free", "MiniMax M2.7 (PlusVibe Free)", 200000, 1.30),
 ]:
     MODEL_REGISTRY[_pvslug] = ("plusvibe", _pvid, _pvlabel, _pvctx, _pvsafe)
+# Cliproxy (локальный шлюз VPS с пулом моделей Antigravity и xAI).
+for _cpslug, _cpid, _cplabel, _cpctx, _cpsafe in [
+    ("cp-gemini-3.8-flash-high", "gemini-3.8-flash-high", "Gemini 3.8 Flash High (Cliproxy)", 1048576, 1.15),
+    ("cp-claude-4.6-sonnet", "claude-4.6-sonnet", "Claude 4.6 Sonnet (Cliproxy)", 200000, 1.20),
+    ("cp-claude-4.6-opus", "claude-4.6-opus", "Claude 4.6 Opus (Cliproxy)", 200000, 1.20),
+    ("cp-grok-4.6", "grok-4.6", "Grok 4.6 (Cliproxy)", 131072, 1.20),
+]:
+    MODEL_REGISTRY[_cpslug] = ("cliproxy", _cpid, _cplabel, _cpctx, _cpsafe)
 # Реестр почищен (2026-06-14): оставлены только новейшие версии каждой модели на КАЖДОМ провайдере
 # (разный провайдер/транспорт — отдельная модель). Убраны устаревшие: glm-5/5.1 (на opencode появился
 # glm-5.2 — см. ниже), kimi-k2.5, minimax-m2.5/m2.7, qwen3.5/3.6-plus, mimo-v2.5/v2-pro.
@@ -774,7 +784,7 @@ def _clamp_reasoning(model_id: str, effort: str, provider: str = None) -> str:
         return "max" if effort == "xhigh" else "high"
     if provider == "sakana":
         return "max" if effort == "xhigh" else "high"  # Sakana: только high/xhigh→max (off/low/medium нет)
-    if provider in ("nanogpt", "seekai", "tokenharbor", "atria", "plusvibe"):
+    if provider in ("nanogpt", "seekai", "tokenharbor", "atria", "plusvibe", "cliproxy"):
         mid = (model_id or "").lower()
         if effort in ("xhigh", "max"):
             return "max" if ("deepseek" in mid or ":thinking" in mid or "glm" in mid or "qwen" in mid or "atria" in mid) else "high"
@@ -2012,6 +2022,11 @@ class _PlusvibeReasoningClient:
 
 
 plusvibe_client = _PlusvibeReasoningClient(plusvibe_api_keys) if plusvibe_api_keys else None
+cliproxy_client = OpenAI(
+    api_key=cliproxy_api_key,
+    base_url=CLIPROXY_BASE_URL,
+    default_headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
+) if cliproxy_api_key else None
 
 AUTO_REPLY_BUFFERS: dict = {}
 AUTO_REPLY_TASKS: dict = {}
@@ -2184,6 +2199,8 @@ def _client_for_provider(provider):
         return atria_client
     if provider == "plusvibe":
         return plusvibe_client
+    if provider == "cliproxy":
+        return cliproxy_client
     if provider == "opencode":
         return opencode_reasoning_client  # путь ответов с инжектом reasoning_effort
     return opencode_client  # неизвестный провайдер — сырой клиент (фоллбэк)
@@ -2222,7 +2239,7 @@ def _model_supports_vision(slug):
         return True  # vision-слуги OpenCode (kimi/glm/qwen/mimo)
     spec = MODEL_REGISTRY.get(slug)
     provider = spec[0] if spec else None
-    if provider in ("nanogpt", "seekai", "tokenharbor", "atria", "plusvibe"):
+    if provider in ("nanogpt", "seekai", "tokenharbor", "atria", "plusvibe", "cliproxy"):
         mid = (spec[1] if spec else "").lower()
         if "deepseek-v4.1-flash" in mid or "vision" in mid or "-vl" in mid or "omni" in mid or "gemini" in mid:
             return True
