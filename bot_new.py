@@ -4332,6 +4332,22 @@ async def generate_ask_reply(context: str, question: str, caller: str = None) ->
         max_tokens=ASK_MAX_TOKENS,  # thinking-модели жрут на reasoning тысячи токенов
         temperature=1.0,
     )
+    if not result:
+        # Автоматический фоллбэк при пустом ответе (например, safety-фильтр Gemini на пикантный/ролевой промпт)
+        for fb_slug in ["cp-grok-4.6", "pv-glm-5.3-flash", "deepseek-pro"]:
+            if fb_slug in MODEL_REGISTRY and fb_slug != ACTIVE_MODEL:
+                log("AI", f"Модель {label} вернула пустой ответ — пробую фоллбэк на {fb_slug}...")
+                fb_res = await _llm_create(
+                    messages=[
+                        {"role": "system", "content": ASK_SYSTEM_PROMPT.replace("{model}", MODEL_REGISTRY[fb_slug][2]) + f"\n\nТекущая дата и время: {now_str} МСК."},
+                        {"role": "user", "content": _build_ask_user_content(context, question, caller)},
+                    ],
+                    max_tokens=ASK_MAX_TOKENS,
+                    temperature=1.0,
+                    model_slug=fb_slug,
+                )
+                if fb_res:
+                    return fb_res
     return result if result else "Модель не смогла ответить (пустой ответ или ошибка API)"
 
 
