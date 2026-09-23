@@ -3099,6 +3099,9 @@ async def describe_image(image_bytes: bytes, caption: str = "", model: str = Non
                 max_tokens=4096,
                 timeout=60,  # иначе дефолт SDK = 600с: один залипший запрос вешал /gen-каталог на 10 мин
             )
+            if not getattr(response, "choices", None):
+                log("MEDIA", f"describe_image: пустой choices от модели (попытка {attempt + 1})")
+                continue
             return _strip_think((response.choices[0].message.content or "").strip()) or "[изображение]"
         except Exception as e:
             if not _is_retriable(e):
@@ -3137,6 +3140,9 @@ async def describe_album(images: list, caption: str = "", model: str = None, det
                 max_tokens=4096,
                 timeout=90,  # альбом тяжелее одного фото, но не 600с дефолта SDK
             )
+            if not getattr(response, "choices", None):
+                log("MEDIA", f"describe_album: пустой choices от модели (попытка {attempt + 1})")
+                continue
             return _strip_think((response.choices[0].message.content or "").strip())
         except Exception as e:
             if not _is_retriable(e):
@@ -4250,6 +4256,9 @@ async def _llm_create(messages: list, max_tokens: int = 4096, temperature: float
                     temperature=temperature,
                     max_tokens=max_tokens,
                 )
+                if not getattr(response, "choices", None):
+                    log("AI", f"Ответ {label} (попытка {attempt + 1}): пустой список choices")
+                    continue
                 msg_obj = response.choices[0].message
                 content = _extract_content(msg_obj)
                 from_reasoning = bool(content) and not (getattr(msg_obj, "content", None) or "").strip()
@@ -5161,6 +5170,20 @@ async def ask_agentic(context: str, question: str, must_search: bool = False, ca
         # После первой итерации не форсируем tool call
         force_tool = False
 
+        if not getattr(response, "choices", None):
+            log("ASK", f"Ответ {label}: пустой список choices (возможно сработал safety-фильтр или отказ модели)")
+            if images:
+                log("ASK", "-g: возможна блокировка безопасности по фото — повторяю запрос без прямого vision...")
+                _log_search_summary()
+                return await ask_agentic(
+                    context, question, must_search=must_search, caller=caller,
+                    ctx_tokens_est=ctx_tokens_est, voice_mode=voice_mode, images=None,
+                    chat_id=chat_id, msg_by_id=msg_by_id, memory_allowed=memory_allowed,
+                    asker_id=asker_id
+                )
+            _log_search_summary()
+            return await generate_ask_reply(context, question, caller=caller)
+
         choice = response.choices[0]
         msg = choice.message
 
@@ -5403,6 +5426,10 @@ async def ask_agentic(context: str, question: str, must_search: bool = False, ca
             max_tokens=ASK_MAX_TOKENS,
             temperature=0.7,
         )
+        if not getattr(response, "choices", None):
+            log("ASK", f"Финальный ответ {label}: пустой choices")
+            _log_search_summary()
+            return await generate_ask_reply(context, question, caller=caller)
         _fchoice = response.choices[0]
         _fmsg = _fchoice.message
         content = _extract_content(_fmsg)
@@ -5425,7 +5452,8 @@ async def ask_agentic(context: str, question: str, must_search: bool = False, ca
                     max_tokens=ASK_MAX_TOKENS,
                     temperature=0.7,
                 )
-                content = _extract_content(response2.choices[0].message)
+                if response2 and getattr(response2, "choices", None):
+                    content = _extract_content(response2.choices[0].message)
             except Exception as e:
                 log("ASK", f"Ошибка повторного запроса без DSML: {e}")
         if content:
@@ -5519,6 +5547,8 @@ async def process_media_cached(m, vision_model: str = None, detail: str = "high"
             if idx is not None:
                 try:
                     img = await m.download_media(bytes)
+                    if img:
+                        img = await _downscale_img(img, 1280)
                 except Exception as e:
                     log("ASK", f"-g: не удалось скачать фото: {e}")
                     img = None
