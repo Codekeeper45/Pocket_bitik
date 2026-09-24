@@ -381,11 +381,9 @@ GLOY_BASE_URL = "https://api.gloyai.fun/v1"  # LLM API FUN (Gloy AI), OpenAI-с�
 GLOY_MAX_TOKENS = 8192  # Gloy жёстко режет max_tokens ∈ [1,8192] (400 иначе) — клампим (ASK_MAX_TOKENS=16000 не пройдёт)
 
 # --- Google Gemini Flash TTS (голосовые ответы в /ask) ---
-GEMINI_TTS_MODEL = os.getenv("GEMINI_TTS_MODEL", "gemini-3.1-flash-tts-preview")
-# Фолбэк-модель: у 3.1-preview документированная проблема «prompt classifier false rejections»
-# (ложные 400 INVALID_ARGUMENT) и «occasional text token returns» (500). Если 3.1 упорно
-# отклоняет — переключаемся на стабильную 2.5-flash-preview-tts. Google рекомендует retry-логику.
-GEMINI_TTS_FALLBACK_MODEL = os.getenv("GEMINI_TTS_FALLBACK_MODEL", "gemini-2.5-flash-preview-tts")
+GEMINI_TTS_MODEL = os.getenv("GEMINI_TTS_MODEL", "gemini-3.8-flash-tts")
+# Фолбэк-модели: 3.8-flash-lite-tts, затем проверенная 3.1-flash-tts-preview / 2.5-flash-preview-tts.
+GEMINI_TTS_FALLBACK_MODEL = os.getenv("GEMINI_TTS_FALLBACK_MODEL", "gemini-3.8-flash-lite-tts")
 GEMINI_TTS_URL = "https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
 # Последний фолбэк — ТА ЖЕ модель, но через OpenRouter (другой транспорт и квота: кредиты
 # OpenRouter, а не Google-ключи). Эндпоинт OpenAI-совместимый /audio/speech, отдаёт сырой PCM.
@@ -1199,13 +1197,15 @@ def _voice_style_text(engine: str = "gemini", fish_model: str = "") -> str:
             "  будь выразительной, комбинируй, ставь тег перед нужной фразой.\n"
             "- Пример: «[soft] Эй… [whispering] да ладно тебе… [laughing] не переживай об этом, [breathy] я рядом.»"
         )
-    # Gemini (дефолт) — [квадратные] аудио-теги
+    # Gemini (дефолт) — [квадратные] аудио-теги и Voice Design
+    style_info = f" (активный стиль: «{VOICE_STYLE_PROMPT}»)" if 'VOICE_STYLE_PROMPT' in globals() and VOICE_STYLE_PROMPT else ""
     return _VOICE_STYLE_COMMON + (
-        "- Управляй интонацией аудио-тегами в квадратных скобках — они НЕ произносятся, а задают подачу:\n"
-        "  [радостно] [взволнованно] [смеётся] [усмехается] [вздыхает] [шёпотом] [тихо] [серьёзно]\n"
-        "  [саркастично] [с теплотой] [задумчиво] [удивлённо] [с сожалением]\n"
-        "- Передавай эмоцию голосом и тегами, а не смайликами.\n"
-        "- Пример: «[усмехается] Ну ты даёшь… [с теплотой] на самом деле, это отличная идея.»"
+        f"- Озвучка: Gemini 3.8 Flash TTS{style_info}. Управляй интонацией, эмоциями и подачей через режиссёрские теги в квадратных скобках (они НЕ зачитываются вслух):\n"
+        "  • Эмоции: [радостно] [восторженно] [смеётся] [усмехается] [хихикает] [вздыхает] [грустно] [плачет] [с сочувствием] [испуганно] [серьёзно] [строго] [саркастично] [ехидно] [ласково] [нежно]\n"
+        "  • Темп и громкость: [шёпотом] [тихо] [громко] [кричит] [быстро] [медленно] [пауза] [с расстановкой]\n"
+        "  • Невербальные междометия: |хм|, |ага|, |угу|, |эх|, |ой|, [вздох], [смешок]\n"
+        "  • Сценическая подача (Voice Design на лету): при отыгрыше роли можно задать в самом начале реплики: (Подача: нежный девичий голос) или (Подача: хриплый старый пират).\n"
+        "- Пример: «(Подача: загадочная) [шёпотом] Слушай внимательно… [усмехается] ты даже не представляешь, что сейчас произошло.»"
     )
 
 
@@ -2194,6 +2194,7 @@ ACTIVE_MEDIA_MODEL = _model_state.get("active_media") or "lite"
 # Голос для озвучки ответов (/ask) и режим авто-голоса (модель сама решает озвучивать)
 ACTIVE_VOICE = _validate_voice(_model_state.get("active_voice") or TTS_DEFAULT_VOICE)
 VOICE_AUTO = bool(_model_state.get("voice_auto", False))
+VOICE_STYLE_PROMPT = _model_state.get("voice_style_prompt") or ""  # постоянный стиль / Voice Design
 _tts_key_idx = 0  # round-robin указатель по GOOGLE_TTS_KEYS
 # TTS-движок и Fish-голоса (избранное)
 TTS_ENGINE = _model_state.get("tts_engine", "gemini")  # "gemini" | "fish"
@@ -2682,7 +2683,7 @@ def count_tokens(text: str) -> int:
 
 
 def _save_model_state():
-    save_json(MODEL_STATE_PATH, {"active": ACTIVE_MODEL, "tools_support": MODEL_TOOLS_SUPPORT, "active_media": ACTIVE_MEDIA_MODEL, "custom_models": CUSTOM_MODELS, "active_voice": ACTIVE_VOICE, "voice_auto": VOICE_AUTO, "tts_engine": TTS_ENGINE, "fish_voice": FISH_VOICE, "fish_favorites": FISH_FAVORITES, "reasoning_effort": REASONING_EFFORT, "gen_image_model": GEN_IMAGE_MODEL, "gen_image_res": GEN_IMAGE_RES, "gen_image_input": GEN_IMAGE_INPUT})
+    save_json(MODEL_STATE_PATH, {"active": ACTIVE_MODEL, "tools_support": MODEL_TOOLS_SUPPORT, "active_media": ACTIVE_MEDIA_MODEL, "custom_models": CUSTOM_MODELS, "active_voice": ACTIVE_VOICE, "voice_auto": VOICE_AUTO, "voice_style_prompt": VOICE_STYLE_PROMPT, "tts_engine": TTS_ENGINE, "fish_voice": FISH_VOICE, "fish_favorites": FISH_FAVORITES, "reasoning_effort": REASONING_EFFORT, "gen_image_model": GEN_IMAGE_MODEL, "gen_image_res": GEN_IMAGE_RES, "gen_image_input": GEN_IMAGE_INPUT})
 
 
 def _set_tools_support(slug, ok):
@@ -3872,12 +3873,16 @@ async def extract_video_note_content(msg) -> str:
 # --- Озвучка ответов (Google Gemini Flash TTS) ---
 
 def _build_tts_prompt(text: str, voice: str) -> str:
-    """Минимальная нейтральная обёртка для TTS: тон, эмоцию и стиль задаёт САМА
-    модель-ответчик через текст и аудио-теги [..]. Здесь — только просьба озвучить
-    естественно и не зачитывать пометки в скобках. Короткий промпт ещё и реже
-    ловит ложный отказ классификатора у 3.1-preview (400)."""
-    return ("Озвучь этот текст естественно, живо, с эмоцией. Слова в квадратных скобках "
-            "вроде [радостно] или [шёпотом] — это пометки интонации, НЕ произноси их вслух:\n" + text)
+    """Формирует промпт для Gemini 3.8 Flash TTS: поддержка режиссуры речи,
+    интонаций в [квадратных скобках] и кастомного Voice Design / стиля."""
+    prefix = (
+        "Озвучь этот текст естественно, живо, выразительно. Пометки в квадратных скобках [..] "
+        "и круглых (..) — это режиссёрские указания интонации, эмоции, темпа и стиля подачи. "
+        "НЕ произноси эти пометки вслух, а отыграй их голосом:\n"
+    )
+    if 'VOICE_STYLE_PROMPT' in globals() and VOICE_STYLE_PROMPT:
+        prefix = f"(Подача и характер голоса: {VOICE_STYLE_PROMPT})\n" + prefix
+    return prefix + text
 
 
 def _strip_for_tts(text: str) -> str:
@@ -4041,6 +4046,8 @@ async def _tts_try_model(text: str, voice: str, model: str, max_attempts: int = 
         _tts_key_idx = (_tts_key_idx + 1) % len(GOOGLE_TTS_KEYS)
         try:
             pcm = await asyncio.to_thread(_sync_tts, text, voice, key, model)
+            if pcm.startswith(b"RIFF"):
+                return await _to_ogg_opus(pcm)
             return await _pcm_to_ogg(pcm)
         except Exception as e:
             last_err = e
@@ -8920,6 +8927,29 @@ async def voice_command(event):
 
     low = arg.lower()
 
+    # /voice style [описание|off|reset] — кастомный Voice Design и подача голоса (Gemini 3.8 Flash TTS)
+    if low.startswith("style") or low.startswith("design"):
+        val = arg[5:].strip() if low.startswith("style") else arg[6:].strip()
+        if not val:
+            cur = f"«{VOICE_STYLE_PROMPT}»" if VOICE_STYLE_PROMPT else "по умолчанию (без фильтра стиля)"
+            await event.edit(f"🎨 **Voice Design (стиль речи):** {cur}\n\n"
+                             f"Установить: `/voice style <описание>`\n"
+                             f"Пример: `/voice style нежный, робкий девичий голос с придыханием`\n"
+                             f"Пример: `/voice style брутальный низкий голос киборга`\n"
+                             f"Сбросить: `/voice style reset`")
+            return
+        if val.lower() in ("off", "reset", "none", "0", "нет", "сброс"):
+            VOICE_STYLE_PROMPT = ""
+            _save_model_state()
+            await event.edit("🔄 Стилизация голоса сброшена на стандартную.")
+            return
+        VOICE_STYLE_PROMPT = val
+        _save_model_state()
+        await event.edit(f"🎨 **Voice Design установлен:** «{VOICE_STYLE_PROMPT}»\n"
+                         f"Теперь все голосовые ответы Gemini будут синтезироваться с этой подачей.\n"
+                         f"`/voice test` — прослушать · `/voice style reset` — сбросить.")
+        return
+
     # /voice engine [gemini|fish] — выбор TTS-движка
     if low.startswith("engine"):
         rest = arg[len("engine"):].strip().lower()
@@ -9000,15 +9030,17 @@ async def voice_command(event):
 
     # без аргумента — список голосов
     if not arg:
-        lines = ["🎙 **Голоса (Gemini TTS)** — ▶ активный:"]
+        lines = [f"🎙 **Голоса (Gemini 3.8 Flash TTS · Пул: {len(GOOGLE_TTS_KEYS)} ключей)** — ▶ активный:"]
         for i, p in enumerate(VOICE_PROFILES, 1):
             mk = f"▶{i}." if p["name"] == ACTIVE_VOICE else f"{i}."
             g = "♀" if p["gender"] == "female" else "♂"
             lines.append(f"{mk} {p['emoji']} `{p['name']}` {g} — {p['personality']}")
         lines.append(f"\nДвижок: **{TTS_ENGINE}**" + (f" (Fish-голос `{FISH_VOICE}`)" if TTS_ENGINE == "fish" and FISH_VOICE else "") +
                      f" · Авто-голос: {'ВКЛ ✅' if VOICE_AUTO else 'выкл'} · флаг `-v` форсит голос")
+        st_text = f"«{VOICE_STYLE_PROMPT}»" if VOICE_STYLE_PROMPT else "стандартный"
+        lines.append(f"🎨 **Voice Design:** {st_text} (`/voice style <описание>` / `/voice style reset`)")
         lines.append("🎧 `/voice samples` — примеры ВСЕХ голосов · `/voice N`/`/voice <имя>` — выбрать · `/voice auto on|off`")
-        lines.append("🐟 `/voice engine fish|gemini` — сменить движок · `/voice fish` — голоса Fish Audio (поиск/избранное)")
+        lines.append("🐟 `/voice engine fish|gemini` — сменить движок · `/voice fish` — голоса Fish Audio")
         await event.edit("\n".join(lines)[:4000])
         return
 
