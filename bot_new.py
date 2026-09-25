@@ -1176,7 +1176,7 @@ _VOICE_STYLE_COMMON = (
 
 
 def _voice_style_text(engine: str = "gemini", fish_model: str = "") -> str:
-    """Инструкция по разметке интонации под активный TTS-движок."""
+    """Инструкция по управлению голосом, режиссурой и стилем для ИИ."""
     if engine == "fish" and not str(fish_model).lower().startswith("s2"):
         # Fish S1 — (круглые скобки) из фикс-набора, ПЕРЕД фразой
         return _VOICE_STYLE_COMMON + (
@@ -1188,7 +1188,6 @@ def _voice_style_text(engine: str = "gemini", fish_model: str = "") -> str:
         )
     if engine == "fish":
         # Fish S2+ (включая S2.1 Pro) — [квадратные скобки] со свободными описаниями подачи.
-        # (словарь эмоций Fish английский → так надёжнее), сам текст реплики — на русском.
         return _VOICE_STYLE_COMMON + (
             "- Управляй интонацией пометками в КВАДРАТНЫХ скобках на АНГЛИЙСКОМ (так Fish надёжнее их понимает),\n"
             "  а сами слова реплики — на русском. Скобки НЕ произносятся. Примеры тегов: [soft] [whispering]\n"
@@ -1197,15 +1196,37 @@ def _voice_style_text(engine: str = "gemini", fish_model: str = "") -> str:
             "  будь выразительной, комбинируй, ставь тег перед нужной фразой.\n"
             "- Пример: «[soft] Эй… [whispering] да ладно тебе… [laughing] не переживай об этом, [breathy] я рядом.»"
         )
-    # Gemini (дефолт) — [квадратные] аудио-теги и Voice Design
-    style_info = f" (активный стиль: «{VOICE_STYLE_PROMPT}»)" if 'VOICE_STYLE_PROMPT' in globals() and VOICE_STYLE_PROMPT else ""
+
+    # Gemini (дефолт) — полное управление голосом, Voice Design и эмоции
+    vf = "Leda (юная, звонкая), Aoede (легкая), Kore (строгая), Zephyr (яркая), Callirrhoe (спокойная), Despina (мягкая), Sulafat (теплая), Autonoe (чистая)"
+    vm = "Puck (бодрый, живой), Charon (глубокий диктор), Fenrir (эмоциональный, дерзкий), Orus (командный, твердый), Algenib (хриплый), Enceladus (придыхание), Iapetus (нейтральный), Umbriel (расслабленный)"
+    cur_st = f"«{VOICE_STYLE_PROMPT}»" if 'VOICE_STYLE_PROMPT' in globals() and VOICE_STYLE_PROMPT else "стандартный"
+
     return _VOICE_STYLE_COMMON + (
-        f"- Озвучка: Gemini 3.8 Flash TTS{style_info}. Управляй интонацией, эмоциями и подачей через режиссёрские теги в квадратных скобках (они НЕ зачитываются вслух):\n"
-        "  • Эмоции: [радостно] [восторженно] [смеётся] [усмехается] [хихикает] [вздыхает] [грустно] [плачет] [с сочувствием] [испуганно] [серьёзно] [строго] [саркастично] [ехидно] [ласково] [нежно]\n"
-        "  • Темп и громкость: [шёпотом] [тихо] [громко] [кричит] [быстро] [медленно] [пауза] [с расстановкой]\n"
-        "  • Невербальные междометия: |хм|, |ага|, |угу|, |эх|, |ой|, [вздох], [смешок]\n"
-        "  • Сценическая подача (Voice Design на лету): при отыгрыше роли можно задать в самом начале реплики: (Подача: нежный девичий голос) или (Подача: хриплый старый пират).\n"
-        "- Пример: «(Подача: загадочная) [шёпотом] Слушай внимательно… [усмехается] ты даже не представляешь, что сейчас произошло.»"
+        f"\n━━ РЕЖИССУРА ГОЛОСА (Gemini 3.8 Flash TTS · Voice Design) ━━\n"
+        f"Ты можешь ПОЛНОСТЬЮ управлять голосом, тембром, сценой и интонацией!\n\n"
+        f"1. Доступные базовые голоса (выбирай любой, подходящий под контекст или роль):\n"
+        f"   • Женские: {vf}\n"
+        f"   • Мужские: {vm}\n"
+        f"   • По умолчанию выбран: {ACTIVE_VOICE} (стиль: {cur_st})\n\n"
+        f"2. Управление параметрами речи и Voice Design:\n"
+        f"   Чтобы задать голос, стиль и сцену, начни свой ответ с блока параметров:\n"
+        f"   [[VOICE]]\n"
+        f"   voice: ИмяГолоса (например: Fenrir, Leda, Puck, Charon, Orus, Aoede)\n"
+        f"   style: Описание характера, возраста и тембра (например: хриплый старый пират, уставший шепот, нежная заботливая девушка)\n"
+        f"   scene: Окружение и атмосфера (например: скрипучая палуба корабля в шторм, тихая спальня ночью, шумный бар)\n"
+        f"   pace: Темп речи (быстрый, размеренный, медленный, отрывистый)\n"
+        f"   accent: Акцент или диалект (пиратский, британский, французский и т.д.)\n"
+        f"   ---\n"
+        f"   Твой текст реплики\n\n"
+        f"   (Либо в одну строку: [[VOICE voice=Fenrir style=\"хриплый старый пират\" scene=\"палуба в шторм\"]] Текст реплики)\n\n"
+        f"3. Интонации и эмоции внутри реплики (НЕ зачитываются вслух, отыгрываются голосом):\n"
+        f"   • Живые звуки: [смеётся], [хихикает], [усмехается], [вздыхает], [ахает], [зевает], [кашляет]\n"
+        f"   • Эмоции: [радостно], [грустно], [испуганно], [восторженно], [саркастично], [серьёзно], [нежно], [с теплотой]\n"
+        f"   • Громкость и темп: [шёпотом], [тихо], [кричит], [громко], [пауза]\n\n"
+        f"4. ЖЕЛЕЗНОЕ ПРАВИЛО:\n"
+        f"   Никогда НЕ вставляй в саму реплику пояснения вроде «(Подача: ...)», мысли или промпты для себя. "
+        f"   Все настройки голоса пиши ТОЛЬКО в блоке [[VOICE]] до разделителя ---, а в реплике — только живую речь персонажа!"
     )
 
 
@@ -1213,10 +1234,11 @@ def _voice_auto_hint(engine: str = "gemini", fish_model: str = "") -> str:
     """Подсказка для авто-режима: модель сама решает, отвечать ли голосом (маркер [[VOICE]])."""
     return (
         "\n\n━━ ВОЗМОЖНОСТЬ ОТВЕТИТЬ ГОЛОСОМ ━━\n"
-        "По умолчанию отвечай ТЕКСТОМ по правилам выше (Telegram-HTML). НО если ответ уместнее и живее голосом "
-        "(эмоция, короткий личный ответ, шутка, поддержка) — можешь ответить голосовым.\n"
-        "Чтобы ответить голосом: начни самую первую строку с маркера [[VOICE]] на отдельной строке, "
-        "а дальше — текст строго по правилам режима голосового ответа (ниже). Не нужен голос — отвечай текстом без маркера."
+        "По умолчанию отвечай ТЕКСТОМ по правилам выше (Telegram-HTML). НО если ответ уместнее, живее и эмоциональнее голосом "
+        "(эмоция, шутка, личный разговор, отыгрыш роли, поддержка, или если пользователь просит голос) — "
+        "ты можешь ответить ГОЛОСОВЫМ сообщением!\n"
+        "Чтобы ответить голосом: начни самую первую строку с блока [[VOICE]] (выбрав любой подходящий голос и стиль под ситуацию, как описано ниже). "
+        "Если голос не нужен — отвечай обычным текстом без блока [[VOICE]]."
         + _voice_style_text(engine, fish_model)
     )
 
@@ -3870,27 +3892,178 @@ async def extract_video_note_content(msg) -> str:
     return "[видео кружок]"
 
 
-# --- Озвучка ответов (Google Gemini Flash TTS) ---
+# --- Озвучка ответов (Google Gemini Flash TTS · Voice Design) ---
 
-def _build_tts_prompt(text: str, voice: str) -> str:
-    """Формирует промпт для Gemini 3.8 Flash TTS: поддержка режиссуры речи,
-    интонаций в [квадратных скобках] и кастомного Voice Design / стиля."""
-    prefix = (
-        "Озвучь этот текст естественно, живо, выразительно. Пометки в квадратных скобках [..] "
-        "и круглых (..) — это режиссёрские указания интонации, эмоции, темпа и стиля подачи. "
-        "НЕ произноси эти пометки вслух, а отыграй их голосом:\n"
-    )
-    if 'VOICE_STYLE_PROMPT' in globals() and VOICE_STYLE_PROMPT:
-        prefix = f"(Подача и характер голоса: {VOICE_STYLE_PROMPT})\n" + prefix
-    return prefix + text
+VOICE_NAMES_CANONICAL = [
+    "Zephyr", "Puck", "Charon", "Kore", "Fenrir", "Leda", "Orus", "Aoede", "Callirrhoe",
+    "Autonoe", "Enceladus", "Iapetus", "Umbriel", "Algieba", "Despina", "Erinome",
+    "Algenib", "Rasalgethi", "Laomedeia", "Achernar", "Alnilam", "Schedar", "Gacrux",
+    "Pulcherrima", "Achird", "Zubenelgenubi", "Vindemiatrix", "Sadachbia", "Sadaltager", "Sulafat"
+]
+VOICE_MAP_LOWER = {v.lower(): v for v in VOICE_NAMES_CANONICAL}
+
+RUS_TAG_MAP = {
+    "смеётся": "[laughs]", "смех": "[laughs]", "усмехается": "[chuckling]", "хихикает": "[giggles]",
+    "шёпотом": "[whispers]", "шепотом": "[whispers]", "шепчет": "[whispers]", "тихо": "[whispers]",
+    "громко": "[shouting]", "кричит": "[shouting]", "плачет": "[crying]",
+    "вздыхает": "[sighs]", "вздох": "[sighs]", "зевает": "[yawn]", "кашляет": "[cough]",
+    "ахает": "[gasp]", "радостно": "[excited]", "весело": "[excited]",
+    "восторженно": "[excitedly]", "грустно": "[sad]", "печально": "[sad]",
+    "устало": "[tired]", "испуганно": "[panicked]", "паника": "[panicked]",
+    "саркастично": "[sarcastic]", "серьёзно": "[serious]", "серьезно": "[serious]",
+    "строго": "[serious]", "дрожит": "[trembling]", "пауза": "<short pause>",
+    "с теплотой": "[warmly]", "нежно": "[tender]", "ласково": "[tender]", "с любовью": "[tender]"
+}
+ENG_TAGS_SET = {
+    "whispers", "laughs", "sighs", "gasp", "shouting", "crying", "screaming", "giggles", "yawn",
+    "cough", "excited", "sad", "tired", "panicked", "sarcastic", "serious", "trembling", "warmly",
+    "tender", "chuckling", "mischievously", "excitedly"
+}
+
+
+def _clean_and_convert_tts_tags(text: str) -> str:
+    """Конвертирует русские интонационные теги в поддерживаемые Gemini TTS английские теги
+    и очищает технические директивы, чтобы они ни при каких условиях не зачитывались вслух."""
+    def repl(m):
+        raw = m.group(1).strip()
+        low = raw.lower()
+        if low in RUS_TAG_MAP:
+            return RUS_TAG_MAP[low]
+        if low in ENG_TAGS_SET:
+            return f"[{low}]"
+        # Служебные пометки (подача, стиль, голос и т.д.) — удаляем
+        if any(low.startswith(p) for p in ("подача", "стиль", "голос", "style", "voice", "scene", "сцена", "pace", "темп", "accent", "акцент")):
+            return ""
+        # Любой неизвестный текст в скобках — удаляем, чтобы модель не зачитывала пометки
+        return ""
+
+    t = re.sub(r'\[([^\]]+)\]', repl, text)
+    t = re.sub(r'\((?:подача|стиль|голос|style|voice|scene|сцена|pace|темп|accent|акцент)[^)]*\)', '', t, flags=re.IGNORECASE)
+    t = re.sub(r'[ \t]+', ' ', t)
+    t = re.sub(r'\n{3,}', '\n\n', t).strip()
+    return t
+
+
+def _parse_voice_directive(raw_text: str, default_voice: str = "Leda", default_style: str = "") -> dict:
+    """Парсит директиву голоса от LLM: извлекает имя голоса, стиль, сцену, темп,
+    акцент и возвращает чистый текст для озвучки без служебных пометок."""
+    voice = default_voice
+    style = default_style
+    scene = ""
+    pace = ""
+    accent = ""
+    text = (raw_text or "").strip()
+
+    m = re.search(r'\[\[VOICE(?:\s*:?\s*([^\]]*))?\]\]', text, flags=re.IGNORECASE)
+    if m:
+        inline_args = (m.group(1) or "").strip()
+        header_end = m.end()
+        if inline_args and inline_args.lower() in VOICE_MAP_LOWER:
+            voice = VOICE_MAP_LOWER[inline_args.lower()]
+        elif inline_args:
+            for kv in re.finditer(r'(\w+)\s*=\s*(?:"([^"]*)"|\'([^\']*)\'|(\S+))', inline_args):
+                k = kv.group(1).lower()
+                v = kv.group(2) or kv.group(3) or kv.group(4) or ""
+                if k in ("voice", "голос") and v.lower() in VOICE_MAP_LOWER:
+                    voice = VOICE_MAP_LOWER[v.lower()]
+                elif k in ("style", "стиль", "подача"): style = v
+                elif k in ("scene", "сцена", "обстановка"): scene = v
+                elif k in ("pace", "темп", "скорость"): pace = v
+                elif k in ("accent", "акцент"): accent = v
+
+        body = text[header_end:].lstrip()
+        lines = body.splitlines()
+        content_lines = []
+        in_header = True
+        for line in lines:
+            sline = line.strip()
+            if in_header and (sline.startswith("---") or sline.startswith("===") or sline == "---"):
+                in_header = False
+                continue
+            if in_header:
+                km = re.match(r'^(voice|голос|style|стиль|подача|scene|сцена|обстановка|pace|темп|accent|акцент)\s*[:=]\s*(.+)$', sline, re.IGNORECASE)
+                if km:
+                    k, v = km.group(1).lower(), km.group(2).strip()
+                    if k in ("voice", "голос") and v.lower() in VOICE_MAP_LOWER:
+                        voice = VOICE_MAP_LOWER[v.lower()]
+                    elif k in ("style", "стиль", "подача"): style = v
+                    elif k in ("scene", "сцена", "обстановка"): scene = v
+                    elif k in ("pace", "темп"): pace = v
+                    elif k in ("accent", "акцент"): accent = v
+                    continue
+                else:
+                    in_header = False
+            content_lines.append(line)
+        text = "\n".join(content_lines).strip()
+
+    while True:
+        m_dir = re.match(r'^\s*[\(\[]\s*(подача|стиль|style|голос|voice|scene|сцена|pace|темп|accent|акцент)\s*[:=]\s*([^\]\)]+)[\)\]]\s*', text, re.IGNORECASE)
+        if not m_dir:
+            break
+        k = m_dir.group(1).lower()
+        v = m_dir.group(2).strip()
+        if k in ("голос", "voice") and v.lower() in VOICE_MAP_LOWER:
+            voice = VOICE_MAP_LOWER[v.lower()]
+        elif k in ("подача", "стиль", "style"):
+            style = v
+        elif k in ("scene", "сцена"):
+            scene = v
+        elif k in ("pace", "темп"):
+            pace = v
+        elif k in ("accent", "акцент"):
+            accent = v
+        text = text[m_dir.end():].strip()
+
+    clean_transcript = _clean_and_convert_tts_tags(text)
+    return {
+        "voice": voice,
+        "style": style,
+        "scene": scene,
+        "pace": pace,
+        "accent": accent,
+        "transcript": clean_transcript
+    }
+
+
+def _build_tts_prompt(text: str, voice: str, style: str = "", scene: str = "", pace: str = "", accent: str = "") -> str:
+    """Формирует каноничный промпт Google Gemini 3.8 Flash TTS:
+    AUDIO PROFILE, SCENE, DIRECTOR'S NOTES и разделитель TRANSCRIPT.
+    Все инструкции и метаданные остаются выше TRANSCRIPT и НИКОГДА не зачитываются вслух."""
+    clean_text = _clean_and_convert_tts_tags(text)
+
+    prompt_parts = []
+    if voice:
+        prompt_parts.append(f"# AUDIO PROFILE: {voice}")
+    if scene:
+        prompt_parts.append(f"## THE SCENE: {scene}")
+
+    notes = []
+    eff_style = style or (VOICE_STYLE_PROMPT if 'VOICE_STYLE_PROMPT' in globals() else "")
+    if eff_style:
+        notes.append(f"Style: {eff_style}")
+    if pace:
+        notes.append(f"Pace: {pace}")
+    if accent:
+        notes.append(f"Accent: {accent}")
+
+    if notes:
+        prompt_parts.append("### DIRECTOR'S NOTES\n" + "\n".join(notes))
+
+    prompt_parts.append(f"#### TRANSCRIPT\n{clean_text}")
+    return "\n".join(prompt_parts)
 
 
 def _strip_for_tts(text: str) -> str:
-    """Готовит текст к озвучке: убирает HTML-теги и markdown-мусор, СОХРАНЯЕТ аудио-теги [..],
+    """Готовит текст к озвучке: убирает HTML-теги, сохраняет <laugh>/<sigh>/<short pause>,
     схлопывает пробелы и режет до TTS_VOICE_CHAR_CAP."""
     t = text or ""
-    t = re.sub(r"<[^>]+>", "", t)              # HTML-теги прочь
-    t = re.sub(r"[*#`_]+", "", t)              # markdown-мусор (звёздочки/решётки/бэктики/подчёрки)
+    def strip_html_keep_tts(m):
+        tag_content = m.group(1).lower().strip()
+        if tag_content in ("laugh", "sigh", "cough", "breath", "short pause"):
+            return f"<{tag_content}>"
+        return ""
+    t = re.sub(r"<([^>]+)>", strip_html_keep_tts, t)
+    t = re.sub(r"[*#`_]+", "", t)
     t = re.sub(r"[ \t]+", " ", t)
     t = re.sub(r"\n{3,}", "\n\n", t).strip()
     if len(t) > TTS_VOICE_CHAR_CAP:
@@ -3898,11 +4071,12 @@ def _strip_for_tts(text: str) -> str:
     return t
 
 
-def _sync_tts(text: str, voice: str, api_key: str, model: str) -> bytes:
-    """Один синхронный запрос к Gemini TTS. Возвращает PCM (s16le, 24kHz, mono). Бросает при ошибке."""
+def _sync_tts(text: str, voice: str, api_key: str, model: str, style: str = "", scene: str = "", pace: str = "", accent: str = "") -> bytes:
+    """Один синхронный запрос к Gemini TTS. Возвращает WAV (RIFF) или PCM. Бросает при ошибке."""
     url = GEMINI_TTS_URL.format(model=model)
+    full_prompt = _build_tts_prompt(text, voice, style=style, scene=scene, pace=pace, accent=accent)
     payload = {
-        "contents": [{"parts": [{"text": _build_tts_prompt(text, voice)}]}],
+        "contents": [{"parts": [{"text": full_prompt}]}],
         "generationConfig": {
             "responseModalities": ["AUDIO"],
             "speechConfig": {"voiceConfig": {"prebuiltVoiceConfig": {"voiceName": voice}}},
@@ -3925,13 +4099,12 @@ def _sync_tts(text: str, voice: str, api_key: str, model: str) -> bytes:
     return base64.b64decode(b64)
 
 
-def _sync_tts_openrouter(text: str, voice: str) -> bytes:
-    """Озвучка через OpenRouter (та же модель google/gemini-3.1-flash-tts-preview, другой
-    транспорт/квота). OpenAI-совместимый /audio/speech, response_format=pcm → сырой PCM
-    s16le 24kHz mono (как у Google direct). Бросает при ошибке."""
+def _sync_tts_openrouter(text: str, voice: str, style: str = "", scene: str = "", pace: str = "", accent: str = "") -> bytes:
+    """Озвучка через OpenRouter."""
+    full_prompt = _build_tts_prompt(text, voice, style=style, scene=scene, pace=pace, accent=accent)
     payload = {
         "model": GEMINI_TTS_OPENROUTER_MODEL,
-        "input": _build_tts_prompt(text, voice),
+        "input": full_prompt,
         "voice": voice,
         "response_format": "pcm",
     }
@@ -4035,17 +4208,16 @@ def _tts_err_kind(e) -> str:
     return "other"
 
 
-async def _tts_try_model(text: str, voice: str, model: str, max_attempts: int = 4) -> bytes:
+async def _tts_try_model(text: str, voice: str, model: str, max_attempts: int = 4, style: str = "", scene: str = "", pace: str = "", accent: str = "") -> bytes:
     """Пытается озвучить одной моделью: до max_attempts попыток с ротацией ключей.
-    Повторяет при quota (другой ключ), transient (503/500) и classifier (ложный 400 у 3.1).
-    Бросает последнюю ошибку, если не вышло."""
+    Повторяет при quota (другой ключ), transient (503/500) и classifier."""
     global _tts_key_idx
     last_err = None
     for attempt in range(max_attempts):
         key = GOOGLE_TTS_KEYS[_tts_key_idx % len(GOOGLE_TTS_KEYS)]
         _tts_key_idx = (_tts_key_idx + 1) % len(GOOGLE_TTS_KEYS)
         try:
-            pcm = await asyncio.to_thread(_sync_tts, text, voice, key, model)
+            pcm = await asyncio.to_thread(_sync_tts, text, voice, key, model, style=style, scene=scene, pace=pace, accent=accent)
             if pcm.startswith(b"RIFF"):
                 return await _to_ogg_opus(pcm)
             return await _pcm_to_ogg(pcm)
@@ -4062,12 +4234,14 @@ async def _tts_try_model(text: str, voice: str, model: str, max_attempts: int = 
     raise last_err if last_err else RuntimeError("TTS: неизвестная ошибка")
 
 
-async def _tts_try_openrouter(text: str, voice: str) -> bytes:
-    """Озвучка через OpenRouter (та же 3.1-модель) с ретраем на transient/classifier. Бросает при провале."""
+async def _tts_try_openrouter(text: str, voice: str, style: str = "", scene: str = "", pace: str = "", accent: str = "") -> bytes:
+    """Озвучка через OpenRouter с ретраем на transient/classifier. Бросает при провале."""
     last_err = None
     for attempt in range(2):
         try:
-            pcm = await asyncio.to_thread(_sync_tts_openrouter, text, voice)
+            pcm = await asyncio.to_thread(_sync_tts_openrouter, text, voice, style=style, scene=scene, pace=pace, accent=accent)
+            if pcm.startswith(b"RIFF"):
+                return await _to_ogg_opus(pcm)
             return await _pcm_to_ogg(pcm)
         except Exception as e:
             last_err = e
@@ -4079,20 +4253,21 @@ async def _tts_try_openrouter(text: str, voice: str) -> bytes:
     raise last_err if last_err else RuntimeError("OpenRouter TTS: неизвестная ошибка")
 
 
-def _gemini_tts_steps(spoken, voice):
-    """Шаги Gemini-цепочки: 3.1 Google → 3.1 OpenRouter → 2.5 Google."""
+def _gemini_tts_steps(spoken, voice, style: str = "", scene: str = "", pace: str = "", accent: str = ""):
+    """Шаги Gemini-цепочки: 3.8 Google → 3.8 OpenRouter → 3.8-lite Google."""
     steps = [
-        (f"Google/{GEMINI_TTS_MODEL}", lambda: _tts_try_model(spoken, voice, GEMINI_TTS_MODEL), bool(GOOGLE_TTS_KEYS)),
-        (f"OpenRouter/{GEMINI_TTS_OPENROUTER_MODEL}", lambda: _tts_try_openrouter(spoken, voice), bool(openrouter_api_key)),
+        (f"Google/{GEMINI_TTS_MODEL}", lambda: _tts_try_model(spoken, voice, GEMINI_TTS_MODEL, style=style, scene=scene, pace=pace, accent=accent), bool(GOOGLE_TTS_KEYS)),
+        (f"OpenRouter/{GEMINI_TTS_OPENROUTER_MODEL}", lambda: _tts_try_openrouter(spoken, voice, style=style, scene=scene, pace=pace, accent=accent), bool(openrouter_api_key)),
     ]
     if GEMINI_TTS_FALLBACK_MODEL and GEMINI_TTS_FALLBACK_MODEL != GEMINI_TTS_MODEL:
-        steps.append((f"Google/{GEMINI_TTS_FALLBACK_MODEL}", lambda: _tts_try_model(spoken, voice, GEMINI_TTS_FALLBACK_MODEL), bool(GOOGLE_TTS_KEYS)))
+        steps.append((f"Google/{GEMINI_TTS_FALLBACK_MODEL}", lambda: _tts_try_model(spoken, voice, GEMINI_TTS_FALLBACK_MODEL, style=style, scene=scene, pace=pace, accent=accent), bool(GOOGLE_TTS_KEYS)))
     return steps
 
 
-async def synthesize_voice(text: str, voice: str, engine: str = None):
-    """Озвучивает text. Движок — engine или TTS_ENGINE (gemini|fish); при сбое выбранного —
-    автофолбэк на другой. Gemini-цепочка: 3.1 Google → 3.1 OpenRouter → 2.5 Google.
+async def synthesize_voice(text: str, voice: str, engine: str = None, style: str = "", scene: str = "", pace: str = "", accent: str = ""):
+    """Озвучивает text с поддержкой режиссуры речи, Voice Design и выбора голоса.
+    Движок — engine или TTS_ENGINE (gemini|fish); при сбое выбранного — автофолбэк на другой.
+    Gemini-цепочка: 3.8 Google → 3.8 OpenRouter → 3.8-lite Google.
     Fish: активный FISH_VOICE. Возвращает bytes OGG/Opus или None (тогда фолбэк на текст)."""
     voice = _validate_voice(voice)
     spoken = _strip_for_tts(text)
@@ -4106,9 +4281,9 @@ async def synthesize_voice(text: str, voice: str, engine: str = None):
     eng = engine or TTS_ENGINE
     fish_step = ("Fish", lambda: _tts_try_fish(spoken), fish_ok)
     if eng == "fish":
-        steps = [fish_step] + _gemini_tts_steps(spoken, voice)  # Fish primary, Gemini — фолбэк
+        steps = [fish_step] + _gemini_tts_steps(spoken, voice, style=style, scene=scene, pace=pace, accent=accent)
     else:
-        steps = _gemini_tts_steps(spoken, voice) + [fish_step]  # Gemini primary, Fish — фолбэк
+        steps = _gemini_tts_steps(spoken, voice, style=style, scene=scene, pace=pace, accent=accent) + [fish_step]
 
     last_err = None
     for label, factory, available in steps:
@@ -5089,7 +5264,7 @@ async def ask_agentic(context: str, question: str, must_search: bool = False, ca
         system_prompt += f"\n\nОБЯЗАТЕЛЬНО используй {force_name} хотя бы один раз перед тем как ответить."
     if voice_mode == "force":
         system_prompt += _voice_style_text(TTS_ENGINE, FISH_TTS_MODEL)
-    elif voice_mode == "auto":
+    elif voice_mode == "auto" or tts_available:
         system_prompt += _voice_auto_hint(TTS_ENGINE, FISH_TTS_MODEL)
 
     user_text = _build_ask_user_content(context, question, caller, now_str)
@@ -6294,12 +6469,18 @@ async def ask_command(event):
     debug = "d" in flags  # дамп полного user-message в asks/<ts>_<event_id>.txt
     want_voice = "v" in flags  # -v: ответить голосом (озвучка через Gemini TTS)
     photo_mode = "vision" if "m" in flags else "ocr"  # -m: фото описывает vision-модель; дефолт — дешёвый OCR
-    # Режим голоса для промпта: force (флаг -v) / auto (включён /voice auto) / off
+    question = (event.pattern_match.group(4) or "").strip()
+
+    # Проверяем явный запрос голоса в тексте вопроса (напр. «ответь голосом», «скажи голосовым», «озвучь»)
+    explicit_voice_req = bool(re.search(r'(?i)\b(?:ответь|скажи|запиши|пришли|отправь)?\s*(?:голосом|голосовым|голосовух[а-я]|гс|voice)\b', question or ""))
+    if explicit_voice_req:
+        want_voice = True
+
+    # Режим голоса для промпта: force (флаг -v или запрос в тексте) / auto (включён /voice auto) / off
     voice_mode = "force" if (want_voice and tts_available) else ("auto" if (VOICE_AUTO and tts_available) else "off")
     user_tokens = (event.pattern_match.group(3) or "").split()
     usernames = [t.lstrip("@") for t in user_tokens if not t.startswith("!")]
     exclude_users = [t.lstrip("!").lstrip("@") for t in user_tokens if t.startswith("!")]
-    question = (event.pattern_match.group(4) or "").strip()
 
     if not question:
         if is_reply:
@@ -6698,17 +6879,29 @@ async def ask_command(event):
             elif qtot >= int(_qlimit * 0.8):
                 notes.append(f"🎁 квота дня: ~{_fmt_ctx(qtot)}/{_qlim_s}")
 
-        # Решаем, идёт ли ответ голосом: force (флаг -v) или auto (модель начала с маркера [[VOICE]]).
-        go_voice, spoken = False, reply
-        if voice_mode == "force":
-            go_voice, spoken = True, reply
-        elif voice_mode == "auto" and reply.lstrip().startswith("[[VOICE]]"):
+        # Решаем, идёт ли ответ голосом: force (флаг -v или запрос в тексте), auto или модель выдала директиву [[VOICE
+        is_voice_directive = bool(re.search(r'^\s*\[\[VOICE', reply, re.IGNORECASE))
+        go_voice = False
+        if voice_mode == "force" and tts_available:
             go_voice = True
-            spoken = reply.lstrip()[len("[[VOICE]]"):].lstrip()
+        elif is_voice_directive and tts_available:
+            go_voice = True
+        elif voice_mode == "auto" and is_voice_directive and tts_available:
+            go_voice = True
 
         if go_voice:
-            await set_status("🎙 Озвучиваю ответ…")
-            ogg = await synthesize_voice(spoken, ACTIVE_VOICE)
+            parsed = _parse_voice_directive(reply, default_voice=ACTIVE_VOICE, default_style=VOICE_STYLE_PROMPT)
+            target_voice = _validate_voice(parsed["voice"]) or ACTIVE_VOICE
+            v_desc = f"{target_voice}" + (f" · {parsed['style']}" if parsed["style"] else "")
+            await set_status(f"🎙 Озвучиваю ({v_desc[:25]})…")
+            ogg = await synthesize_voice(
+                parsed["transcript"],
+                target_voice,
+                style=parsed["style"],
+                scene=parsed["scene"],
+                pace=parsed["pace"],
+                accent=parsed["accent"]
+            )
             if ogg:
                 bio = io.BytesIO(ogg)
                 bio.name = "voice.ogg"
@@ -6719,15 +6912,16 @@ async def ask_command(event):
                         await status.delete()
                     except Exception:
                         pass
-                log("ASK", f"Голосовой ответ на '{question[:60]}' отправлен (voice={ACTIVE_VOICE}, mode={voice_mode})")
+                log("ASK", f"Голосовой ответ на '{question[:60]}' отправлен (voice={target_voice}, style='{parsed['style']}', scene='{parsed['scene']}')")
                 return
             notes.append("🔇 голос не сгенерировался")  # фолбэк на текст
 
         note = (" — " + "; ".join(notes)) if notes else ""
         prefix = f"{label}{_reasoning_tag()}{note}:\n\n"
-        # На текстовом пути срезаем возможный ведущий маркер [[VOICE]] (если авто-режим выбрал голос, но он упал).
-        if reply.lstrip().startswith("[[VOICE]]"):
-            reply = reply.lstrip()[len("[[VOICE]]"):].lstrip()
+        # На текстовом пути срезаем возможный ведущий маркер [[VOICE]] (если авто-режим выбрал голос, но он упал или выключен).
+        if is_voice_directive:
+            clean_parsed = _parse_voice_directive(reply)
+            reply = clean_parsed["transcript"]
         # Чистим markdown-мусор (#/*) ДО нарезки на части — модель путает HTML и markdown.
         reply = _html_clean_markdown(reply)
         # Сначала отправляем ответ, потом удаляем статус — иначе сбой delete съест ответ.
