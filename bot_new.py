@@ -4077,7 +4077,8 @@ def _parse_voice_directive(raw_text: str, default_voice: str = "Leda", default_s
 def _build_tts_prompt(text: str, voice: str, style: str = "", scene: str = "", pace: str = "", accent: str = "") -> str:
     """Формирует каноничный промпт Google Gemini 3.8 Flash TTS:
     AUDIO PROFILE, SCENE, DIRECTOR'S NOTES и разделитель TRANSCRIPT.
-    Все инструкции и метаданные остаются выше TRANSCRIPT и НИКОГДА не зачитываются вслух."""
+    Все инструкции и метаданные остаются выше TRANSCRIPT и НИКОГДА не зачитываются вслух.
+    Предотвращает затухание/дрейф шёпота (ASMR Style Decay) на длинных репликах."""
     clean_text, dyn_styles = clean_and_extract_performance(text)
 
     prompt_parts = []
@@ -4094,6 +4095,19 @@ def _build_tts_prompt(text: str, voice: str, style: str = "", scene: str = "", p
     for ds in dyn_styles:
         if ds not in all_styles:
             all_styles.append(ds)
+
+    is_whisper_asmr = any(
+        any(k in s.lower() for k in ("шёпот", "шепот", "whisper", "асмр", "asmr", "ушко", "вкрадчив"))
+        for s in all_styles + [scene, clean_text[:100]]
+    )
+
+    if is_whisper_asmr:
+        all_styles.append("Continuous pure close-mic ASMR whisper. CRITICAL: MAINTAIN soft breathy whisper across the ENTIRE duration without increasing volume or shifting to normal conversational speech")
+        if not pace:
+            pace = "Slow, intimate, liquid"
+        # Для предотвращения дрейфа связок в длинном тексте добавляем естественные микро-вдохи между мыслями
+        if "<breath>" not in clean_text:
+            clean_text = re.sub(r'([.!?])\s+(?=[А-ЯA-Z])', r'\1 <breath> <short pause> ', clean_text)
 
     if all_styles:
         notes.append(f"Style: {'; '.join(all_styles)}")
