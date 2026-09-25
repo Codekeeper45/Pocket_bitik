@@ -539,6 +539,14 @@ for _cpslug, _cpid, _cplabel, _cpctx, _cpsafe in [
 ]:
     MODEL_REGISTRY[_cpslug] = ("cliproxy", _cpid, _cplabel, _cpctx, _cpsafe)
 
+# OpenRouter (Space Bunny Alpha)
+for _orslug, _orid, _orlabel, _orctx, _orsafe in [
+    ("space-bunny", "stealth/space-bunny-alpha", "Space Bunny Alpha (OpenRouter Free)", 1000000, 1.15),
+    ("space-bunny-alpha", "stealth/space-bunny-alpha", "Space Bunny Alpha (OpenRouter Free)", 1000000, 1.15),
+    ("or-space-bunny", "stealth/space-bunny-alpha", "Space Bunny Alpha (OpenRouter Free)", 1000000, 1.15),
+]:
+    MODEL_REGISTRY[_orslug] = ("openrouter", _orid, _orlabel, _orctx, _orsafe)
+
 # Алиасы для быстрого выбора (Claude Thinking по умолчанию)
 MODEL_REGISTRY["cp-gemini-flash"] = MODEL_REGISTRY["cp-gemini-3.8-flash-high"]
 MODEL_REGISTRY["cp-gemini-pro"] = MODEL_REGISTRY["cp-gemini-3.1-pro-high"]
