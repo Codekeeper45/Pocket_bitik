@@ -1203,30 +1203,27 @@ def _voice_style_text(engine: str = "gemini", fish_model: str = "") -> str:
     cur_st = f"«{VOICE_STYLE_PROMPT}»" if 'VOICE_STYLE_PROMPT' in globals() and VOICE_STYLE_PROMPT else "стандартный"
 
     return _VOICE_STYLE_COMMON + (
-        f"\n━━ РЕЖИССУРА ГОЛОСА (Gemini 3.8 Flash TTS · Voice Design) ━━\n"
-        f"Ты можешь ПОЛНОСТЬЮ управлять голосом, тембром, сценой и интонацией!\n\n"
-        f"1. Доступные базовые голоса (выбирай любой, подходящий под контекст или роль):\n"
+        f"\n━━ РЕЖИССУРА ГОЛОСА И ДИЗАЙН РЕЧИ (Gemini 3.8 Flash TTS) ━━\n"
+        f"Ты обладаешь ПОЛНЫМ контролем над синтезом речи, выбором голоса, тембром и сценой!\n\n"
+        f"1. Доступные голоса Google (выбирай подходящий под роль или характер ответа):\n"
         f"   • Женские: {vf}\n"
         f"   • Мужские: {vm}\n"
-        f"   • По умолчанию выбран: {ACTIVE_VOICE} (стиль: {cur_st})\n\n"
-        f"2. Управление параметрами речи и Voice Design:\n"
-        f"   Чтобы задать голос, стиль и сцену, начни свой ответ с блока параметров:\n"
+        f"   • Сейчас по умолчанию: {ACTIVE_VOICE} (стиль: {cur_st})\n\n"
+        f"2. Автономное задание голоса и Voice Design (блок [[VOICE]] в начале ответа):\n"
         f"   [[VOICE]]\n"
-        f"   voice: ИмяГолоса (например: Fenrir, Leda, Puck, Charon, Orus, Aoede)\n"
-        f"   style: Описание характера, возраста и тембра (например: хриплый старый пират, уставший шепот, нежная заботливая девушка)\n"
-        f"   scene: Окружение и атмосфера (например: скрипучая палуба корабля в шторм, тихая спальня ночью, шумный бар)\n"
+        f"   voice: ИмяГолоса (например: Fenrir, Leda, Puck, Charon, Orus, Despina)\n"
+        f"   style: Подробное описание тембра, возраста, характера и смены интонаций (например: звонкая аниме-девушка; на фразе про секрет переходи на тихий интимный шёпот)\n"
+        f"   scene: Окружение и акустика (например: ночная спальня, близко к уху; палуба корабля в шторм; шумный бар)\n"
         f"   pace: Темп речи (быстрый, размеренный, медленный, отрывистый)\n"
-        f"   accent: Акцент или диалект (пиратский, британский, французский и т.д.)\n"
+        f"   accent: Акцент при необходимости\n"
         f"   ---\n"
-        f"   Твой текст реплики\n\n"
-        f"   (Либо в одну строку: [[VOICE voice=Fenrir style=\"хриплый старый пират\" scene=\"палуба в шторм\"]] Текст реплики)\n\n"
-        f"3. Интонации и эмоции внутри реплики (НЕ зачитываются вслух, отыгрываются голосом):\n"
-        f"   • Живые звуки: [смеётся], [хихикает], [усмехается], [вздыхает], [ахает], [зевает], [кашляет]\n"
-        f"   • Эмоции: [радостно], [грустно], [испуганно], [восторженно], [саркастично], [серьёзно], [нежно], [с теплотой]\n"
-        f"   • Громкость и темп: [шёпотом], [тихо], [кричит], [громко], [пауза]\n\n"
-        f"4. ЖЕЛЕЗНОЕ ПРАВИЛО:\n"
-        f"   Никогда НЕ вставляй в саму реплику пояснения вроде «(Подача: ...)», мысли или промпты для себя. "
-        f"   Все настройки голоса пиши ТОЛЬКО в блоке [[VOICE]] до разделителя ---, а в реплике — только живую речь персонажа!"
+        f"   Твой живой текст реплики\n\n"
+        f"3. Интонации и звуки внутри реплики (озвучиваются естественно, слова в скобках НЕ читаются):\n"
+        f"   • Живые звуки: [смеётся], [хихикает], [вздыхает], [ахает], [зевает], [кашляет], [пауза]\n"
+        f"   • Смена интонаций: [шёпотом], [тихо], [кричит], [радостно], [грустно], [саркастично], [нежно]\n\n"
+        f"4. СТРОГИЕ ПРАВИЛА ЧИСТОТЫ ОЗВУЧКИ:\n"
+        f"   • Никогда НЕ пиши в реплике книжные действия в звёздочках вроде *поправляет ушки*, *улыбнулась*, *смотрит в окно* — озвучка зачитывает слова, пиши только то, что звучит голосом!\n"
+        f"   • Все настройки тембра, характера и шёпота задавай в style в блоке [[VOICE]]."
     )
 
 
@@ -3902,46 +3899,87 @@ VOICE_NAMES_CANONICAL = [
 ]
 VOICE_MAP_LOWER = {v.lower(): v for v in VOICE_NAMES_CANONICAL}
 
-RUS_TAG_MAP = {
-    "смеётся": "[laughs]", "смех": "[laughs]", "усмехается": "[chuckling]", "хихикает": "[giggles]",
-    "шёпотом": "[whispers]", "шепотом": "[whispers]", "шепчет": "[whispers]", "тихо": "[whispers]",
-    "громко": "[shouting]", "кричит": "[shouting]", "плачет": "[crying]",
-    "вздыхает": "[sighs]", "вздох": "[sighs]", "зевает": "[yawn]", "кашляет": "[cough]",
-    "ахает": "[gasp]", "радостно": "[excited]", "весело": "[excited]",
-    "восторженно": "[excitedly]", "грустно": "[sad]", "печально": "[sad]",
-    "устало": "[tired]", "испуганно": "[panicked]", "паника": "[panicked]",
-    "саркастично": "[sarcastic]", "серьёзно": "[serious]", "серьезно": "[serious]",
-    "строго": "[serious]", "дрожит": "[trembling]", "пауза": "<short pause>",
-    "с теплотой": "[warmly]", "нежно": "[tender]", "ласково": "[tender]", "с любовью": "[tender]"
+# Звуковые эффекты -> нативные Google Gemini 3.8 XML-теги (никогда не читаются словами)
+SOUND_MAP = {
+    "смеётся": "<laugh>", "смеется": "<laugh>", "смех": "<laugh>", "хихикает": "<laugh>",
+    "усмехается": "<laugh>", "смешок": "<laugh>",
+    "laughs": "<laugh>", "laughing": "<laugh>", "laugh": "<laugh>", "giggles": "<laugh>", "giggle": "<laugh>",
+    "вздыхает": "<sigh>", "вздох": "<sigh>", "sighs": "<sigh>", "sigh": "<sigh>",
+    "кашляет": "<cough>", "кашель": "<cough>", "cough": "<cough>",
+    "ахает": "<gasp>", "вскрикивает": "<gasp>", "gasp": "<gasp>",
+    "зевает": "<yawn>", "зевок": "<yawn>", "yawn": "<yawn>",
+    "дышит": "<breath>", "вдох": "<breath>", "выдох": "<breath>", "breath": "<breath>",
+    "пауза": "<short pause>", "молчание": "<short pause>", "pause": "<short pause>", "break": "<short pause>",
 }
-ENG_TAGS_SET = {
-    "whispers", "laughs", "sighs", "gasp", "shouting", "crying", "screaming", "giggles", "yawn",
-    "cough", "excited", "sad", "tired", "panicked", "sarcastic", "serious", "trembling", "warmly",
-    "tender", "chuckling", "mischievously", "excitedly"
+
+# Эмоции и подача -> добавляются в DIRECTOR'S NOTES Style для физического управления тембром
+EMOTION_STYLE_MAP = {
+    "шёпотом": "тихий заговорщический шёпот (whispering)",
+    "шепотом": "тихий заговорщический шёпот (whispering)",
+    "шепчет": "шёпот на выдохе (whispering)",
+    "тихо": "очень тихий приглушенный голос",
+    "whispers": "quiet whispering",
+    "whispering": "whispering",
+    "whisper": "whispering",
+    "громко": "громкий командный голос",
+    "кричит": "эмоциональный крик (shouting)",
+    "shouting": "shouting",
+    "плачет": "дрожащий плачущий голос со слезами",
+    "crying": "crying emotional tone",
+    "радостно": "радостная сияющая подача, улыбка в голосе",
+    "весело": "веселый игривый тон",
+    "excited": "excited upbeat tone",
+    "грустно": "печальный подавленный голос",
+    "sad": "sad mournful tone",
+    "саркастично": "едкий сарказм, язвительная насмешливая подача",
+    "sarcastic": "sarcastic mocking tone",
+    "нежно": "нежный ласковый заботливый голос",
+    "ласково": "мягкая убаюкивающая подача",
+    "tender": "tender affectionate tone",
+    "испуганно": "испуганный дрожащий голос",
+    "panicked": "panicked trembling tone",
+    "серьёзно": "строгий серьезный тон",
+    "серьезно": "строгий серьезный тон",
+    "serious": "serious firm tone",
 }
 
 
-def _clean_and_convert_tts_tags(text: str) -> str:
-    """Конвертирует русские интонационные теги в поддерживаемые Gemini TTS английские теги
-    и очищает технические директивы, чтобы они ни при каких условиях не зачитывались вслух."""
-    def repl(m):
-        raw = m.group(1).strip()
-        low = raw.lower()
-        if low in RUS_TAG_MAP:
-            return RUS_TAG_MAP[low]
-        if low in ENG_TAGS_SET:
-            return f"[{low}]"
-        # Служебные пометки (подача, стиль, голос и т.д.) — удаляем
-        if any(low.startswith(p) for p in ("подача", "стиль", "голос", "style", "voice", "scene", "сцена", "pace", "темп", "accent", "акцент")):
+def clean_and_extract_performance(text: str):
+    """Очищает текст от всех ролевых пометок (*действие*, [действие], (действие)),
+    преобразует звуки в нативные XML-теги (<laugh>, <sigh>, <short pause>)
+    и собирает эмоциональные модификаторы в DIRECTOR'S NOTES Style."""
+    found_styles = []
+
+    def handle_cue(raw: str) -> str:
+        s = raw.strip().lower()
+        if s in SOUND_MAP:
+            return f" {SOUND_MAP[s]} "
+        for k, style_desc in EMOTION_STYLE_MAP.items():
+            if k == s or s.startswith(k):
+                if style_desc not in found_styles:
+                    found_styles.append(style_desc)
+                return " <short pause> "
+        if any(s.startswith(p) for p in ("подача", "стиль", "голос", "style", "voice", "scene", "сцена", "pace", "темп", "accent", "акцент")):
             return ""
-        # Любой неизвестный текст в скобках — удаляем, чтобы модель не зачитывала пометки
+        # Любые сценические описания действий (*поправляет волосы*, *улыбнулась*) — вырезаем под ноль!
         return ""
 
-    t = re.sub(r'\[([^\]]+)\]', repl, text)
-    t = re.sub(r'\((?:подача|стиль|голос|style|voice|scene|сцена|pace|темп|accent|акцент)[^)]*\)', '', t, flags=re.IGNORECASE)
+    # 1. Заменяем пометки в звёздочках: *action*
+    t = re.sub(r'\*([^*]+)\*', lambda m: handle_cue(m.group(1)), text)
+    # 2. Заменяем пометки в квадратных скобках: [action]
+    t = re.sub(r'\[([^\]]+)\]', lambda m: handle_cue(m.group(1)), t)
+    # 3. Заменяем пометки в круглых скобках: (action)
+    def paren_sub(m):
+        content = m.group(1).strip()
+        low = content.lower()
+        if low in SOUND_MAP or any(low.startswith(k) for k in EMOTION_STYLE_MAP) or any(low.startswith(p) for p in ("подача", "стиль", "голос", "style", "voice", "scene", "сцена")):
+            return handle_cue(content)
+        return m.group(0)
+    t = re.sub(r'\(([^)]+)\)', paren_sub, t)
+
     t = re.sub(r'[ \t]+', ' ', t)
     t = re.sub(r'\n{3,}', '\n\n', t).strip()
-    return t
+    return t, found_styles
 
 
 def _parse_voice_directive(raw_text: str, default_voice: str = "Leda", default_style: str = "") -> dict:
@@ -3954,6 +3992,7 @@ def _parse_voice_directive(raw_text: str, default_voice: str = "Leda", default_s
     accent = ""
     text = (raw_text or "").strip()
 
+    # Pattern A: [[VOICE ...]] блок
     m = re.search(r'\[\[VOICE(?:\s*:?\s*([^\]]*))?\]\]', text, flags=re.IGNORECASE)
     if m:
         inline_args = (m.group(1) or "").strip()
@@ -3996,8 +4035,9 @@ def _parse_voice_directive(raw_text: str, default_voice: str = "Leda", default_s
             content_lines.append(line)
         text = "\n".join(content_lines).strip()
 
+    # Pattern B: Ведущие директивы (Подача: ...), [Voice: Fenrir], *Style: ...*
     while True:
-        m_dir = re.match(r'^\s*[\(\[]\s*(подача|стиль|style|голос|voice|scene|сцена|pace|темп|accent|акцент)\s*[:=]\s*([^\]\)]+)[\)\]]\s*', text, re.IGNORECASE)
+        m_dir = re.match(r'^\s*[\(\[\*]\s*(подача|стиль|style|голос|voice|scene|сцена|pace|темп|accent|акцент)\s*[:=]\s*([^\]\)\*]+)[\)\]\*]\s*', text, re.IGNORECASE)
         if not m_dir:
             break
         k = m_dir.group(1).lower()
@@ -4014,10 +4054,19 @@ def _parse_voice_directive(raw_text: str, default_voice: str = "Leda", default_s
             accent = v
         text = text[m_dir.end():].strip()
 
-    clean_transcript = _clean_and_convert_tts_tags(text)
+    clean_transcript, dynamic_styles = clean_and_extract_performance(text)
+
+    all_styles = []
+    if style: all_styles.append(style)
+    for ds in dynamic_styles:
+        if ds not in all_styles:
+            all_styles.append(ds)
+
+    combined_style = "; ".join(all_styles)
+
     return {
         "voice": voice,
-        "style": style,
+        "style": combined_style,
         "scene": scene,
         "pace": pace,
         "accent": accent,
@@ -4029,7 +4078,7 @@ def _build_tts_prompt(text: str, voice: str, style: str = "", scene: str = "", p
     """Формирует каноничный промпт Google Gemini 3.8 Flash TTS:
     AUDIO PROFILE, SCENE, DIRECTOR'S NOTES и разделитель TRANSCRIPT.
     Все инструкции и метаданные остаются выше TRANSCRIPT и НИКОГДА не зачитываются вслух."""
-    clean_text = _clean_and_convert_tts_tags(text)
+    clean_text, dyn_styles = clean_and_extract_performance(text)
 
     prompt_parts = []
     if voice:
@@ -4038,9 +4087,16 @@ def _build_tts_prompt(text: str, voice: str, style: str = "", scene: str = "", p
         prompt_parts.append(f"## THE SCENE: {scene}")
 
     notes = []
+    all_styles = []
     eff_style = style or (VOICE_STYLE_PROMPT if 'VOICE_STYLE_PROMPT' in globals() else "")
     if eff_style:
-        notes.append(f"Style: {eff_style}")
+        all_styles.append(eff_style)
+    for ds in dyn_styles:
+        if ds not in all_styles:
+            all_styles.append(ds)
+
+    if all_styles:
+        notes.append(f"Style: {'; '.join(all_styles)}")
     if pace:
         notes.append(f"Pace: {pace}")
     if accent:
@@ -4054,16 +4110,16 @@ def _build_tts_prompt(text: str, voice: str, style: str = "", scene: str = "", p
 
 
 def _strip_for_tts(text: str) -> str:
-    """Готовит текст к озвучке: убирает HTML-теги, сохраняет <laugh>/<sigh>/<short pause>,
-    схлопывает пробелы и режет до TTS_VOICE_CHAR_CAP."""
+    """Готовит текст к озвучке: сохраняет поддерживаемые теги XML (<laugh>/<sigh>/<short pause>/<gasp>/<yawn>/<cough>/<breath>),
+    чистит остатки HTML, схлопывает пробелы и режет до TTS_VOICE_CHAR_CAP."""
     t = text or ""
     def strip_html_keep_tts(m):
         tag_content = m.group(1).lower().strip()
-        if tag_content in ("laugh", "sigh", "cough", "breath", "short pause"):
+        if tag_content in ("laugh", "sigh", "cough", "breath", "short pause", "gasp", "yawn"):
             return f"<{tag_content}>"
         return ""
     t = re.sub(r"<([^>]+)>", strip_html_keep_tts, t)
-    t = re.sub(r"[*#`_]+", "", t)
+    t = re.sub(r"[#`_]+", "", t)
     t = re.sub(r"[ \t]+", " ", t)
     t = re.sub(r"\n{3,}", "\n\n", t).strip()
     if len(t) > TTS_VOICE_CHAR_CAP:
