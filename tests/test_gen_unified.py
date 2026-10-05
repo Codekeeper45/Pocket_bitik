@@ -113,6 +113,20 @@ if __name__ == "__main__":
 
 
 class TestMockedToolLoop(unittest.IsolatedAsyncioTestCase):
+    async def test_transient_retry_preserves_prompt_and_refs(self):
+        from unittest.mock import AsyncMock
+        response = (b"image", "image/png")
+        with patch.object(bot, "_gen_rate_gate", new=AsyncMock()), \
+             patch.object(bot.asyncio, "sleep", new=AsyncMock()), \
+             patch.object(bot, "_sync_generate_image", side_effect=[bot.GenTransient("generic error"), response]) as generate, \
+             patch.object(bot, "GEN_IMAGE_INPUT", True), \
+             patch.object(bot, "_sync_repair_image_prompt") as repair:
+            result = await bot._gen_one_image("exact prompt", ["reference"], "2K", "1:1", True, "user brief")
+        self.assertEqual(result[:3], (b"image", "image/png", "exact prompt"))
+        self.assertEqual(generate.call_count, 2)
+        self.assertEqual(generate.call_args_list[0], generate.call_args_list[1])
+        repair.assert_not_called()
+
     async def test_current_chat_tool_search_is_bounded_and_returns_prompt(self):
         # Test the model/tool protocol without Telegram, OpenRouter, or image endpoint network access.
         tc = SimpleNamespace(id="call1", type="function", function=SimpleNamespace(
