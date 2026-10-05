@@ -3567,6 +3567,13 @@ _GEN_COMPOSITION_RULES = (
     "ТОЛПА: организуй группы в глубине, варьируй силуэты/жесты/направления взглядов и действия "
     "по событию; фокусные герои имеют больше внимания. Именной ансамбль сохраняет каждого "
     "героя и его подтверждённый дизайн; анонимная массовка допускает вариацию. "
+    "ПОСЛОЙНАЯ ПОСТАНОВКА ТОЛПЫ И ПЕРСОНАЖЕЙ (Layered Staging): при сложных многофигурных сценах "
+    "и наличии толпы разделяй композицию на три независимых визуальных слоя, чтобы избежать "
+    "смазывания и каши: 1) Задний слой (Background Plate) - чистая архитектура, улица или интерьер "
+    "с мотивированным светом, без случайных людей; 2) Слой массовки (Midground Crowd) - обособленные "
+    "группы людей на среднем плане с воздушными промежутками между силуэтами, без слипания контуров; "
+    "3) Слой главных персонажей (Foreground Hero Layer) - резкий фокус, четкие контуры, приоритетный "
+    "свет и выразительные жесты, без наложения и слияния с фоновой толпой. "
     "КАРТОЧКА ПЕРСОНАЖА (Model Sheet / Turnaround): при запросе концепта или карточки героя создавай "
     "многоракурсный лист (вид спереди, сбоку, сзади на чистом нейтральном фоне), фиксируй точные "
     "палитры, одежду, форму волос и черты лица для их повторного использования как мастер-референса. "
@@ -4067,6 +4074,125 @@ def _parse_gen_prompt_out(out: str, catalog: list) -> tuple:
     else:  # формат не соблюдён — выкидываем служебные строки, остальное считаем промптом
         prompt_text = re.sub(r"(?im)^\s*(IDEA|REFS|ASPECT):.*$", "", out).strip()
     return prompt_text, refs, idea, aspect
+
+
+def _detect_pages_count(user_prompt: str, toks: list = None) -> int:
+    """Определяет запрошенное количество страниц/кадров (от 2 до 4). При обычном запросе возвращает 1."""
+    toks = toks or []
+    for t in toks:
+        m = re.match(r"^(?:--pages=|-p)(\d+)$", t, re.IGNORECASE)
+        if m:
+            return max(1, min(4, int(m.group(1))))
+    for i, t in enumerate(toks):
+        if t.lower() in ("--pages", "-pages", "-p") and i + 1 < len(toks) and toks[i + 1].isdigit():
+            return max(1, min(4, int(toks[i + 1])))
+
+    m_num = re.search(r"(?i)\b(?:манга|комикс|истори[яи]|стрип|сюжет|глав[аы])?\s*(?:на|из|в)?\s*([2-4])\s*(?:страниц[ыае]?|кадр[а-я]*|полос[ыае]?)\b", user_prompt)
+    if m_num:
+        return int(m_num.group(1))
+
+    word_map = {
+        "две": 2, "три": 3, "четыре": 4,
+        "двух": 2, "трех": 3, "трёх": 3, "четырех": 4, "четырёх": 4,
+        "2-х": 2, "3-х": 3, "4-х": 4, "2": 2, "3": 3, "4": 4
+    }
+    m_word = re.search(r"(?i)\b(?:на|из|в)?\s*(две|три|четыре|двух|трех|трёх|четырех|четырёх|2-х|3-х|4-х)\s*(?:страниц[ыае]?|кадр[а-я]*|полос[ыае]?)\b", user_prompt)
+    if m_word:
+        return word_map.get(m_word.group(1).lower(), 1)
+
+    m_dash = re.search(r"(?i)\b(двух|трех|трёх|четырех|четырёх|2-|3-|4-)страничн[а-я]*\b", user_prompt)
+    if m_dash:
+        w = m_dash.group(1).lower().rstrip("-")
+        return word_map.get(w, 1)
+
+    return 1
+
+
+def _parse_gen_multipage_out(out: str, pages_count: int) -> list:
+    """Парсит ответ планировщика многостраничных историй (PAGE 1:, PAGE 2:, ...) на список словарей страниц."""
+    out = (out or "").strip()
+    page_blocks = re.split(r"(?im)^\s*(?:---|#+)?\s*PAGE\s+(\d+)\s*[:—\-]*\s*", out)
+    pages = []
+    if len(page_blocks) > 1:
+        i = 1
+        while i < len(page_blocks):
+            try:
+                p_num = int(page_blocks[i])
+            except ValueError:
+                p_num = len(pages) + 1
+            p_text = page_blocks[i + 1].strip()
+            m_idea = re.search(r"(?im)^\s*IDEA:\s*(.+)$", p_text)
+            idea = m_idea.group(1).strip() if m_idea else None
+            m_asp = re.search(r"(?im)^\s*ASPECT:\s*([0-9]+:[0-9]+)", p_text)
+            asp = m_asp.group(1) if m_asp and m_asp.group(1) in ("9:16", "16:9", "1:1") else None
+            m_prompt = re.search(r"(?is)PROMPT:\s*(.+)$", p_text)
+            if m_prompt:
+                prompt = m_prompt.group(1).strip()
+            else:
+                prompt = re.sub(r"(?im)^\s*(IDEA|REFS|ASPECT):.*$", "", p_text).strip()
+            pages.append({"page": p_num, "idea": idea, "prompt": prompt, "aspect": asp})
+            i += 2
+    if not pages or len(pages) < pages_count:
+        m_prompt = re.search(r"(?is)PROMPT:\s*(.+)$", out)
+        main_prompt = m_prompt.group(1).strip() if m_prompt else out
+        m_idea = re.search(r"(?im)^\s*IDEA:\s*(.+)$", out)
+        main_idea = m_idea.group(1).strip() if m_idea else "Страница манги"
+        pages = []
+        for p in range(1, pages_count + 1):
+            pages.append({
+                "page": p,
+                "idea": f"{main_idea} (Часть {p})",
+                "prompt": f"Page {p} of sequential story: {main_prompt}",
+                "aspect": "9:16"
+            })
+    return pages[:pages_count]
+
+
+_GEN_MULTIPAGE_SYSTEM = (
+    "Ты - сценарист и визуальный промпт-инженер многостраничных историй (манга, комиксы, серии кадров). "
+    "Твоя задача - разбить замысел пользователя ровно на {pages_count} последовательных страниц/кадров сюжета. "
+    "Для КАЖДОЙ страницы оформи отдельный блок СТРОГО в формате:\n"
+    "PAGE N:\n"
+    "IDEA: <краткая фраза на русском - суть действия на этой странице>\n"
+    "ASPECT: 9:16\n"
+    "PROMPT: <подробный английский промпт по правилам GPT Image (субъект, окружение, действие, ракурс, стиль, детали)>\n\n"
+    "КРИТИЧЕСКИ ВАЖНО ДЛЯ КОНСИСТЕНТНОСТИ: сохраняй одинаковые имена, черты лица, причёски, цвета волос, костюмы "
+    "и художественный стиль персонажей во всех страницах без исключения. Начиная со страницы 2 генератор получит "
+    "изображение первой страницы как референс внешности персонажей."
+)
+
+
+async def _build_multipage_prompts(user_prompt: str, pages_count: int, context_text: str = None,
+                                    image_desc: str = None, catalog: list = None, chat_id: int = None,
+                                    initial_refs: list = None, include_ids=None, exclude_ids=None) -> list:
+    """Генерирует согласованный план из N страниц через активную языковую модель."""
+    system_text = _GEN_MULTIPAGE_SYSTEM.format(pages_count=pages_count)
+    user_req = f"Пользователь хочет историю/мангу ровно на {pages_count} страниц:\n{user_prompt}"
+    if context_text:
+        user_req += f"\n\nКонтекст чата:\n{context_text[:2000]}"
+    if image_desc:
+        user_req += f"\n\nОписание входных фото-референсов:\n{image_desc[:1000]}"
+
+    llm, model_id, _ = get_active_model()
+    out = None
+    if llm:
+        try:
+            resp = await asyncio.to_thread(
+                llm.chat.completions.create,
+                model=model_id,
+                messages=[
+                    {"role": "system", "content": system_text},
+                    {"role": "user", "content": user_req}
+                ],
+                max_tokens=ASK_MAX_TOKENS,
+                temperature=0.35
+            )
+            if resp and getattr(resp, "choices", None):
+                out = _extract_content(resp.choices[0].message)
+        except Exception as e:
+            log("GEN", f"Многостраничный планировщик LLM завершился с ошибкой: {e}")
+
+    return _parse_gen_multipage_out(out, pages_count)
 
 
 _IMAGE_REPAIR_SYSTEM = (
@@ -7942,6 +8068,7 @@ async def _gen_send_image(chat, raw, mime, final_prompt, prompt_by_ai, reply_to,
             await client.send_message(chat, refs_line, parse_mode="md", reply_to=getattr(sent, "id", None), link_preview=False)
         except Exception as e:
             log("GEN", f"Строка референсов не отправилась: {e}")
+    return sent
 
 
 @client.on(events.NewMessage(pattern=r"(?s)^[./]gen(?:\s+(\d+))?((?:\s+-(?:vertical|horizontal|square|sq|4k|2k|1k|x\d+|noimg|ni|raw|m|r|i|c|v|h|improve|creative))+)?((?:\s+!?@\w+)+)?[ \t\r\n]+(.+)$"))
@@ -8240,6 +8367,65 @@ async def gen_command(event):
             else:
                 await set_status(f"✅ {counter['ok']}/{batch_count} вариантов отправлено тебе в Избранное (Saved Messages) 📌")
             await asyncio.sleep(8)
+            try:
+                await status.delete()
+            except Exception:
+                pass
+            return
+
+        # ── многостраничная последовательная генерация (при запросе N страниц) ──
+        pages_count = _detect_pages_count(user_prompt, toks)
+        if pages_count > 1:
+            await set_status(f"🎨 Многостраничный сюжет ({pages_count} стр.): составляю сценарий…")
+            pages_plan = await _build_multipage_prompts(
+                user_prompt, pages_count, context_text=context_text,
+                image_desc=image_desc, catalog=catalog, chat_id=event.chat_id,
+                initial_refs=input_b64s, include_ids=include_ids, exclude_ids=exclude_ids
+            )
+            page_results = []
+            anchor_b64 = None
+
+            for p_info in pages_plan:
+                p_idx = p_info["page"]
+                p_idea = p_info.get("idea") or f"Страница {p_idx}"
+                p_prompt = p_info.get("prompt") or user_prompt
+                p_asp = p_info.get("aspect") or aspect_ratio or "9:16"
+
+                await set_status(f"🎨 Генерирую страницу {p_idx}/{pages_count}…")
+                # Для сохранения персонажей между страницами: передаем кадр первой страницы как референс
+                p_inputs = list(input_b64s or [])
+                if anchor_b64:
+                    p_inputs = [anchor_b64] + p_inputs
+                    p_prompt += "\n\nStrict character consistency: maintain identical facial features, hairstyles, eye colors, outfits, and art style from the reference image."
+
+                raw_p, mime_p, used_fp, used_fb = await _gen_one_image(
+                    p_prompt, p_inputs, image_size, p_asp,
+                    True, user_prompt, set_status
+                )
+                if raw_p:
+                    page_results.append((raw_p, mime_p, used_fp, p_idea, p_idx))
+                    if anchor_b64 is None:
+                        anchor_b64 = base64.b64encode(raw_p).decode("ascii")
+                else:
+                    log("GEN", f"Страница {p_idx}/{pages_count} не сгенерирована ({mime_p})")
+                    break
+
+            if not page_results:
+                await set_status("❌ Не удалось сгенерировать страницы истории.")
+                return
+
+            await set_status(f"📤 Отправляю готовые страницы ({len(page_results)}/{pages_count})…")
+            reply_anchor = reply_target_id
+            for raw_p, mime_p, prompt_p, idea_p, p_num in page_results:
+                page_label = f"[{p_num}/{len(page_results)}]"
+                sent_msg = await _gen_send_image(
+                    event.chat_id, raw_p, mime_p, prompt_p, True, reply_anchor,
+                    refs_line=gen_refs_line if p_num == len(page_results) else None,
+                    idea=f"{page_label} {idea_p}" if idea_p else page_label
+                )
+                if sent_msg and hasattr(sent_msg, "id"):
+                    reply_anchor = sent_msg.id
+
             try:
                 await status.delete()
             except Exception:
