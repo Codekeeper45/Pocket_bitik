@@ -1,0 +1,102 @@
+[
+  {
+    "id": "7d645590361640ec907c2d69d49662a5",
+    "endpoint": "/v1/images/edits",
+    "outcome": "success",
+    "error_code": "",
+    "attempt_count": 2,
+    "switch_count": 1,
+    "duration_ms": 57598,
+    "attempts": [
+      {
+        "identity": "identity_1",
+        "code": "image_tool_error",
+        "status": "failed"
+      },
+      {
+        "identity": "identity_2",
+        "code": "",
+        "status": "success"
+      }
+    ]
+  },
+  {
+    "id": "bf9e083bf8d544c0be0a7b2adb8adc78",
+    "endpoint": "/v1/images/generations",
+    "outcome": "success",
+    "error_code": "",
+    "attempt_count": 2,
+    "switch_count": 1,
+    "duration_ms": 55305,
+    "attempts": [
+      {
+        "identity": "identity_6",
+        "code": "image_tool_error",
+        "status": "failed"
+      },
+      {
+        "identity": "identity_7",
+        "code": "",
+        "status": "success"
+      }
+    ]
+  },
+  {
+    "id": "33349a25f4df4f0b97b8193312b5859b",
+    "endpoint": "/v1/images/generations",
+    "outcome": "success",
+    "error_code": "",
+    "attempt_count": 3,
+    "switch_count": 2,
+    "duration_ms": 84573,
+    "attempts": [
+      {
+        "identity": "identity_1",
+        "code": "image_tool_error",
+        "status": "failed"
+      },
+      {
+        "identity": "identity_4",
+        "code": "instant_image_limit",
+        "status": "failed"
+      },
+      {
+        "identity": "identity_6",
+        "code": "",
+        "status": "success"
+      }
+    ]
+  },
+  {
+    "id": "1f78b2c77d394e0b960ac0fb3d892572",
+    "endpoint": "/v1/images/generations",
+    "outcome": "text_review",
+    "error_code": "upstream_text_reply",
+    "attempt_count": 1,
+    "switch_count": 0,
+    "duration_ms": 9996,
+    "attempts": [
+      {
+        "identity": "identity_1",
+        "code": "upstream_text_reply",
+        "status": "text_review"
+      }
+    ]
+  },
+  {
+    "id": "de550b19c3134f528c50ad2976d5ed52",
+    "endpoint": "/v1/images/edits",
+    "outcome": "success",
+    "error_code": "",
+    "attempt_count": 1,
+    "switch_count": 0,
+    "duration_ms": 54526,
+    "attempts": [
+      {
+        "identity": "identity_2",
+        "code": "",
+        "status": "success"
+      }
+    ]
+  }
+]

@@ -1,0 +1,247 @@
+diff --git a/services/account_service.py b/services/account_service.py
+index 1315b3a..337ae73 100644
+--- a/services/account_service.py
++++ b/services/account_service.py
+@@ -161,6 +161,9 @@ class AccountService:
+         self._accounts = self._load_accounts()
+         self._account_snapshot_checked_at = time.monotonic()
+         self._image_inflight: dict[str, int] = {}
++        self._image_identity_inflight: dict[str, int] = {}
++        self._image_slot_identity: dict[str, str] = {}
++        self._image_identity_cooldowns: dict[str, float] = {}
+         self._image_failure_refresh_lock = Lock()
+         self._image_failure_refresh_active: set[str] = set()
+         self._image_failure_refresh_active_scopes: dict[str, str] = {}
+@@ -1844,16 +1847,66 @@ class AccountService:
+             plan_types: set[str] | tuple[str, ...] | None = None,
+     ) -> list[str]:
+         excluded = set(excluded_tokens or set())
+-        return [
+-            token
+-            for item in self._accounts.values()
++        now = time.monotonic()
++        candidates: list[str] = []
++        for item in self._accounts.values():
++            token = item.get("access_token") or ""
++            if not token or token in excluded:
++                continue
++            identity = str(item.get("user_id") or token).strip() or token
++            cooldown = self._image_identity_cooldowns.get(identity, 0.0)
++            if cooldown > now:
++                continue
++            if (
++                self._is_image_account_available(item)
++                and self._account_matches_plan_type(item, plan_type)
++                and self._account_matches_any_plan_type(item, plan_types)
++                and self._account_matches_source_type(item, source_type)
++            ):
++                candidates.append(token)
++        return candidates
++
++    def defer_image_identity(self, access_token: str, seconds: float = 900.0) -> None:
++        """Temporarily cool an identity whose upstream Instant image capability is exhausted."""
++        with self._image_slot_condition:
++            token = self._resolve_access_token_locked(access_token)
++            account = self._accounts.get(token) or {}
++            identity = str(account.get("user_id") or token).strip() or token
++            try:
++                reset_at = float(account.get("quota_reset_at") or 0)
++                reset_delay = reset_at - time.time()
++                if 0 < reset_delay <= 24 * 60 * 60:
++                    seconds = max(seconds, reset_delay)
++            except (TypeError, ValueError):
++                pass
++            self._image_identity_cooldowns[identity] = max(
++                self._image_identity_cooldowns.get(identity, 0.0),
++                time.monotonic() + max(60.0, seconds),
++            )
++            self._image_slot_condition.notify_all()
++
++
++    def _all_ready_identities_cooling_locked(self) -> bool:
++        now = time.monotonic()
++        identities = {
++            str(item.get("user_id") or token).strip() or token
++            for token, item in self._accounts.items()
+             if self._is_image_account_available(item)
+-               and self._account_matches_plan_type(item, plan_type)
+-               and self._account_matches_any_plan_type(item, plan_types)
+-               and self._account_matches_source_type(item, source_type)
+-               and (token := item.get("access_token") or "")
+-               and token not in excluded
+-        ]
++        }
++        return bool(identities) and all(
++            self._image_identity_cooldowns.get(identity, 0.0) > now
++            for identity in identities
++        )
++
++    def _exclude_identity_siblings_locked(self, tokens: set[str]) -> set[str]:
++        identities = {
++            str((self._accounts.get(self._resolve_access_token_locked(token)) or {}).get("user_id") or self._resolve_access_token_locked(token)).strip()
++            for token in tokens if token
++        }
++        return tokens | {
++            token for token, item in self._accounts.items()
++            if str(item.get("user_id") or token).strip() in identities
++        }
+ 
+     def _list_available_candidate_tokens(
+             self,
+@@ -1863,16 +1916,25 @@ class AccountService:
+             plan_types: set[str] | tuple[str, ...] | None = None,
+     ) -> list[str]:
+         max_concurrency = max(1, int(config.image_account_concurrency or 1))
+-        return [
+-            token
+-            for token in self._list_ready_candidate_tokens(
+-                excluded_tokens,
+-                plan_type,
+-                source_type,
+-                plan_types,
+-            )
+-            if int(self._image_inflight.get(token, 0)) < max_concurrency
+-        ]
++        ready = self._list_ready_candidate_tokens(
++            excluded_tokens, plan_type, source_type, plan_types
++        )
++        # Multiple credential records can represent one upstream identity. Schedule
++        # and cap concurrency by user_id (falling back to token for legacy rows).
++        by_identity: dict[str, list[str]] = {}
++        for token in ready:
++            account = self._accounts.get(token) or {}
++            identity = str(account.get("user_id") or token).strip() or token
++            by_identity.setdefault(identity, []).append(token)
++        candidates: list[str] = []
++        for identity, tokens in by_identity.items():
++            if int(self._image_identity_inflight.get(identity, 0)) >= max_concurrency:
++                continue
++            # Prefer the freshest healthy sibling while keeping one queue position
++            # per identity in round-robin order.
++            tokens.sort(key=lambda token: str((self._accounts.get(token) or {}).get("last_remote_checked_at") or ""), reverse=True)
++            candidates.append(tokens[0])
++        return candidates
+ 
+     def _acquire_next_candidate_token(
+             self,
+@@ -1902,6 +1964,9 @@ class AccountService:
+                     for token in (excluded_tokens or set())
+                     if token
+                 }
++                resolved_excluded_tokens = self._exclude_identity_siblings_locked(
++                    resolved_excluded_tokens
++                )
+                 if not self._list_ready_candidate_tokens(
+                     resolved_excluded_tokens,
+                     plan_type,
+@@ -1923,7 +1988,11 @@ class AccountService:
+                 if tokens:
+                     access_token = tokens[self._index % len(tokens)]
+                     self._index += 1
++                    account = self._accounts.get(access_token) or {}
++                    identity = str(account.get("user_id") or access_token).strip() or access_token
+                     self._image_inflight[access_token] = int(self._image_inflight.get(access_token, 0)) + 1
++                    self._image_identity_inflight[identity] = int(self._image_identity_inflight.get(identity, 0)) + 1
++                    self._image_slot_identity[access_token] = identity
+                     return access_token
+                 self._image_slot_condition.wait(
+                     timeout=min(1.0, remaining) if remaining is not None else 1.0
+@@ -1951,6 +2020,11 @@ class AccountService:
+         会有上游波动等可重试失败混入，不能仅凭限流就下终结性结论。
+         """
+         excluded = set(excluded_tokens or set())
++        if self._all_ready_identities_cooling_locked():
++            return ImageAccountSelectionError(
++                "unavailable",
++                "all ready identities are temporarily cooling for image capability limits",
++            )
+         matched = 0
+         limited = 0
+         for item in self._accounts.values():
+@@ -1990,6 +2064,13 @@ class AccountService:
+             self._image_inflight.pop(access_token, None)
+         else:
+             self._image_inflight[access_token] = current_inflight - 1
++        identity = self._image_slot_identity.get(access_token)
++        if identity and int(self._image_identity_inflight.get(identity, 0)) <= 1:
++            self._image_slot_identity.pop(access_token, None)
++            self._image_identity_inflight.pop(identity, None)
++        elif identity:
++            self._image_identity_inflight[identity] -= 1
++            self._image_slot_identity.pop(access_token, None)
+ 
+     def get_available_access_token(
+             self,
+diff --git a/services/image_failure.py b/services/image_failure.py
+index f1215ca..7648e84 100644
+--- a/services/image_failure.py
++++ b/services/image_failure.py
+@@ -128,6 +128,9 @@ FAILURE_POLICIES: dict[str, FailurePolicy] = {
+     "upstream_text_reply": FailurePolicy(
+         "request", None, False, 400, "invalid_request_error",
+     ),
++    "instant_image_limit": FailurePolicy(
++        "account", "image_generation", True, 502, "server_error",
++    ),
+     "no_image_generated": FailurePolicy(
+         "request", None, False, 502, "server_error",
+     ),
+@@ -221,6 +224,13 @@ def image_failure(
+     normalized = FAILURE_CODE_ALIASES.get(normalized, normalized)
+     if normalized not in FAILURE_POLICIES:
+         normalized = "upstream_error"
++    # Only known tool-unavailable signals are transient. Policy/input errors win.
++    if normalized in {"upstream_text_reply", "image_tool_error", "upstream_error", "no_image_generated"}:
++        detail = str(raw_detail or "").casefold()
++        if "instant limit has been reached" in detail and "mini model is text-only" in detail:
++            normalized = "instant_image_limit"
++        elif "由于我这边发生了错误，我未能生成图片" in detail:
++            normalized = "image_tool_error"
+     policy = FAILURE_POLICIES[normalized]
+     return ImageFailure(
+         code=normalized,
+@@ -467,6 +477,8 @@ POLICY_CODES = {"content_policy_violation", "moderation_blocked", "safety_blocke
+ 
+ def _failure_priority(code: str) -> int:
+     normalized = FAILURE_CODE_ALIASES.get(str(code or "").strip().lower(), str(code or "").strip().lower())
++    if normalized == "instant_image_limit":
++        return 6
+     if normalized == "auth_invalid":
+         return 8
+     if normalized in {"image_quota_exhausted", "insufficient_quota"}:
+@@ -1076,6 +1088,21 @@ def classify_message_facts(
+     if normalized_role == "assistant" and normalized_content_type == "text" and (
+         end_turn or is_terminal_message_status(normalized_status)
+     ) and has_text:
++        def text_values(value: Any) -> list[str]:
++            if isinstance(value, str):
++                return [value]
++            if isinstance(value, Mapping):
++                return [text for child in value.values() for text in text_values(child)]
++            if isinstance(value, (list, tuple)):
++                return [text for child in value for text in text_values(child)]
++            return []
++
++        text = " ".join(text_values(raw_detail)).casefold()
++        if (
++            "instant limit has been reached" in text
++            and "mini model is text-only" in text
++        ):
++            return image_failure("instant_image_limit", raw_detail=raw_detail)
+         return image_failure(
+             "upstream_text_reply",
+             raw_detail=raw_detail,
+diff --git a/services/protocol/conversation.py b/services/protocol/conversation.py
+index db87512..7b7138d 100644
+--- a/services/protocol/conversation.py
++++ b/services/protocol/conversation.py
+@@ -2069,6 +2069,9 @@ def _generate_single_image(
+         error: ImageGenerationError | None = None,
+     ) -> bool:
+         nonlocal retry_token, fallback_retry_pending, retry_error, pending_switch_attempt_index
++        # Capability cooldown must also apply to the final failed attempt.
++        if failure.code == "instant_image_limit" and token:
++            account_service.defer_image_identity(token)
+         if (
+             failure.code == "task_interrupted"
+             or (
