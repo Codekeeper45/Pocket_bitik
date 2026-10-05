@@ -3551,6 +3551,30 @@ _GEN_TEXT_RULES = (
     "Никогда не сокращай, не перефразируй и не переводи требуемый текст; если точность важна — добавь «без другого текста»."
 )
 
+_GEN_COMPOSITION_RULES = (
+    "ХУДОЖЕСТВЕННАЯ ПОСТАНОВКА (применяй подходящее, а не все приёмы сразу): "
+    "сначала выбери эмоциональный центр и главное действие, затем план, ракурс и формат. "
+    "Построй иерархию внимания: главный герой/контакт читаются первыми, второстепенные элементы "
+    "не конкурируют по контрасту и детализации. Трети, симметрия и центральная композиция являются "
+    "альтернативами, не догмой. Оставь воздух у силуэтов и место для запрошенного текста. "
+    "Раздели передний, средний и дальний планы; перспектива, масштаб и перекрытия согласованы. "
+    "Избегай касаний контуров, когда фоновые линии выглядят растущими из головы, слияния плеч, "
+    "лишних кистей и рук без понятного владельца. Для объятий конкретно опиши принадлежность "
+    "видимых рук и направление контакта, сохрани сам жест. В большой группе размести каждого "
+    "на определённом плане с отдельным силуэтом, не сокращай запрошенный состав. "
+    "Освещение: мотивированный главный источник, согласованное направление теней, контактные "
+    "тени и цветовой рефлекс среды; ограниченная согласованная палитра вместо случайной радуги. "
+    "ФОТО: осмысленная дистанция и перспектива объектива, правдоподобная глубина резкости; "
+    "не размывай обязательных участников. АНИМЕ: чистые читаемые линии, устойчивые пропорции, "
+    "простые уверенные формы cel-shading на героях; живописный фон с тем же светом и перспективой. "
+    "ЖИВОПИСЬ/ЦИФРОВОЙ АРТ: строй крупные светотональные массы, вариацию жёстких и мягких краёв, "
+    "детали концентрируй у центра внимания; не навязывай lineart или фотореализм каждому стилю. "
+    "Перед выдачей PROMPT проверь постановку: состав и привязки имен, силуэты и контакты, "
+    "перспектива, свет, читаемость текста, отсутствие противоречий. Выбери несколько конкретных "
+    "свойств нужной сцены и включи их в PROMPT, не копируй всю эту памятку и не обещай отсутствие "
+    "артефактов. При правке сохраняй композицию/стиль и всё, что пользователь не просил менять."
+)
+
 _GEN_QUALITY_NOTE = (
     "Параметры качества/разрешения выставляются в API и в промпт не входят. Упоминать «2K/4K/8k» в тексте "
     "не нужно — и не обещай пользователю гарантированного результата от высоких настроек: они не гарантируют "
@@ -3617,7 +3641,7 @@ _GEN_OUTPUT_FOOTER = (
 def _gen_unified_system(has_catalog: bool, edit_mode: bool, has_tools: bool = False) -> str:
     """Единая system-строка промптера /gen. Режимов нет — собирается из нужных блоков по контексту.
     has_catalog — доступны кандидаты-референсы (REFS); edit_mode — на вход реальные картинки на правку."""
-    parts = [_GEN_INTENT_CORE, _GEN_ENSEMBLE_RULES, _GEN_TEXT_RULES, _GEN_QUALITY_NOTE]
+    parts = [_GEN_INTENT_CORE, _GEN_ENSEMBLE_RULES, _GEN_COMPOSITION_RULES, _GEN_TEXT_RULES, _GEN_QUALITY_NOTE]
     if edit_mode:
         parts.append(_GEN_EDIT_RULES)
     if has_catalog:
@@ -5199,17 +5223,19 @@ async def _run_chat_search(chat_id, args: dict, msg_by_id: dict = None, include_
             log("ASK", f"chat_search failed: {e}")
             return f"Ошибка при поиске в чате: {e}"
 
-    if from_user and not user_ent and results:
-        # фильтрация по имени в python если get_entity не нашел аккаунт
-        fu_low = str(from_user).lower().lstrip("@")
+    if from_user and not user_ent:
+        # Never broaden an unresolved sender filter into an unfiltered chat search.
+        # Try an exact-ish local username/name match; zero matches stay zero.
+        fu_low = str(from_user).strip().lower().lstrip("@")
         filtered = []
         for m in results:
             snd = m.sender if m.sender else None
-            snd_label = _label_for(m, snd).lower()
-            if fu_low in snd_label:
+            username = str(getattr(snd, "username", "") or "").strip().lower().lstrip("@")
+            full_name = " ".join(filter(None, (getattr(snd, "first_name", None), getattr(snd, "last_name", None)))).strip().lower()
+            label = _label_for(m, snd).strip().lower()
+            if fu_low == username or fu_low == full_name or fu_low == label:
                 filtered.append(m)
-        if filtered:
-            results = filtered
+        results = filtered
 
     if not results:
         f_note = f" (фильтр: {fl})" if fl != "all" else ""

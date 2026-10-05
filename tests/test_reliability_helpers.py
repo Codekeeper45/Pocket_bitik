@@ -2,6 +2,7 @@
 import ast
 import asyncio
 import time
+import datetime
 import unittest
 from pathlib import Path
 from unittest.mock import patch
@@ -42,10 +43,42 @@ class ReliabilityTests(unittest.IsolatedAsyncioTestCase):
                     if False: yield None
                 return iterator()
         client = Client()
-        fn = load('_run_chat_search', dict(client=client, log=lambda *args: None))
-        result = await fn(123, {'query': 'Зая', 'filter': 'photo'})
+        import sys, types
+        types_mod = types.ModuleType('telethon.tl.types')
+        types_mod.InputMessagesFilterPhotos = lambda: object()
+        tl_mod = types.ModuleType('telethon.tl'); tl_mod.types = types_mod
+        telethon_mod = types.ModuleType('telethon'); telethon_mod.tl = tl_mod
+        with patch.dict(sys.modules, {'telethon': telethon_mod, 'telethon.tl': tl_mod, 'telethon.tl.types': types_mod}):
+            fn = load('_run_chat_search', dict(client=client, log=lambda *args: None))
+            result = await fn(123, {'query': 'Зая', 'filter': 'photo'})
         self.assertIn('ничего не найдено', result)
         self.assertEqual(len(client.calls), 2)
         self.assertEqual(client.calls[0][0], client.calls[1][0])
         self.assertEqual(client.calls[0][1]['search'], client.calls[1][1]['search'])
         self.assertNotIn('filter', client.calls[1][1])
+
+    async def test_unresolved_sender_filter_never_returns_unfiltered_hits(self):
+        class Client:
+            def iter_messages(self, chat, **kwargs):
+                async def iterator():
+                    yield type('Message', (), {'id': 1, 'sender': type('Sender', (), {'first_name': 'Alice', 'last_name': 'Smith', 'username': 'alice'})(), 'sender_id': 7, 'date': None, 'out': False, 'raw_text': '', 'photo': None, 'document': None, 'reply_to_msg_id': None})()
+                return iterator()
+        fn = load('_run_chat_search', dict(client=Client(), datetime=datetime.datetime, MEDIA_CACHE={}, log=lambda *args: None,
+                                           _forward_src=lambda m: '', _fmt_date=lambda d: '', _media_tag=lambda m: '',
+                                           _label_for=lambda m, s: 'Alice Smith',
+                                           _preview=lambda text, n: text))
+        result = await fn(123, {'query': 'photo', 'from_user': 'missing-person'})
+        self.assertIn('ничего не найдено', result)
+
+    async def test_sender_match_is_exact_not_substring(self):
+        class Client:
+            def iter_messages(self, chat, **kwargs):
+                async def iterator():
+                    yield type('Message', (), {'id': 1, 'sender': type('Sender', (), {'first_name': 'Alice Smith', 'last_name': '', 'username': 'alice'})(), 'sender_id': 7, 'date': None, 'out': False, 'raw_text': '', 'photo': None, 'document': None, 'reply_to_msg_id': None})()
+                return iterator()
+        fn = load('_run_chat_search', dict(client=Client(), datetime=datetime.datetime, MEDIA_CACHE={}, log=lambda *args: None,
+                                           _forward_src=lambda m: '', _fmt_date=lambda d: '', _media_tag=lambda m: '',
+                                           _label_for=lambda m, s: 'Alice Smith',
+                                           _preview=lambda text, n: text))
+        result = await fn(123, {'query': 'photo', 'from_user': 'Alice'})
+        self.assertIn('Найдено 1 сообщений', result)  # Exact full-name matching remains supported.
