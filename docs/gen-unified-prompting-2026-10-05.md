@@ -26,3 +26,21 @@ Offline tests cover prompt policy, parser validation, sequential ref role mappin
 ## Known handoff caveat
 
 The gateway parser `api/image_inputs.py` was inspected directly: `_json_image_sources` accepts `images` arrays, up to 16 inputs. The bot now serializes every selected input as a data URL in this array instead of silently discarding all but the first image. This path is covered by request-body regression and live multi-reference QA.
+
+## Live QA observations
+
+- Owner explicitly permits creative direction when the request asks the model to invent plots or complete ideas. The same unified system handles this; there is no second creative mode.
+- Saved Messages: plain key output #155165, searched reference #155167, iterative edit #155177, two-role reference output #155179, final vision edit #155189. Ask reply #155178 succeeded.
+- Tool discovery budget increased to 16 so multi-person, multi-reference requests can search, read surrounding dialogue and inspect images.
+- OpenRouter auxiliary descriptions/embeddings returned 402 (insufficient credits). Telegram direct search and active Cliproxy vision continued; semantic embedding search is degraded, not claimed healthy.
+- One early edit changed eye/mouth proportions despite constraints; multi-ref later result visually preserved mascot better. No claim of pixel-identical edits or guaranteed first-try perfection.
+
+## Field feedback in Toster Script
+
+Delivered images: https://t.me/c/2567687026/593434 (space crew), /593436 (app repair), /593444 (surreal feast), /593449 (cozy tea). Vision QA: ten humanoids in space scene, six in repair scene, four distinct named friends in tea scene. Some names drifted; surreal scene obscured eating drawings with candy-like props.
+
+Actual participant replies: #593458 praised cookies in tea scene; #593457 says Pshika is not rainbow-colored; #593459 praised basin; #593460 says she eats birch juice, seeds and drawings, not candy; #593461 called current outputs slop compared with earlier attempts. These are mixed feedback, not approval. No emoji reactions were present at collection time.
+
+Comic attempts failed upstream with HTTP 400 generic Chinese generation error; bot incorrectly labels it moderation. Comic success not established. Repair fallback also lacked DeepSeek balance (402).
+
+Added ensemble instructions: named roster, distinct staging/actions, exact names, stable panel designs, main visual gag priority; creative freedom remains explicit. Reply correction #593464 uses the participant feedback.

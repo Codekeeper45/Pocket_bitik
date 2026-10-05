@@ -33,6 +33,8 @@ async def main():
             since=int(sys.argv[2]); rows=[]
             async for m in client.iter_messages(target,limit=30,min_id=since):
                 row={'id':m.id,'text':(m.raw_text or '')[:5000],'photo':bool(m.photo),'document':bool(m.document),'reply':getattr(m.reply_to,'reply_to_msg_id',None)}
+                row['sender_id']=m.sender_id
+                row['reactions']=m.reactions.to_dict() if m.reactions else None
                 if m.photo or (m.document and str(getattr(m.file,'mime_type','')).startswith('image/')):
                     out=Path('/home/hermes/projects/Pocket_bitik/qa_artifacts'); out.mkdir(exist_ok=True)
                     row['path']=await client.download_media(m,file=str(out/f'{m.id}'))
