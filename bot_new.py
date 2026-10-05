@@ -3108,8 +3108,14 @@ def _looks_like_refusal(text: str) -> bool:
 
 
 async def describe_image(image_bytes: bytes, caption: str = "", model: str = None, detail: str = "high", prompt: str = None) -> str:
-    model = model or get_active_media_model()
-    media_client = _client_for_media_model(model)  # OpenRouter или OpenCode-Go по id модели
+    # Use the existing active vision route for default descriptions instead of
+    # requiring a separate paid OpenRouter media balance. Explicit model wins.
+    if (model is None and active_model_supports_vision()
+            and (MODEL_REGISTRY.get(ACTIVE_MODEL) or (None,))[0] == "cliproxy"):
+        media_client, model, _ = get_active_model()
+    else:
+        model = model or get_active_media_model()
+        media_client = _client_for_media_model(model)
     if not media_client:
         return caption or "[изображение]"
     b64 = base64.b64encode(image_bytes).decode("utf-8")
@@ -3304,7 +3310,8 @@ def _sync_generate_image(prompt: str, input_images_b64: list = None, model: str 
             "Authorization": f"Bearer {CHATGPT2API_AUTH_KEY}",
             "Content-Type": "application/json"
         }
-        resp = requests.post(endpoint, headers=headers, json=body, timeout=180)
+        # Native gateway may try up to 3 accounts; allow its bounded request deadline to finish.
+        resp = requests.post(endpoint, headers=headers, json=body, timeout=(20, 600))
         if resp.status_code >= 500:
             resp.raise_for_status()
         if not resp.ok:
@@ -3331,8 +3338,11 @@ def _sync_generate_image(prompt: str, input_images_b64: list = None, model: str 
         items = data.get("data") or []
         b64_out = items[0].get("b64_json") if items else None
         if not b64_out:
-            err = (data.get("error") or {}).get("message") or "пустой ответ"
-            raise GenRejected(f"шлюз не вернул изображение: {err}")
+            error = data.get("error") or {}
+            err = error.get("message") or "пустой ответ"
+            if error.get("code") == "content_policy_violation":
+                raise GenRejected(f"шлюз не вернул изображение: {err}")
+            raise GenTransient(f"шлюз не вернул изображение: {err}")
         raw = base64.b64decode(b64_out)
         return raw, (items[0].get("media_type") or _img_mime_from_bytes(raw[:16]))
 
@@ -5148,8 +5158,25 @@ async def _run_chat_search(chat_id, args: dict, msg_by_id: dict = None, include_
             if m:
                 results.append(m)
     except Exception as e:
-        log("ASK", f"chat_search failed: {e}")
-        return f"Ошибка при поиске в чате: {e}"
+        if "search query filter is invalid" in str(e).lower() and filter_obj is not None:
+            # Some Telegram peers reject combined text/media filters. Preserve query,
+            # sender and scope; filter matching media locally instead.
+            retry_kwargs = dict(kwargs)
+            retry_kwargs.pop("filter", None)
+            results = []
+            try:
+                async for m in client.iter_messages(chat_id, **retry_kwargs):
+                    if m and ((fl == "photo" and m.photo)
+                              or (fl == "document" and m.document)
+                              or (fl == "voice" and m.voice)
+                              or (fl == "video" and m.video)):
+                        results.append(m)
+            except Exception as retry_error:
+                log("ASK", f"chat_search fallback failed: {retry_error}")
+                return f"Ошибка при поиске в чате: {retry_error}"
+        else:
+            log("ASK", f"chat_search failed: {e}")
+            return f"Ошибка при поиске в чате: {e}"
 
     if from_user and not user_ent and results:
         # фильтрация по имени в python если get_entity не нашел аккаунт
@@ -7683,6 +7710,7 @@ async def _gen_one_image(final_prompt, input_b64s, image_size, aspect_ratio, all
                 log("GEN", "Repair не изменил промпт (DeepSeek недоступен/сам фильтрует) — отказ")
             return None, "moderation", None, used_fallback
         except (GenTransient, requests.exceptions.RequestException) as e:
+            log("GEN", f"Ошибка генерации ({gen_model}): {type(e).__name__}: {str(e)[:400]}")
             # 5xx от ОСНОВНОЙ модели = провайдер/адаптер лежит, ждать бессмысленно → сразу на запасную (без 2× пауз).
             _http_code = getattr(getattr(e, "response", None), "status_code", 0) or 0
             if _http_code >= 500 and not used_fallback and not gateway_pool and OPENROUTER_IMAGE_FALLBACK and OPENROUTER_IMAGE_FALLBACK != gen_model:
@@ -13174,12 +13202,16 @@ async def _index_embed_image(raw: bytes):
 
 
 _INDEX_QEMB_CACHE = {}          # процесс-level кэш эмбеддингов ЗАПРОСА: тот же текст не платит повторно (сбрасывается на рестарт)
+_INDEX_EMBED_UNAVAILABLE_UNTIL = 0.0
 _INDEX_QEMB_CACHE_MAX = 512     # эмбеддинг детерминирован → идентичные memory_search/overview/media в /ask перестают жечь /embeddings
 
 
 async def _index_embed_query(text: str, image_space: bool = False):
     """Текст запроса → нормированный np-вектор в нужном пространстве (qwen3 текст или gemini картинки).
     Кэшируем по (image_space, текст): в одном /ask модель шлёт околодубли запросов — платим за эмбеддинг раз."""
+    global _INDEX_EMBED_UNAVAILABLE_UNTIL
+    if time.monotonic() < _INDEX_EMBED_UNAVAILABLE_UNTIL:
+        return None  # lexical retrieval stays available; don't hammer an unpaid endpoint
     model = INDEX_EMBED_IMAGE_MODEL if image_space else INDEX_EMBED_TEXT_MODEL
     dim = INDEX_EMBED_IMAGE_DIM if image_space else INDEX_EMBED_TEXT_DIM
     ck = (bool(image_space), (text or "").strip())
@@ -13204,6 +13236,8 @@ async def _index_embed_query(text: str, image_space: bool = False):
                 _INDEX_QEMB_CACHE.pop(next(iter(_INDEX_QEMB_CACHE)))  # FIFO-выселение старейшего
         return out
     except Exception as e:
+        if getattr(getattr(e, "response", None), "status_code", None) == 402:
+            _INDEX_EMBED_UNAVAILABLE_UNTIL = time.monotonic() + 900
         log("INDEX", f"Эмбеддинг запроса не удался: {e}")
         return None
 

@@ -54,6 +54,13 @@ class TestUnifiedGenPrompt(unittest.TestCase):
         self.assertEqual(remapped, "use image #2 as subject and image #3 for style")
         self.assertIn("Image #3: style", bot._gen_actual_role_instruction(roles))
 
+    def test_gateway_empty_success_is_not_moderation(self):
+        response = SimpleNamespace(ok=True, status_code=200, json=lambda: {'data': []})
+        with patch.object(bot.requests, 'post', return_value=response) as post:
+            with self.assertRaises(bot.GenTransient):
+                bot._sync_generate_image('comic', model='gpt-image-2.5-sunburst')
+        self.assertEqual(post.call_args.kwargs['timeout'], (20, 600))
+
     def test_gateway_structured_error_codes(self):
         for code, exception in [("content_policy_violation", bot.GenRejected),
                                 ("no_image_generated", bot.GenTransient),
@@ -125,6 +132,18 @@ if __name__ == "__main__":
 
 
 class TestMockedToolLoop(unittest.IsolatedAsyncioTestCase):
+    async def test_default_description_uses_active_cliproxy_vision(self):
+        reply = SimpleNamespace(choices=[SimpleNamespace(message=SimpleNamespace(content='gray bunny'))])
+        llm = SimpleNamespace(chat=SimpleNamespace(completions=SimpleNamespace(create=lambda **kw: reply)))
+        with patch.object(bot, 'active_model_supports_vision', return_value=True), \
+             patch.object(bot, 'ACTIVE_MODEL', 'cp-test'), \
+             patch.object(bot, 'MODEL_REGISTRY', {'cp-test': ('cliproxy', 'vision-test')}), \
+             patch.object(bot, 'get_active_model', return_value=(llm, 'vision-test', 'cliproxy')), \
+             patch.object(bot, '_client_for_media_model') as paid:
+            result = await bot.describe_image(b'bytes')
+        self.assertEqual(result, 'gray bunny')
+        paid.assert_not_called()
+
     async def test_gateway_does_not_stack_retries_or_use_paid_fallback(self):
         from unittest.mock import AsyncMock
         for failure, reason in [(bot.GenTransient('pool failed'), 'overload'),
