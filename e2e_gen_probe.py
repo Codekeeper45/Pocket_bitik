@@ -39,7 +39,7 @@ async def main():
                     out=Path('/home/hermes/projects/Pocket_bitik/qa_artifacts'); out.mkdir(exist_ok=True)
                     row['path']=await client.download_media(m,file=str(out/f'{m.id}'))
                 rows.append(row)
-            print(json.dumps(rows,ensure_ascii=False))
+            print(json.dumps(rows,ensure_ascii=False,default=str))
     finally:
         await client.disconnect()
 
