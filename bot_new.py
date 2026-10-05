@@ -3567,6 +3567,11 @@ _GEN_COMPOSITION_RULES = (
     "ТОЛПА: организуй группы в глубине, варьируй силуэты/жесты/направления взглядов и действия "
     "по событию; фокусные герои имеют больше внимания. Именной ансамбль сохраняет каждого "
     "героя и его подтверждённый дизайн; анонимная массовка допускает вариацию. "
+    "КАРТОЧКА ПЕРСОНАЖА (Model Sheet / Turnaround): при запросе концепта или карточки героя создавай "
+    "многоракурсный лист (вид спереди, сбоку, сзади на чистом нейтральном фоне), фиксируй точные "
+    "палитры, одежду, форму волос и черты лица для их повторного использования как мастер-референса. "
+    "ПРОЗРАЧНЫЙ ФОН И СЛОИ (Layered Assets): для изолированных объектов и стикеров задавай чистый "
+    "контур без паразитного цветного рефлекса среды, нейтральный рассеянный свет и прозрачный фон. "
     "КОМИКС И МАНГА: выстраивай иерархию кадров кома-вари (доминирующий кадр кульминации "
     "занимает большую часть пространства, вспомогательные кадры показывают подготовку и реакцию). "
     "Соблюдай траекторию чтения взгляда (Z-образная для вебтунов и западных комиксов, "
@@ -3576,6 +3581,9 @@ _GEN_COMPOSITION_RULES = (
     "Линии скорости и концентрации (сюутюсэн) сходятся к точке удара или эмоционального шока. "
     "Речевые бабблы соответствуют тону: овальные для спокойной речи, шипастые для крика, "
     "прямоугольные блоки для закадрового текста. Размещай текст строго без перекрытия лиц и глаз. "
+    "ОТКРЫТЫЕ ЗАПРОСЫ В ЧАТАХ: если в групповом чате запрос неопределённый («пусть кто-то... кто выбери»), "
+    "проверяй актуальный контекст и участников чата через инструменты поиска/чтения, а не подставляй "
+    "случайных внешних героев поп-культуры без явной просьбы. "
     "Для одиночного изображения выбирай выразительный момент, для серии ключевые состояния. "
     "Текст/макет читаются в целевом размере. Художественные решения уточняют запрос, "
     "не меняют его персонажей, подписи, действие или отношения."
@@ -7805,14 +7813,37 @@ async def _gen_one_image(final_prompt, input_b64s, image_size, aspect_ratio, all
         try:
             await _gen_rate_gate()
             raw, mime = await asyncio.to_thread(_sync_generate_image, fp, input_b64s or None, gen_model, size, aspect_ratio)
-            # QA the generated artifact bytes (not source refs); advisory-only, never re-generates/rewrites.
+            # QA the generated artifact bytes (not source refs); performs bounded targeted inpainting repair when defect is confident.
             qa = await _gen_visual_qa(raw, user_prompt, fp)
             if qa and qa["findings"]:
-                significant = [f for f in qa["findings"] if f["severity"] in ("high", "medium") and f["confidence"] >= 0.65]
-                for finding in significant:
+                high_issues = [f for f in qa["findings"] if f["severity"] == "high" and f["confidence"] >= 0.70]
+                for finding in qa["findings"]:
                     log("GEN", f"Visual QA {finding['severity']} {finding['confidence']:.2f} @ {finding['location']}: {finding['issue']}")
-                if significant:
-                    await _s("⚠️ В готовом изображении vision заметил возможный дефект (проверьте результат); изображение отправляю без автоматической правки.")
+                if high_issues and allow_repair:
+                    primary_issue = high_issues[0]
+                    await _s(f"🔧 Vision обнаружил дефект ({primary_issue['location']}) — выполняю точечную автоправку…")
+                    try:
+                        import base64
+                        raw_b64 = base64.b64encode(raw).decode('ascii')
+                        repair_prompt = (
+                            f"Targeted inpainting fix: strictly modify only the {primary_issue['location']} to correct: {primary_issue['issue']}. "
+                            f"Keep all other characters, faces, background, composition, lighting, and colors 100% strictly identical and unchanged."
+                        )
+                        repaired_raw, repaired_mime = await asyncio.to_thread(
+                            _sync_generate_image, repair_prompt, [raw_b64], gen_model, size, aspect_ratio
+                        )
+                        repaired_qa = await _gen_visual_qa(repaired_raw, user_prompt, repair_prompt)
+                        repaired_high = [f for f in (repaired_qa.get("findings") if repaired_qa else []) if f["severity"] == "high" and f["confidence"] >= 0.70]
+                        if len(repaired_high) < len(high_issues):
+                            log("GEN", f"Visual QA Auto-Repair успешен: дефекты снижены ({len(high_issues)} -> {len(repaired_high)})")
+                            raw, mime = repaired_raw, repaired_mime
+                            qa = repaired_qa
+                        else:
+                            log("GEN", "Visual QA Auto-Repair не дал улучшений — сохраняю исходный результат")
+                    except Exception as rep_err:
+                        log("GEN", f"Visual QA Auto-Repair пропущен: {rep_err}")
+                elif high_issues:
+                    await _s("⚠️ В готовом изображении vision заметил возможный дефект (проверьте результат); изображение отправляю.")
             return raw, mime, fp, used_fallback
         except GenExhausted as e:
             # ДНЕВНОЙ лимит модели исчерпан — ретраить сегодня бессмысленно (и жжёт квоту). Пробуем запасную (своя квота).
