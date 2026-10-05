@@ -52,7 +52,7 @@ class TestUnifiedGenPrompt(unittest.TestCase):
         self.assertEqual(mapping, {2: 2, 4: 3})
         remapped = bot._gen_role_number_remap("use image #2 as subject and image #4 for style", mapping)
         self.assertEqual(remapped, "use image #2 as subject and image #3 for style")
-        self.assertIn("Image #3 — style", bot._gen_actual_role_instruction(roles))
+        self.assertIn("Image #3: style", bot._gen_actual_role_instruction(roles))
 
     def test_gateway_receives_every_reference(self):
         response = SimpleNamespace(ok=True, status_code=200,
@@ -96,7 +96,7 @@ class TestUnifiedGenPrompt(unittest.TestCase):
         import inspect
         source = inspect.getsource(bot._build_gen_prompt)
         self.assertIn("catalog[:] = working_catalog", source)
-        self.assertIn("tool_budget = 4", source)
+        self.assertIn("tool_budget = 16", source)
         self.assertIn("_run_chat_inspect_image", source)
         self.assertIn("_run_chat_search(chat_id, args, msg_by_id, include_ids, exclude_ids)", source)
 

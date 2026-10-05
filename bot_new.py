@@ -3715,8 +3715,12 @@ async def _build_gen_prompt(user_prompt: str, context_text: str = None, image_de
             parts.append("Предыдущие варианты из пакета (только для разнообразия, не меняй требования пользователя):\n" +
                          "\n".join(f"{i}. {p}" for i, p in enumerate(previous_prompts, 1)))
         text_block = "\n\n".join(parts)
-        if want_vision and cat_used:
+        if want_vision and (cat_used or initial_refs):
             content = [{"type": "text", "text": text_block}]
+            for i, encoded in enumerate(initial_refs or [], 1):
+                mime = _img_mime_from_bytes(base64.b64decode(encoded)[:16])
+                content.append({"type": "text", "text": f"INPUT IMAGE #{i}: user-supplied reference; follow roles explicitly requested by user"})
+                content.append({"type": "image_url", "image_url": {"url": f"data:{mime};base64,{encoded}", "detail": "high"}})
             for it in cat_used:
                 content.append({"type": "text", "text": _gen_catalog_ref_label(it, include_missing_desc=False)})
                 raw = it.get("thumb") or it.get("bytes")
@@ -3736,7 +3740,7 @@ async def _build_gen_prompt(user_prompt: str, context_text: str = None, image_de
         return tools
 
     llm, model_id, _label = get_active_model()
-    tool_budget = 4
+    tool_budget = 16
     tool_calls_used = 0
     out = None
     messages = [
@@ -3872,8 +3876,8 @@ def _gen_actual_role_instruction(roles: list) -> str:
     """Exact mapping from actual image endpoint order to user-selected role, after skips/dedup."""
     if not roles:
         return ""
-    return ("Финальные роли референсов в ПОРЯДКЕ изображений, которые реально пойдут в image API (нумерация с 1):\n"
-            + "\n".join(f"Image #{i} — {role}" for i, role in roles))
+    return ("Reference roles in the actual input order (1-based). Follow the requested role only:\n"
+            + "\n".join(f"Image #{i}: {role}" for i, role in roles))
 
 
 def _gen_role_number_remap(prompt: str, candidate_to_actual: dict) -> str:
@@ -7781,7 +7785,7 @@ async def gen_command(event):
 
     # — референс-фото (моё сообщение + альбом, reply + альбом, ссылки) собираем ДО удаления команды —
     input_b64s, skipped_imgs = await _gen_collect_input_images(event, reply_msg, extra_msgs=link_ref_msgs)
-    input_roles = ["subject"] * len(input_b64s)
+    input_roles = ["user-supplied reference; use only the role explicitly requested in the prompt"] * len(input_b64s)
 
     # Единая семантика: ИИ всегда точно разворачивает запрос; -i/-c только legacy aliases без переключения режима.
     status = None
