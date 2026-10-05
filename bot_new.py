@@ -3154,8 +3154,12 @@ async def describe_album(images: list, caption: str = "", model: str = None, det
     # Описывает несколько фото альбома ОДНИМ запросом к vision-модели. "" при сбое (→ фоллбэк).
     if not images:
         return ""
-    model = model or get_active_media_model()
-    media_client = _client_for_media_model(model)  # OpenRouter или OpenCode-Go по id модели
+    if (model is None and active_model_supports_vision()
+            and (MODEL_REGISTRY.get(ACTIVE_MODEL) or (None,))[0] == "cliproxy"):
+        media_client, model, _ = get_active_model()
+    else:
+        model = model or get_active_media_model()
+        media_client = _client_for_media_model(model)
     if not media_client:
         return ""
     cap = f", подпись: \"{caption}\"" if caption else ""
