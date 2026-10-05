@@ -3309,10 +3309,16 @@ def _sync_generate_image(prompt: str, input_images_b64: list = None, model: str 
             resp.raise_for_status()
         if not resp.ok:
             try:
-                detail = (resp.json().get("error") or {}).get("message") or resp.text
+                error = resp.json().get("error") or {}
+                detail = error.get("message") or resp.text
+                error_code = str(error.get("code") or "").lower()
             except Exception:
-                detail = resp.text
+                detail, error_code = resp.text, ""
             s = str(detail)
+            if error_code == "content_policy_violation":
+                raise GenRejected(f"HTTP {resp.status_code}: {s[:200]}")
+            if error_code in {"upstream_text_reply", "no_image_generated", "image_tool_error"}:
+                raise GenTransient(f"HTTP {resp.status_code} ({error_code}): {s[:200]}")
             low = s.lower()
             if any(mk in low for mk in _GEN_DAILY_MARKERS):
                 raise GenExhausted(f"HTTP {resp.status_code}: {s[:200]}")

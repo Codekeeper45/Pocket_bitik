@@ -54,6 +54,18 @@ class TestUnifiedGenPrompt(unittest.TestCase):
         self.assertEqual(remapped, "use image #2 as subject and image #3 for style")
         self.assertIn("Image #3: style", bot._gen_actual_role_instruction(roles))
 
+    def test_gateway_structured_error_codes(self):
+        for code, exception in [("content_policy_violation", bot.GenRejected),
+                                ("no_image_generated", bot.GenTransient),
+                                ("image_tool_error", bot.GenTransient),
+                                ("upstream_text_reply", bot.GenTransient)]:
+            with self.subTest(code=code):
+                response = SimpleNamespace(ok=False, status_code=400,
+                    json=lambda: {"error": {"code": code, "message": "generation failed"}}, text="")
+                with patch.object(bot.requests, "post", return_value=response):
+                    with self.assertRaises(exception):
+                        bot._sync_generate_image("comic", model="gpt-image-2.5-sunburst")
+
     def test_gateway_generic_generation_error_is_retryable(self):
         response = SimpleNamespace(ok=False, status_code=400,
             json=lambda: {"error": {"message": "由于我这边发生了错误，我未能生成图片。"}}, text="")
