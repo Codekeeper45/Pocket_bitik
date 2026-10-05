@@ -60,3 +60,9 @@ Fantasy comic #593494 delivered after changes: four panels, consistent human des
 Same-prompt model comparison: requested sunburst HTTP200 in 130.1s; gpt-image-2 HTTP400 generic failure in 11.1s. Single paired sample cannot establish general quality superiority; no model switch made. Sunburst comparison still has small-badge spelling errors.
 
 Regression suite now 13 tests including exact generic-error classification and bounded retry preserving prompt/references without repair. Live cozy retry confirmed two unchanged-request retries; successful recovery not yet established at this entry.
+
+## Continuity follow-up
+
+Applied explicit per-panel spatial continuity, speaker attribution, natural distinct hand contact and first-panel-only large labels. Gateway and OpenRouter structured error codes both handled. 14 regression tests passed.
+
+Repeated train scene: https://t.me/c/2567687026/593534. Vision comparison against #593524 confirms Doctor now visibly exits the carriage toward Maga; hand fusion moderately reduced, not eliminated. Six panels preserved. Name glyph ambiguity remains (Maga/Mara) and is not claimed fixed. New nearby comments #593532/#593533 say pictures are interesting/amusing but are not replies to the corrected image, so not scored as direct approval.
