@@ -35,7 +35,7 @@ class TestUnifiedGenPrompt(unittest.TestCase):
             for edit in (False, True):
                 system = bot._gen_unified_system(catalog, edit)
                 self.assertIn("СБОРКА ПРОМПТА", system)
-                self.assertIn("не вставляй веса", system)
+                self.assertIn("без неподдерживаемых весов", system)
                 self.assertIn("вместе с его действием", system)
                 self.assertIn("ТЕОРИЯ РИСУНКА", system)
                 self.assertIn("каждое обязательное требование", system)
@@ -150,6 +150,34 @@ if __name__ == "__main__":
 
 
 class TestMockedToolLoop(unittest.IsolatedAsyncioTestCase):
+    async def test_visual_qa_checks_generated_bytes_and_parses_findings(self):
+        generated = b"generated-artifact"
+        response = '{"findings":[{"severity":"high","issue":"extra finger","location":"left hand","confidence":0.91}]}'
+        with patch.object(bot, "describe_image", return_value=response) as vision:
+            result = await bot._gen_visual_qa(generated, "draw a person", "a person in a coat")
+        self.assertEqual(result["findings"][0]["severity"], "high")
+        self.assertEqual(vision.call_args.args[0], generated)
+        self.assertIn("draw a person", vision.call_args.kwargs["prompt"])
+        self.assertIn("a person in a coat", vision.call_args.kwargs["prompt"])
+
+    async def test_visual_qa_failure_is_nonfatal(self):
+        with patch.object(bot, "describe_image", side_effect=RuntimeError("offline")):
+            self.assertIsNone(await bot._gen_visual_qa(b"output", "brief", "prompt"))
+        with patch.object(bot, "describe_image", return_value="not json"):
+            self.assertIsNone(await bot._gen_visual_qa(b"output", "brief", "prompt"))
+
+    async def test_visual_qa_is_advisory_output_preserved_no_repair(self):
+        from unittest.mock import AsyncMock
+        artifact = b"generated-image"
+        qa = {"findings": [{"severity": "high", "issue": "bad hand", "location": "left", "confidence": .9}]}
+        with patch.object(bot, "GEN_IMAGE_MODEL", "gpt-image-2.5-sunburst"), \
+             patch.object(bot, "_gen_rate_gate", new=AsyncMock()), \
+             patch.object(bot, "_sync_generate_image", return_value=(artifact, "image/png")), \
+             patch.object(bot, "_gen_visual_qa", new=AsyncMock(return_value=qa)) as inspect_image:
+            result = await bot._gen_one_image("prompt", ["reference"], "2K", "1:1", True, "user req")
+        self.assertEqual(result[:2], (artifact, "image/png"))
+        inspect_image.assert_awaited_once_with(artifact, "user req", "prompt")
+
     async def test_default_description_uses_active_cliproxy_vision(self):
         reply = SimpleNamespace(choices=[SimpleNamespace(message=SimpleNamespace(content='gray bunny'))])
         llm = SimpleNamespace(chat=SimpleNamespace(completions=SimpleNamespace(create=lambda **kw: reply)))
