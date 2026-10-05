@@ -37,3 +37,5 @@ env/
 *.bak
 .claude/
 voice_samples/
+qa_artifacts/
+remote_baseline.py
