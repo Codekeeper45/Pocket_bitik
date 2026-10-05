@@ -7678,7 +7678,7 @@ async def _gen_one_image(final_prompt, input_b64s, image_size, aspect_ratio, all
                 attempt += 1
                 wait = min(30, 15 + 8 * attempt)  # RPM-лимит: ждём дольше (23, 30с)
                 log("GEN", f"Временный сбой провайдера ({gen_model}): {e} — ретрай через {wait}с (осталось {transient_left})")
-                await _s("⏳ Провайдер генерации перегружен — повторяю…")
+                await _s("⏳ Временный сбой генерации — повторяю тот же запрос…")
                 await asyncio.sleep(wait)
                 continue
             if not used_fallback and OPENROUTER_IMAGE_FALLBACK and OPENROUTER_IMAGE_FALLBACK != gen_model:
