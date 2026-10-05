@@ -52,3 +52,11 @@ Successful cyberpunk comic: https://t.me/c/2567687026/593479. Vision QA confirms
 Inspected actual gateway services/openai_backend_api.py `_image_model_slug`: `gpt-image-2.5-sunburst`, `gpt-image-2.5`, and `gpt-image-2.5-flare` all map to backend `auto`; `gpt-image-2` maps to `gpt-5-3`. Merely changing 2.5 label does not establish a stronger backend.
 
 Bot now treats the exact generic generation-error message as transient, bounded unchanged-prompt retries instead of moderation repair. Explicit safety handling is not bypassed. Ensemble instructions explicitly require rendering requested exact names on badges, not only naming design descriptions. Real prompt probe retained four exact badges, per-panel storyline and stable designs.
+
+## Follow-up verified results
+
+Fantasy comic #593494 delivered after changes: four panels, consistent human designs, readable main Russian text; names correct where badges visible, minor finger artifacts. Actual reactions: one heart, one thumbs-up at capture.
+
+Same-prompt model comparison: requested sunburst HTTP200 in 130.1s; gpt-image-2 HTTP400 generic failure in 11.1s. Single paired sample cannot establish general quality superiority; no model switch made. Sunburst comparison still has small-badge spelling errors.
+
+Regression suite now 13 tests including exact generic-error classification and bounded retry preserving prompt/references without repair. Live cozy retry confirmed two unchanged-request retries; successful recovery not yet established at this entry.
