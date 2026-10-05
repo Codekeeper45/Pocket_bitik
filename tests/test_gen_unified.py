@@ -166,16 +166,33 @@ class TestMockedToolLoop(unittest.IsolatedAsyncioTestCase):
         with patch.object(bot, "describe_image", return_value="not json"):
             self.assertIsNone(await bot._gen_visual_qa(b"output", "brief", "prompt"))
 
-    async def test_visual_qa_is_advisory_output_preserved_no_repair(self):
+    async def test_visual_qa_auto_repair_replaces_image_on_success(self):
         from unittest.mock import AsyncMock
         artifact = b"generated-image"
-        qa = {"findings": [{"severity": "high", "issue": "bad hand", "location": "left", "confidence": .9}]}
+        repaired = b"repaired-clean-image"
+        qa_initial = {"findings": [{"severity": "high", "issue": "bad hand", "location": "left hand", "confidence": 0.9}]}
+        qa_repaired = {"findings": []}
+
         with patch.object(bot, "GEN_IMAGE_MODEL", "gpt-image-2.5-sunburst"), \
              patch.object(bot, "_gen_rate_gate", new=AsyncMock()), \
-             patch.object(bot, "_sync_generate_image", return_value=(artifact, "image/png")), \
-             patch.object(bot, "_gen_visual_qa", new=AsyncMock(return_value=qa)) as inspect_image:
+             patch.object(bot, "_sync_generate_image", side_effect=[(artifact, "image/png"), (repaired, "image/png")]) as gen_call, \
+             patch.object(bot, "_gen_visual_qa", side_effect=[qa_initial, qa_repaired]) as inspect_image:
             result = await bot._gen_one_image("prompt", ["reference"], "2K", "1:1", True, "user req")
+        self.assertEqual(result[:2], (repaired, "image/png"))
+        self.assertEqual(gen_call.call_count, 2)
+        self.assertEqual(inspect_image.call_count, 2)
+
+    async def test_visual_qa_preserves_original_when_repair_disabled(self):
+        from unittest.mock import AsyncMock
+        artifact = b"generated-image"
+        qa = {"findings": [{"severity": "high", "issue": "bad hand", "location": "left", "confidence": 0.9}]}
+        with patch.object(bot, "GEN_IMAGE_MODEL", "gpt-image-2.5-sunburst"), \
+             patch.object(bot, "_gen_rate_gate", new=AsyncMock()), \
+             patch.object(bot, "_sync_generate_image", return_value=(artifact, "image/png")) as gen_call, \
+             patch.object(bot, "_gen_visual_qa", new=AsyncMock(return_value=qa)) as inspect_image:
+            result = await bot._gen_one_image("prompt", ["reference"], "2K", "1:1", False, "user req")
         self.assertEqual(result[:2], (artifact, "image/png"))
+        self.assertEqual(gen_call.call_count, 1)
         inspect_image.assert_awaited_once_with(artifact, "user req", "prompt")
 
     async def test_default_description_uses_active_cliproxy_vision(self):
