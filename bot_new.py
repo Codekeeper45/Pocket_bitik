@@ -134,6 +134,8 @@ plusvibe_api_keys = _collect_plusvibe_keys()  # PlusVibe API (plusvibeapi.ru, р
 PLUSVIBE_BASE_URL = os.getenv("PLUSVIBE_BASE_URL", "https://plusvibeapi.ru/v1")
 cliproxy_api_key = os.getenv("CLIPROXY_API_KEY")  # Cliproxy API (локальный шлюз VPS с пулом моделей)
 CLIPROXY_BASE_URL = os.getenv("CLIPROXY_BASE_URL", "https://push-receive-meeting-backgrounds.trycloudflare.com/v1")
+CHATGPT2API_AUTH_KEY = os.getenv("CHATGPT2API_AUTH_KEY")
+CHATGPT2API_BASE_URL = os.getenv("CHATGPT2API_BASE_URL", "https://tess-unchary-lenore.ngrok-free.dev/v1")
 tavily_api_key = os.getenv("TAVILY_API_KEY")  # веб-поиск/извлечение страниц для /ask (tavily.com); без ключа веб-инструменты выключены
 index_db_url = os.getenv("INDEX_DB_URL")  # MariaDB для /index (GraphRAG-память): mysql://user:pass@host:port/db (pass URL-encoded)
 llama_cloud_api_key = os.getenv("LLAMA_CLOUD_API_KEY")  # OCR фото (LlamaParse); без него фото идут через vision
@@ -174,7 +176,7 @@ OPENROUTER_VISION_MODEL = "google/gemini-3.1-flash-lite"  # дефолт vision 
 # заменены на дешёвые STT (проверено живьём: HTTP 200, ogg напрямую). Gemini для STT дорог.
 OPENROUTER_AUDIO_MODEL = "nvidia/parakeet-tdt-0.6b-v3"
 OPENROUTER_AUDIO_FALLBACK = "mistralai/voxtral-mini-transcribe"  # запасная, если Parakeet не отвечает
-OPENROUTER_IMAGE_MODEL = "openai/gpt-image-2"  # /gen: text→image и image→image (OpenAI GPT Image 2, платная)
+OPENROUTER_IMAGE_MODEL = "gpt-image-2.5-sunburst"  # /gen: text→image и image→image (ChatGPT2API шлюз / OpenAI GPT Image 2.5)
 OPENROUTER_IMAGE_FALLBACK = "google/gemini-3.1-flash-image"  # запасная при сбое/перегрузке основной (4K не умеет → авто-даунгрейд до 2K)
 GEN_IMAGE_MAX_INPUT = 3_000_000  # лимит входного запроса ~4.5 МБ; base64 ×1.33 → входное фото до ~3 МБ
 GEN_CTX_IMG_MAX = 16        # /gen: суммарный потолок каталога (свежие+индекс) для vision-промптера; он же describe-пул свежих
@@ -3260,13 +3262,77 @@ def _img_mime_from_bytes(b: bytes) -> str:
 
 def _sync_generate_image(prompt: str, input_images_b64: list = None, model: str = None,
                          image_size: str = "2K", aspect_ratio: str = None) -> tuple:
-    """Генерация/редактирование через OpenRouter Unified Image API (POST /api/v1/images). Возвращает (байты, mime).
-    Проверено живьём: gpt-image-2 и gemini-flash-image обе работают ТОЛЬКО на этом эндпоинте
-    (chat/completions для pure-image моделей даёт 500). resolution=1K/2K/4K, aspect_ratio — точная ориентация,
-    референсы — input_references:[{type:image_url,image_url:{url:data-URL}}], ответ data[0].b64_json (сырые байты).
-    Ошибки: 5xx/сеть/таймаут — обычные исключения (временные, ретрай); 4xx/нет картинки — GenRejected (правка промпта)."""
+    """Генерация/редактирование через ChatGPT2API Gateway или OpenRouter Unified Image API. Возвращает (байты, mime)."""
+    target_model = model or GEN_IMAGE_MODEL or OPENROUTER_IMAGE_MODEL
+
+    # Маршрутизация на наш собственный шлюз chatgpt2api
+    if "gpt-image-2.5" in target_model or "chatgpt2api" in target_model or (CHATGPT2API_AUTH_KEY and target_model.startswith("gpt-image-")):
+        cg_model = target_model.split("/")[-1] if "/" in target_model else target_model
+        # Преобразование aspect_ratio / size в пиксели (1024x1024, 1536x1024, 1024x1536)
+        if aspect_ratio == "16:9" or aspect_ratio == "horizontal":
+            res_str = "1536x1024"
+        elif aspect_ratio == "9:16" or aspect_ratio == "vertical":
+            res_str = "1024x1536"
+        else:
+            res_str = "1024x1024"
+
+        # Image-to-image (редактирование по референсу)
+        if input_images_b64 and len(input_images_b64) > 0:
+            endpoint = f"{CHATGPT2API_BASE_URL.rstrip('/')}/images/edits"
+            ref_b64 = input_images_b64[0]
+            try:
+                mime_type = _img_mime_from_bytes(base64.b64decode(ref_b64)[:16])
+            except Exception:
+                mime_type = "image/png"
+            body = {
+                "model": cg_model,
+                "prompt": prompt,
+                "image": f"data:{mime_type};base64,{ref_b64}",
+                "size": res_str,
+                "response_format": "b64_json"
+            }
+        else:
+            endpoint = f"{CHATGPT2API_BASE_URL.rstrip('/')}/images/generations"
+            body = {
+                "model": cg_model,
+                "prompt": prompt,
+                "size": res_str,
+                "n": 1,
+                "response_format": "b64_json"
+            }
+
+        headers = {
+            "Authorization": f"Bearer {CHATGPT2API_AUTH_KEY}",
+            "Content-Type": "application/json"
+        }
+        resp = requests.post(endpoint, headers=headers, json=body, timeout=180)
+        if resp.status_code >= 500:
+            resp.raise_for_status()
+        if not resp.ok:
+            try:
+                detail = (resp.json().get("error") or {}).get("message") or resp.text
+            except Exception:
+                detail = resp.text
+            s = str(detail)
+            low = s.lower()
+            if any(mk in low for mk in _GEN_DAILY_MARKERS):
+                raise GenExhausted(f"HTTP {resp.status_code}: {s[:200]}")
+            if resp.status_code == 429 or any(mk in low for mk in _GEN_TRANSIENT_MARKERS):
+                raise GenTransient(f"HTTP {resp.status_code}: {s[:200]}")
+            raise GenRejected(f"HTTP {resp.status_code}: {s[:200]}")
+
+        data = resp.json()
+        items = data.get("data") or []
+        b64_out = items[0].get("b64_json") if items else None
+        if not b64_out:
+            err = (data.get("error") or {}).get("message") or "пустой ответ"
+            raise GenRejected(f"шлюз не вернул изображение: {err}")
+        raw = base64.b64decode(b64_out)
+        return raw, (items[0].get("media_type") or _img_mime_from_bytes(raw[:16]))
+
+    # Стандартный путь OpenRouter Unified Image API
     body = {
-        "model": model or OPENROUTER_IMAGE_MODEL,
+        "model": target_model,
         "prompt": prompt,
         "resolution": image_size,  # 1K/2K/4K — реальное разрешение выхода
         "n": 1,
