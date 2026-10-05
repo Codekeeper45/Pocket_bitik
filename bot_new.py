@@ -8095,8 +8095,8 @@ async def gen_command(event):
                                  "Генерация не завершена; точная причина записана в журнале. "
                                  "Это не обязательно дневной лимит, повтор завтра может не помочь.")
             else:
-                await set_status("❌ Провайдер генерации сейчас перегружен (лимит ~5 запросов/мин).\n"
-                                 f"Попробуй ещё раз через минуту: `/gen {user_prompt[:200]}`")
+                await set_status("❌ Шлюз не смог завершить генерацию.\n"
+                                 "Это может быть временный сбой, а не лимит запросов. Причина записана в журнале.")
             return
         log("GEN", f"Готово за {time.time() - t0:.1f}с · {len(raw) / 1024:.0f} КБ · {mime} · prompt_by_ai={prompt_by_ai} · модель={'fast(запасная)' if used_fb else 'pro'}")
         await _gen_send_image(event.chat_id, raw, mime, used_fp, prompt_by_ai, reply_target_id, refs_line=gen_refs_line, idea=gen_idea)
