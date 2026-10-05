@@ -3631,7 +3631,10 @@ def _sync_image_prompt(user_prompt: str, context_text: str = None, image_desc: s
     edit_mode (есть референсы) — только уточнение формулировок, без отсебятины;
     иначе — творческий детальный промпт. image_desc — vision-описания референсов (DeepSeek сам не видит).
     previous_prompts — для пакета: промпты уже сделанных вариантов; DeepSeek сам придумает НЕпохожий."""
-    if deepseek_client is None:
+    prompt_client, prompt_model = deepseek_client, DEEPSEEK_MODEL
+    if (MODEL_REGISTRY.get(ACTIVE_MODEL) or (None,))[0] == "cliproxy":
+        prompt_client, prompt_model, _ = get_active_model()
+    if prompt_client is None:
         return user_prompt
     parts = []
     if context_text:
@@ -3645,8 +3648,9 @@ def _sync_image_prompt(user_prompt: str, context_text: str = None, image_desc: s
                      "(ни идею, ни композицию, ни ракурс, ни формулировки):\n" + joined +
                      "\n\nПридумай СВЕЖИЙ, заметно непохожий вариант — доверься своей фантазии, удиви.")
     try:
-        resp = deepseek_client.chat.completions.create(
-            model=DEEPSEEK_MODEL,
+        resp = prompt_client.chat.completions.create(
+            model=prompt_model,
+            timeout=90,
             messages=[{"role": "system", "content": _gen_unified_system(False, edit_mode)},
                       {"role": "user", "content": "\n\n".join(parts)}],
             max_tokens=ASK_MAX_TOKENS,  # deepseek-v4-pro — reasoning-модель: 600 токенов съедались размышлениями
