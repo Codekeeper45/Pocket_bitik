@@ -283,6 +283,60 @@ class TestMockedToolLoop(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result[0], "Image #1 subject.")
         self.assertEqual(result[1], [(1, "subject")])
 
+    def test_detect_pages_count(self):
+        cases = [
+            ("манга на 2 страницы: в первой Зая встречает Кими", [], 2),
+            ("комикс из 3 страниц: 1) утро 2) день 3) вечер", [], 3),
+            ("нарисуй 4 кадра истории про космонавта", [], 4),
+            ("двухстраничная манга где герои гуляют", [], 2),
+            ("история на три страницы", [], 3),
+            ("нарисуй кота на крыше", [], 1),
+            ("на 2 кота на крыше", [], 1),
+            ("сделай арт", ["-p2"], 2),
+            ("сделай арт", ["--pages", "3"], 3),
+            ("сделай арт", ["-p4"], 4),
+        ]
+        for prompt, toks, expected in cases:
+            with self.subTest(prompt=prompt):
+                self.assertEqual(bot._detect_pages_count(prompt, toks), expected)
+
+    def test_parse_gen_multipage_out(self):
+        sample = """
+PAGE 1:
+IDEA: Зая сидит в кафе
+ASPECT: 9:16
+PROMPT: A manga page 1: Zaya sits in a cafe...
+
+PAGE 2:
+IDEA: Кими входит в кафе
+ASPECT: 9:16
+PROMPT: A manga page 2: Kimi enters the cafe...
+"""
+        parsed = bot._parse_gen_multipage_out(sample, 2)
+        self.assertEqual(len(parsed), 2)
+        self.assertEqual(parsed[0]["page"], 1)
+        self.assertIn("Зая", parsed[0]["idea"])
+        self.assertIn("cafe", parsed[0]["prompt"])
+        self.assertEqual(parsed[1]["page"], 2)
+        self.assertIn("Кими", parsed[1]["idea"])
+        self.assertIn("Kimi", parsed[1]["prompt"])
+
+    def test_parse_gen_multipage_fallback(self):
+        sample = "IDEA: общая идея\nPROMPT: Sequential story prompt."
+        parsed = bot._parse_gen_multipage_out(sample, 3)
+        self.assertEqual(len(parsed), 3)
+        self.assertEqual(parsed[0]["page"], 1)
+        self.assertEqual(parsed[1]["page"], 2)
+        self.assertEqual(parsed[2]["page"], 3)
+        self.assertIn("Page 1 of sequential story", parsed[0]["prompt"])
+        self.assertIn("Page 3 of sequential story", parsed[2]["prompt"])
+
+    def test_layered_staging_in_composition_rules(self):
+        system = bot._gen_unified_system(True, False)
+        self.assertIn("ПОСЛОЙНАЯ ПОСТАНОВКА", system)
+        self.assertIn("Background Plate", system)
+        self.assertIn("Foreground Hero Layer", system)
+
 
 if __name__ == "__main__":
     unittest.main()
