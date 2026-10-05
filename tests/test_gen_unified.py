@@ -54,6 +54,13 @@ class TestUnifiedGenPrompt(unittest.TestCase):
         self.assertEqual(remapped, "use image #2 as subject and image #3 for style")
         self.assertIn("Image #3: style", bot._gen_actual_role_instruction(roles))
 
+    def test_gateway_generic_generation_error_is_retryable(self):
+        response = SimpleNamespace(ok=False, status_code=400,
+            json=lambda: {"error": {"message": "由于我这边发生了错误，我未能生成图片。"}}, text="")
+        with patch.object(bot, "CHATGPT2API_AUTH_KEY", "test"), patch.object(bot.requests, "post", return_value=response):
+            with self.assertRaises(bot.GenTransient):
+                bot._sync_generate_image("four panel comic", model="gpt-image-2.5-sunburst")
+
     def test_gateway_receives_every_reference(self):
         response = SimpleNamespace(ok=True, status_code=200,
             json=lambda: {"data": [{"b64_json": base64.b64encode(b"output").decode()}]})

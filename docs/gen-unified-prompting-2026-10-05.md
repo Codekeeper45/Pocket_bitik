@@ -44,3 +44,11 @@ Actual participant replies: #593458 praised cookies in tea scene; #593457 says P
 Comic attempts failed upstream with HTTP 400 generic Chinese generation error; bot incorrectly labels it moderation. Comic success not established. Repair fallback also lacked DeepSeek balance (402).
 
 Added ensemble instructions: named roster, distinct staging/actions, exact names, stable panel designs, main visual gag priority; creative freedom remains explicit. Reply correction #593464 uses the participant feedback.
+
+## Anime comic diagnosis and recovery
+
+Successful cyberpunk comic: https://t.me/c/2567687026/593479. Vision QA confirms four panels, human anime characters and consistent designs, readable main dialogue; requested names were omitted from pixels, and secondary signage contains gibberish. Fantasy and cozy attempts repeatedly returned a generic Chinese generation failure, not verified safety rejections.
+
+Inspected actual gateway services/openai_backend_api.py `_image_model_slug`: `gpt-image-2.5-sunburst`, `gpt-image-2.5`, and `gpt-image-2.5-flare` all map to backend `auto`; `gpt-image-2` maps to `gpt-5-3`. Merely changing 2.5 label does not establish a stronger backend.
+
+Bot now treats the exact generic generation-error message as transient, bounded unchanged-prompt retries instead of moderation repair. Explicit safety handling is not bypassed. Ensemble instructions explicitly require rendering requested exact names on badges, not only naming design descriptions. Real prompt probe retained four exact badges, per-panel storyline and stable designs.

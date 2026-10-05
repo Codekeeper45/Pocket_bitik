@@ -3316,7 +3316,8 @@ def _sync_generate_image(prompt: str, input_images_b64: list = None, model: str 
             low = s.lower()
             if any(mk in low for mk in _GEN_DAILY_MARKERS):
                 raise GenExhausted(f"HTTP {resp.status_code}: {s[:200]}")
-            if resp.status_code == 429 or any(mk in low for mk in _GEN_TRANSIENT_MARKERS):
+            if (resp.status_code == 429 or any(mk in low for mk in _GEN_TRANSIENT_MARKERS)
+                    or "由于我这边发生了错误，我未能生成图片" in s):
                 raise GenTransient(f"HTTP {resp.status_code}: {s[:200]}")
             raise GenRejected(f"HTTP {resp.status_code}: {s[:200]}")
 
@@ -3487,7 +3488,9 @@ _GEN_INTENT_CORE = (
 _GEN_ENSEMBLE_RULES = (
     "ГРУППОВЫЕ СЦЕНЫ И КОМИКСЫ: заранее зафиксируй список требуемых персонажей. "
     "Каждому назначь отдельное место, действие и отличимый силуэт; не заменяй названных героев безымянной массовкой. "
-    "Сохраняй имена дословно. Если всех установить невозможно, явно обозначь охват в IDEA. "
+    "Сохраняй имена дословно. Если нужны подписи, включи в PROMPT явную инструкцию напечатать "
+    "эти имена рядом с героями или на бейджах: перечисления имён в описании дизайнов недостаточно. "
+    "Если всех установить невозможно, явно обозначь охват в IDEA. "
     "В комиксе задай точное число панелей, порядок чтения, действия и реплики по каждой панели; "
     "повторяющиеся персонажи сохраняют дизайн во всех панелях. "
     "Креатив разрешён по просьбе пользователя, включая милые, эпичные и абсурдные сюжеты. "
