@@ -125,10 +125,26 @@ if __name__ == "__main__":
 
 
 class TestMockedToolLoop(unittest.IsolatedAsyncioTestCase):
+    async def test_gateway_does_not_stack_retries_or_use_paid_fallback(self):
+        from unittest.mock import AsyncMock
+        for failure, reason in [(bot.GenTransient('pool failed'), 'overload'),
+                                (bot.GenExhausted('pool quota'), 'exhausted')]:
+            with self.subTest(reason=reason):
+                with patch.object(bot, '_gen_rate_gate', new=AsyncMock()), \
+                     patch.object(bot, 'GEN_IMAGE_MODEL', 'gpt-image-2.5-sunburst'), \
+                     patch.object(bot, 'GEN_IMAGE_INPUT', True), \
+                     patch.object(bot, 'OPENROUTER_IMAGE_FALLBACK', 'paid-fallback'), \
+                     patch.object(bot, '_sync_generate_image', side_effect=failure) as generate:
+                    result = await bot._gen_one_image('exact', ['ref'], '2K', '1:1', True, 'brief')
+                self.assertEqual(result[1], reason)
+                self.assertFalse(result[3])
+                self.assertEqual(generate.call_count, 1)
+
     async def test_transient_retry_preserves_prompt_and_refs(self):
         from unittest.mock import AsyncMock
         response = (b"image", "image/png")
-        with patch.object(bot, "_gen_rate_gate", new=AsyncMock()), \
+        with patch.object(bot, "GEN_IMAGE_MODEL", "other-image-model"), \
+             patch.object(bot, "_gen_rate_gate", new=AsyncMock()), \
              patch.object(bot.asyncio, "sleep", new=AsyncMock()), \
              patch.object(bot, "_sync_generate_image", side_effect=[bot.GenTransient("generic error"), response]) as generate, \
              patch.object(bot, "GEN_IMAGE_INPUT", True), \

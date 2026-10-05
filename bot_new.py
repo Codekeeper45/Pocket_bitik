@@ -7639,15 +7639,17 @@ async def _gen_one_image(final_prompt, input_b64s, image_size, aspect_ratio, all
             await status_cb(text)
     gen_model = GEN_IMAGE_MODEL
     used_fallback = False
-    transient_left = 2  # ретраи дорогие: провальная попытка тоже списывается из дневной квоты
-    repair_left = 2 if allow_repair else 0
+    gateway_pool = gen_model.startswith("gpt-image-2.5")
+    # Gateway owns the bounded cross-account retry budget (3 attempts total).
+    transient_left = 0 if gateway_pool else 2
+    repair_left = 0 if gateway_pool else (2 if allow_repair else 0)
     attempt = 0
     size = _clamp_resolution(image_size, GEN_IMAGE_RES)  # primary может не уметь 4K → опускаем (фолбэк восстановит запрошенное)
     if size != image_size:
         log("GEN", f"{gen_model} не поддерживает {image_size} → генерирую в {size}")
     # Референсы/правка есть, но выбранная модель — только text→image? Сразу на Gemini-фолбэк (он умеет image→image),
     # иначе input_references уйдут модели, которая их не принимает, и запрос упадёт.
-    if input_b64s and not GEN_IMAGE_INPUT and OPENROUTER_IMAGE_FALLBACK and OPENROUTER_IMAGE_FALLBACK != gen_model:
+    if input_b64s and not GEN_IMAGE_INPUT and not gateway_pool and OPENROUTER_IMAGE_FALLBACK and OPENROUTER_IMAGE_FALLBACK != gen_model:
         log("GEN", f"{gen_model} не принимает картинки на вход (text→image) — генерирую с референсами на запасной {OPENROUTER_IMAGE_FALLBACK}")
         gen_model = OPENROUTER_IMAGE_FALLBACK
         used_fallback = True
@@ -7661,7 +7663,7 @@ async def _gen_one_image(final_prompt, input_b64s, image_size, aspect_ratio, all
         except GenExhausted as e:
             # ДНЕВНОЙ лимит модели исчерпан — ретраить сегодня бессмысленно (и жжёт квоту). Пробуем запасную (своя квота).
             log("GEN", f"Дневной лимит исчерпан ({gen_model}): {e}")
-            if not used_fallback and OPENROUTER_IMAGE_FALLBACK and OPENROUTER_IMAGE_FALLBACK != gen_model:
+            if not used_fallback and not gateway_pool and OPENROUTER_IMAGE_FALLBACK and OPENROUTER_IMAGE_FALLBACK != gen_model:
                 used_fallback = True
                 gen_model = OPENROUTER_IMAGE_FALLBACK
                 size = image_size  # gemini-фолбэк тянет запрошенное разрешение (кламп был под primary)
@@ -7683,7 +7685,7 @@ async def _gen_one_image(final_prompt, input_b64s, image_size, aspect_ratio, all
         except (GenTransient, requests.exceptions.RequestException) as e:
             # 5xx от ОСНОВНОЙ модели = провайдер/адаптер лежит, ждать бессмысленно → сразу на запасную (без 2× пауз).
             _http_code = getattr(getattr(e, "response", None), "status_code", 0) or 0
-            if _http_code >= 500 and not used_fallback and OPENROUTER_IMAGE_FALLBACK and OPENROUTER_IMAGE_FALLBACK != gen_model:
+            if _http_code >= 500 and not used_fallback and not gateway_pool and OPENROUTER_IMAGE_FALLBACK and OPENROUTER_IMAGE_FALLBACK != gen_model:
                 used_fallback = True
                 gen_model = OPENROUTER_IMAGE_FALLBACK
                 size = image_size  # gemini-фолбэк тянет запрошенное разрешение (кламп был под primary)
@@ -7700,7 +7702,7 @@ async def _gen_one_image(final_prompt, input_b64s, image_size, aspect_ratio, all
                 await _s("⏳ Временный сбой генерации — повторяю тот же запрос…")
                 await asyncio.sleep(wait)
                 continue
-            if not used_fallback and OPENROUTER_IMAGE_FALLBACK and OPENROUTER_IMAGE_FALLBACK != gen_model:
+            if not used_fallback and not gateway_pool and OPENROUTER_IMAGE_FALLBACK and OPENROUTER_IMAGE_FALLBACK != gen_model:
                 used_fallback = True
                 gen_model = OPENROUTER_IMAGE_FALLBACK
                 size = image_size  # gemini-фолбэк тянет запрошенное разрешение (кламп был под primary)
