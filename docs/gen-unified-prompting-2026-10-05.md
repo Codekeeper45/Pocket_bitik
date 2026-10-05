@@ -66,3 +66,7 @@ Regression suite now 13 tests including exact generic-error classification and b
 Applied explicit per-panel spatial continuity, speaker attribution, natural distinct hand contact and first-panel-only large labels. Gateway and OpenRouter structured error codes both handled. 14 regression tests passed.
 
 Repeated train scene: https://t.me/c/2567687026/593534. Vision comparison against #593524 confirms Doctor now visibly exits the carriage toward Maga; hand fusion moderately reduced, not eliminated. Six panels preserved. Name glyph ambiguity remains (Maga/Mara) and is not claimed fixed. New nearby comments #593532/#593533 say pictures are interesting/amusing but are not replies to the corrected image, so not scored as direct approval.
+
+## Reliability incident follow-up
+
+Observed live edits HTTP502 after58s at18:33:36, so earlier180s client deadline is not proven root cause. Increased gateway read timeout600s for native3-account budget, retained20s connect timeout. Terminal error now logged. Empty200 is transient, not moderation. Default image descriptions now use active Cliproxy vision (verified live on MissZai sticker); paid media remains for explicitly selected model. Query embedding402 triggers900s circuit break, lexical retrieval preserved. Invalid Telegram media filter retries same text/sender without server filter and filters media locally. Prompt fallback uses active Cliproxy instead of unpaid DeepSeek where available. 17 tests passed; live bot generation remains blocked by gateway502, under investigation.
