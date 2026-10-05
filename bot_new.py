@@ -3364,10 +3364,16 @@ def _sync_generate_image(prompt: str, input_images_b64: list = None, model: str 
         resp.raise_for_status()  # 5xx — временная ошибка провайдера → ретрай тем же промптом
     if not resp.ok:  # 4xx: РАЗДЕЛЯЕМ дневной лимит / RPM-лимит-перегрузку / реальную модерацию
         try:
-            detail = (resp.json().get("error") or {}).get("message") or resp.text
+            error = resp.json().get("error") or {}
+            detail = error.get("message") or resp.text
+            error_code = str(error.get("code") or "").lower()
         except Exception:
-            detail = resp.text
+            detail, error_code = resp.text, ""
         s = str(detail)
+        if error_code == "content_policy_violation":
+            raise GenRejected(f"HTTP {resp.status_code}: {s[:200]}")
+        if error_code in {"upstream_text_reply", "no_image_generated", "image_tool_error"}:
+            raise GenTransient(f"HTTP {resp.status_code} ({error_code}): {s[:200]}")
         low = s.lower()
         if any(mk in low for mk in _GEN_DAILY_MARKERS):
             raise GenExhausted(f"HTTP {resp.status_code}: {s[:200]}")
@@ -3499,6 +3505,13 @@ _GEN_ENSEMBLE_RULES = (
     "Если всех установить невозможно, явно обозначь охват в IDEA. "
     "В комиксе задай точное число панелей, порядок чтения, действия и реплики по каждой панели; "
     "повторяющиеся персонажи сохраняют дизайн во всех панелях. "
+    "Для последовательной истории явно задай, кто где находится, куда движется и в каком кадре "
+    "происходит переход; не меняй местами героев внутри и снаружи помещения или транспорта. "
+    "Реплики привяжи к конкретному говорящему. В эмоциональной сцене смысл передают лица, "
+    "паузы и жесты, а не одинаковая улыбка во всех кадрах. "
+    "Сложные контакты рук ставь ясно: две различимые кисти, естественный хват, без слияния пальцев; "
+    "не отменяй заданный жест ради упрощения. Обязательные подписи делай крупными в первом кадре, "
+    "не размножай мелкие бейджи по всей странице без просьбы пользователя. "
     "Креатив разрешён по просьбе пользователя, включая милые, эпичные и абсурдные сюжеты. "
     "Для безумных сцен выдели главный визуальный прикол, вторичные детали не должны его скрывать.\n"
 )
