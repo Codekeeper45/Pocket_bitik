@@ -3637,9 +3637,16 @@ _GEN_COMPOSITION_RULES = (
     "прямоугольные блоки для закадрового текста. Размещай текст строго без перекрытия лиц и глаз. "
     "Язык речевых бабблов и звуков (SFX) строго соответствует языку запроса пользователя (русский); "
     "запрещено вставлять японские иероглифы или катакану без прямого указания пользователя. "
-    "ОТКРЫТЫЕ ЗАПРОСЫ В ЧАТАХ: если в групповом чате запрос неопределённый («пусть кто-то... кто выбери»), "
-    "проверяй актуальный контекст и участников чата через инструменты поиска/чтения, а не подставляй "
-    "случайных внешних героев поп-культуры без явной просьбы. "
+    "КАСТИНГ ЧАТЕРОВ В ГРУППОВЫХ ЧАТАХ (НЕ РИСУЙ РАНДОМНЫХ ЛЮДЕЙ): когда пользователь в групповом чате "
+    "просит сцену с людьми без указания конкретных имён (например, «горячо влюбленные», «романтическая пара», "
+    "«самый крутой», «кто-то обнимается на работе», «друзья на тусовке», «вечеринка чата»), КАТЕГОРИЧЕСКИ "
+    "ЗАПРЕЩЕНО рисовать безымянных случайных прохожих или незнакомцев с улицы (NPC), если пользователь прямо "
+    "не потребовал «случайные незнакомцы»! Пользователь ждёт живого сотворчества и прямо разрешает дополнять "
+    "свою идею участниками чата. Ты ОБЯЗАН использовать инструменты (chat_ant_search, chat_search, chat_inspect_image) "
+    "или недавнюю историю, чтобы найти реальных активных чатеров и подставить их в сюжет! "
+    "Если в чате нет явной пары — подбери двух активных участников (по флирту, шуткам или общению), посмотри их аватарки, "
+    "надели их образами персонажей и поставь в сцену. В строке IDEA явно назови выбранных участников: "
+    "«В образе влюблённых на работе выступают участники чата @user1 и @user2...». "
     "Для одиночного изображения выбирай выразительный момент, для серии ключевые состояния. "
     "Текст/макет читаются в целевом размере. Художественные решения уточняют запрос, "
     "не меняют его персонажей, подписи, действие или отношения."
@@ -5636,10 +5643,15 @@ async def _run_chat_search(chat_id, args: dict, msg_by_id: dict = None, include_
     return "\n".join(lines)
 
 
-JEV_SYSTEMONE_URL = os.environ.get("JEV_ENDPOINT", "http://127.0.0.1:8321/v1/systemone")
+JEV_SYSTEMONE_URL = os.environ.get("JEV_ENDPOINT", "https://farming-oven-import-fitting.trycloudflare.com/v1/systemone")
 
 def _jev_sync_choice(state: str, instructions: str, options: dict, timeout: float = 4.5) -> dict:
-    """Синхронный вызов Jev choice (TypeSafe System One) через локальный шлюз :8321."""
+    """Синхронный вызов Jev choice (TypeSafe System One) с отказоустойчивым перебором туннеля, локального шлюза и апстрима."""
+    endpoints = [
+        JEV_SYSTEMONE_URL,
+        "http://127.0.0.1:8321/v1/systemone",
+        "https://opencode.ai/zen/v1/systemone",
+    ]
     payload = {
         "model": "jev-1.13-free",
         "state": state,
@@ -5651,15 +5663,28 @@ def _jev_sync_choice(state: str, instructions: str, options: dict, timeout: floa
             }
         },
     }
-    req = urllib.request.Request(
-        JEV_SYSTEMONE_URL,
-        data=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
-        headers={"Content-Type": "application/json", "User-Agent": "curl/8.5.0", "Accept": "application/json"},
-    )
-    with urllib.request.urlopen(req, timeout=timeout) as resp:
-        data = json.loads(resp.read().decode("utf-8"))
-        answers = data.get("answers") or {}
-        return answers.get("pick") or {}
+    encoded = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+    last_err = None
+    for ep in endpoints:
+        if not ep:
+            continue
+        req = urllib.request.Request(
+            ep,
+            data=encoded,
+            headers={"Content-Type": "application/json", "User-Agent": "curl/8.5.0", "Accept": "application/json"},
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
+                data = json.loads(resp.read().decode("utf-8"))
+                answers = data.get("answers") or {}
+                if "pick" in answers:
+                    return answers.get("pick") or {}
+        except Exception as e:
+            last_err = e
+            continue
+    if last_err:
+        raise last_err
+    return {}
 
 
 async def _run_chat_ant_search(chat_id, args: dict, msg_by_id: dict = None, include_ids=None, exclude_ids=None) -> str:
