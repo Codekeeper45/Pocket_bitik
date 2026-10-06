@@ -363,6 +363,13 @@ PROMPT: A manga page 2: Kimi enters the cafe...
         self.assertIn("арт с лисой", res)
         self.assertIn("#3", res)
 
+    def test_visual_attributes_formula_in_ensemble_rules(self):
+        system = bot._gen_unified_system(True, False)
+        self.assertIn("ФОРМУЛА ВНЕШНОСТИ", system)
+        self.assertIn("Пол (парень, девушка", system)
+        self.assertIn("Никогда не меняй пол, цвет волос и приметы местами", system)
+        self.assertIn("ПОИСК ВНЕШНОСТИ ЧАТЕРОВ И ПРЕДМЕТОВ", bot._gen_unified_system(True, False, has_tools=True))
+
 
 if __name__ == "__main__":
     unittest.main()
