@@ -3303,11 +3303,17 @@ def _sync_generate_image(prompt: str, input_images_b64: list = None, model: str 
                          image_size: str = "2K", aspect_ratio: str = None) -> tuple:
     """Генерация/редактирование через ChatGPT2API Gateway или OpenRouter Unified Image API. Возвращает (байты, mime)."""
     target_prompt = prompt
-    if isinstance(prompt, str) and prompt.strip().startswith('{'):
+    if isinstance(prompt, str) and "{" in prompt:
         try:
-            _d = json.loads(prompt)
-            if isinstance(_d, dict) and 'prompt' in _d and isinstance(_d['prompt'], str):
-                target_prompt = _d['prompt']
+            start = prompt.find("{")
+            end = prompt.rfind("}")
+            if start != -1 and end != -1 and end > start:
+                _d = json.loads(prompt[start:end+1])
+                if isinstance(_d, dict) and 'prompt' in _d and isinstance(_d['prompt'], str):
+                    target_prompt = _d['prompt']
+                    after = prompt[end+1:].strip()
+                    if after:
+                        target_prompt += "\n\n" + after
         except Exception:
             pass
     target_model = model or GEN_IMAGE_MODEL or OPENROUTER_IMAGE_MODEL
@@ -8736,11 +8742,14 @@ async def _gen_send_image(chat, raw, mime, final_prompt, prompt_by_ai, reply_to,
             record(artifact_key, chat=chat, reply_to=reply_to, path=artifact, status='ambiguous')
             raise
     display_prompt = final_prompt
-    if isinstance(final_prompt, str) and final_prompt.strip().startswith('{'):
+    if isinstance(final_prompt, str) and "{" in final_prompt:
         try:
-            _d = json.loads(final_prompt)
-            if isinstance(_d, dict) and 'prompt' in _d and isinstance(_d['prompt'], str):
-                display_prompt = _d['prompt']
+            start = final_prompt.find("{")
+            end = final_prompt.rfind("}")
+            if start != -1 and end != -1 and end > start:
+                _d = json.loads(final_prompt[start:end+1])
+                if isinstance(_d, dict) and 'prompt' in _d and isinstance(_d['prompt'], str):
+                    display_prompt = _d['prompt']
         except Exception:
             pass
     if prompt_by_ai:  # промпт от ИИ — СВЁРНУТОЙ цитатой и БЕЗ обрезки; идея — видимой строкой над ней
