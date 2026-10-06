@@ -8216,8 +8216,10 @@ async def _gen_repair_regions(raw, mime, qa, user_prompt, final_prompt, gen_mode
             proposed = blend_patch(candidate, Image.open(io.BytesIO(fixed)), box)
             proposed_bytes = io.BytesIO(); proposed.save(proposed_bytes, format='PNG')
             # Validate seams and identity against the original user contract, NOT the repair prompt.
-            after = await _gen_visual_qa(proposed_bytes.getvalue(), user_prompt, final_prompt)
-            if after is None or len(_gen_repair_findings(after)) >= len(_gen_repair_findings(qa)):
+            after = await _gen_visual_qa(proposed_bytes.getvalue(), user_prompt, final_prompt + '\nComposite validation: inspect the repaired box ' + str(region['box']) + ' in original pixel coordinates. Report visible seams, halos, sharpness/texture or lighting discontinuities, changed identity, and all remaining face/hand defects. Do not treat compositing artifacts as intentional style.')
+            seam_keys = ('шов', 'швы', 'ореол', 'стык', 'seam', 'halo', 'discontinuity', 'identity', 'личност')
+            seam_bad = after and any(f['confidence'] >= .65 and f['severity'] in ('medium', 'high') and any(k in f['issue'].lower() for k in seam_keys) for f in after['findings'])
+            if after is None or seam_bad or len(_gen_repair_findings(after)) >= len(_gen_repair_findings(qa)):
                 log('GEN', f'Region {index} composite improvement unproven; reverting'); continue
             candidate = proposed; qa = after; accepted += 1
         except Exception as exc:
