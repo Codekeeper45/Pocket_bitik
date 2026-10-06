@@ -1130,7 +1130,34 @@ CHAT_INSPECT_IMAGE_TOOL = {
     }
 }
 
-CHAT_TOOLS = [CHAT_SEARCH_TOOL, CHAT_READ_CONTEXT_TOOL, CHAT_INSPECT_IMAGE_TOOL]
+CHAT_ANT_SEARCH_TOOL = {
+    "type": "function",
+    "function": {
+        "name": "chat_ant_search",
+        "description": (
+            "Умный семантический поиск по смыслу через модель Jev (муравьиный поиск по чату). "
+            "Ищет нужный фрагмент разговора, тему или факт в недавней истории чата, даже когда точные ключевые слова неизвестны. "
+            "Используй, когда обычный chat_search по точным словам ничего не нашёл или когда запрос смысловой/ассоциативный "
+            "(например: 'где обсуждали поломку', 'кто скидывал мем с котом', 'где спорили про деньги')."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "query": {
+                    "type": "string",
+                    "description": "Что именно ищем по смыслу (тема, событие, вопрос, признак сообщения)."
+                },
+                "limit": {
+                    "type": "integer",
+                    "description": "Глубина поиска в сообщениях (по умолчанию 60, макс 120)."
+                }
+            },
+            "required": ["query"]
+        }
+    }
+}
+
+CHAT_TOOLS = [CHAT_SEARCH_TOOL, CHAT_READ_CONTEXT_TOOL, CHAT_INSPECT_IMAGE_TOOL, CHAT_ANT_SEARCH_TOOL]
 
 ASK_SYSTEM_PROMPT = """Ты — {model}, ИИ с характером и собственной точкой зрения. Не нейтральный ассистент, а собеседник с позицией.
 
@@ -3928,12 +3955,14 @@ async def _build_gen_prompt(user_prompt: str, context_text: str = None, image_de
                 except (json.JSONDecodeError, TypeError):
                     args = {}
                 name = tc.function.name
-                if name not in {"chat_search", "chat_read_context", "chat_inspect_image"}:
+                if name not in {"chat_search", "chat_ant_search", "chat_read_context", "chat_inspect_image"}:
                     result = "Неизвестный инструмент."
                 elif not chat_id:
                     result = "Ошибка: нет текущего чата."
                 elif name == "chat_search":
                     result = await _run_chat_search(chat_id, args, msg_by_id, include_ids, exclude_ids)
+                elif name == "chat_ant_search":
+                    result = await _run_chat_ant_search(chat_id, args, msg_by_id, include_ids, exclude_ids)
                 elif name == "chat_read_context":
                     result = await _run_chat_read_context(chat_id, args, msg_by_id, include_ids, exclude_ids)
                 else:
@@ -5590,6 +5619,155 @@ async def _run_chat_search(chat_id, args: dict, msg_by_id: dict = None, include_
     return "\n".join(lines)
 
 
+JEV_SYSTEMONE_URL = os.environ.get("JEV_ENDPOINT", "http://127.0.0.1:8321/v1/systemone")
+
+def _jev_sync_choice(state: str, instructions: str, options: dict, timeout: float = 4.5) -> dict:
+    """Синхронный вызов Jev choice (TypeSafe System One) через локальный шлюз :8321."""
+    payload = {
+        "model": "jev-1.13-free",
+        "state": state,
+        "questions": {
+            "pick": {
+                "type": "choice",
+                "instructions": instructions,
+                "criteria": options,
+            }
+        },
+    }
+    req = urllib.request.Request(
+        JEV_SYSTEMONE_URL,
+        data=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
+        headers={"Content-Type": "application/json", "User-Agent": "curl/8.5.0", "Accept": "application/json"},
+    )
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
+        data = json.loads(resp.read().decode("utf-8"))
+        answers = data.get("answers") or {}
+        return answers.get("pick") or {}
+
+
+async def _run_chat_ant_search(chat_id, args: dict, msg_by_id: dict = None, include_ids=None, exclude_ids=None) -> str:
+    """Исполняет chat_ant_search: семантический муравьиный поиск по смыслу через модель Jev (System One)."""
+    if not chat_id:
+        return "Ошибка: нет ID текущего чата."
+    query = (args.get("query") or "").strip()
+    if not query:
+        return "Ошибка: поисковый запрос не может быть пустым."
+
+    limit = max(15, min(int(args.get("limit") or 60), 120))
+    messages = []
+    try:
+        async for m in client.iter_messages(chat_id, limit=limit):
+            if not m or getattr(m, "action", None) is not None:
+                continue
+            sid = getattr(m, "sender_id", None)
+            if exclude_ids and sid in exclude_ids:
+                continue
+            if include_ids and sid not in include_ids:
+                continue
+            messages.append(m)
+            if msg_by_id is not None and getattr(m, "id", None) is not None:
+                msg_by_id[m.id] = m
+    except Exception as e:
+        log("ASK", f"chat_ant_search сбор сообщений не удался: {e}")
+        return f"Ошибка при сборе сообщений чата: {e}"
+
+    if not messages:
+        return "В заданной глубине истории чата сообщений не найдено."
+
+    # Хронологический порядок: от старых к новым
+    chronological = list(reversed(messages))
+
+    if len(chronological) <= 8:
+        winning_msgs = chronological
+        confidence_str = "100% (малый контекст)"
+    else:
+        # Дробим на блоки по 6-10 сообщений
+        chunk_size = max(5, min(10, len(chronological) // 5 or 5))
+        chunks = [chronological[i:i + chunk_size] for i in range(0, len(chronological), chunk_size)]
+
+        block_descriptions = []
+        options = {}
+        for idx, ch in enumerate(chunks, 1):
+            key = f"block_{idx}"
+            first_m, last_m = ch[0], ch[-1]
+            first_id, last_id = first_m.id, last_m.id
+            snippets = []
+            for m in ch:
+                sender = _label_for(m, getattr(m, "sender", None))
+                txt = (m.raw_text or "").replace("\n", " ").strip()
+                if txt:
+                    snippets.append(f"{sender}: {txt[:80]}")
+                elif m.photo:
+                    snippets.append(f"{sender}: [Фото]")
+                elif m.document:
+                    snippets.append(f"{sender}: [Документ]")
+            summary = "; ".join(snippets[:5])
+            block_descriptions.append(f"Блок {idx} (#{first_id}..#{last_id}): {summary}")
+            options[key] = f"Блок {idx} (#{first_id}..#{last_id})"
+
+        state_text = "\n".join(block_descriptions)
+        instructions = f"В каком блоке сообщений обсуждается или содержится: «{query}»?"
+
+        try:
+            choice_result = await asyncio.to_thread(_jev_sync_choice, state_text, instructions, options)
+            picked_key = choice_result.get("choice") or "block_1"
+            confidence = choice_result.get("confidence")
+            conf_val = f"{float(confidence)*100:.0f}%" if confidence is not None else "высокая"
+            confidence_str = f"{conf_val} (Jev System One)"
+
+            block_idx = 0
+            if picked_key.startswith("block_") and picked_key[6:].isdigit():
+                block_idx = int(picked_key[6:]) - 1
+            if 0 <= block_idx < len(chunks):
+                winning_msgs = chunks[block_idx]
+            else:
+                winning_msgs = chunks[-1]
+        except Exception as err:
+            log("ASK", f"Jev call failed: {err}")
+            return f"⚠️ Jev недоступен ({err}). Используй стандартный chat_search(query=...)."
+
+    try:
+        chat_ent = await client.get_entity(chat_id)
+    except Exception:
+        chat_ent = None
+
+    def _make_msg_link(mid):
+        if chat_ent is None:
+            return ""
+        from telethon.tl.types import User
+        if isinstance(chat_ent, User):
+            return ""
+        u = getattr(chat_ent, "username", None)
+        if u:
+            return f"https://t.me/{u}/{mid}"
+        raw_id = str(getattr(chat_ent, "id", chat_id)).lstrip("-")
+        if raw_id.startswith("100"):
+            raw_id = raw_id[3:]
+        return f"https://t.me/c/{raw_id}/{mid}"
+
+    lines = [
+        f"🐜 [МУРАВЕЙ JEV] Семантический поиск по смыслу: «{query}»",
+        f"🎯 Найден релевантный фрагмент диалога (уверенность Jev: {confidence_str}):",
+        "",
+    ]
+    for m in winning_msgs:
+        dt_str = _fmt_date(m.date) if hasattr(m, "date") else "???"
+        author = _label_for(m, getattr(m, "sender", None))
+        mtag = _media_tag(m) if hasattr(m, "voice") else ("📷 [Фото]" if getattr(m, "photo", None) else "")
+        media_str = f" [{mtag}]" if mtag else ""
+        txt = (m.raw_text or "").replace("\n", " ").strip()
+        preview = _preview(txt, 250) if txt else "(без текста)"
+        link_str = _make_msg_link(m.id)
+        link_part = f" ({link_str})" if link_str else ""
+        lines.append(f"• #{m.id}{link_part} [{dt_str}] {author}{media_str}: {preview}")
+
+    lines.append("")
+    lines.append("💡 Доступные действия:")
+    lines.append("- Чтобы развернуть диалог вокруг нужного сообщения: `chat_read_context(message_id=...)`")
+    lines.append("- Чтобы детально рассмотреть фото из сообщения: `chat_inspect_image(message_id=...)`")
+    return "\n".join(lines)
+
+
 async def _run_chat_read_context(chat_id, args: dict, msg_by_id: dict = None, include_ids=None, exclude_ids=None) -> str:
     """Исполняет chat_read_context: считывает сообщения до и после message_id."""
     if not chat_id:
@@ -6165,6 +6343,13 @@ async def ask_agentic(context: str, question: str, must_search: bool = False, ca
                 sstats["chat_search"] = sstats.get("chat_search", 0) + 1
                 res = await _run_chat_search(chat_id, args, msg_by_id)
                 log("ASK", f"Поиск в чате chat_search: '{args.get('query')}' (filter={args.get('filter')}) → {len(res)} симв")
+                messages.append({"role": "tool", "tool_call_id": tool_call.id, "content": res})
+                return
+
+            if tname == "chat_ant_search":
+                sstats["chat_ant"] = sstats.get("chat_ant", 0) + 1
+                res = await _run_chat_ant_search(chat_id, args, msg_by_id)
+                log("ASK", f"Муравей chat_ant_search: '{args.get('query')}' → {len(res)} симв")
                 messages.append({"role": "tool", "tool_call_id": tool_call.id, "content": res})
                 return
 

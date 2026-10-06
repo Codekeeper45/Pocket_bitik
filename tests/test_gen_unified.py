@@ -128,13 +128,14 @@ class TestUnifiedGenPrompt(unittest.TestCase):
         self.assertIn("-raw", help_text)
 
     def test_ask_chat_tools_are_not_changed(self):
-        # Ask still uses the original tool list and runtime handlers (only optional filters were added).
+        # Ask uses the tool list including the Jev semantic search tool (chat_ant_search).
         self.assertEqual([t["function"]["name"] for t in bot.CHAT_TOOLS],
-                         ["chat_search", "chat_read_context", "chat_inspect_image"])
+                         ["chat_search", "chat_read_context", "chat_inspect_image", "chat_ant_search"])
         import inspect
         ask_agentic = inspect.getsource(bot.ask_agentic)
         self.assertIn("CHAT_TOOLS if has_chat else []", ask_agentic)
         self.assertIn("_run_chat_search(chat_id, args, msg_by_id)", ask_agentic)
+        self.assertIn("_run_chat_ant_search(chat_id, args, msg_by_id)", ask_agentic)
 
     def test_prompt_builder_keeps_ref_candidates_mutable_for_empty_catalog(self):
         import inspect
@@ -336,6 +337,31 @@ PROMPT: A manga page 2: Kimi enters the cafe...
         self.assertIn("ПОСЛОЙНАЯ ПОСТАНОВКА", system)
         self.assertIn("Background Plate", system)
         self.assertIn("Foreground Hero Layer", system)
+
+    def test_chat_ant_search_tool_in_chat_tools(self):
+        tool_names = [t["function"]["name"] for t in bot.CHAT_TOOLS]
+        self.assertIn("chat_ant_search", tool_names)
+        self.assertIn("chat_search", tool_names)
+
+    async def test_run_chat_ant_search_selects_relevant_block(self):
+        from datetime import datetime
+        msgs = [
+            SimpleNamespace(id=1, date=datetime.now(), sender_id=10, sender=None, raw_text="привет", photo=False, document=False, action=None),
+            SimpleNamespace(id=2, date=datetime.now(), sender_id=10, sender=None, raw_text="погода супер", photo=False, document=False, action=None),
+            SimpleNamespace(id=3, date=datetime.now(), sender_id=10, sender=None, raw_text="нарисовал арт с лисой", photo=False, document=False, action=None),
+            SimpleNamespace(id=4, date=datetime.now(), sender_id=10, sender=None, raw_text="скинул код", photo=False, document=False, action=None),
+        ]
+        class MockClient:
+            async def iter_messages(self, chat_id, limit=60):
+                for m in msgs:
+                    yield m
+        mock_jev = {"choice": "block_1", "confidence": 0.95}
+        with patch.object(bot, "client", MockClient()), \
+             patch.object(bot, "_jev_sync_choice", return_value=mock_jev):
+            res = await bot._run_chat_ant_search(123, {"query": "арт с лисой"})
+        self.assertIn("МУРАВЕЙ JEV", res)
+        self.assertIn("арт с лисой", res)
+        self.assertIn("#3", res)
 
 
 if __name__ == "__main__":
