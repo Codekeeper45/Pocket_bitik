@@ -10,6 +10,7 @@ from unittest.mock import patch
 os.environ.setdefault("api_id", "12345")
 os.environ.setdefault("api_hash", "deadbeefdeadbeefdeadbeefdeadbeef")
 import bot_new as bot
+bot._GEN_PROVIDER_GATE.min_interval = 0
 
 
 class TestUnifiedGenPrompt(unittest.TestCase):
@@ -332,13 +333,9 @@ PROMPT: A manga page 2: Kimi enters the cafe...
 
     def test_parse_gen_multipage_fallback(self):
         sample = "IDEA: общая идея\nPROMPT: Sequential story prompt."
-        parsed = bot._parse_gen_multipage_out(sample, 3)
-        self.assertEqual(len(parsed), 3)
-        self.assertEqual(parsed[0]["page"], 1)
-        self.assertEqual(parsed[1]["page"], 2)
-        self.assertEqual(parsed[2]["page"], 3)
-        self.assertIn("Page 1 of sequential story", parsed[0]["prompt"])
-        self.assertIn("Page 3 of sequential story", parsed[2]["prompt"])
+        from gen_series import SeriesPlanError
+        with self.assertRaises(SeriesPlanError):
+            bot._parse_gen_multipage_out(sample, 3)
 
     def test_layered_staging_in_composition_rules(self):
         system = bot._gen_unified_system(True, False)
