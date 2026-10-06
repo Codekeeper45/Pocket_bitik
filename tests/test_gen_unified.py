@@ -175,11 +175,13 @@ class TestMockedToolLoop(unittest.IsolatedAsyncioTestCase):
         def image(color):
             b = io.BytesIO(); Image.new('RGB', (100, 100), color).save(b, format='PNG'); return b.getvalue()
         artifact = image('blue')
-        repaired = image('green')
+        b = io.BytesIO(); Image.new('RGB', (1024,1024), 'green').save(b,format='PNG'); repaired=b.getvalue()
         qa_initial = {"findings": [{"severity": "high", "issue": "bad hand", "location": "left hand", "confidence": 0.9, "bbox": [0.2, 0.2, 0.4, 0.4]}]}
         qa_repaired = {"findings": []}
 
-        with patch.object(bot, "GEN_IMAGE_MODEL", "gpt-image-2.5-sunburst"), \
+        with patch('gen_pair_qa.compare_images',AsyncMock(return_value=True)), \
+             patch.object(bot,'get_image_desc_client',return_value=(object(),'qa')), \
+             patch.object(bot, "GEN_IMAGE_MODEL", "gpt-image-2.5-sunburst"), \
              patch.object(bot, "_gen_rate_gate", new=AsyncMock()), \
              patch.object(bot, "_sync_generate_image", side_effect=[(artifact, "image/png"), (repaired, "image/png")]) as gen_call, \
              patch.object(bot, "_gen_visual_qa", side_effect=[qa_initial, qa_repaired, qa_repaired]) as inspect_image:
