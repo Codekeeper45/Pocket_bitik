@@ -3430,7 +3430,8 @@ def _sync_generate_image(prompt: str, input_images_b64: list = None, model: str 
             raise GenExhausted(f"HTTP {resp.status_code}: {s[:200]}")
         if resp.status_code == 429 or any(mk in low for mk in _GEN_TRANSIENT_MARKERS):
             raise GenTransient(f"HTTP {resp.status_code}: {s[:200]}")
-        raise GenRejected(f"HTTP {resp.status_code}: {s[:200]}")
+        from gen_provider import classify_provider_error
+        raise classify_provider_error(resp.status_code, error_code)
     data = resp.json()
     items = data.get("data") or []
     b64_out = items[0].get("b64_json") if items else None
@@ -8162,7 +8163,7 @@ def _clamp_resolution(size, supported):
     return max(le, key=lambda s: _RES_RANK[s]) if le else min(ok, key=lambda s: _RES_RANK[s])
 
 
-_GEN_VISUAL_QA_PROMPT = '''Оцени именно ПРИЛОЖЕННОЕ ГОТОВОЕ изображение, а не референс. Сопоставь с исходными требованиями пользователя и промптом генерации. Не требуй фотореализма: намеренная стилизация, мультяшность, живописная условность и необычная анатомия в явно стилизованной работе сами по себе не дефекты. Не угадывай личность/имя неизвестного человека. Найди только очевидные существенные ошибки изображения: сломанные/лишние части тела, грубо искажённые предметы, нечитаемый обязательный текст, пропущенное ключевое требование. Мелкие, спорные или стилевые особенности игнорируй. Верни только JSON вида {"findings":[{"severity":"high|medium|low","issue":"...","location":"...","confidence":0.0,"bbox":[0.1,0.1,0.2,0.2]}]}; если существенных дефектов нет, findings=[] . Для каждой локальной ошибки укажи bbox точной проблемной области в нормализованных координатах [лево,верх,право,низ] от 0 до 1; координаты относятся именно к приложенному изображению. Найди ВСЕ видимые дефектные зоны за один проход, включая лица среднего плана, не прикрывай мутации словом стилизация. Для глобальной ошибки сюжета bbox=null, не придумывай область. Учитывай исходный запрос как приоритетный.'''
+_GEN_VISUAL_QA_PROMPT = '''Оцени именно ПРИЛОЖЕННОЕ ГОТОВОЕ изображение, а не референс. Сопоставь с исходными требованиями пользователя и промптом генерации. Не требуй фотореализма: намеренная стилизация, мультяшность, живописная условность и необычная анатомия в явно стилизованной работе сами по себе не дефекты. Не угадывай личность/имя неизвестного человека. Найди только очевидные существенные ошибки изображения: сломанные/лишние части тела, грубо искажённые предметы, нечитаемый обязательный текст, пропущенное ключевое требование. Мелкие, спорные или стилевые особенности игнорируй. Верни только JSON вида {"findings":[{"id":"f1","category":"anatomy|fidelity|technical|composition|identity|text|seam|style|other","affected_subject":null,"requirement_id":null,"severity":"high|medium|low","issue":"...","location":"...","confidence":0.0,"bbox":[0.1,0.1,0.2,0.2]}]}; если существенных дефектов нет, findings=[] . Для каждой локальной ошибки укажи bbox точной проблемной области в нормализованных координатах [лево,верх,право,низ] от 0 до 1; координаты относятся именно к приложенному изображению. Найди ВСЕ видимые дефектные зоны за один проход, включая лица среднего плана, не прикрывай мутации словом стилизация. Для глобальной ошибки сюжета bbox=null, не придумывай область. Учитывай исходный запрос как приоритетный.'''
 
 
 def get_image_desc_client():
@@ -8187,7 +8188,7 @@ async def _gen_visual_qa(raw: bytes, user_prompt: str, final_prompt: str):
         if not isinstance(findings, list):
             raise ValueError("findings is not a list")
         clean = []
-        for item in findings[:12]:
+        for item in findings:
             if not isinstance(item, dict):
                 continue
             severity = item.get("severity")
@@ -8195,7 +8196,7 @@ async def _gen_visual_qa(raw: bytes, user_prompt: str, final_prompt: str):
             import math
             if severity not in ("high", "medium", "low") or isinstance(confidence, bool) or not isinstance(confidence, (int, float)) or not math.isfinite(confidence):
                 raise ValueError('invalid finding severity/confidence')
-            finding = {"severity": severity, "issue": str(item.get("issue", ""))[:300],
+            finding = {"category": item.get('category', 'other'), "id": item.get('id', str(len(clean)+1)), "affected_subject": item.get('affected_subject'), "requirement_id": item.get('requirement_id'), "severity": severity, "issue": str(item.get("issue", ""))[:300],
                        "location": str(item.get("location", "unspecified"))[:160],
                        "confidence": max(0.0, min(1.0, float(confidence)))}
             from gen_regions_geometry import validate_bbox
@@ -8213,7 +8214,7 @@ async def _gen_visual_qa(raw: bytes, user_prompt: str, final_prompt: str):
 def _gen_repair_findings(qa):
     keys = ('лиц', 'глаз', 'зуб', 'рот', 'пальц', 'рук', 'анатом', 'мутац', 'челюст', 'бров', 'лоб', 'face', 'eye', 'teeth', 'mouth', 'hand', 'finger', 'brow', 'forehead')
     return [f for f in (qa or {}).get('findings', []) if f['confidence'] >= 0.65 and
-            (f['severity'] == 'high' or (f['severity'] == 'medium' and any(k in f['issue'].lower() for k in keys)))]
+            (f.get('category') == 'anatomy' or (f.get('category', 'other') == 'other' and (f['severity'] == 'high' or (f['severity'] == 'medium' and any(k in f['issue'].lower() for k in keys)))))]
 
 
 async def _gen_repair_regions(raw, mime, qa, user_prompt, final_prompt, gen_model, size, status_cb=None):
@@ -8221,16 +8222,20 @@ async def _gen_repair_regions(raw, mime, qa, user_prompt, final_prompt, gen_mode
     import io
     from PIL import Image
     from gen_regions_geometry import plan_regions, blend_patch
-    original = Image.open(io.BytesIO(raw)).convert('RGB')
+    original = Image.open(io.BytesIO(raw)); original.load()
+    original = original.convert('RGBA' if 'A' in original.getbands() else 'RGB')
     issues = _gen_repair_findings(qa)
     regions = plan_regions(issues, original.size, margin=0.35)
-    budget = max(1, min(12, int(os.getenv('GEN_REPAIR_REGION_BUDGET', '6'))))
+    budget = max(0, min(2, int(os.getenv('GEN_REPAIR_REGION_BUDGET', '2'))))
     if len(regions) > budget:
         log('GEN', f'Region repair budget: {len(regions)} zones, processing {budget}; remainder not claimed repaired')
     candidate = original.copy(); accepted = 0
     for index, region in enumerate(regions[:budget], 1):
         from gen_repair import prepare_context_crop, extract_mapped_region
         box = region['box']
+        if (box[2]-box[0])*(box[3]-box[1]) > original.width*original.height*.25:
+            log('GEN', 'Repair area exceeds 25%; keep original instead of broad patch')
+            continue
         crop, mapping = prepare_context_crop(candidate, box, context=.15)
         b = io.BytesIO(); crop.save(b, format='PNG')
         local_issues = '; '.join(f['issue'] for f in region['findings'])
@@ -8345,7 +8350,10 @@ async def _gen_provider_call(prompt, inputs, model, size, aspect):
     invocation = CURRENT.get()
     if invocation:
         invocation.consume()
-    return await _GEN_PROVIDER_GATE.run(_sync_generate_image, prompt, inputs, model, size, aspect, timeout=620)
+    raw, mime = await _GEN_PROVIDER_GATE.run(_sync_generate_image, prompt, inputs, model, size, aspect, timeout=620)
+    from gen_provider import validate_image
+    validated = validate_image(raw)
+    return validated.data, validated.mime_type
 
 async def _gen_one_image(final_prompt, input_b64s, image_size, aspect_ratio, allow_repair, user_prompt, status_cb=None):
     """Один цикл генерации с ретраями (transient тем же промптом / фолбэк на Fast / repair при модерации).
@@ -8378,6 +8386,18 @@ async def _gen_one_image(final_prompt, input_b64s, image_size, aspect_ratio, all
             await _gen_rate_gate()
             raw, mime = await _gen_provider_call(fp, input_b64s or None, gen_model, size, aspect_ratio)
             qa = await _gen_visual_qa(raw, user_prompt, fp)
+            if allow_repair and qa:
+                severe = [f for f in qa['findings'] if f.get('severity') == 'high' and f.get('confidence', 0) >= .8]
+                if severe and (len(severe) > 2 or any(not f.get('bbox') for f in severe)):
+                    try:
+                        newer, newer_mime = await _gen_provider_call(fp, input_b64s or None, gen_model, size, aspect_ratio)
+                        from gen_pair_qa import compare_images
+                        route = get_image_desc_client()
+                        if route and await compare_images(raw, newer, user_prompt, client=route[0], model=route[1]):
+                            raw, mime = newer, newer_mime
+                            qa = await _gen_visual_qa(raw, user_prompt, fp)
+                    except Exception as exc:
+                        log('GEN', f'Whole candidate rejected/unavailable: {type(exc).__name__}')
             if qa and qa['findings']:
                 for finding in qa['findings']:
                     log('GEN', f"Visual QA {finding['severity']} {finding['confidence']:.2f} @ {finding['location']}: {finding['issue']}")

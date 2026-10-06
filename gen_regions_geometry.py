@@ -115,6 +115,8 @@ def validate_bbox(bbox: object) -> list[float] | None:
     try:
         if not isinstance(bbox, (list, tuple)) or len(bbox) != 4:
             return None
+        if any(type(v) not in (int, float) for v in bbox):
+            return None
         vals = [float(v) for v in bbox]
         if not all(math.isfinite(v) for v in vals):
             return None
