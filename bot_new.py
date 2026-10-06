@@ -3302,6 +3302,14 @@ def _img_mime_from_bytes(b: bytes) -> str:
 def _sync_generate_image(prompt: str, input_images_b64: list = None, model: str = None,
                          image_size: str = "2K", aspect_ratio: str = None) -> tuple:
     """Генерация/редактирование через ChatGPT2API Gateway или OpenRouter Unified Image API. Возвращает (байты, mime)."""
+    target_prompt = prompt
+    if isinstance(prompt, str) and prompt.strip().startswith('{'):
+        try:
+            _d = json.loads(prompt)
+            if isinstance(_d, dict) and 'prompt' in _d and isinstance(_d['prompt'], str):
+                target_prompt = _d['prompt']
+        except Exception:
+            pass
     target_model = model or GEN_IMAGE_MODEL or OPENROUTER_IMAGE_MODEL
 
     # Маршрутизация на наш собственный шлюз chatgpt2api
@@ -3316,11 +3324,11 @@ def _sync_generate_image(prompt: str, input_images_b64: list = None, model: str 
             endpoint = f"{CHATGPT2API_BASE_URL.rstrip('/')}/images/edits"
             from gen_references import provider_inputs
             from gen_provider import GATEWAY_PROFILE
-            prompt, packed_refs = provider_inputs(prompt, input_images_b64, GATEWAY_PROFILE)
+            target_prompt, packed_refs = provider_inputs(target_prompt, input_images_b64, GATEWAY_PROFILE)
             ref_urls = list(packed_refs)
             body = {
                 "model": cg_model,
-                "prompt": prompt,
+                "prompt": target_prompt,
                 "images": ref_urls,
                 "size": res_str,
                 "response_format": "b64_json"
@@ -3329,7 +3337,7 @@ def _sync_generate_image(prompt: str, input_images_b64: list = None, model: str 
             endpoint = f"{CHATGPT2API_BASE_URL.rstrip('/')}/images/generations"
             body = {
                 "model": cg_model,
-                "prompt": prompt,
+                "prompt": target_prompt,
                 "size": res_str,
                 "n": 1,
                 "response_format": "b64_json"
@@ -3390,7 +3398,7 @@ def _sync_generate_image(prompt: str, input_images_b64: list = None, model: str 
     # Стандартный путь OpenRouter Unified Image API
     body = {
         "model": target_model,
-        "prompt": prompt,
+        "prompt": target_prompt,
         "resolution": image_size,  # 1K/2K/4K — реальное разрешение выхода
         "n": 1,
     }
@@ -8727,11 +8735,19 @@ async def _gen_send_image(chat, raw, mime, final_prompt, prompt_by_ai, reply_to,
         except Exception:
             record(artifact_key, chat=chat, reply_to=reply_to, path=artifact, status='ambiguous')
             raise
+    display_prompt = final_prompt
+    if isinstance(final_prompt, str) and final_prompt.strip().startswith('{'):
+        try:
+            _d = json.loads(final_prompt)
+            if isinstance(_d, dict) and 'prompt' in _d and isinstance(_d['prompt'], str):
+                display_prompt = _d['prompt']
+        except Exception:
+            pass
     if prompt_by_ai:  # промпт от ИИ — СВЁРНУТОЙ цитатой и БЕЗ обрезки; идея — видимой строкой над ней
-        cap_text = idea_line + "🎨 " + final_prompt
+        cap_text = idea_line + "🎨 " + display_prompt
         if len(cap_text) <= 1000:  # влезает в лимит подписи Telegram (1024)
             try:
-                cap, cap_ents = _collapsed_entities("🎨 " + final_prompt, parse_html=False)
+                cap, cap_ents = _collapsed_entities("🎨 " + display_prompt, parse_html=False)
                 if idea_line:  # идею НЕ сворачиваем: префиксуем и сдвигаем entities цитаты (offsets в UTF-16)
                     shift = len(add_surrogate(idea_line))
                     for e in cap_ents:
@@ -8744,7 +8760,7 @@ async def _gen_send_image(chat, raw, mime, final_prompt, prompt_by_ai, reply_to,
         else:  # длинный промпт: картинка с идеей в подписи + полный промпт отдельной свёрнутой цитатой
             sent = await safe_send(chat, bio, caption=(idea_line.strip() or None), reply_to=reply_to)
             try:
-                await send_long(chat, "🎨 " + final_prompt, parse_mode=None, reply_to=getattr(sent, "id", None), collapse_threshold=0)
+                await send_long(chat, "🎨 " + display_prompt, parse_mode=None, reply_to=getattr(sent, "id", None), collapse_threshold=0)
             except Exception as exc:
                 log('GEN', f'Image delivered; auxiliary prompt failed: {type(exc).__name__}')
     else:
