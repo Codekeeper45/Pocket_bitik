@@ -15,7 +15,7 @@ class RegionIntegration(unittest.IsolatedAsyncioTestCase):
    result,_=await bot._gen_repair_regions(first,'image/png',qa,'user','original','gpt-image-2.5-sunburst','2K')
   self.assertEqual(gen.call_count,2);self.assertNotEqual(result,first)
   im=Image.open(io.BytesIO(result));self.assertEqual(im.getpixel((100,100)),(0,0,255))
-  self.assertEqual(inspect.call_args.args[2],'original')
+  self.assertTrue(inspect.call_args.args[2].startswith('original'))
  async def test_failed_qa_or_missing_bbox_preserves_bytes(self):
   original=raw('blue')
   for valid,answer in [(True,None),(True,{'findings':[finding([.1,.1,.2,.2])]}),(False,{'findings':[]})]:

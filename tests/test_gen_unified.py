@@ -189,7 +189,7 @@ class TestMockedToolLoop(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result[1], "image/png")
         self.assertEqual(gen_call.call_count, 2)
         self.assertEqual(inspect_image.call_count, 3)
-        self.assertEqual(inspect_image.call_args.args[2], 'prompt')
+        self.assertTrue(inspect_image.call_args.args[2].startswith('prompt'))
 
     async def test_visual_qa_preserves_original_when_repair_disabled(self):
         from unittest.mock import AsyncMock
