@@ -3621,6 +3621,12 @@ _GEN_COMPOSITION_RULES = (
     "группы людей на среднем плане с воздушными промежутками между силуэтами, без слипания контуров; "
     "3) Слой главных персонажей (Foreground Hero Layer) - резкий фокус, четкие контуры, приоритетный "
     "свет и выразительные жесты, без наложения и слияния с фоновой толпой. "
+    "КИНЕМАТОГРАФИЧЕСКИЙ РАСФОКУС ТОЛПЫ (Depth of Field): при сценах с большой толпой (более 8-10 человек) "
+    "принудительно задавай оптическую глубину резкости: бритвенно-резкий фокус на ключевых героях "
+    "переднего плана и мягкое кинематографическое размытие (soft cinematic depth-of-field bokeh) на массовке "
+    "среднего и дальнего планов. Это устраняет деформации лиц и зубов у фоновых фигур и создаёт кинематографичный объём. "
+    "Именные плашки размещай ТОЛЬКО над главными героями переднего плана (максимум 3-5 человек); строго запрещено "
+    "разбрасывать микротекст и летающие плашки по головам людей в толпе. "
     "КАРТОЧКА ПЕРСОНАЖА (Model Sheet / Turnaround): при запросе концепта или карточки героя создавай "
     "многоракурсный лист (вид спереди, сбоку, сзади на чистом нейтральном фоне), фиксируй точные "
     "палитры, одежду, форму волос и черты лица для их повторного использования как мастер-референса. "
@@ -4275,9 +4281,12 @@ _IMAGE_REPAIR_SYSTEM = (
 
 
 def _sync_repair_image_prompt(bad_prompt: str, user_prompt: str) -> str:
-    """Правка отклонённого промпта через DeepSeek или активную LLM (в сторону соответствия правилам провайдера)."""
-    client = deepseek_client
-    model = DEEPSEEK_MODEL
+    """Правка отклонённого промпта через активную LLM (Gemini Cliproxy) или DeepSeek."""
+    client, model = None, None
+    if (MODEL_REGISTRY.get(ACTIVE_MODEL) or (None,))[0] == "cliproxy":
+        client, model, _ = get_active_model()
+    if client is None:
+        client, model = deepseek_client, DEEPSEEK_MODEL
     if client is None:
         client, model, _ = get_active_model()
     if client is None:
@@ -8205,7 +8214,12 @@ async def _gen_one_image(final_prompt, input_b64s, image_size, aspect_ratio, all
             # QA the generated artifact bytes (not source refs); performs bounded targeted inpainting repair when defect is confident.
             qa = await _gen_visual_qa(raw, user_prompt, fp)
             if qa and qa["findings"]:
-                high_issues = [f for f in qa["findings"] if f["severity"] == "high" and f["confidence"] >= 0.70]
+                _crit_kws = ("лиц", "глаз", "зуб", "рот", "пальц", "рук", "анатом", "мутац", "челюст", "face", "eye", "tooth", "teeth", "mouth", "hand", "finger")
+                high_issues = [
+                    f for f in qa["findings"]
+                    if (f["severity"] == "high" and f["confidence"] >= 0.65)
+                    or (f["severity"] == "medium" and f["confidence"] >= 0.65 and any(kw in f["issue"].lower() for kw in _crit_kws))
+                ]
                 for finding in qa["findings"]:
                     log("GEN", f"Visual QA {finding['severity']} {finding['confidence']:.2f} @ {finding['location']}: {finding['issue']}")
                 if high_issues and allow_repair:
@@ -8222,7 +8236,11 @@ async def _gen_one_image(final_prompt, input_b64s, image_size, aspect_ratio, all
                             _sync_generate_image, repair_prompt, [raw_b64], gen_model, size, aspect_ratio
                         )
                         repaired_qa = await _gen_visual_qa(repaired_raw, user_prompt, repair_prompt)
-                        repaired_high = [f for f in (repaired_qa.get("findings") if repaired_qa else []) if f["severity"] == "high" and f["confidence"] >= 0.70]
+                        repaired_high = [
+                            f for f in (repaired_qa.get("findings") if repaired_qa else [])
+                            if (f["severity"] == "high" and f["confidence"] >= 0.65)
+                            or (f["severity"] == "medium" and f["confidence"] >= 0.65 and any(kw in f["issue"].lower() for kw in _crit_kws))
+                        ]
                         if len(repaired_high) < len(high_issues):
                             log("GEN", f"Visual QA Auto-Repair успешен: дефекты снижены ({len(high_issues)} -> {len(repaired_high)})")
                             raw, mime = repaired_raw, repaired_mime
