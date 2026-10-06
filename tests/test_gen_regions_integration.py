@@ -16,6 +16,12 @@ class RegionIntegration(unittest.IsolatedAsyncioTestCase):
   self.assertEqual(gen.call_count,2);self.assertNotEqual(result,first)
   im=Image.open(io.BytesIO(result));self.assertEqual(im.getpixel((100,100)),(0,0,255))
   self.assertTrue(inspect.call_args.args[2].startswith('original'))
+ async def test_seam_rejects_otherwise_improved_composite(self):
+  original=raw('blue');f=finding([.1,.1,.2,.2])
+  seam={'severity':'medium','confidence':.9,'issue':'visible seam halo','location':'patch edge'}
+  with patch.object(bot,'_sync_generate_image',return_value=(raw('green'),'image/png')),patch.object(bot,'_gen_visual_qa',AsyncMock(side_effect=[{'findings':[]},{'findings':[seam]}])),patch.object(bot,'_gen_rate_gate',AsyncMock()):
+   result,_=await bot._gen_repair_regions(original,'image/png',{'findings':[f]},'user','original','model','2K')
+  self.assertEqual(result,original)
  async def test_failed_qa_or_missing_bbox_preserves_bytes(self):
   original=raw('blue')
   for valid,answer in [(True,None),(True,{'findings':[finding([.1,.1,.2,.2])]}),(False,{'findings':[]})]:
