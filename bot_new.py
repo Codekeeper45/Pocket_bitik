@@ -9470,6 +9470,18 @@ async def gen_command(event):
         await set_status('Генерация или доставка не завершена. Тип ошибки: ' + type(e).__name__ + '.' + suffix)
 
 
+@client.on(events.NewMessage(outgoing=True, pattern=r"^[./]del(?:\s+(\d+))?$", from_users="me"))
+async def del_command(event):
+    target_id = int(event.pattern_match.group(1)) if event.pattern_match.group(1) else (event.reply_to_msg_id or None)
+    ids_to_del = [event.id]
+    if target_id:
+        ids_to_del.append(target_id)
+    try:
+        await client.delete_messages(event.chat_id, ids_to_del)
+    except Exception:
+        pass
+
+
 @client.on(events.NewMessage(outgoing=True, pattern=r"^[./]auto_reply$", from_users="me"))
 async def auto_reply_on(event):
     if await _slash_for_other_bot(event):
