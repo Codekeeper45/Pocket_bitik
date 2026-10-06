@@ -8703,7 +8703,8 @@ async def _gen_send_image(chat, raw, mime, final_prompt, prompt_by_ai, reply_to,
     sent = None
     if invocation and invocation.timings.get('final_qa_unavailable'):
         verification += '\nПовторная QA недоступна, показаны ранее найденные замечания'
-    idea_line = marker(artifact_key) + '\n' + f'{dimensions} · {verification}\n' + (f"💡 {str(idea).strip()}\n" if idea and str(idea).strip() else '')
+    # Service IDs, dimensions and QA diagnostics stay in records, not captions.
+    idea_line = (f"💡 {str(idea).strip()}\n" if idea and str(idea).strip() else '')
     record(artifact_key, chat=chat, reply_to=reply_to, path=artifact, status='pending', caption=idea_line)
     async def safe_send(*args, **kwargs):
         try:

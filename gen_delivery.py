@@ -34,6 +34,14 @@ def lookup(key,chat):
 
 async def reconcile(client,entry):
  """Read exact caption marker. Raise on uncertain query, never pretend absent."""
+ if entry.get('message_id'):
+  msg=await client.get_messages(entry['chat'],ids=entry['message_id'])
+  if msg and getattr(msg,'out',False):return msg
+  raise RuntimeError('saved delivery cannot be verified')
+ # Legacy captions had a searchable marker. New clean captions cannot prove
+ # that a timed-out send was absent, so never risk sending a duplicate.
+ if marker(entry['key']) not in entry.get('caption', ''):
+  raise RuntimeError('ambiguous unmarked delivery requires manual verification')
  found=await client.get_messages(entry['chat'],search=marker(entry['key']),limit=100)
  for msg in found:
   if getattr(msg,'out',False) and marker(entry['key']) in (getattr(msg,'raw_text','') or getattr(msg,'message','') or ''):
