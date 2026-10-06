@@ -14,29 +14,29 @@
       "quota_unknown": false,
       "quota_reset_at": 1791264196,
       "last_remote_check_result": "ok",
-      "last_remote_checked_at": 1791221361,
+      "last_remote_checked_at": 1791224695,
       "identity": "identity_1"
     },
     {
       "id": "acct_7922aa7630203ca829476ce5",
       "available": true,
       "status_category": "normal",
-      "quota_remaining": 4,
+      "quota_remaining": 2,
       "quota_unknown": false,
       "quota_reset_at": 1791269651,
       "last_remote_check_result": "ok",
-      "last_remote_checked_at": 1791221378,
+      "last_remote_checked_at": 1791223448,
       "identity": "identity_2"
     },
     {
       "id": "acct_101923032a27baab47624e40",
       "available": true,
       "status_category": "normal",
-      "quota_remaining": 23,
+      "quota_remaining": 20,
       "quota_unknown": false,
       "quota_reset_at": 1791301706,
       "last_remote_check_result": "ok",
-      "last_remote_checked_at": 1791220746,
+      "last_remote_checked_at": 1791224687,
       "identity": "identity_3"
     },
     {
@@ -45,9 +45,9 @@
       "status_category": "limited",
       "quota_remaining": 0,
       "quota_unknown": false,
-      "quota_reset_at": 1791289917,
+      "quota_reset_at": 1791289918,
       "last_remote_check_result": "ok",
-      "last_remote_checked_at": 1791221362,
+      "last_remote_checked_at": 1791224695,
       "identity": "identity_4"
     },
     {
@@ -76,22 +76,22 @@
       "id": "acct_a5768ece8f2c66906e323935",
       "available": true,
       "status_category": "normal",
-      "quota_remaining": 21,
+      "quota_remaining": 20,
       "quota_unknown": false,
-      "quota_reset_at": 1791293278,
+      "quota_reset_at": 1791293277,
       "last_remote_check_result": "ok",
-      "last_remote_checked_at": 1791221400,
+      "last_remote_checked_at": 1791222156,
       "identity": "identity_7"
     },
     {
       "id": "acct_02aa350128a15d48d5c9020a",
       "available": true,
       "status_category": "normal",
-      "quota_remaining": 22,
+      "quota_remaining": 19,
       "quota_unknown": false,
       "quota_reset_at": 1791293576,
       "last_remote_check_result": "ok",
-      "last_remote_checked_at": 1791218228,
+      "last_remote_checked_at": 1791224602,
       "identity": "identity_8"
     },
     {
@@ -100,9 +100,9 @@
       "status_category": "limited",
       "quota_remaining": 0,
       "quota_unknown": false,
-      "quota_reset_at": 1791289917,
+      "quota_reset_at": 1791289918,
       "last_remote_check_result": "ok",
-      "last_remote_checked_at": 1791221362,
+      "last_remote_checked_at": 1791224695,
       "identity": "identity_4"
     },
     {
@@ -133,9 +133,9 @@
       "status_category": "limited",
       "quota_remaining": 0,
       "quota_unknown": false,
-      "quota_reset_at": 1791289917,
+      "quota_reset_at": 1791289918,
       "last_remote_check_result": "ok",
-      "last_remote_checked_at": 1791221362,
+      "last_remote_checked_at": 1791224695,
       "identity": "identity_4"
     },
     {
@@ -166,9 +166,9 @@
       "status_category": "limited",
       "quota_remaining": 0,
       "quota_unknown": false,
-      "quota_reset_at": 1791289917,
+      "quota_reset_at": 1791289918,
       "last_remote_check_result": "ok",
-      "last_remote_checked_at": 1791221362,
+      "last_remote_checked_at": 1791224695,
       "identity": "identity_4"
     },
     {
@@ -201,7 +201,7 @@
       "quota_unknown": false,
       "quota_reset_at": 1791289917,
       "last_remote_check_result": "ok",
-      "last_remote_checked_at": 1791221362,
+      "last_remote_checked_at": 1791224695,
       "identity": "identity_4"
     },
     {
@@ -223,7 +223,7 @@
       "quota_unknown": false,
       "quota_reset_at": 1791293151,
       "last_remote_check_result": "ok",
-      "last_remote_checked_at": 1791218226,
+      "last_remote_checked_at": 1791224688,
       "identity": "identity_6"
     },
     {
@@ -234,7 +234,7 @@
       "quota_unknown": false,
       "quota_reset_at": 1791289917,
       "last_remote_check_result": "ok",
-      "last_remote_checked_at": 1791221362,
+      "last_remote_checked_at": 1791224695,
       "identity": "identity_4"
     },
     {
@@ -261,6 +261,37 @@
     }
   ],
   "recent_failures": [
+    {
+      "id": "a84df872ed164b6c94eed051f55865b9",
+      "time": "2026-10-06 02:23:21",
+      "endpoint": "/v1/images/edits",
+      "error_code": "image_stream_timeout",
+      "status_code": 502,
+      "outcome": "failed",
+      "duration_ms": 179014,
+      "attempt_count": 2,
+      "switch_count": 1,
+      "attempts": [
+        {
+          "attempt": 1,
+          "status": "failed",
+          "outcome": "failed",
+          "duration_ms": 86674,
+          "error_code": "image_poll_timeout",
+          "identity": "identity_3",
+          "instant_limit": false
+        },
+        {
+          "attempt": 2,
+          "status": "failed",
+          "outcome": "failed",
+          "duration_ms": 92301,
+          "error_code": "image_stream_timeout",
+          "identity": "identity_8",
+          "instant_limit": false
+        }
+      ]
+    },
     {
       "id": "1f78b2c77d394e0b960ac0fb3d892572",
       "time": "2026-10-06 01:25:49",
@@ -793,50 +824,6 @@
           "duration_ms": 8454,
           "error_code": "upstream_text_reply",
           "identity": "identity_6",
-          "instant_limit": false
-        }
-      ]
-    },
-    {
-      "id": "a8202f4109af4f7e9bca26552c45bb59",
-      "time": "2026-10-05 22:40:23",
-      "endpoint": "/v1/images/generations",
-      "error_code": "upstream_text_reply",
-      "status_code": 400,
-      "outcome": "text_review",
-      "duration_ms": 9800,
-      "attempt_count": 1,
-      "switch_count": 0,
-      "attempts": [
-        {
-          "attempt": 1,
-          "status": "text_review",
-          "outcome": "text_review",
-          "duration_ms": 9797,
-          "error_code": "upstream_text_reply",
-          "identity": "identity_6",
-          "instant_limit": false
-        }
-      ]
-    },
-    {
-      "id": "161dbd949b88484d90c76ae69ee664d6",
-      "time": "2026-10-05 22:38:26",
-      "endpoint": "/v1/images/edits",
-      "error_code": "upstream_text_reply",
-      "status_code": 400,
-      "outcome": "text_review",
-      "duration_ms": 14982,
-      "attempt_count": 1,
-      "switch_count": 0,
-      "attempts": [
-        {
-          "attempt": 1,
-          "status": "text_review",
-          "outcome": "text_review",
-          "duration_ms": 14974,
-          "error_code": "upstream_text_reply",
-          "identity": "identity_5",
           "instant_limit": false
         }
       ]
