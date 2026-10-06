@@ -3159,7 +3159,7 @@ async def describe_image(image_bytes: bytes, caption: str = "", model: str = Non
                 model=model,
                 messages=[{"role": "user", "content": [
                     {"type": "text", "text": prompt_text},
-                    {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{b64}", "detail": detail}},
+                    {"type": "image_url", "image_url": {"url": f"data:{_img_mime_from_bytes(image_bytes[:16])};base64,{b64}", "detail": detail}},
                 ]}],
                 max_tokens=4096,
                 timeout=60,  # иначе дефолт SDK = 600с: один залипший запрос вешал /gen-каталог на 10 мин
@@ -8533,11 +8533,7 @@ async def gen_command(event):
         except Exception:
             pass
 
-    if is_owner and not (_is_attached_photo(event.message) or _is_attached_image_doc(event.message)):
-        try:
-            await event.delete()  # чистим команду; ОСТАВЛЯЕМ только при реально приложенном фото/картинке-файле
-        except Exception:
-            pass
+    # User commands are retained; only service statuses may be cleaned up.
 
     async def set_status(text):
         if not status:

@@ -23,6 +23,19 @@ class LayerIntegration(unittest.IsolatedAsyncioTestCase):
         with patch.object(bot,'_gen_one_image',f):
             self.assertEqual((await bot._gen_render_image('p',[],'2K',None,True,'cat'))[0],b'a')
         f.assert_awaited_once()
+    async def asyncSetUp(self):
+        self.layer_flag = patch.dict(os.environ, {'GEN_LAYERS_ENABLED': '1'})
+        self.layer_flag.start()
+        self.addCleanup(self.layer_flag.stop)
+
+    async def test_disabled_layers_use_one_generation(self):
+        f = AsyncMock(return_value=(b'one', 'image/png', 'p', False))
+        with patch.dict(os.environ, {'GEN_LAYERS_ENABLED': '0'}), patch.object(bot, '_gen_one_image', f), patch.object(bot, 'get_active_model') as planner:
+            result = await bot._gen_render_image('p', [], '2K', None, True, 'по слоям A B')
+        self.assertEqual(result[0], b'one')
+        f.assert_awaited_once()
+        planner.assert_not_called()
+
     async def test_layers_make_separate_calls_and_final_qa(self):
         f=AsyncMock(side_effect=[(png(),'image/png','bg',False),(png(True),'image/png','asset',False)])
         qa=AsyncMock(return_value={'findings':[]})
