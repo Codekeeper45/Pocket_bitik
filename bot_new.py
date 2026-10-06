@@ -4095,43 +4095,77 @@ async def _build_gen_prompt(user_prompt: str, context_text: str = None, image_de
 
 
 def _gen_remap_selected_refs(input_b64s: list, input_roles: list, catalog: list, selected: list) -> tuple:
-    """Build the actual generator input list and correct every role number after selection/dedupe/size skips.
+    """Select provider inputs fail-closed while keeping endpoint order and 1-based role maps.
 
-    Initial user references keep their original order and IDs. Selected catalog refs append after them only when
-    they fit the generator limits. Returned roles use sequential 1-based numbers matching actual input order.
+    ``timings.reference_registry`` records provenance without attributing submitted images to an owner.
     """
+    import hashlib
+    from io import BytesIO
+    from gen_references import make_reference
+    from gen_runtime import CURRENT
+
     out = list(input_b64s or [])
-    roles = []
-    for i, role in enumerate(input_roles or [], 1):
-        roles.append((i, role or "subject"))
-    used_mids = set()
-    total = sum(len(b) * 3 // 4 for b in out)
+    roles = [(i, role or "subject") for i, role in enumerate(input_roles or [], 1)]
+    total = sum(len(base64.b64decode(value)) for value in out)
+    if len(out) > GEN_CTX_REF_MAX or total > GEN_IMAGE_MAX_INPUT:
+        raise ValueError("required initial references exceed generator limits")
+    metadata = []
+    digests = {}
+    for i, value in enumerate(out, 1):
+        raw = base64.b64decode(value, validate=True)
+        digest = hashlib.sha256(raw).hexdigest()
+        digests[digest] = i
+        try:
+            from PIL import Image
+            with Image.open(BytesIO(raw)) as image:
+                mime = Image.MIME.get(image.format, "application/octet-stream")
+        except Exception:
+            mime = "application/octet-stream"
+        metadata.append({"api_index": i, "ref_id": "submitted:" + digest[:24], "sha256": digest,
+                         "mime": mime, "size_bytes": len(raw), "source_type": "submitted",
+                         "role": (input_roles[i-1] if i-1 < len(input_roles or []) else None) or "subject"})
+
     by_idx = {int(it.get("idx", 0)): it for it in (catalog or [])}
     selected_out, candidate_to_actual = [], {}
-    for idx, role in (selected or []):
-        it = by_idx.get(int(idx))
-        if not it:
+    seen_candidates = set()
+    for raw_idx, role in selected or []:
+        idx = int(raw_idx)
+        it = by_idx.get(idx)
+        if it is None:
+            raise KeyError(f"selected catalog reference unavailable: {idx}")
+        role = role or "subject"
+        blob = it.get("ref") or it.get("bytes")
+        if not blob:
+            raise ValueError(f"selected catalog reference {idx} has no image bytes")
+        blob = bytes(blob)
+        digest = hashlib.sha256(blob).hexdigest()
+        existing = digests.get(digest)
+        if existing is not None:
+            candidate_to_actual[idx] = existing
+            if idx not in seen_candidates:
+                selected_out.append(idx)
+                seen_candidates.add(idx)
             continue
-        mid = it.get("mid")
-        source_key = (it.get('chat'), mid)
-        if mid and source_key in used_mids:
-            continue
-        blob = it.get("ref")
-        if not blob and it.get("bytes"):
-            blob = it["bytes"]
-        if blob is None or len(out) >= GEN_CTX_REF_MAX or total + len(blob) > GEN_IMAGE_MAX_INPUT:
-            continue
-        b64 = base64.b64encode(blob).decode("utf-8")
-        if b64 in out:
-            continue
-        out.append(b64)
+        if len(out) >= GEN_CTX_REF_MAX or total + len(blob) > GEN_IMAGE_MAX_INPUT:
+            raise ValueError(f"required selected reference {idx} exceeds generator count/byte limits")
+        actual_n = len(out) + 1
+        out.append(base64.b64encode(blob).decode("utf-8"))
         total += len(blob)
-        if mid:
-            used_mids.add(source_key)
-        actual_n = len(out)
-        roles.append((actual_n, role or "subject"))
-        selected_out.append(int(idx))
-        candidate_to_actual[int(idx)] = actual_n
+        digests[digest] = actual_n
+        roles.append((actual_n, role))
+        selected_out.append(idx)
+        seen_candidates.add(idx)
+        candidate_to_actual[idx] = actual_n
+        chat, mid = it.get("chat"), it.get("mid")
+        metadata.append({"api_index": actual_n,
+                         "ref_id": make_reference(int(chat or 0), int(mid or idx or 1), blob).ref_id,
+                         "sha256": digest, "mime": it.get("mime") or "application/octet-stream",
+                         "size_bytes": len(blob), "source_type": "catalog", "chat_id": chat,
+                         "message_id": mid, "link": it.get("link"), "caption": it.get("caption") or "",
+                         "role": role})
+    invocation = CURRENT.get()
+    if invocation is not None:
+        invocation.timings["reference_registry"] = {"references": metadata, "input_count": len(out), "input_bytes": total}
     return out, roles, selected_out, candidate_to_actual
 
 
@@ -8343,7 +8377,7 @@ async def _gen_repair_regions(raw, mime, qa, user_prompt, final_prompt, gen_mode
             crop_baseline = io.BytesIO(); candidate.crop(box).save(crop_baseline, format='PNG')
             crop_candidate = io.BytesIO(); mapped_patch.save(crop_candidate, format='PNG')
             crop_pair_ok = await compare_images(crop_baseline.getvalue(), crop_candidate.getvalue(),
-                'Fix exactly: ' + local_issues + '. Preserve pose and framing.', client=route[0], model=route[1]) if route else False
+                'Fix exactly: ' + local_issues + '. Preserve pose and framing.', client=route[0], model=route[1], targets=[str(f.get('id') or f'region-{index}-{i}') for i, f in enumerate(region['findings'])]) if route else False
             from PIL import ImageChops
             outside_diff = ImageChops.difference(candidate, proposed)
             outside_diff.paste(0, box)
@@ -8353,7 +8387,7 @@ async def _gen_repair_regions(raw, mime, qa, user_prompt, final_prompt, gen_mode
                 continue
             paired_ok = await compare_images(baseline.getvalue(), proposed_bytes.getvalue(),
                 'Target defects: ' + local_issues + '. ORIGINAL USER REQUIREMENTS: ' + user_prompt,
-                client=route[0], model=route[1]) if route else False
+                client=route[0], model=route[1], targets=[str(f.get('id') or f'region-{index}-{i}') for i, f in enumerate(region['findings'])]) if route else False
             if after is None or seam_bad or not paired_ok:
                 log('GEN', f'Region {index} composite improvement unproven; reverting'); continue
             candidate = proposed; qa = after; accepted += 1
@@ -8444,7 +8478,8 @@ async def _gen_provider_call(prompt, inputs, model, size, aspect):
     validated = validate_image(raw)
     if invocation:
         from gen_provider import capability_notice
-        invocation.timings['capability_notices'] = capability_notice(aspect, size, validated.pixel_size)
+        if aspect is not None or 'capability_notices' not in invocation.timings:
+            invocation.timings['capability_notices'] = capability_notice(aspect, size, validated.pixel_size)
         invocation.timings['actual_model'] = model
     return validated.data, validated.mime_type
 
@@ -8497,8 +8532,23 @@ async def _gen_one_image_impl(final_prompt, input_b64s, image_size, aspect_ratio
     gen_model = GEN_IMAGE_MODEL
     used_fallback = False
     gateway_pool = gen_model.startswith("gpt-image-2.5")
-    # Gateway owns the bounded cross-account retry budget (3 attempts total).
-    transient_left = 0 if gateway_pool else 2
+    # Exactly one same-provider retry is allowed; fallback is a single separate attempt.
+    # Gateway owns bounded cross-account retries internally; do not stack another layer.
+    transient_left = 0 if gateway_pool else 1
+    attempt = 0
+    # One fixed absolute deadline covers generation, retries, QA, and repair. Provider
+    # gate calls retain their own timeout but are never started past this budget.
+    from gen_runtime import CURRENT
+    invocation = CURRENT.get()
+    deadline = (invocation.started + min(900, invocation.max_seconds)) if invocation else (time.monotonic() + 900)
+    def remaining():
+        return max(0.0, deadline - time.monotonic())
+    def ensure_budget():
+        if remaining() <= 0:
+            raise TimeoutError("image generation deadline reached")
+        if invocation and invocation.generation_calls >= invocation.max_generation_calls:
+            raise RuntimeError("generation call budget reached")
+
     repair_left = 2 if allow_repair else 0
     attempt = 0
     size = _clamp_resolution(image_size, GEN_IMAGE_RES)  # primary может не уметь 4K → опускаем (фолбэк восстановит запрошенное)
@@ -8514,7 +8564,9 @@ async def _gen_one_image_impl(final_prompt, input_b64s, image_size, aspect_ratio
     fp = final_prompt
     while True:
         try:
+            ensure_budget()
             await _gen_rate_gate()
+            ensure_budget()
             raw, mime = await _gen_provider_call(fp, input_b64s or None, gen_model, size, aspect_ratio)
             qa = await _gen_visual_qa(raw, user_prompt, fp)
             if allow_repair and qa:
@@ -8522,6 +8574,7 @@ async def _gen_one_image_impl(final_prompt, input_b64s, image_size, aspect_ratio
                 action = action_for(qa['findings'])
                 if action == 'regenerate_once':
                     try:
+                        ensure_budget()
                         newer, newer_mime = await _gen_provider_call(fp, input_b64s or None, gen_model, size, aspect_ratio)
                         from gen_pair_qa import compare_images
                         from gen_runtime import CURRENT
@@ -8529,7 +8582,7 @@ async def _gen_one_image_impl(final_prompt, input_b64s, image_size, aspect_ratio
                         route = invocation.qa_route if invocation and invocation.qa_route else get_image_desc_client()
                         newer_qa = await _gen_visual_qa(newer, user_prompt, fp)
                         targets = [{'issue': f.get('issue') or f.get('description'), 'id': f.get('id')} for f in qa['findings']]
-                        if newer_qa is not None and route and await compare_images(raw, newer, json.dumps(targets,ensure_ascii=False) + '\nRequirements: ' + user_prompt, client=route[0], model=route[1]):
+                        if newer_qa is not None and route and await compare_images(raw, newer, json.dumps(targets,ensure_ascii=False) + '\nRequirements: ' + user_prompt, client=route[0], model=route[1], targets=[str(f['id']) for f in qa['findings']]):
                             raw, mime, qa = newer, newer_mime, newer_qa
                     except Exception as exc:
                         log('GEN', f'Whole candidate rejected/unavailable: {type(exc).__name__}')
@@ -8538,14 +8591,21 @@ async def _gen_one_image_impl(final_prompt, input_b64s, image_size, aspect_ratio
                     log('GEN', f"Visual QA {finding['severity']} {finding['confidence']:.2f} @ {finding['location']}: {finding.get('issue', finding.get('evidence', ''))}")
                 if allow_repair and _gen_repair_findings(qa):
                     try:
+                        ensure_budget()
                         raw, mime = await _gen_repair_regions(raw, mime, qa, user_prompt, fp, gen_model, size, status_cb)
                     except Exception as exc:
                         log('GEN', f'Regional repair unavailable: {type(exc).__name__}; keeping original')
             from gen_runtime import CURRENT
             invocation = CURRENT.get()
             if invocation:
-                invocation.qa = await _gen_visual_qa(raw, user_prompt, fp) if allow_repair and qa and qa['findings'] else qa
+                final_qa = await _gen_visual_qa(raw, user_prompt, fp) if allow_repair and qa and qa['findings'] else qa
+                invocation.qa = final_qa if final_qa is not None else qa
+                if final_qa is None:
+                    invocation.timings['final_qa_unavailable'] = True
             return raw, mime, fp, used_fallback
+        except TimeoutError as e:
+            log("GEN", "Generation deadline reached; stopping without another provider call")
+            return None, "overload", None, used_fallback
         except GenExhausted as e:
             # ДНЕВНОЙ лимит модели исчерпан — ретраить сегодня бессмысленно (и жжёт квоту). Пробуем запасную (своя квота).
             log("GEN", f"Дневной лимит исчерпан ({gen_model}): {e}")
@@ -8576,7 +8636,8 @@ async def _gen_one_image_impl(final_prompt, input_b64s, image_size, aspect_ratio
                 used_fallback = True
                 gen_model = OPENROUTER_IMAGE_FALLBACK
                 size = image_size  # gemini-фолбэк тянет запрошенное разрешение (кламп был под primary)
-                transient_left = 2
+                # Do not reset the per-invocation attempt budget on provider switch.
+                transient_left = max(0, min(transient_left, 1))
                 attempt = 0
                 log("GEN", f"Основная модель отдаёт {_http_code} — сразу переключаюсь на запасную {gen_model}")
                 await _s("🔁 Основная модель недоступна — пробую запасную (Gemini)…")
@@ -8587,18 +8648,27 @@ async def _gen_one_image_impl(final_prompt, input_b64s, image_size, aspect_ratio
                 wait = min(30, 15 + 8 * attempt)  # RPM-лимит: ждём дольше (23, 30с)
                 log("GEN", f"Временный сбой провайдера ({gen_model}): {e} — ретрай через {wait}с (осталось {transient_left})")
                 await _s("⏳ Временный сбой генерации — повторяю тот же запрос…")
+                if remaining() <= wait:
+                    return None, "overload", None, used_fallback
                 await asyncio.sleep(wait)
                 continue
             if not used_fallback and not gateway_pool and OPENROUTER_IMAGE_FALLBACK and OPENROUTER_IMAGE_FALLBACK != gen_model:
                 used_fallback = True
                 gen_model = OPENROUTER_IMAGE_FALLBACK
                 size = image_size  # gemini-фолбэк тянет запрошенное разрешение (кламп был под primary)
-                transient_left = 2
+                # One total bounded retry budget: never reset attempts when changing providers.
+                transient_left = max(0, min(transient_left, 1))
                 attempt = 0
                 log("GEN", f"Основная модель не отвечает — переключаюсь на запасную {gen_model}")
                 await _s("🔁 Основная модель перегружена — пробую запасную (Gemini)…")
                 continue
             return None, "overload", None, used_fallback
+        except RuntimeError as e:
+            # Invocation generation-call budget is authoritative across QA repair calls too.
+            if "generation call budget" in str(e).lower():
+                log("GEN", "Generation call budget reached; stopping without another provider call")
+                return None, "overload", None, used_fallback
+            raise
 
 
 async def _gen_send_image(chat, raw, mime, final_prompt, prompt_by_ai, reply_to, refs_line=None, idea=None):
@@ -8609,7 +8679,7 @@ async def _gen_send_image(chat, raw, mime, final_prompt, prompt_by_ai, reply_to,
     from gen_runtime import CURRENT, ARTIFACTS, status_text
     invocation = CURRENT.get()
     artifact_key = (invocation.job_id if invocation else __import__('uuid').uuid4().hex) + '_' + __import__('hashlib').sha256(raw).hexdigest()[:12]
-    artifact = ARTIFACTS.save(artifact_key, raw, '.png' if 'png' in mime else '.jpg')
+    artifact = ARTIFACTS.save(artifact_key, raw, '.png' if 'png' in mime else '.webp' if 'webp' in mime else '.jpg')
     from PIL import Image
     with Image.open(io.BytesIO(raw)) as im:
         dimensions = f'{im.width}×{im.height}'
@@ -8627,10 +8697,22 @@ async def _gen_send_image(chat, raw, mime, final_prompt, prompt_by_ai, reply_to,
         bio.name = "gen.jpg"
     else:
         bio.name = "gen.webp"  # не сконвертившийся webp — хотя бы честное расширение
-    from gen_delivery import record
-    record(artifact_key, chat=chat, reply_to=reply_to, path=artifact, status='pending')
+    from gen_delivery import record, marker
+    if invocation:
+        invocation.timings['delivery_key'] = artifact_key
     sent = None
-    idea_line = f'{dimensions} · {verification}\n' + (f"💡 {str(idea).strip()}\n" if idea and str(idea).strip() else '')
+    if invocation and invocation.timings.get('final_qa_unavailable'):
+        verification += '\nПовторная QA недоступна, показаны ранее найденные замечания'
+    idea_line = marker(artifact_key) + '\n' + f'{dimensions} · {verification}\n' + (f"💡 {str(idea).strip()}\n" if idea and str(idea).strip() else '')
+    record(artifact_key, chat=chat, reply_to=reply_to, path=artifact, status='pending', caption=idea_line)
+    async def safe_send(*args, **kwargs):
+        try:
+            result = await client.send_file(*args, **kwargs)
+            record(artifact_key, chat=chat, reply_to=reply_to, path=artifact, status='delivered', message_id=getattr(result,'id',None))
+            return result
+        except Exception:
+            record(artifact_key, chat=chat, reply_to=reply_to, path=artifact, status='ambiguous')
+            raise
     if prompt_by_ai:  # промпт от ИИ — СВЁРНУТОЙ цитатой и БЕЗ обрезки; идея — видимой строкой над ней
         cap_text = idea_line + "🎨 " + final_prompt
         if len(cap_text) <= 1000:  # влезает в лимит подписи Telegram (1024)
@@ -8641,19 +8723,18 @@ async def _gen_send_image(chat, raw, mime, final_prompt, prompt_by_ai, reply_to,
                     for e in cap_ents:
                         e.offset += shift
                     cap = idea_line + cap
-                sent = await client.send_file(chat, bio, caption=cap, formatting_entities=cap_ents, reply_to=reply_to)
-            except Exception as e:
-                log("GEN", f"Свёрнутая подпись не отправилась ({e}) — шлю обычной")
-                bio.seek(0)
-                sent = await client.send_file(chat, bio, caption=cap_text, reply_to=reply_to)
+                sent = await safe_send(chat, bio, caption=cap, formatting_entities=cap_ents, reply_to=reply_to)
+            except Exception:
+                # Delivery outcome is ambiguous; never automatically duplicate the image.
+                raise
         else:  # длинный промпт: картинка с идеей в подписи + полный промпт отдельной свёрнутой цитатой
-            sent = await client.send_file(chat, bio, caption=(idea_line.strip() or None), reply_to=reply_to)
+            sent = await safe_send(chat, bio, caption=(idea_line.strip() or None), reply_to=reply_to)
             try:
                 await send_long(chat, "🎨 " + final_prompt, parse_mode=None, reply_to=getattr(sent, "id", None), collapse_threshold=0)
             except Exception as exc:
                 log('GEN', f'Image delivered; auxiliary prompt failed: {type(exc).__name__}')
     else:
-        sent = await client.send_file(chat, bio, caption=idea_line.strip(), reply_to=reply_to)
+        sent = await safe_send(chat, bio, caption=idea_line.strip(), reply_to=reply_to)
     if refs_line:  # ссылки на сообщения-источники референсов — отдельным сообщением под картинкой
         try:
             await client.send_message(chat, refs_line, parse_mode="md", reply_to=getattr(sent, "id", None), link_preview=False)
@@ -8667,9 +8748,39 @@ async def _gen_send_image(chat, raw, mime, final_prompt, prompt_by_ai, reply_to,
     return sent
 
 
+@client.on(events.NewMessage(pattern=r'^[./]genretry\s+([A-Za-z0-9_-]+)$'))
+async def gen_retry_file(event):
+    if not event.out or str(event.sender_id) != str(OWNER_ID):
+        return
+    from gen_delivery import lookup, reconcile, record, marker
+    try:
+        entry = lookup(event.pattern_match.group(1), event.chat_id)
+        if entry['status'] == 'delivered':
+            await event.reply('Результат уже отправлен. Оригинал: .genfile ' + entry['key'])
+            return
+        try:
+            existing = await reconcile(client, entry)
+        except Exception:
+            await event.reply('Не удалось проверить историю. Повторную отправку остановил, чтобы не создать дубликат.')
+            return
+        if existing:
+            record(entry['key'], chat=event.chat_id, reply_to=entry['reply_to'], path=entry['path'], status='delivered', message_id=existing.id)
+            await event.reply('Результат уже есть в чате: сообщение ' + str(existing.id))
+            return
+        try:
+            sent = await client.send_file(event.chat_id, entry['path'], caption=entry.get('caption') or marker(entry['key']), reply_to=entry['reply_to'])
+        except Exception:
+            record(entry['key'], chat=event.chat_id, reply_to=entry['reply_to'], path=entry['path'], status='ambiguous')
+            await event.reply('Отправка не подтверждена. Файл сохранён; новая генерация не запускалась.')
+            return
+        record(entry['key'], chat=event.chat_id, reply_to=entry['reply_to'], path=entry['path'], status='delivered', message_id=sent.id)
+    except (ValueError, PermissionError, FileNotFoundError):
+        await event.reply('Результат недоступен в этом чате или истёк срок хранения.')
+
+
 @client.on(events.NewMessage(pattern=r'^[./]genfile\s+([A-Za-z0-9_-]+)$'))
 async def gen_original_file(event):
-    if not event.out or event.sender_id != me_id:
+    if not event.out or str(event.sender_id) != str(OWNER_ID):
         return
     from gen_delivery import lookup
     try:
@@ -8742,7 +8853,113 @@ def _track_gen_activity(fn):
     return wrapped
 
 
-@client.on(events.NewMessage(pattern=r"(?s)^[./]gen(?:\s+(\d+))?((?:\s+-(?:vertical|horizontal|square|sq|4k|2k|1k|x\d+|p\d+|pages|noimg|ni|raw|m|r|i|c|v|h|improve|creative))+)?((?:\s+!?@\w+)+)?[ \t\r\n]+(.+)$"))
+@client.on(events.NewMessage(pattern=r"^[./]genresume\s+([A-Za-z0-9_-]{1,128})\s*$"))
+@_track_gen_activity
+async def gen_resume(event):
+    """Resume missing pages from the immutable per-job plan; never re-deliver uncertain sends."""
+    if not event.out or str(event.sender_id) != str(OWNER_ID):
+        return
+    import json as _json
+    from pathlib import Path as _Path
+    from gen_series import (parse_multipage_plan, SeriesCheckpoint, execute_series,
+                            load_series_state, save_series_state)
+    from gen_runtime import ARTIFACTS as _ARTIFACTS
+
+    job_id = event.pattern_match.group(1)
+    try:
+        record = load_series_state(".", job_id=job_id, owner_id=str(event.sender_id), chat_id=str(event.chat_id))
+        generation = record.get("generation")
+        if not isinstance(generation, dict):
+            raise ValueError("generation snapshot missing")
+        required = ("input_b64s", "input_roles", "image_size", "aspect_ratio", "user_prompt", "reply_target_id")
+        if any(key not in generation for key in required):
+            raise ValueError("generation snapshot incomplete")
+        plan_doc = {"pages": record.get("plan"), "bible": record.get("bible", {}),
+                    "version": record.get("version", "1")}
+        plan = parse_multipage_plan(_json.dumps(plan_doc, ensure_ascii=False), len(record.get("plan") or []),
+                                    user_aspect=generation.get("aspect_ratio"))
+        checkpoint = SeriesCheckpoint.from_json(record.get("checkpoint", ""), plan=plan)
+        if checkpoint.job_id != job_id or str(checkpoint.owner_id) != str(event.sender_id) or str(checkpoint.chat_id) != str(event.chat_id):
+            raise ValueError("checkpoint owner/chat mismatch")
+        # Artifact references can expire. Refuse before generating or delivering anything.
+        for result in checkpoint.completed.values():
+            artifact = result.get("artifact") if isinstance(result, dict) else None
+            if artifact and (not _Path(artifact).is_file() or __import__('time').time() - _Path(artifact).stat().st_mtime > getattr(_ARTIFACTS, 'ttl_seconds', 86400)):
+                raise ValueError("saved page artifact expired; cannot safely resume")
+        # A persisted result without a delivered marker can represent an uncertain Telegram
+        # acceptance window. Without an idempotency marker, do not automatically resend it.
+        uncertain = set(checkpoint.completed) - set(checkpoint.delivered)
+        if uncertain:
+            from gen_delivery import lookup, reconcile
+            for number in sorted(uncertain):
+                saved = checkpoint.completed[number]
+                key = saved.get('delivery_key')
+                if not key:
+                    await event.reply('Сохранённая отправка не имеет ключа проверки. Автоповтор остановлен.')
+                    return
+                try:
+                    entry = lookup(key, event.chat_id)
+                    existing = await reconcile(client, entry)
+                except Exception:
+                    await event.reply('Проверка доставки недоступна. Повторная отправка остановлена.')
+                    return
+                if existing:
+                    checkpoint.delivered.add(number)
+                    saved['message_id'] = existing.id
+                else:
+                    await event.reply('Страница сохранена. Сначала восстанови доставку: .genretry ' + key)
+                    return
+            record['checkpoint'] = checkpoint.to_json()
+            save_series_state(_Path('gen_series_state') / f'{job_id}.json', record)
+        pages_meta = record.get("pages_meta") or {}
+        refs = generation["input_b64s"]
+        roles = generation["input_roles"]
+        ref_catalog = {str(i): {"image": value, "role": roles[i-1] if i-1 < len(roles) else "subject"}
+                       for i, value in enumerate(refs, 1)}
+        store_path = _Path("gen_series_state") / f"{job_id}.json"
+        async def save_checkpoint(state):
+            save_series_state(store_path, {**record, "checkpoint": state.to_json()})
+        async def generate(page, bible, anchor, max_input_bytes):
+            selected = list(page.refs)
+            if any(ref not in ref_catalog for ref in selected):
+                raise ValueError("series references missing from captured registry")
+            inputs = [ref_catalog[ref]["image"] for ref in selected]
+            page_roles = [ref_catalog[ref]["role"] for ref in selected]
+            prompt = page.prompt + "\\nSeries bible: " + _json.dumps(bible, ensure_ascii=False)
+            if anchor:
+                inputs = [base64.b64encode(anchor).decode("ascii")] + inputs
+                page_roles = ["page 1 anchor; preserve character and style identity"] + page_roles
+                prompt += "\\n\\nStrict character consistency: maintain identical facial features, hairstyles, eye colors, outfits, and art style from the reference image.\\nReference roles: " + "; ".join(f"ref {i+1}: {role}" for i, role in enumerate(page_roles))
+            from gen_provider import GATEWAY_PROFILE
+            if sum(len(base64.b64decode(value)) for value in inputs) > GATEWAY_PROFILE.max_bytes:
+                raise ValueError("series anchor and references exceed byte budget")
+            rendered = await _gen_render_image(prompt, inputs, generation["image_size"], page.aspect or generation["aspect_ratio"],
+                                               True, generation["user_prompt"], None)
+            raw, mime, used_prompt, _fallback = rendered
+            if not raw:
+                raise RuntimeError(f"generation {mime}")
+            artifact = _ARTIFACTS.save(f"{job_id}_series_{page.number}", raw, ".png" if "png" in mime else ".jpg")
+            from gen_runtime import CURRENT
+            active = CURRENT.get()
+            key = (active.job_id if active else job_id) + '_' + __import__('hashlib').sha256(raw).hexdigest()[:12]
+            return {"artifact": str(artifact), "mime": mime, "prompt": used_prompt, 'delivery_key': key,
+                    "idea": (pages_meta.get(str(page.number)) or {}).get("idea") or f"Страница {page.number}"}
+        async def deliver(page, result):
+            raw = _Path(result["artifact"]).read_bytes()
+            await _gen_send_image(event.chat_id, raw, result["mime"], result["prompt"], True,
+                                  generation["reply_target_id"], idea=f"[{page.number}/{len(plan.pages)}] {result['idea']}")
+        result = await execute_series(plan, generate=generate, checkpoint=checkpoint,
+                                      save_checkpoint=save_checkpoint, deliver=deliver,
+                                      anchor_selector=lambda results: results.get(1) and _Path(results[1]["artifact"]).read_bytes())
+        if result.failures:
+            await event.reply(f"⚠️ Серия {job_id}: страница {min(result.failures)} — {result.failures[min(result.failures)]}")
+        else:
+            await event.reply(f"✅ Серия {job_id} продолжена.")
+    except Exception as exc:
+        await event.reply('Не удалось продолжить серию: ' + type(exc).__name__)
+
+
+@client.on(events.NewMessage(pattern=r"(?s)^[./]gen(?:\s+(\d+))?((?:\s+-(?:vertical|horizontal|square|sq|4k|2k|1k|x\d+|p\d+|pages|noimg|ni|raw|m|r|i|c|v|h|improve|creative))+)?((?:\s+!?@\w+)+)?[ \\t\\r\\n]+(.+)$"))
 @_track_gen_activity
 async def gen_command(event):
     """Генерация изображений (GPT Image 2 via OpenRouter). Промпт как есть, либо его строит/улучшает DeepSeek
@@ -9061,10 +9278,9 @@ async def gen_command(event):
             await set_status(f"🎨 Многостраничный сюжет ({pages_count} стр.): составляю сценарий…")
             import json as _series_json
             from pathlib import Path as _SeriesPath
-            from gen_series import parse_multipage_plan, SeriesCheckpoint, execute_series
+            from gen_series import parse_multipage_plan, SeriesCheckpoint, execute_series, save_series_state
             from gen_runtime import ARTIFACTS as _SERIES_ARTIFACTS, CURRENT as _SERIES_CURRENT
             from gen_jobs import JobStore as _SeriesJobStore
-            _series_store = _SeriesJobStore(_SeriesPath("gen_series_state") / f"{_job_id}.json")
             pages_plan = await _build_multipage_prompts(
                 user_prompt, pages_count, context_text=context_text,
                 image_desc=image_desc, catalog=catalog, chat_id=event.chat_id,
@@ -9072,9 +9288,10 @@ async def gen_command(event):
             )
             _series_plan = parse_multipage_plan(_series_json.dumps({"pages": [
                 {"number": p["page"], "prompt": p["prompt"], "aspect": p.get("aspect"), "refs": p.get("refs", [])}
-                for p in pages_plan]}, ensure_ascii=False), pages_count, user_aspect=aspect_ratio)
+                for p in pages_plan], 'bible': pages_plan[0].get('bible', {})}, ensure_ascii=False), pages_count, user_aspect=aspect_ratio)
             _invocation = _SERIES_CURRENT.get()
             _job_id = _invocation.job_id if _invocation else __import__('uuid').uuid4().hex
+            _series_store = _SeriesJobStore(_SeriesPath("gen_series_state") / f"{_job_id}.json")
             _checkpoint = SeriesCheckpoint(_series_plan.plan_id)
             _checkpoint.chat_id = str(event.chat_id)
             _checkpoint.owner_id = str(event.sender_id)
@@ -9085,7 +9302,7 @@ async def gen_command(event):
                 "aspect_ratio": aspect_ratio, "reply_target_id": reply_target_id,
                 "gen_refs_line": gen_refs_line}
             async def _save_series_checkpoint(state):
-                await _series_store.save({"job_id": _job_id, "chat_id": state.chat_id, "owner_id": state.owner_id,
+                save_series_state(_series_store.path, {"job_id": _job_id, "chat_id": state.chat_id, "owner_id": state.owner_id,
                     "plan": [{"number": p.number, "prompt": p.prompt, "aspect": p.aspect, "refs": list(p.refs)} for p in _series_plan.pages],
                     "bible": _series_plan.bible, "version": _series_plan.version, "checkpoint": state.to_json(),
                     "pages_meta": state.pages_meta, "generation": _generation})
@@ -9101,13 +9318,19 @@ async def gen_command(event):
                 p_info = _page_info[p_idx]
                 p_idea = p_info.get("idea") or f"Страница {p_idx}"
                 p_prompt = page.prompt
-                selected_refs = [r for r in page.refs if r in _ref_catalog]
-                p_inputs = [_ref_catalog[r]["image"] for r in selected_refs]
-                selected_roles = [_ref_catalog[r]["role"] for r in selected_refs]
+                selected_refs = list(page.refs)
+                if any(r not in _ref_catalog for r in selected_refs):
+                    raise ValueError('series references missing from captured registry')
+                p_inputs = [_ref_catalog[r]['image'] for r in selected_refs]
+                selected_roles = [_ref_catalog[r]['role'] for r in selected_refs]
+                p_prompt += '\nSeries bible: ' + _series_json.dumps(bible, ensure_ascii=False)
                 if anchor:
                     p_inputs = [base64.b64encode(anchor).decode("ascii")] + p_inputs
                     selected_roles = ["page 1 anchor; preserve character and style identity"] + selected_roles
                     p_prompt += "\n\nStrict character consistency: maintain identical facial features, hairstyles, eye colors, outfits, and art style from the reference image.\nReference roles: " + "; ".join(f"ref {i+1}: {role}" for i, role in enumerate(selected_roles))
+                from gen_provider import GATEWAY_PROFILE
+                if sum(len(b) for b in p_inputs) > GATEWAY_PROFILE.max_bytes:
+                    raise ValueError('series anchor and references exceed byte budget')
                 await set_status(f"🎨 Генерирую страницу {p_idx}/{pages_count}…")
                 raw_p, mime_p, used_fp, used_fb = await _gen_render_image(
                     p_prompt, p_inputs, image_size, page.aspect or aspect_ratio,
@@ -9118,7 +9341,8 @@ async def gen_command(event):
                     failure_reason = mime_p
                     raise RuntimeError(f"generation {mime_p}")
                 artifact_path = _SERIES_ARTIFACTS.save(f"{_job_id}_series_{p_idx}", raw_p, ".png" if "png" in mime_p else ".jpg")
-                return {"artifact": str(artifact_path), "mime": mime_p, "prompt": used_fp, "idea": p_idea}
+                delivery_key = (_SERIES_CURRENT.get().job_id if _SERIES_CURRENT.get() else _job_id) + '_' + __import__('hashlib').sha256(raw_p).hexdigest()[:12]
+                return {"artifact": str(artifact_path), "mime": mime_p, "prompt": used_fp, "idea": p_idea, 'delivery_key': delivery_key}
             async def _series_deliver(page, result):
                 nonlocal reply_target_id
                 p_idx = page.number
@@ -9202,7 +9426,11 @@ async def gen_command(event):
             pass  # Successful delivery is not undone by status cleanup failure.
     except Exception as e:
         log("GEN", f"Ошибка /gen: {type(e).__name__}")
-        await set_status("❌ Генерация или доставка не завершена. Тип ошибки: " + type(e).__name__ + ". Подробности доступны оператору в журнале.")
+        from gen_runtime import CURRENT
+        active = CURRENT.get()
+        saved_key = active.timings.get('delivery_key') if active else None
+        suffix = (' Файл сохранён. Проверить и повторить доставку: .genretry ' + saved_key) if saved_key else ''
+        await set_status('Генерация или доставка не завершена. Тип ошибки: ' + type(e).__name__ + '.' + suffix)
 
 
 @client.on(events.NewMessage(outgoing=True, pattern=r"^[./]auto_reply$", from_users="me"))

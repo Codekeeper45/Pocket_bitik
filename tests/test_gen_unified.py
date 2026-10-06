@@ -58,13 +58,19 @@ class TestUnifiedGenPrompt(unittest.TestCase):
         self.assertEqual(result[3], "1:1")
 
     def test_sequential_roles_reflect_actual_input_after_dedupe_and_size_cap(self):
-        initial = [base64.b64encode(b"user-image").decode()]
+        import io
+        from PIL import Image
+        def png(color):
+            b=io.BytesIO(); Image.new('RGB',(32,32),color).save(b,format='PNG'); return b.getvalue()
+        initial = [base64.b64encode(png('blue')).decode()]
         catalog = [
-            {"idx": 2, "mid": 20, "bytes": b"catalog-a"},
-            {"idx": 4, "mid": 40, "bytes": b"catalog-b"},
+            {"idx": 2, "mid": 20, "bytes": png('green')},
+            {"idx": 4, "mid": 40, "bytes": png('red')},
         ]
+        with self.assertRaises(KeyError):
+            bot._gen_remap_selected_refs(initial,['subject'],catalog,[(777,'missing')])
         out, roles, used, mapping = bot._gen_remap_selected_refs(
-            initial, ["subject"], catalog, [(2, "subject"), (4, "style"), (777, "bad")]
+            initial, ["subject"], catalog, [(2, "subject"), (4, "style")]
         )
         self.assertEqual(len(out), 3)
         self.assertEqual(roles, [(1, "subject"), (2, "subject"), (3, "style")])

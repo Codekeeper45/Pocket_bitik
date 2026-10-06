@@ -3,10 +3,24 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from gen_series import parse_multipage_plan, execute_series, SeriesCheckpoint
+from gen_series import (parse_multipage_plan, execute_series, SeriesCheckpoint,
+    SeriesPlanError, series_state_path, save_series_state, load_series_state)
 
 
 class IncrementalSeriesHandlerTests(unittest.TestCase):
+    def test_per_job_state_is_private_and_owner_chat_bound(self):
+        with tempfile.TemporaryDirectory() as td:
+            for jid, owner, chat in (("job-a", "u1", "c1"), ("job-b", "u2", "c2")):
+                path = series_state_path(td, jid)
+                save_series_state(path, {"job_id": jid, "owner_id": owner, "chat_id": chat})
+                self.assertEqual(path.stat().st_mode & 0o777, 0o600)
+            self.assertNotEqual(series_state_path(td, "job-a"), series_state_path(td, "job-b"))
+            self.assertEqual(load_series_state(td, job_id="job-a", owner_id="u1", chat_id="c1")["job_id"], "job-a")
+            for owner, chat in (("u2", "c1"), ("u1", "c2")):
+                with self.assertRaises(SeriesPlanError):
+                    load_series_state(td, job_id="job-a", owner_id=owner, chat_id=chat)
+            with self.assertRaises(SeriesPlanError): series_state_path(td, "../escape")
+
     def test_persists_before_delivery_and_resumes_delivery_without_regeneration(self):
         plan = parse_multipage_plan('{"pages":[{"number":1,"prompt":"one"},{"number":2,"prompt":"two"}]}', 2)
         calls, sends = [], []

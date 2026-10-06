@@ -267,6 +267,12 @@ class GenerationJobs:
             if isinstance(result, bytes) and artifact_store:
                 rec.artifact_path = str(artifact_store.save(rec.job_id, result))
             rec.status = "completed"
+            from gen_runtime import CURRENT
+            invocation = CURRENT.get()
+            if invocation and invocation.result is not None:
+                recorded_error = getattr(invocation.result, 'error', None)
+                if recorded_error:
+                    rec.status = 'failed'; rec.error = recorded_error.kind
         except asyncio.CancelledError:
             rec.status = "cancelled"; rec.error = "cancelled (provider thread may have completed)"; raise
         except Exception as exc:
