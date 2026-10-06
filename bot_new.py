@@ -8989,7 +8989,7 @@ async def gen_resume(event):
         await event.reply('Не удалось продолжить серию: ' + type(exc).__name__)
 
 
-@client.on(events.NewMessage(pattern=r"(?s)^[./]gen(?:\s+(\d+))?((?:\s+-(?:vertical|horizontal|square|sq|4k|2k|1k|x\d+|p\d+|pages|noimg|ni|raw|m|r|i|c|v|h|improve|creative))+)?((?:\s+!?@\w+)+)?[ \\t\\r\\n]+(.+)$"))
+@client.on(events.NewMessage(pattern=r"(?s)^[./]gen(?:\s+(\d+))?((?:\s+-(?:vertical|horizontal|square|sq|4k|2k|1k|x\d+|p\d+|pages|noimg|ni|raw|m|r|i|c|v|h|improve|creative|16:9|9:16|1:1|4:3|3:4))+)?((?:\s+!?@\w+)+)?[ \t\r\n]+(.+)$"))
 @_track_gen_activity
 async def gen_command(event):
     """Генерация изображений (GPT Image 2 via OpenRouter). Промпт как есть, либо его строит/улучшает DeepSeek
@@ -9012,9 +9012,11 @@ async def gen_command(event):
     raw = any(t in ("-r", "-raw") for t in toks)                # -r: БЕЗ ИИ — твой промпт дословно в генератор (literal)
     aspect_ratio = None                                         # ориентация → aspect_ratio Image API (точно)
     for t in toks:
-        if t in ("-v", "-vertical"): aspect_ratio = "9:16"
-        elif t in ("-h", "-horizontal"): aspect_ratio = "16:9"
-        elif t in ("-sq", "-square"): aspect_ratio = "1:1"
+        if t in ("-v", "-vertical", "-9:16"): aspect_ratio = "9:16"
+        elif t in ("-h", "-horizontal", "-16:9"): aspect_ratio = "16:9"
+        elif t in ("-sq", "-square", "-1:1"): aspect_ratio = "1:1"
+        elif t in ("-4:3",): aspect_ratio = "4:3"
+        elif t in ("-3:4",): aspect_ratio = "3:4"
     image_size = "2K"                                           # дефолт 2K (1024²→2048², вчетверо чётче); -4k/-1k меняют
     for t in toks:
         if t.lower() == "-4k": image_size = "4K"
