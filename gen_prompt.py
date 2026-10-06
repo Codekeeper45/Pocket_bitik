@@ -28,7 +28,10 @@ class ContractError(ValueError):
 
 def extract_contract(value) -> SceneContract:
     if isinstance(value, str):
-        try: value = json.loads(value)
+        text = value.strip()
+        if "{" in text and "}" in text:
+            text = text[text.find("{"):text.rfind("}")+1]
+        try: value = json.loads(text)
         except json.JSONDecodeError as exc: raise ContractError("expected structured JSON scene contract") from exc
     if not isinstance(value, dict): raise ContractError("scene contract must be an object")
     allowed = {"task_type", "prompt", "participants", "participant_count", "known_appearance", "hypotheses", "action", "composition", "required_text", "style", "aspect", "refs", "immutable_requirements", "fictional_interpretation"}
@@ -44,9 +47,14 @@ def extract_contract(value) -> SceneContract:
     if task not in {"creation", "edit", "series"}: raise ContractError("invalid task_type")
     if not isinstance(prompt, str) or not prompt.strip(): raise ContractError("prompt is required")
     count = value.get("participant_count")
+    if count is not None:
+        if isinstance(count, str) and count.strip().isdigit():
+            count = int(count.strip())
+        elif not isinstance(count, int) or count < 0:
+            raise ContractError("participant_count must be a nonnegative integer")
     participants = strings("participants")
-    if count is not None and (type(count) is not int or count < 0): raise ContractError("participant_count must be a nonnegative integer")
-    if count is not None and participants and count != len(participants): raise ContractError("participant_count conflicts with participants")
+    if count is not None and participants and count != len(participants):
+        raise ContractError("participant_count conflicts with participants")
     aspect = value.get("aspect")
     if aspect not in (None, "1:1", "9:16", "16:9", "4:3", "3:4"): raise ContractError("unsupported aspect")
     refs = value.get("refs", ())
