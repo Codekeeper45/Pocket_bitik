@@ -31,10 +31,8 @@ class PairQA(unittest.IsolatedAsyncioTestCase):
   self.assertEqual([x['text'] for x in content if x['type']=='text'][1:3],['ORIGINAL','CANDIDATE'])
   self.assertTrue(all(x['image_url']['url'].startswith('data:image/png;base64,') for x in content if x['type']=='image_url'))
  async def test_unknown_fields_fail_closed(self):
-  # The contract currently validates required fields/evidence and is tolerant of extensions.
-  # Unknown-field rejection is exercised by the strict findings parser, not this comparator.
   raw=self.png();data=self.passing();data['unexpected']=True
-  self.assertTrue(await compare_images(raw,raw,'fix hand',client=self.client(data),model='mock'))
+  self.assertFalse(await compare_images(raw,raw,'fix hand',client=self.client(data),model='mock'))
  async def test_missing_choices_is_not_clean(self):
   buf=io.BytesIO();Image.new('RGB',(20,20)).save(buf,format='PNG');raw=buf.getvalue()
   client=SimpleNamespace(chat=SimpleNamespace(completions=SimpleNamespace(create=lambda **kw:SimpleNamespace(choices=[]))))

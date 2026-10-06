@@ -21,7 +21,10 @@ class Reference:
     api_index: Optional[int] = None
     priority: int = 0
     pixel_size: Optional[tuple[int, int]] = None
-    source: str = "user"
+    source: str = "catalog"
+    source_type: str = "catalog"
+    mime_type: str = "application/octet-stream"
+    size_bytes: int = 0
 
 
 def make_reference(chat_id: int, message_id: int, data: bytes, **metadata) -> Reference:
@@ -38,6 +41,16 @@ def make_reference(chat_id: int, message_id: int, data: bytes, **metadata) -> Re
             size = im.size
     except Exception:
         pass
+    mime = "application/octet-stream"
+    try:
+        from PIL import Image
+        with Image.open(BytesIO(raw)) as image:
+            mime = Image.MIME.get(image.format, mime)
+    except Exception:
+        pass
+    metadata.setdefault("source_type", "catalog")
+    metadata.setdefault("mime_type", mime)
+    metadata.setdefault("size_bytes", len(raw))
     return Reference(rid, chat_id, message_id, digest, raw, pixel_size=size, **metadata)
 
 

@@ -7,6 +7,46 @@ import re
 
 class SeriesPlanError(ValueError): pass
 
+
+def validate_series_job(record: dict, *, job_id: str, owner_id: str, chat_id: str) -> dict:
+    """Validate identity-bound persisted state before a caller resumes or delivers it."""
+    if not re.fullmatch(r"[A-Za-z0-9_-]{1,128}", str(job_id or "")):
+        raise SeriesPlanError("invalid series job id")
+    if not isinstance(record, dict) or record.get("job_id") != job_id:
+        raise SeriesPlanError("series job id mismatch")
+    if str(record.get("owner_id", "")) != str(owner_id) or str(record.get("chat_id", "")) != str(chat_id):
+        raise SeriesPlanError("series job owner/chat mismatch")
+    return record
+
+
+def series_state_path(root, job_id: str):
+    from pathlib import Path
+    if not re.fullmatch(r"[A-Za-z0-9_-]{1,128}", str(job_id or "")):
+        raise SeriesPlanError("invalid series job id")
+    return Path(root) / "gen_series_state" / f"{job_id}.json"
+
+
+def save_series_state(path, payload: dict) -> None:
+    """Atomic mode-0600 JSON state file, isolated by validated job id."""
+    import os, tempfile
+    path = __import__('pathlib').Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(prefix=path.name + ".", dir=path.parent)
+    try:
+        os.fchmod(fd, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            json.dump(payload, f, ensure_ascii=False, sort_keys=True); f.flush(); os.fsync(f.fileno())
+        os.replace(tmp, path)
+    finally:
+        if os.path.exists(tmp): os.unlink(tmp)
+
+
+def load_series_state(root, *, job_id: str, owner_id: str, chat_id: str) -> dict:
+    path = series_state_path(root, job_id)
+    try: record = json.loads(path.read_text(encoding="utf-8"))
+    except FileNotFoundError as exc: raise SeriesPlanError("series job not found") from exc
+    return validate_series_job(record, job_id=job_id, owner_id=owner_id, chat_id=chat_id)
+
 @dataclass(frozen=True)
 class SeriesPage:
     number: int
@@ -120,7 +160,9 @@ class SeriesCheckpoint:
         delivered=data.get("delivered", [])
         if not isinstance(delivered,list) or any(type(n) is not int for n in delivered) or not set(delivered) <= valid or not set(delivered) <= set(completed):
             raise SeriesPlanError("invalid checkpoint delivery markers")
-        return cls(plan.plan_id, completed, failures, set(delivered), str(data.get("chat_id", "")), str(data.get("owner_id", "")), str(data.get("job_id", "")), data.get("pages_meta", {}))
+        pages_meta = data.get("pages_meta", {})
+        if not isinstance(pages_meta, dict): raise SeriesPlanError("invalid page metadata")
+        return cls(plan.plan_id, completed, failures, set(delivered), str(data.get("chat_id", "")), str(data.get("owner_id", "")), str(data.get("job_id", "")), pages_meta)
 
 async def execute_series(plan: SeriesPlan, *, generate, checkpoint: SeriesCheckpoint | None = None, save_checkpoint=None, deliver=None, max_input_bytes=None, anchor_selector=None):
     """Run missing pages only. Persist generated artifacts before delivery and resume delivery separately."""
@@ -158,12 +200,19 @@ async def execute_series(plan: SeriesPlan, *, generate, checkpoint: SeriesCheckp
                 v=save_checkpoint(state)
                 if inspect.isawaitable(v): await v
             if deliver:
-                v=deliver(page,result)
-                if inspect.isawaitable(v): await v
-                state.delivered.add(page.number)
-                if save_checkpoint:
-                    v=save_checkpoint(state)
+                try:
+                    v=deliver(page,result)
                     if inspect.isawaitable(v): await v
+                    state.delivered.add(page.number)
+                    if save_checkpoint:
+                        v=save_checkpoint(state)
+                        if inspect.isawaitable(v): await v
+                except Exception as exc:
+                    state.failures[page.number]=f"delivery {type(exc).__name__}: {exc}"
+                    if save_checkpoint:
+                        v=save_checkpoint(state)
+                        if inspect.isawaitable(v): await v
+                    return state
         except Exception as exc:
             phase = 'delivery ' if page.number in results else 'generation '
             state.completed=dict(results); state.failures[page.number]=f"{phase}{type(exc).__name__}"
@@ -173,4 +222,4 @@ async def execute_series(plan: SeriesPlan, *, generate, checkpoint: SeriesCheckp
             return state
     return state
 
-__all__=["SeriesPlanError","SeriesPage","SeriesPlan","parse_multipage_plan","SeriesCheckpoint","execute_series"]
+__all__=["SeriesPlanError","SeriesPage","SeriesPlan","parse_multipage_plan","SeriesCheckpoint","execute_series","validate_series_job","series_state_path","save_series_state","load_series_state"]
