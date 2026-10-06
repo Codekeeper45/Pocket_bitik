@@ -8165,6 +8165,13 @@ def _clamp_resolution(size, supported):
 _GEN_VISUAL_QA_PROMPT = '''Оцени именно ПРИЛОЖЕННОЕ ГОТОВОЕ изображение, а не референс. Сопоставь с исходными требованиями пользователя и промптом генерации. Не требуй фотореализма: намеренная стилизация, мультяшность, живописная условность и необычная анатомия в явно стилизованной работе сами по себе не дефекты. Не угадывай личность/имя неизвестного человека. Найди только очевидные существенные ошибки изображения: сломанные/лишние части тела, грубо искажённые предметы, нечитаемый обязательный текст, пропущенное ключевое требование. Мелкие, спорные или стилевые особенности игнорируй. Верни только JSON вида {"findings":[{"severity":"high|medium|low","issue":"...","location":"...","confidence":0.0,"bbox":[0.1,0.1,0.2,0.2]}]}; если существенных дефектов нет, findings=[] . Для каждой локальной ошибки укажи bbox точной проблемной области в нормализованных координатах [лево,верх,право,низ] от 0 до 1; координаты относятся именно к приложенному изображению. Найди ВСЕ видимые дефектные зоны за один проход, включая лица среднего плана, не прикрывай мутации словом стилизация. Для глобальной ошибки сюжета bbox=null, не придумывай область. Учитывай исходный запрос как приоритетный.'''
 
 
+def get_image_desc_client():
+    if active_model_supports_vision() and (MODEL_REGISTRY.get(ACTIVE_MODEL) or (None,))[0] == 'cliproxy':
+        client_, model_, _ = get_active_model()
+        return client_, model_
+    model_ = get_active_media_model()
+    return _client_for_media_model(model_), model_
+
 async def _gen_visual_qa(raw: bytes, user_prompt: str, final_prompt: str):
     """Single-pass localized QA; failure is distinct from verified clean output."""
     import json
@@ -8222,7 +8229,9 @@ async def _gen_repair_regions(raw, mime, qa, user_prompt, final_prompt, gen_mode
         log('GEN', f'Region repair budget: {len(regions)} zones, processing {budget}; remainder not claimed repaired')
     candidate = original.copy(); accepted = 0
     for index, region in enumerate(regions[:budget], 1):
-        box = region['box']; crop = original.crop(box)
+        from gen_repair import prepare_context_crop, extract_mapped_region
+        box = region['box']
+        crop, mapping = prepare_context_crop(candidate, box, context=.15)
         b = io.BytesIO(); crop.save(b, format='PNG')
         local_issues = '; '.join(f['issue'] for f in region['findings'])
         if status_cb:
@@ -8235,13 +8244,23 @@ async def _gen_repair_regions(raw, mime, qa, user_prompt, final_prompt, gen_mode
             crop_qa = await _gen_visual_qa(fixed, 'Correct only these local defects while preserving the crop: '+local_issues, prompt)
             if crop_qa is None or _gen_repair_findings(crop_qa):
                 log('GEN', f'Region {index} not verified fixed; keeping original pixels'); continue
-            proposed = blend_patch(candidate, Image.open(io.BytesIO(fixed)), box)
+            response = Image.open(io.BytesIO(fixed))
+            if response.size != mapping.canvas_size:
+                raise ValueError('repair returned unexpected canvas dimensions')
+            mapped_patch = extract_mapped_region(response, mapping, box)
+            proposed = blend_patch(candidate, mapped_patch, box)
             proposed_bytes = io.BytesIO(); proposed.save(proposed_bytes, format='PNG')
             # Validate seams and identity against the original user contract, NOT the repair prompt.
             after = await _gen_visual_qa(proposed_bytes.getvalue(), user_prompt, final_prompt + '\nComposite validation: inspect the repaired box ' + str(region['box']) + ' in original pixel coordinates. Report visible seams, halos, sharpness/texture or lighting discontinuities, changed identity, and all remaining face/hand defects. Do not treat compositing artifacts as intentional style.')
             seam_keys = ('шов', 'швы', 'ореол', 'стык', 'seam', 'halo', 'discontinuity', 'identity', 'личност')
             seam_bad = after and any(f['confidence'] >= .65 and f['severity'] in ('medium', 'high') and any(k in f['issue'].lower() for k in seam_keys) for f in after['findings'])
-            if after is None or seam_bad or len(_gen_repair_findings(after)) >= len(_gen_repair_findings(qa)):
+            from gen_pair_qa import compare_images
+            route = get_image_desc_client()
+            baseline = io.BytesIO(); candidate.save(baseline, format='PNG')
+            paired_ok = await compare_images(baseline.getvalue(), proposed_bytes.getvalue(),
+                'Target defects: ' + local_issues + '. ORIGINAL USER REQUIREMENTS: ' + user_prompt,
+                client=route[0], model=route[1]) if route else False
+            if after is None or seam_bad or not paired_ok:
                 log('GEN', f'Region {index} composite improvement unproven; reverting'); continue
             candidate = proposed; qa = after; accepted += 1
         except Exception as exc:
@@ -8322,6 +8341,10 @@ from gen_jobs import GlobalRateGate
 _GEN_PROVIDER_GATE = GlobalRateGate(max_concurrent=2, min_interval=13.0)
 
 async def _gen_provider_call(prompt, inputs, model, size, aspect):
+    from gen_runtime import CURRENT
+    invocation = CURRENT.get()
+    if invocation:
+        invocation.consume()
     return await _GEN_PROVIDER_GATE.run(_sync_generate_image, prompt, inputs, model, size, aspect, timeout=620)
 
 async def _gen_one_image(final_prompt, input_b64s, image_size, aspect_ratio, allow_repair, user_prompt, status_cb=None):
@@ -8363,6 +8386,10 @@ async def _gen_one_image(final_prompt, input_b64s, image_size, aspect_ratio, all
                         raw, mime = await _gen_repair_regions(raw, mime, qa, user_prompt, fp, gen_model, size, status_cb)
                     except Exception as exc:
                         log('GEN', f'Regional repair unavailable: {type(exc).__name__}; keeping original')
+            from gen_runtime import CURRENT
+            invocation = CURRENT.get()
+            if invocation:
+                invocation.qa = await _gen_visual_qa(raw, user_prompt, fp) if allow_repair and qa and qa['findings'] else qa
             return raw, mime, fp, used_fallback
         except GenExhausted as e:
             # ДНЕВНОЙ лимит модели исчерпан — ретраить сегодня бессмысленно (и жжёт квоту). Пробуем запасную (своя квота).
@@ -8424,6 +8451,14 @@ async def _gen_send_image(chat, raw, mime, final_prompt, prompt_by_ai, reply_to,
     сообщением, если длинная). refs_line — строка «Референсы:» со ссылками (отдельным сообщением-ответом
     под картинкой). idea — фраза-идея от промптера: видимой строкой 💡 над свёрнутым промптом.
     chat='me' = Saved Messages."""
+    from gen_runtime import CURRENT, ARTIFACTS, status_text
+    invocation = CURRENT.get()
+    artifact_key = (invocation.job_id if invocation else __import__('uuid').uuid4().hex) + '_' + __import__('hashlib').sha256(raw).hexdigest()[:12]
+    artifact = ARTIFACTS.save(artifact_key, raw, '.png' if 'png' in mime else '.jpg')
+    from PIL import Image
+    with Image.open(io.BytesIO(raw)) as im:
+        dimensions = f'{im.width}×{im.height}'
+    verification = status_text(invocation.qa if invocation else None)
     if "webp" in mime:
         raw = await _webp_to_png(raw)  # webp Telegram шлёт стикером — конвертим
     bio = io.BytesIO(raw)
@@ -8435,7 +8470,7 @@ async def _gen_send_image(chat, raw, mime, final_prompt, prompt_by_ai, reply_to,
     else:
         bio.name = "gen.webp"  # не сконвертившийся webp — хотя бы честное расширение
     sent = None
-    idea_line = f"💡 {idea.strip()}\n" if (idea and str(idea).strip()) else ""
+    idea_line = f'{dimensions} · {verification}\n' + (f"💡 {str(idea).strip()}\n" if idea and str(idea).strip() else '')
     if prompt_by_ai:  # промпт от ИИ — СВЁРНУТОЙ цитатой и БЕЗ обрезки; идея — видимой строкой над ней
         cap_text = idea_line + "🎨 " + final_prompt
         if len(cap_text) <= 1000:  # влезает в лимит подписи Telegram (1024)
@@ -8453,9 +8488,12 @@ async def _gen_send_image(chat, raw, mime, final_prompt, prompt_by_ai, reply_to,
                 sent = await client.send_file(chat, bio, caption=cap_text, reply_to=reply_to)
         else:  # длинный промпт: картинка с идеей в подписи + полный промпт отдельной свёрнутой цитатой
             sent = await client.send_file(chat, bio, caption=(idea_line.strip() or None), reply_to=reply_to)
-            await send_long(chat, "🎨 " + final_prompt, parse_mode=None, reply_to=getattr(sent, "id", None), collapse_threshold=0)
+            try:
+                await send_long(chat, "🎨 " + final_prompt, parse_mode=None, reply_to=getattr(sent, "id", None), collapse_threshold=0)
+            except Exception as exc:
+                log('GEN', f'Image delivered; auxiliary prompt failed: {type(exc).__name__}')
     else:
-        sent = await client.send_file(chat, bio, reply_to=reply_to)
+        sent = await client.send_file(chat, bio, caption=idea_line.strip(), reply_to=reply_to)
     if refs_line:  # ссылки на сообщения-источники референсов — отдельным сообщением под картинкой
         try:
             await client.send_message(chat, refs_line, parse_mode="md", reply_to=getattr(sent, "id", None), link_preview=False)
@@ -8476,11 +8514,23 @@ def _track_gen_activity(fn):
                 save_json('gen_activity.json', {'pid': os.getpid(), 'updated': time.time(), 'jobs': _GEN_ACTIVE_JOBS})
             except Exception as exc:
                 log('GEN', f'Activity tracking unavailable: {type(exc).__name__}')
-        _GEN_ACTIVE_JOBS[key] = {'chat': event.chat_id, 'message': event.id, 'started': time.time()}
+        from gen_runtime import CURRENT, Invocation
+        invocation = Invocation(max_generation_calls=40, max_seconds=3600)
+        token = CURRENT.set(invocation)
+        _GEN_ACTIVE_JOBS[key] = {'chat': event.chat_id, 'message': event.id, 'started': time.time(), 'job_id': invocation.job_id}
         publish()
+        async def heartbeat():
+            while True:
+                await asyncio.sleep(10)
+                if key in _GEN_ACTIVE_JOBS:
+                    _GEN_ACTIVE_JOBS[key]['heartbeat'] = time.time()
+                    publish()
+        beat = asyncio.create_task(heartbeat())
         try:
-            return await fn(event)
+            return await asyncio.wait_for(fn(event), timeout=3600)
         finally:
+            beat.cancel()
+            CURRENT.reset(token)
             _GEN_ACTIVE_JOBS.pop(key, None)
             publish()
     return wrapped

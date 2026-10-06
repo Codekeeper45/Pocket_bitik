@@ -5,16 +5,16 @@ os.environ.setdefault('api_id','12345');os.environ.setdefault('api_hash','deadbe
 import bot_new as bot
 
 def raw(color):
- b=io.BytesIO();Image.new('RGB',(200,200),color).save(b,format='PNG');return b.getvalue()
+ b=io.BytesIO();Image.new('RGB',(1024,1024),color).save(b,format='PNG');return b.getvalue()
 def finding(box):return {'severity':'medium','confidence':.9,'issue':'bad face','location':'head','bbox':box}
 class RegionIntegration(unittest.IsolatedAsyncioTestCase):
  async def test_multiple_zones_one_detection_pass(self):
   first=raw('blue'); fixed=raw('green');a=finding([.1,.1,.2,.2]);b=finding([.7,.7,.8,.8]);qa={'findings':[a,b]}
   inspect=AsyncMock(side_effect=[{'findings':[]},{'findings':[b]},{'findings':[]},{'findings':[]}])
-  with patch.object(bot,'_sync_generate_image',return_value=(fixed,'image/png')) as gen,patch.object(bot,'_gen_visual_qa',inspect),patch.object(bot,'_gen_rate_gate',AsyncMock()):
+  with patch('gen_pair_qa.compare_images',AsyncMock(return_value=True)),patch.object(bot,'get_image_desc_client',return_value=(object(),'qa')),patch.object(bot,'_sync_generate_image',return_value=(fixed,'image/png')) as gen,patch.object(bot,'_gen_visual_qa',inspect),patch.object(bot,'_gen_rate_gate',AsyncMock()):
    result,_=await bot._gen_repair_regions(first,'image/png',qa,'user','original','gpt-image-2.5-sunburst','2K')
   self.assertEqual(gen.call_count,2);self.assertNotEqual(result,first)
-  im=Image.open(io.BytesIO(result));self.assertEqual(im.getpixel((100,100)),(0,0,255))
+  im=Image.open(io.BytesIO(result));self.assertEqual(im.getpixel((500,500)),(0,0,255))
   self.assertTrue(inspect.call_args.args[2].startswith('original'))
  async def test_seam_rejects_otherwise_improved_composite(self):
   original=raw('blue');f=finding([.1,.1,.2,.2])
