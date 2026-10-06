@@ -1,18 +1,9 @@
 {
   "schema_version": 1,
-  "mode": "synthetic_manifest_only",
-  "note": "Manifest specifies evaluation prompts/criteria only; it contains no images or claimed generation/API outputs.",
-  "cases": [
-    {"id":"portrait","scene":"single fictional portrait","requirements":["face unobstructed","vertical composition"],"metrics":["fidelity","identity","latency","calls"]},
-    {"id":"two_heroes","scene":"two fictional characters interacting","requirements":["exactly two subjects","interaction legible"],"metrics":["fidelity","anatomy","identity"]},
-    {"id":"hands","scene":"fictional subject holding a small object","requirements":["hands visible","grip plausible"],"metrics":["anatomy","fidelity"]},
-    {"id":"crowd","scene":"small fictional crowd of full figures","requirements":["all requested figures present","no unintended crops"],"metrics":["fidelity","anatomy"]},
-    {"id":"required_text","scene":"fictional poster with exact caption PLACEHOLDER TITLE","requirements":["caption exactly PLACEHOLDER TITLE"],"metrics":["text","fidelity"]},
-    {"id":"reference_roles","scene":"fictional character in a distinct environment","requirements":["subject ref affects character only","background ref affects setting only","style ref affects rendering"],"metrics":["fidelity","identity"]},
-    {"id":"local_edit","scene":"localized edit of a fictional image","requirements":["only requested region changed","no visible seam"],"metrics":["seams","fidelity"]},
-    {"id":"edge_subject","scene":"fictional subject near frame edge","requirements":["limbs not accidentally clipped","edge context retained"],"metrics":["fidelity","anatomy"]},
-    {"id":"wide_vertical","scene":"same fictional scene requested in wide and vertical formats","requirements":["orientation obeyed","no misleading ratio claim"],"metrics":["fidelity","latency"]},
-    {"id":"short_series","scene":"three-page fictional visual story","requirements":["three distinct pages","character design consistent"],"metrics":["identity","fidelity","calls"]}
-  ],
-  "scoring": {"human_review_required": true, "llm_score_is_not_acceptance": true, "repeat_runs_for_stochastic_cases": 3}
+  "description": "Synthetic offline harness contract fixture; no generated image quality claims.",
+  "runs": [
+    {"id":"base-01","variant":"single","quality":{"fidelity":0.8,"anatomy":0.7,"text":0.9,"seams":1.0},"cost_usd":0.04,"timing_ms":{"generation":12000,"qa":900},"calls":{"generation":1,"qa":1},"artifacts":["synthetic://base-01"]},
+    {"id":"base-02","variant":"single","quality":{"fidelity":0.6,"anatomy":0.8,"text":0.8,"seams":0.9},"cost_usd":0.05,"timing_ms":{"generation":14000,"qa":1100},"calls":{"generation":1,"qa":1},"artifacts":["synthetic://base-02"]},
+    {"id":"candidate-01","variant":"two-candidates","quality":{"fidelity":0.9,"anatomy":0.8,"text":0.9,"seams":0.9},"cost_usd":0.1,"timing_ms":{"generation":24000,"qa":1800},"calls":{"generation":2,"qa":2},"artifacts":["synthetic://candidate-01a","synthetic://candidate-01b"]}
+  ]
 }

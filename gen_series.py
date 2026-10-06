@@ -55,7 +55,13 @@ def parse_multipage_plan(output: str, pages_count: int, *, user_aspect=None, rep
             if not isinstance(refs,list) or any(not isinstance(r,str) or not r for r in refs): raise SeriesPlanError(f"invalid refs on page {n}")
             pages.append(SeriesPage(n,p.strip(),aspect,tuple(dict.fromkeys(refs)))); seen.add(n)
         if seen != set(range(1,pages_count+1)): raise SeriesPlanError("pages must be numbered 1..N without gaps")
-        if not isinstance(bible,dict): raise SeriesPlanError("bible must be an object")
+        if not isinstance(bible,dict) or any(not isinstance(k, str) for k in bible): raise SeriesPlanError("bible must be an object with string keys")
+        # Snapshot canonical JSON data so downstream page generation cannot mutate
+        # the planner-owned object and silently change series continuity.
+        try:
+            bible = json.loads(json.dumps(bible, ensure_ascii=False, sort_keys=True))
+        except (TypeError, ValueError) as exc:
+            raise SeriesPlanError("bible must contain JSON-compatible values") from exc
         pages.sort(key=lambda p:p.number)
         canonical=json.dumps({"pages":[p.__dict__ for p in pages],"bible":bible,"version":version},sort_keys=True,ensure_ascii=False)
         return SeriesPlan(tuple(pages),dict(bible),version,sha256(canonical.encode()).hexdigest())
@@ -73,16 +79,70 @@ class SeriesCheckpoint:
     plan_id: str
     completed: dict = field(default_factory=dict)
     failures: dict = field(default_factory=dict)
+    delivered: set = field(default_factory=set)
+
+    def to_json(self) -> str:
+        """Serialize checkpoint metadata/artifact references; bytes become base64."""
+        import base64
+        def encode(v):
+            if isinstance(v, bytes): return {"$bytes": base64.b64encode(v).decode("ascii")}
+            if isinstance(v, dict): return {str(k): encode(x) for k, x in v.items()}
+            if isinstance(v, (list, tuple)): return [encode(x) for x in v]
+            if v is None or type(v) in (str, int, float, bool): return v
+            raise SeriesPlanError(f"unsupported checkpoint value: {type(v).__name__}")
+        return json.dumps({"schema":1,"plan_id":self.plan_id,"completed":encode(self.completed),"failures":encode(self.failures),"delivered":sorted(self.delivered)}, sort_keys=True)
+
+    @classmethod
+    def from_json(cls, raw: str, *, plan: SeriesPlan):
+        import base64
+        def decode(v):
+            if isinstance(v, dict) and set(v) == {"$bytes"}:
+                try: return base64.b64decode(v["$bytes"], validate=True)
+                except Exception as exc: raise SeriesPlanError("invalid checkpoint artifact encoding") from exc
+            if isinstance(v, dict): return {k: decode(x) for k, x in v.items()}
+            if isinstance(v, list): return [decode(x) for x in v]
+            return v
+        try: data=json.loads(raw)
+        except Exception as exc: raise SeriesPlanError("invalid checkpoint JSON") from exc
+        if not isinstance(data, dict) or data.get("schema") != 1 or data.get("plan_id") != plan.plan_id:
+            raise SeriesPlanError("checkpoint schema/plan mismatch")
+        completed=decode(data.get("completed",{})); failures=decode(data.get("failures",{}))
+        valid={p.number for p in plan.pages}
+        if not isinstance(completed,dict) or not isinstance(failures,dict): raise SeriesPlanError("invalid checkpoint maps")
+        try:
+            completed={int(k):v for k,v in completed.items()}; failures={int(k):v for k,v in failures.items()}
+        except (TypeError, ValueError) as exc: raise SeriesPlanError("invalid checkpoint page number") from exc
+        if not (set(completed)|set(failures)) <= valid: raise SeriesPlanError("checkpoint contains an unknown page")
+        delivered=data.get("delivered", [])
+        if not isinstance(delivered,list) or any(type(n) is not int for n in delivered) or not set(delivered) <= valid or not set(delivered) <= set(completed):
+            raise SeriesPlanError("invalid checkpoint delivery markers")
+        return cls(plan.plan_id, completed, failures, set(delivered))
 
 async def execute_series(plan: SeriesPlan, *, generate, checkpoint: SeriesCheckpoint | None = None, save_checkpoint=None, deliver=None, max_input_bytes=None, anchor_selector=None):
-    """Run missing pages only. Callbacks are async-compatible and fully injected."""
+    """Run missing pages only. Persist generated artifacts before delivery and resume delivery separately."""
     import inspect
     state=checkpoint or SeriesCheckpoint(plan.plan_id)
     if state.plan_id != plan.plan_id: raise SeriesPlanError("checkpoint belongs to a different immutable plan")
     results=dict(state.completed)
     anchor=anchor_selector(results) if anchor_selector and results else None
     for page in plan.pages:
-        if page.number in results: continue
+        if page.number in results:
+            state.failures.pop(page.number, None)
+            if deliver and page.number not in state.delivered:
+                try:
+                    v=deliver(page, results[page.number])
+                    if inspect.isawaitable(v): await v
+                    state.delivered.add(page.number)
+                    if save_checkpoint:
+                        v=save_checkpoint(state)
+                        if inspect.isawaitable(v): await v
+                except Exception as exc:
+                    state.failures[page.number]=f"delivery {type(exc).__name__}: {exc}"
+                    if save_checkpoint:
+                        v=save_checkpoint(state)
+                        if inspect.isawaitable(v): await v
+                    return state
+            continue
         try:
             kwargs={"page":page,"bible":plan.bible,"anchor":anchor,"max_input_bytes":max_input_bytes}
             result=generate(**kwargs)
@@ -96,8 +156,13 @@ async def execute_series(plan: SeriesPlan, *, generate, checkpoint: SeriesCheckp
             if deliver:
                 v=deliver(page,result)
                 if inspect.isawaitable(v): await v
+                state.delivered.add(page.number)
+                if save_checkpoint:
+                    v=save_checkpoint(state)
+                    if inspect.isawaitable(v): await v
         except Exception as exc:
-            state.completed=dict(results); state.failures[page.number]=f"{type(exc).__name__}: {exc}"
+            phase = 'delivery ' if page.number in results else 'generation '
+            state.completed=dict(results); state.failures[page.number]=f"{phase}{type(exc).__name__}"
             if save_checkpoint:
                 v=save_checkpoint(state)
                 if inspect.isawaitable(v): await v

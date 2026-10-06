@@ -1,47 +1,44 @@
-# Image pipeline evaluation (offline by default)
+# Offline image-pipeline evaluation
 
-`tests/fixtures/gen_eval/manifest.json` is a prompt/criteria catalogue only. It has no personal references, image fixtures, credentials, or purported provider outputs.
+This harness evaluates **recorded evidence only**. It does not invoke image generation, a vision model, OCR, or network services. Synthetic fixture values are executable contract examples, not model-quality findings.
 
-## Deterministic run
+## Run
 
 From the repository root:
 
 ```sh
-/home/hermes/integrations/telegram-user/venv/bin/python qa_artifacts/evaluate_pipeline.py
+/home/hermes/integrations/telegram-user/venv/bin/python -m unittest tests.test_gen_evaluation -v
+/home/hermes/integrations/telegram-user/venv/bin/python gen_evaluation.py tests/fixtures/gen_eval/manifest.json
 ```
 
-The runner validates manifest structure and emits `defined_not_run` per case with `live_calls: 0`, `images_generated: 0`. It does not measure image quality and makes no provider claims.
+The manifest must use `schema_version: 1`. Every run records a unique `id`, `variant`, non-empty quality dimensions scored by a declared evaluator (0..1), measured `cost_usd`, measured per-stage `timing_ms`, integer per-stage `calls`, and artifact references. Missing measurements are rejected, not imputed. Keep repeated stochastic runs and inspect individual artifacts; means are descriptive only and not a significance test. Human visual review remains necessary for fidelity, identity, anatomy, composition, text, and repair seams.
 
-## Optional bounded callback
+## Experimental controls
 
-Import `load_manifest` and `run_bounded_live` from `qa_artifacts.evaluate_pipeline`. Supply an explicitly selected async/sync callback that accepts one case dictionary. The helper allows at most 3 cases and at most 180 seconds per awaitable; it has no provider configuration and does not make network calls itself. The callback owner is responsible for permission, provider route, costs, artifacts, and actual-output verification. Never interpret callback success as evidence of an image's quality. Retain actual output images separately for human review; do not put private images in the manifest or source control.
+- Candidate sampling defaults to one. A count greater than one requires explicit `enabled=True`; no production integration is performed by this module.
+- OCR is dependency-injected (`inspect_required_text`); absent adapter is explicitly unavailable. Adapter output is not a universal OCR benchmark and should be retained with its implementation/version in experiment records.
+- Upscale reports source/output dimensions and method separately. It explicitly makes no detail-improvement claim; assess faces/text/details by blind visual comparison.
+- Mask experiments are rejected unless the selected `ProviderProfile.supports_masks` is true. Capability declaration alone does not imply mask quality.
+- Record prompt/schema/provider/model revision and actual provider costs/timing/artifact locations alongside each experiment (extend the run manifest as needed); never store credentials or private reference images in fixtures.
 
-## Review protocol
+Fixture runs use `synthetic://` artifact identifiers and plausible dummy measurements solely to exercise validation and aggregation. They must not be cited as measured production results. No user images or external generation are part of the harness.
 
-For stochastic scenes use at least three runs, compare the same requirement checklist and record actual provider/model, dimensions, stage durations, and calls from real run metadata. Review fidelity, anatomy, identity, seams, exact text, latency, and calls separately. Provide candidate images to a human reviewer; an LLM score is not acceptance. Compare multi-candidate generation against generation plus repair only in a separately approved, bounded experiment. Keep best-of routing, OCR/text rendering, multi-scale QA, mask edits, upscaling, and model routing disabled absent measured results and owner approval.
+## Reading comparisons
 
-## Runtime job API (integration reference)
+Compare variants on the same scene set and multiple stochastic seeds. Report per-dimension quality alongside cost, latency, call count, and sample count. A higher mean quality with higher spend/latency is a tradeoff, not an automatic win. Never select or enable routing, best-of-N, repair, OCR rendering, mask editing, or upscaling from a single favorable sample. Preserve raw evaluator notes and show candidates to a human reviewer.
 
-`GenerationJobs(store=JobStore(path), gate=GlobalRateGate(max_concurrent=N, min_interval=seconds), max_queue=..., default_deadline=...)`; call `await startup()` once at process boot. Submit provider work via `await submit(chat_id, callable, *args, artifact_store=ArtifactStore(...), context_budget=ContextBudget(...), deadline=seconds)`. It returns a `JobRecord` immediately; observe `record.status` or drain at shutdown with `await drain(timeout)`, which closes intake first. `await resume_intake()` reopens it. Delivery is deliberately separate: `await retry_delivery(job_id, deliver_callback, attempts=...)` reads the retained artifact path and never regenerates. Provider callbacks should be synchronous when wrapping a blocking SDK; `GlobalRateGate` tracks a worker thread through its actual completion even after cancellation/timeout. Use one shared gate instance for all generation/repair/series calls in this process.
+CLI rejects malformed/incomplete manifests with a non-zero error; the Python API raises `EvaluationError`.
 
-The coordinator is process-local (not distributed); JSON snapshots are atomically replaced and stale queued/running/delivering jobs become `interrupted` on boot and require explicit recovery. Do not automatically rerun paid work. No Telegram adapter is wired by this module.
+### Current harness scope
 
-## Runtime limits / caveats
+Implemented: strict measured-evidence validation, per-variant descriptive aggregation, opt-in candidate-count policy helper, injectable optional OCR adapter, explicit upscale measurement labels, and profile-gated mask option. Not implemented: actual generation, visual scoring, OCR engine, model routing, upscaler, or provider mask request. No external generation was run for this task.
 
-Choose queue/call/context limits and artifact TTL/quota from real usage, not this deterministic harness. Artifacts may contain user data: configure a project-isolated private directory, enforce TTL/quota, and restrict permissions/backups. The current `drain` waits for running tasks; if its timeout expires, keep the process alive or apply an explicit shutdown policy. A Python thread cannot be forcibly stopped; the semaphore remains held until the callback returns.
+### Synthetic fixture summary
 
-This evaluation task intentionally has not called Telegram or any image-generation API.
+The fixture contains 2 `single` runs and 1 `two-candidates` run, with intentionally illustrative quality/cost/timing/call fields. These are schema-test data only, not empirical findings.
 
-## Measured results
+## Future evidence report template
 
-No live generation, delivery, benchmark, or human visual assessment was run for this implementation. Offline manifest validation and local unit tests only.
+For a real approved experiment, add a separate report containing date/runtime, dataset version and permission status, model/provider identity, scene-level blind assessments, n and seed, artifact references, measured quality dimensions, call count, latency and cost, OCR exact-match where applicable, and explicit limitations. Do not overwrite synthetic fixture numbers with claims unless they are actually measured.
 
-## Delivery/retention guarantees
-
-A successful byte result can be written atomically by `ArtifactStore`; delivery retries reference that saved file. Pruning applies age first and then oldest-first total quota. The caller must ensure artifact paths survive long enough for retry and remove expired job metadata separately according to its retention policy.
-
-## Limitations
-
-Concurrency coordination is in-memory per process; multi-process deployments need a shared queue/lock backend before claiming global limits across processes. The interval rate gate is global only within the shared object/process. Fairness is FIFO per chat, while concurrently submitted chats contend for available slots normally.
-
-No execution above enables or changes the disabled layered-generation path.
+**Decision:** no experimental behavior enabled by this offline harness. Further production integration requires separate review and evidence.

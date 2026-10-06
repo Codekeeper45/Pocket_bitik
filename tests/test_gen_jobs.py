@@ -50,4 +50,36 @@ class GenerationJobsTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(await self.jobs.drain(1))
         with self.assertRaisesRegex(RuntimeError, "draining"): await self.jobs.submit("c", lambda: 1)
 
+    async def test_chat_round_robin_fifo(self):
+        gate = GlobalRateGate(1)
+        jobs = GenerationJobs(store=JobStore(Path(self.tmp.name) / "fair.json"), gate=gate)
+        order = []
+        started = asyncio.Event()
+        def work(label):
+            order.append(label)
+            if label == "a1": started_loop.call_soon_threadsafe(started.set)
+            time.sleep(.01)
+            return label
+        started_loop = asyncio.get_running_loop()
+        first = await jobs.submit("A", work, "a1")
+        await started.wait()
+        await jobs.submit("A", work, "a2")
+        await jobs.submit("B", work, "b1")
+        self.assertTrue(await jobs.drain(2))
+        # FIFO within A is guaranteed; B arrives after A2 has already claimed
+        # the next fair turn, so arrival interleaving is intentionally deterministic.
+        self.assertEqual(order, ["a1", "a2", "b1"])
+        self.assertEqual(first.status, "completed")
+
+    async def test_run_event_lazily_starts_and_records_delivery_failure(self):
+        from gen_jobs import GenerationJobs, JobStore, GlobalRateGate
+        jobs = GenerationJobs(store=JobStore(Path(self.tmp.name) / "lazy.json"), gate=GlobalRateGate(1))
+        rec = await jobs.run_event("chat", lambda: b"image", artifact_store=ArtifactStore(Path(self.tmp.name) / "art"))
+        self.assertEqual(rec.status, "completed")
+        async def fail_delivery(path): raise OSError("private payload must not persist")
+        with self.assertRaises(OSError): await jobs.retry_delivery(rec.job_id, fail_delivery, attempts=1)
+        data = await jobs.store.load()
+        self.assertEqual(data["jobs"][rec.job_id]["status"], "delivery_failed")
+        self.assertEqual(data["jobs"][rec.job_id]["error"], "OSError")
+
 if __name__ == "__main__": unittest.main()

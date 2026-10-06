@@ -39,3 +39,10 @@ env/
 voice_samples/
 qa_artifacts/
 remote_baseline.py
+# Generation state contains private prompts/reference artifacts, never versioned.
+gen_artifacts/
+gen_delivery_records/
+gen_series_state/
+gen_activity.json
+gen_jobs.json
+gen_series_jobs.json

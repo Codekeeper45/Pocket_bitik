@@ -97,13 +97,17 @@ class GlobalRateGate:
             try:
                 return await asyncio.wait_for(asyncio.shield(fut), timeout) if timeout else await asyncio.shield(fut)
             except (asyncio.CancelledError, asyncio.TimeoutError):
-                try:
-                    await asyncio.shield(fut)
-                except Exception:
-                    pass
+                # Caller exits promptly; unfinished blocking work retains its slot.
+                held_by_future = True
+                def release_when_done(done):
+                    self.semaphore.release()
+                    if not done.cancelled():
+                        done.exception()  # retrieve late provider error
+                fut.add_done_callback(release_when_done)
                 raise
         finally:
-            self.semaphore.release()
+            if not locals().get('held_by_future', False):
+                self.semaphore.release()
 
     @property
     def inflight_threads(self) -> int:
@@ -177,8 +181,18 @@ class GenerationJobs:
         self._accepting = True
         self._active: set[asyncio.Task] = set()
         self._tasks: dict[str, asyncio.Task] = {}
+        self._changed = asyncio.Event()
+        self._started = False
+        self._startup_lock = asyncio.Lock()
+        self._reserved = 0
 
     async def startup(self) -> list[str]:
+        async with self._startup_lock:
+            return await self._startup_once()
+
+    async def _startup_once(self) -> list[str]:
+        if self._started:
+            return []
         data = await self.store.load()
         old = data.get("jobs", {})
         interrupted = []
@@ -188,6 +202,7 @@ class GenerationJobs:
                 raw["updated_at"] = raw["heartbeat_at"] = time.time(); interrupted.append(jid)
             self.jobs[jid] = JobRecord(**{k: raw[k] for k in JobRecord.__dataclass_fields__ if k in raw})
         await self._persist()
+        self._started = True
         return interrupted
 
     async def _persist(self) -> None:
@@ -196,14 +211,19 @@ class GenerationJobs:
     async def submit(self, chat_id: str | int, work: Callable[..., Any], *args: Any,
                      artifact_store: Optional[ArtifactStore] = None, context_budget: Optional[ContextBudget] = None,
                      deadline: Optional[float] = None) -> JobRecord:
+        if not self._started:
+            await self.startup()
         chat = str(chat_id)
         async with self._lock:
             if not self._accepting: raise RuntimeError("job intake is draining")
-            if sum(len(q) for q in self._waiting.values()) + len(self._active) >= self.max_queue: raise RuntimeError("generation queue full")
+            if sum(r.status in {'queued','running'} for r in self.jobs.values()) >= self.max_queue:
+                raise RuntimeError("generation queue full")
+            self._reserved += 1
             rec = JobRecord(job_id=uuid.uuid4().hex, chat_id=chat, boot_id=self.boot_id)
             self.jobs[rec.job_id] = rec
             q = self._waiting.setdefault(chat, deque()); q.append(rec.job_id)
             if chat not in self._chat_rotation: self._chat_rotation.append(chat)
+            self._changed.set()
             await self._persist()
         task = asyncio.create_task(self._execute(rec, work, args, artifact_store, context_budget, deadline or self.default_deadline))
         self._active.add(task); task.add_done_callback(self._active.discard)
@@ -211,24 +231,39 @@ class GenerationJobs:
         return rec
 
     async def _fair_turn(self, rec: JobRecord) -> None:
-        # Per-chat turn order: each job waits until it is the head of its chat queue.
+        # Round-robin by chat, preserving FIFO within each chat.
         while True:
             async with self._lock:
                 q = self._waiting.get(rec.chat_id, deque())
-                if q and q[0] == rec.job_id:
+                if q and q[0] == rec.job_id and self._chat_rotation and self._chat_rotation[0] == rec.chat_id:
+                    self._chat_rotation.popleft()
                     q.popleft()
-                    if q: self._chat_rotation.append(rec.chat_id)
+                    if q:
+                        self._chat_rotation.append(rec.chat_id)
                     else: self._waiting.pop(rec.chat_id, None)
+                    self._reserved -= 1
+                    self._changed.set()
                     return
-            await asyncio.sleep(.005)
+                self._changed.clear()
+            await self._changed.wait()
+
+    async def run_event(self, chat_id: str | int, work: Callable[..., Any], *args: Any, **kwargs: Any) -> JobRecord:
+        """Enqueue and await one event's terminal record; suitable for handler hooks."""
+        rec = await self.submit(chat_id, work, *args, **kwargs)
+        task = self._tasks.get(rec.job_id)
+        if task:
+            await asyncio.shield(task)
+        return rec
 
     async def _execute(self, rec: JobRecord, work: Callable[..., Any], args: tuple[Any, ...],
                        artifact_store: Optional[ArtifactStore], budget: Optional[ContextBudget], deadline: float) -> None:
-        await self._fair_turn(rec)
-        rec.status = "running"; rec.updated_at = rec.heartbeat_at = time.time(); rec.attempts += 1; await self._persist()
+        expires = time.monotonic() + deadline
         try:
+            await asyncio.wait_for(self._fair_turn(rec), timeout=deadline)
+            rec.status = "running"; rec.updated_at = rec.heartbeat_at = time.time(); rec.attempts += 1; await self._persist()
             if budget: budget.consume_call()
-            result = await asyncio.wait_for(self.gate.run(work, *args, timeout=deadline), timeout=deadline)
+            remaining = max(.001, expires - time.monotonic())
+            result = await asyncio.wait_for(self.gate.run(work, *args, timeout=remaining), timeout=remaining)
             if isinstance(result, bytes) and artifact_store:
                 rec.artifact_path = str(artifact_store.save(rec.job_id, result))
             rec.status = "completed"
@@ -237,6 +272,16 @@ class GenerationJobs:
         except Exception as exc:
             rec.status = "failed"; rec.error = type(exc).__name__
         finally:
+            async with self._lock:
+                q = self._waiting.get(rec.chat_id)
+                if q and rec.job_id in q:
+                    q.remove(rec.job_id)
+                    self._reserved = max(0, self._reserved-1)
+                    if not q:
+                        self._waiting.pop(rec.chat_id, None)
+                        try: self._chat_rotation.remove(rec.chat_id)
+                        except ValueError: pass
+                    self._changed.set()
             rec.updated_at = rec.heartbeat_at = time.time(); await self._persist()
 
     async def retry_delivery(self, job_id: str, deliver: Callable[[Path], Awaitable[Any] | Any], *, attempts: int = 3) -> Any:
@@ -260,8 +305,19 @@ class GenerationJobs:
         rec = self.jobs[job_id]
         if rec.status not in {"queued", "running"}: return False
         task = self._tasks.get(job_id)
-        if task and not task.done(): task.cancel()
-        rec.status = "cancelled"; rec.updated_at = time.time(); await self._persist(); return True
+        if task and not task.done():
+            task.cancel()
+        async with self._lock:
+            q = self._waiting.get(rec.chat_id)
+            if q and job_id in q:
+                q.remove(job_id); self._reserved = max(0, self._reserved - 1)
+                if not q:
+                    self._waiting.pop(rec.chat_id, None)
+                    try: self._chat_rotation.remove(rec.chat_id)
+                    except ValueError: pass
+                self._changed.set()
+        rec.status = "cancelled"; rec.updated_at = time.time(); await self._persist()
+        return True
 
     async def drain(self, timeout: Optional[float] = None) -> bool:
         """Stop intake and wait for work. Returns false if deadline expires."""

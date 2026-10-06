@@ -162,4 +162,40 @@ def rewrite_ref_numbers(prompt: str, mapping: dict[int, int]) -> str:
     return re.sub(r"\bREF\s*#?(\d+)\b", lambda m: f"REF #{mapping[int(m.group(1))]}" if int(m.group(1)) in mapping else m.group(0), prompt, flags=re.I)
 
 
-__all__ = ["Reference", "ReferenceRegistry", "make_reference", "resize_image", "TelegramLink", "parse_telegram_link", "filter_refs", "remap_roles", "rewrite_ref_numbers"]
+def provider_inputs(prompt, inputs, profile, *, references=()):
+    """Validate and serialize provider images in stable order; fail rather than drop refs."""
+    import base64
+    import json
+    from gen_provider import validate_image
+
+    if not isinstance(prompt, str):
+        raise ValueError("prompt must be text")
+    if isinstance(profile.max_images, bool) or not isinstance(profile.max_images, int) or profile.max_images < 0:
+        raise ValueError("provider max_images must be a nonnegative integer")
+    if isinstance(profile.max_bytes, bool) or not isinstance(profile.max_bytes, int) or profile.max_bytes < 1:
+        raise ValueError("provider max_bytes must be a positive integer")
+    values = tuple(inputs)
+    if len(values) > profile.max_images:
+        raise ValueError(f"image count {len(values)} exceeds provider limit {profile.max_images}")
+    if references and len(references) != len(values):
+        raise ValueError("reference/input count mismatch; refusing to alter image indices")
+    packed = []
+    for index, value in enumerate(values, 1):
+        if isinstance(value, str):
+            try:
+                raw = base64.b64decode(value, validate=True)
+            except Exception as exc:
+                raise ValueError(f"input image {index} has invalid base64") from exc
+        elif isinstance(value, (bytes, bytearray)):
+            raw = bytes(value)
+        else:
+            raise ValueError(f"input image {index} must be bytes or base64 text")
+        image = validate_image(raw, max_bytes=profile.max_bytes)
+        packed.append(f"data:{image.mime_type};base64,{base64.b64encode(image.data).decode('ascii')}")
+    payload = json.dumps({"prompt": prompt, "images": packed}, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+    if len(payload) > profile.max_bytes:
+        raise ValueError(f"provider payload exceeds byte limit ({len(payload)} > {profile.max_bytes})")
+    return prompt, tuple(packed)
+
+
+__all__ = ["Reference", "ReferenceRegistry", "make_reference", "resize_image", "TelegramLink", "parse_telegram_link", "filter_refs", "remap_roles", "rewrite_ref_numbers", "provider_inputs"]
