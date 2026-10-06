@@ -13,7 +13,8 @@ QA получает готовые байты, исходный запрос и 
 - unittest: test_gen_unified, test_gen_regions_geometry, test_gen_regions_integration, test_gen_image_layers, test_gen_layers_integration, test_reliability_helpers.
 - qa_artifacts/probe_alpha.py: реальный ответ HTTP 200, RGBA, alpha 0..255, 1048647 полностью прозрачных пикселей.
 - qa_artifacts/probe_layers_live.py: фон + одна независимая группа, итог PNG 1536x1024, 2734254 байт. Повторный независимый осмотр обнаружил слабые контактные тени и спорную кисть; результат нельзя называть идеальным.
-- qa_artifacts/probe_regions_live.py: реальный проблемный исходник из Socrate Store 11088, полный QA, crop edit, композит и пиксельная проверка вне регионов.
+- qa_artifacts/probe_regions_live.py: реальный исходник Socrate Store 11088; найдены две уверенные зоны, отремонтированы обе, принята одна, вторая откачена из-за недоказанного улучшения. Проверка пикселей вне регионов: difference=null. Повторный независимый осмотр обнаружил остаточную разницу фактуры на лбу и дефекты массовки. После этого добавлена явная проверка швов/ореолов с откатом, но без обещания их полного отсутствия.
+- Полный unittest discover: 46 тестов прошли с тестовыми env; запуск без env падал на существующем test_cp.py из-за отсутствия Telegram api_id/api_hash.
 
 ## Эксплуатация
 
