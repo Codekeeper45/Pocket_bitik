@@ -48,6 +48,8 @@ def parse_plan(text, width, height, user_prompt):
     if not isinstance(requested, list):
         raise LayerError("requested_identities must be a list")
     # Planner must preserve every explicitly requested name/count verbatim in its declared roster.
+    # Unnamed subjects must use stable string identifiers, never nullable roster entries.
+    requested = [item for item in requested if item is not None and item != '']
     for item in requested:
         if not isinstance(item, str) or not item.strip():
             raise LayerError("requested_identities entries must be nonempty strings")
@@ -84,7 +86,7 @@ def composite_layers(background, layers, size, blur_background=False):
 
 def make_planner_prompt(user_prompt, width, height):
     return ("Return JSON only with keys style, lighting, perspective, background, requested_identities, layers. "
-            "background: {prompt}. layers: array of independently renderable character/group objects, each with prompt, identities array, "
+            "background: {prompt}. requested_identities is an array of name strings, [] for unnamed subjects, never null entries. layers: array of independently renderable character/group objects, each with prompt, identities array, "
             "and normalized x,y,w,h (0..1). Preserve EVERY person/count/name explicitly requested; do not cap named characters. "
             "Use as many layers/groups as budget permits, group only when identity/count remains explicit. Keep one coherent style, light direction, "
             "camera/perspective and ground plane across assets. Foreground prompts MUST request isolated subjects on genuinely transparent RGBA alpha, "
