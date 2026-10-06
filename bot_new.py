@@ -48,6 +48,7 @@ except ImportError:
 from types import SimpleNamespace
 from logging.handlers import RotatingFileHandler
 from datetime import datetime, timedelta, timezone
+from gen_image_layers import LayerError, parse_plan as _parse_layer_plan, composite_layers as _composite_image_layers, make_planner_prompt as _make_layer_planner_prompt
 
 # Логирование с ротацией: bot.log до 50МБ × 10 ротированных копий (≤500МБ суммарно) + stdout.
 # ВАЖНО: запускать БЕЗ `> bot.log 2>&1` — конфликт с RotatingFileHandler.
@@ -3614,19 +3615,11 @@ _GEN_COMPOSITION_RULES = (
     "ТОЛПА: организуй группы в глубине, варьируй силуэты/жесты/направления взглядов и действия "
     "по событию; фокусные герои имеют больше внимания. Именной ансамбль сохраняет каждого "
     "героя и его подтверждённый дизайн; анонимная массовка допускает вариацию. "
-    "ПОСЛОЙНАЯ ПОСТАНОВКА ТОЛПЫ И ПЕРСОНАЖЕЙ (Layered Staging): при сложных многофигурных сценах "
-    "и наличии толпы разделяй композицию на три независимых визуальных слоя, чтобы избежать "
-    "смазывания и каши: 1) Задний слой (Background Plate) - чистая архитектура, улица или интерьер "
-    "с мотивированным светом, без случайных людей; 2) Слой массовки (Midground Crowd) - обособленные "
-    "группы людей на среднем плане с воздушными промежутками между силуэтами, без слипания контуров; "
-    "3) Слой главных персонажей (Foreground Hero Layer) - резкий фокус, четкие контуры, приоритетный "
-    "свет и выразительные жесты, без наложения и слияния с фоновой толпой. "
-    "КИНЕМАТОГРАФИЧЕСКИЙ РАСФОКУС ТОЛПЫ (Depth of Field): при сценах с большой толпой (более 8-10 человек) "
-    "принудительно задавай оптическую глубину резкости: бритвенно-резкий фокус на ключевых героях "
-    "переднего плана и мягкое кинематографическое размытие (soft cinematic depth-of-field bokeh) на массовке "
-    "среднего и дальнего планов. Это устраняет деформации лиц и зубов у фоновых фигур и создаёт кинематографичный объём. "
-    "Именные плашки размещай ТОЛЬКО над главными героями переднего плана (максимум 3-5 человек); строго запрещено "
-    "разбрасывать микротекст и летающие плашки по головам людей в толпе. "
+    "ПОСЛОЙНАЯ ПОСТАНОВКА: при явной просьбе о независимых слоях или сложной толпе "
+    "планируй фон (Background Plate), массовку и главных героев (Foreground Hero Layer) отдельными объектами, сохраняя точное число "
+    "и все названные личности; не ограничивай количество именных героев произвольным потолком. "
+    "Размытие не обязательно: используй его только если оно мотивировано сценой, только для фона, "
+    "и никогда не размывай requested identities или требуемый текст. Именные подписи добавляй только по просьбе. "
     "КАРТОЧКА ПЕРСОНАЖА (Model Sheet / Turnaround): при запросе концепта или карточки героя создавай "
     "многоракурсный лист (вид спереди, сбоку, сзади на чистом нейтральном фоне), фиксируй точные "
     "палитры, одежду, форму волос и черты лица для их повторного использования как мастер-референса. "
@@ -8147,11 +8140,11 @@ def _clamp_resolution(size, supported):
     return max(le, key=lambda s: _RES_RANK[s]) if le else min(ok, key=lambda s: _RES_RANK[s])
 
 
-_GEN_VISUAL_QA_PROMPT = '''Оцени именно ПРИЛОЖЕННОЕ ГОТОВОЕ изображение, а не референс. Сопоставь с исходными требованиями пользователя и промптом генерации. Не требуй фотореализма: намеренная стилизация, мультяшность, живописная условность и необычная анатомия в явно стилизованной работе сами по себе не дефекты. Не угадывай личность/имя неизвестного человека. Найди только очевидные существенные ошибки изображения: сломанные/лишние части тела, грубо искажённые предметы, нечитаемый обязательный текст, пропущенное ключевое требование. Мелкие, спорные или стилевые особенности игнорируй. Верни только JSON вида {"findings":[{"severity":"high|medium|low","issue":"...","location":"...","confidence":0.0}]}; если существенных дефектов нет, findings=[] . Учитывай исходный запрос как приоритетный.'''
+_GEN_VISUAL_QA_PROMPT = '''Оцени именно ПРИЛОЖЕННОЕ ГОТОВОЕ изображение, а не референс. Сопоставь с исходными требованиями пользователя и промптом генерации. Не требуй фотореализма: намеренная стилизация, мультяшность, живописная условность и необычная анатомия в явно стилизованной работе сами по себе не дефекты. Не угадывай личность/имя неизвестного человека. Найди только очевидные существенные ошибки изображения: сломанные/лишние части тела, грубо искажённые предметы, нечитаемый обязательный текст, пропущенное ключевое требование. Мелкие, спорные или стилевые особенности игнорируй. Верни только JSON вида {"findings":[{"severity":"high|medium|low","issue":"...","location":"...","confidence":0.0,"bbox":[0.1,0.1,0.2,0.2]}]}; если существенных дефектов нет, findings=[] . Для каждой локальной ошибки укажи bbox точной проблемной области в нормализованных координатах [лево,верх,право,низ] от 0 до 1; координаты относятся именно к приложенному изображению. Найди ВСЕ видимые дефектные зоны за один проход, включая лица среднего плана, не прикрывай мутации словом стилизация. Для глобальной ошибки сюжета bbox=null, не придумывай область. Учитывай исходный запрос как приоритетный.'''
 
 
 async def _gen_visual_qa(raw: bytes, user_prompt: str, final_prompt: str):
-    """Best-effort, single-pass visual QA of generated bytes; never changes or rejects output."""
+    """Single-pass localized QA; failure is distinct from verified clean output."""
     import json
     request = (f"Исходный запрос пользователя:\n{user_prompt[:3000]}\n\n"
                f"Промпт генерации:\n{final_prompt[:5000]}\n\n{_GEN_VISUAL_QA_PROMPT}")
@@ -8170,15 +8163,132 @@ async def _gen_visual_qa(raw: bytes, user_prompt: str, final_prompt: str):
                 continue
             severity = item.get("severity")
             confidence = item.get("confidence")
-            if severity not in ("high", "medium", "low") or not isinstance(confidence, (int, float)):
-                continue
-            clean.append({"severity": severity, "issue": str(item.get("issue", ""))[:300],
-                          "location": str(item.get("location", "unspecified"))[:160],
-                          "confidence": max(0.0, min(1.0, float(confidence)))})
+            import math
+            if severity not in ("high", "medium", "low") or isinstance(confidence, bool) or not isinstance(confidence, (int, float)) or not math.isfinite(confidence):
+                raise ValueError('invalid finding severity/confidence')
+            finding = {"severity": severity, "issue": str(item.get("issue", ""))[:300],
+                       "location": str(item.get("location", "unspecified"))[:160],
+                       "confidence": max(0.0, min(1.0, float(confidence)))}
+            from gen_regions_geometry import validate_bbox
+            if validate_bbox(item.get('bbox')) is not None:
+                finding['bbox'] = validate_bbox(item['bbox'])
+            clean.append(finding)
+        if findings and not clean:
+            raise ValueError('nonempty findings contained no valid entries')
         return {"findings": clean}
     except Exception as e:
         log("GEN", f"Visual QA недоступен/невалиден: {type(e).__name__}: {str(e)[:180]}")
         return None
+
+
+def _gen_repair_findings(qa):
+    keys = ('лиц', 'глаз', 'зуб', 'рот', 'пальц', 'рук', 'анатом', 'мутац', 'челюст', 'бров', 'лоб', 'face', 'eye', 'teeth', 'mouth', 'hand', 'finger', 'brow', 'forehead')
+    return [f for f in (qa or {}).get('findings', []) if f['confidence'] >= 0.65 and
+            (f['severity'] == 'high' or (f['severity'] == 'medium' and any(k in f['issue'].lower() for k in keys)))]
+
+
+async def _gen_repair_regions(raw, mime, qa, user_prompt, final_prompt, gen_model, size, status_cb=None):
+    """Crop all localized defects once, repair separate crops, feather paste, validate full result."""
+    import io
+    from PIL import Image
+    from gen_regions_geometry import plan_regions, blend_patch
+    original = Image.open(io.BytesIO(raw)).convert('RGB')
+    issues = _gen_repair_findings(qa)
+    regions = plan_regions(issues, original.size, margin=0.35)
+    budget = max(1, min(12, int(os.getenv('GEN_REPAIR_REGION_BUDGET', '6'))))
+    if len(regions) > budget:
+        log('GEN', f'Region repair budget: {len(regions)} zones, processing {budget}; remainder not claimed repaired')
+    candidate = original.copy(); accepted = 0
+    for index, region in enumerate(regions[:budget], 1):
+        box = region['box']; crop = original.crop(box)
+        b = io.BytesIO(); crop.save(b, format='PNG')
+        local_issues = '; '.join(f['issue'] for f in region['findings'])
+        if status_cb:
+            await status_cb(f'🔧 Ремонт области {index}/{min(len(regions), budget)} с запасом…')
+        prompt = ('Repair this cropped image only: ' + local_issues + '. Preserve subject identity, pose, style, clothes, lighting, exact framing and edge context. '
+                  'Do not add people or zoom. Produce the corrected crop, not a full new scene. Original scene context: ' + final_prompt[:2000])
+        try:
+            await _gen_rate_gate()
+            fixed, _ = await asyncio.to_thread(_sync_generate_image, prompt, [base64.b64encode(b.getvalue()).decode()], gen_model, size, None)
+            crop_qa = await _gen_visual_qa(fixed, 'Correct only these local defects while preserving the crop: '+local_issues, prompt)
+            if crop_qa is None or _gen_repair_findings(crop_qa):
+                log('GEN', f'Region {index} not verified fixed; keeping original pixels'); continue
+            proposed = blend_patch(candidate, Image.open(io.BytesIO(fixed)), box)
+            proposed_bytes = io.BytesIO(); proposed.save(proposed_bytes, format='PNG')
+            # Validate seams and identity against the original user contract, NOT the repair prompt.
+            after = await _gen_visual_qa(proposed_bytes.getvalue(), user_prompt, final_prompt)
+            if after is None or len(_gen_repair_findings(after)) >= len(_gen_repair_findings(qa)):
+                log('GEN', f'Region {index} composite improvement unproven; reverting'); continue
+            candidate = proposed; qa = after; accepted += 1
+        except Exception as exc:
+            log('GEN', f'Region {index} failed: {type(exc).__name__}; keeping original')
+    if not accepted:
+        return raw, mime
+    out = io.BytesIO(); candidate.save(out, format='PNG')
+    log('GEN', f'Regional repair accepted {accepted}/{len(regions)}; remaining defects {len(_gen_repair_findings(qa))}')
+    return out.getvalue(), 'image/png'
+
+
+async def _gen_render_image(final_prompt, input_b64s, image_size, aspect_ratio, allow_repair, user_prompt, status_cb=None):
+    """Dispatch explicit independent layers; ordinary scenes retain the single-image path."""
+    import io
+    from PIL import Image
+    from gen_image_layers import parse_plan, composite_layers, make_planner_prompt, LayerError
+    wants_layers = bool(re.search(r"по\s+слоям|отдельн\w*\s+сло|layered\s+generation|independent\s+layers", user_prompt, re.I))
+    if not wants_layers:
+        return await _gen_one_image(final_prompt, input_b64s, image_size, aspect_ratio, allow_repair, user_prompt, status_cb)
+    async def progress(text):
+        if status_cb:
+            await status_cb(text)
+    try:
+        width, height = ((1536, 1024) if aspect_ratio == '16:9' else (1024, 1536) if aspect_ratio == '9:16' else (1024, 1024))
+        llm, mid, _ = get_active_model()
+        if llm is None:
+            raise LayerError('layer planner unavailable')
+        await progress('🎨 Планирую отдельные слои и расположение групп…')
+        response = await asyncio.to_thread(llm.chat.completions.create, model=mid,
+            messages=[{'role': 'system', 'content': make_planner_prompt(user_prompt, width, height)},
+                      {'role': 'user', 'content': 'Scene contract and resolved identities:\n' + final_prompt}],
+            max_tokens=8000, temperature=0.2)
+        plan = parse_plan(_extract_content(response.choices[0].message), width, height, user_prompt)
+        budget = max(2, min(32, int(os.getenv('GEN_LAYER_BUDGET', '12'))))
+        if len(plan['layers']) + 1 > budget:
+            raise LayerError(f"requested plan needs {len(plan['layers'])+1} generations, layer budget is {budget}; no people silently omitted")
+        shared = f"Style: {plan['style']}. Lighting: {plan['lighting']}. Perspective: {plan['perspective']}. "
+        background_prompt = shared + plan['background']['prompt'] + ' Background plate only, leave designated character placements empty.'
+        bg, mime, _, fallback = await _gen_one_image(background_prompt, input_b64s, image_size, aspect_ratio,
+            allow_repair, background_prompt, status_cb)
+        if bg is None:
+            return bg, mime, None, fallback
+        assets = []
+        for i, layer in enumerate(plan['layers'], 1):
+            await progress(f"🎨 Отдельная группа {i}/{len(plan['layers'])}…")
+            asset_prompt = shared + layer['prompt'] + ' Isolated full silhouettes on REAL TRANSPARENT RGBA alpha, generous transparent margins. No scenery or painted checkerboard.'
+            asset, asset_mime, _, _ = await _gen_one_image(asset_prompt, input_b64s, image_size, None,
+                allow_repair, asset_prompt, status_cb)
+            if asset is None:
+                raise LayerError(f'layer {i} generation failed: {asset_mime}')
+            assets.append((io.BytesIO(asset), layer))
+            # Validate actual alpha after every asset before spending more requests.
+            composite_layers(io.BytesIO(bg), assets, (width, height))
+        # Only blur background when the plan and user both request motivated blur.
+        blur = bool(plan.get('blur_background')) and bool(re.search(r'размы|расфокус|боке|blur|bokeh', user_prompt, re.I))
+        canvas = composite_layers(io.BytesIO(bg), assets, (width, height), blur_background=blur)
+        out = io.BytesIO(); canvas.save(out, format='PNG'); raw = out.getvalue()
+        qa = await _gen_visual_qa(raw, user_prompt, final_prompt)
+        if qa is None:
+            raise LayerError('final layered composite QA unavailable')
+        if _gen_repair_findings(qa):
+            raw, _ = await _gen_repair_regions(raw, 'image/png', qa, user_prompt, final_prompt, GEN_IMAGE_MODEL, image_size, status_cb)
+            qa = await _gen_visual_qa(raw, user_prompt, final_prompt)
+            if qa is None or _gen_repair_findings(qa):
+                raise LayerError('final composite has unresolved substantial defects; refusing unverified layered result')
+        log('GEN', f"Independent RGBA layers composed: {len(assets)} groups plus background; {width}x{height}")
+        return raw, 'image/png', final_prompt, fallback
+    except Exception as exc:
+        log('GEN', f'Independent layer generation failed: {type(exc).__name__}: {str(exc)[:250]}')
+        await progress('⚠️ Не удалось собрать проверенные отдельные слои. Генератор мог не вернуть настоящий alpha; результат не выдаю за послойный.')
+        return None, 'layers_failed', None, False
 
 
 async def _gen_one_image(final_prompt, input_b64s, image_size, aspect_ratio, allow_repair, user_prompt, status_cb=None):
@@ -8211,46 +8321,15 @@ async def _gen_one_image(final_prompt, input_b64s, image_size, aspect_ratio, all
         try:
             await _gen_rate_gate()
             raw, mime = await asyncio.to_thread(_sync_generate_image, fp, input_b64s or None, gen_model, size, aspect_ratio)
-            # QA the generated artifact bytes (not source refs); performs bounded targeted inpainting repair when defect is confident.
             qa = await _gen_visual_qa(raw, user_prompt, fp)
-            if qa and qa["findings"]:
-                _crit_kws = ("лиц", "глаз", "зуб", "рот", "пальц", "рук", "анатом", "мутац", "челюст", "face", "eye", "tooth", "teeth", "mouth", "hand", "finger")
-                high_issues = [
-                    f for f in qa["findings"]
-                    if (f["severity"] == "high" and f["confidence"] >= 0.65)
-                    or (f["severity"] == "medium" and f["confidence"] >= 0.65 and any(kw in f["issue"].lower() for kw in _crit_kws))
-                ]
-                for finding in qa["findings"]:
-                    log("GEN", f"Visual QA {finding['severity']} {finding['confidence']:.2f} @ {finding['location']}: {finding['issue']}")
-                if high_issues and allow_repair:
-                    primary_issue = high_issues[0]
-                    await _s(f"🔧 Vision обнаружил дефект ({primary_issue['location']}) — выполняю точечную автоправку…")
+            if qa and qa['findings']:
+                for finding in qa['findings']:
+                    log('GEN', f"Visual QA {finding['severity']} {finding['confidence']:.2f} @ {finding['location']}: {finding['issue']}")
+                if allow_repair and _gen_repair_findings(qa):
                     try:
-                        import base64
-                        raw_b64 = base64.b64encode(raw).decode('ascii')
-                        repair_prompt = (
-                            f"Targeted inpainting fix: strictly modify only the {primary_issue['location']} to correct: {primary_issue['issue']}. "
-                            f"Keep all other characters, faces, background, composition, lighting, and colors 100% strictly identical and unchanged."
-                        )
-                        repaired_raw, repaired_mime = await asyncio.to_thread(
-                            _sync_generate_image, repair_prompt, [raw_b64], gen_model, size, aspect_ratio
-                        )
-                        repaired_qa = await _gen_visual_qa(repaired_raw, user_prompt, repair_prompt)
-                        repaired_high = [
-                            f for f in (repaired_qa.get("findings") if repaired_qa else [])
-                            if (f["severity"] == "high" and f["confidence"] >= 0.65)
-                            or (f["severity"] == "medium" and f["confidence"] >= 0.65 and any(kw in f["issue"].lower() for kw in _crit_kws))
-                        ]
-                        if len(repaired_high) < len(high_issues):
-                            log("GEN", f"Visual QA Auto-Repair успешен: дефекты снижены ({len(high_issues)} -> {len(repaired_high)})")
-                            raw, mime = repaired_raw, repaired_mime
-                            qa = repaired_qa
-                        else:
-                            log("GEN", "Visual QA Auto-Repair не дал улучшений — сохраняю исходный результат")
-                    except Exception as rep_err:
-                        log("GEN", f"Visual QA Auto-Repair пропущен: {rep_err}")
-                elif high_issues:
-                    await _s("⚠️ В готовом изображении vision заметил возможный дефект (проверьте результат); изображение отправляю.")
+                        raw, mime = await _gen_repair_regions(raw, mime, qa, user_prompt, fp, gen_model, size, status_cb)
+                    except Exception as exc:
+                        log('GEN', f'Regional repair unavailable: {type(exc).__name__}; keeping original')
             return raw, mime, fp, used_fallback
         except GenExhausted as e:
             # ДНЕВНОЙ лимит модели исчерпан — ретраить сегодня бессмысленно (и жжёт квоту). Пробуем запасную (своя квота).
@@ -8352,7 +8431,30 @@ async def _gen_send_image(chat, raw, mime, final_prompt, prompt_by_ai, reply_to,
     return sent
 
 
+_GEN_ACTIVE_JOBS = {}
+
+def _track_gen_activity(fn):
+    import functools
+    @functools.wraps(fn)
+    async def wrapped(event):
+        key = f"{event.chat_id}:{event.id}"
+        def publish():
+            try:
+                save_json('gen_activity.json', {'pid': os.getpid(), 'updated': time.time(), 'jobs': _GEN_ACTIVE_JOBS})
+            except Exception as exc:
+                log('GEN', f'Activity tracking unavailable: {type(exc).__name__}')
+        _GEN_ACTIVE_JOBS[key] = {'chat': event.chat_id, 'message': event.id, 'started': time.time()}
+        publish()
+        try:
+            return await fn(event)
+        finally:
+            _GEN_ACTIVE_JOBS.pop(key, None)
+            publish()
+    return wrapped
+
+
 @client.on(events.NewMessage(pattern=r"(?s)^[./]gen(?:\s+(\d+))?((?:\s+-(?:vertical|horizontal|square|sq|4k|2k|1k|x\d+|p\d+|pages|noimg|ni|raw|m|r|i|c|v|h|improve|creative))+)?((?:\s+!?@\w+)+)?[ \t\r\n]+(.+)$"))
+@_track_gen_activity
 async def gen_command(event):
     """Генерация изображений (GPT Image 2 via OpenRouter). Промпт как есть, либо его строит/улучшает DeepSeek
     из контекста (N последних сообщений / текст reply / флаг -i). Фото в сообщении/reply → image-to-image."""
@@ -8598,7 +8700,7 @@ async def gen_command(event):
                     if counter["exhausted"]:  # дневной лимит уже исчерпан — не тратим квоту на обречённый запрос
                         counter["done"] += 1
                         return
-                    raw_i, mime_i, used_fp, _fb = await _gen_one_image(
+                    raw_i, mime_i, used_fp, _fb = await _gen_render_image(
                         fp, input_b64s, image_size, aspect_ratio, (by_ai or ai_prompt), user_prompt)
                     counter["done"] += 1
                     if raw_i is not None:
@@ -8679,7 +8781,7 @@ async def gen_command(event):
                     p_inputs = [anchor_b64] + p_inputs
                     p_prompt += "\n\nStrict character consistency: maintain identical facial features, hairstyles, eye colors, outfits, and art style from the reference image."
 
-                raw_p, mime_p, used_fp, used_fb = await _gen_one_image(
+                raw_p, mime_p, used_fp, used_fb = await _gen_render_image(
                     p_prompt, p_inputs, image_size, p_asp,
                     True, user_prompt, set_status
                 )
@@ -8746,13 +8848,15 @@ async def gen_command(event):
         await set_status("🎨 Генерирую изображение… (может занять до пары минут)")
         t0 = time.time()
         # allow_repair: ИИ-промпт был ЗАПРОШЕН (даже если его первая попытка вернула пустое и промпт ушёл исходным)
-        raw, mime, used_fp, used_fb = await _gen_one_image(
+        raw, mime, used_fp, used_fb = await _gen_render_image(
             final_prompt, input_b64s, image_size, aspect_ratio,
             (prompt_by_ai or ai_prompt), user_prompt, set_status)
         if raw is None:
             if mime == "moderation":
                 await set_status("❌ Запрос отклонён модерацией провайдера.\n"
                                  f"Переформулируй промпт и попробуй снова: `/gen {user_prompt[:200]}`")
+            elif mime == "layers_failed":
+                await set_status("❌ Отдельные слои не удалось собрать или проверить. Непрозрачные ассеты не вклеиваю прямоугольниками. Подробности в журнале.")
             elif mime == "exhausted":
                 await set_status("❌ Провайдер сообщил о нехватке баланса или квоты.\n"
                                  "Генерация не завершена; точная причина записана в журнале. "

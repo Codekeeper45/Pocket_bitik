@@ -169,19 +169,27 @@ class TestMockedToolLoop(unittest.IsolatedAsyncioTestCase):
 
     async def test_visual_qa_auto_repair_replaces_image_on_success(self):
         from unittest.mock import AsyncMock
-        artifact = b"generated-image"
-        repaired = b"repaired-clean-image"
-        qa_initial = {"findings": [{"severity": "high", "issue": "bad hand", "location": "left hand", "confidence": 0.9}]}
+        import io
+        from PIL import Image
+        def image(color):
+            b = io.BytesIO(); Image.new('RGB', (100, 100), color).save(b, format='PNG'); return b.getvalue()
+        artifact = image('blue')
+        repaired = image('green')
+        qa_initial = {"findings": [{"severity": "high", "issue": "bad hand", "location": "left hand", "confidence": 0.9, "bbox": [0.2, 0.2, 0.4, 0.4]}]}
         qa_repaired = {"findings": []}
 
         with patch.object(bot, "GEN_IMAGE_MODEL", "gpt-image-2.5-sunburst"), \
              patch.object(bot, "_gen_rate_gate", new=AsyncMock()), \
              patch.object(bot, "_sync_generate_image", side_effect=[(artifact, "image/png"), (repaired, "image/png")]) as gen_call, \
-             patch.object(bot, "_gen_visual_qa", side_effect=[qa_initial, qa_repaired]) as inspect_image:
+             patch.object(bot, "_gen_visual_qa", side_effect=[qa_initial, qa_repaired, qa_repaired]) as inspect_image:
             result = await bot._gen_one_image("prompt", ["reference"], "2K", "1:1", True, "user req")
-        self.assertEqual(result[:2], (repaired, "image/png"))
+        output = Image.open(io.BytesIO(result[0]))
+        self.assertEqual(output.getpixel((0, 0)), (0, 0, 255))
+        self.assertEqual(output.getpixel((30, 30)), (0, 128, 0))
+        self.assertEqual(result[1], "image/png")
         self.assertEqual(gen_call.call_count, 2)
-        self.assertEqual(inspect_image.call_count, 2)
+        self.assertEqual(inspect_image.call_count, 3)
+        self.assertEqual(inspect_image.call_args.args[2], 'prompt')
 
     async def test_visual_qa_preserves_original_when_repair_disabled(self):
         from unittest.mock import AsyncMock
