@@ -80,6 +80,10 @@ class SeriesCheckpoint:
     completed: dict = field(default_factory=dict)
     failures: dict = field(default_factory=dict)
     delivered: set = field(default_factory=set)
+    chat_id: str = ""
+    owner_id: str = ""
+    job_id: str = ""
+    pages_meta: dict = field(default_factory=dict)
 
     def to_json(self) -> str:
         """Serialize checkpoint metadata/artifact references; bytes become base64."""
@@ -90,7 +94,7 @@ class SeriesCheckpoint:
             if isinstance(v, (list, tuple)): return [encode(x) for x in v]
             if v is None or type(v) in (str, int, float, bool): return v
             raise SeriesPlanError(f"unsupported checkpoint value: {type(v).__name__}")
-        return json.dumps({"schema":1,"plan_id":self.plan_id,"completed":encode(self.completed),"failures":encode(self.failures),"delivered":sorted(self.delivered)}, sort_keys=True)
+        return json.dumps({"schema":1,"plan_id":self.plan_id,"completed":encode(self.completed),"failures":encode(self.failures),"delivered":sorted(self.delivered),"chat_id":self.chat_id,"owner_id":self.owner_id,"job_id":self.job_id,"pages_meta":self.pages_meta}, sort_keys=True)
 
     @classmethod
     def from_json(cls, raw: str, *, plan: SeriesPlan):
@@ -116,7 +120,7 @@ class SeriesCheckpoint:
         delivered=data.get("delivered", [])
         if not isinstance(delivered,list) or any(type(n) is not int for n in delivered) or not set(delivered) <= valid or not set(delivered) <= set(completed):
             raise SeriesPlanError("invalid checkpoint delivery markers")
-        return cls(plan.plan_id, completed, failures, set(delivered))
+        return cls(plan.plan_id, completed, failures, set(delivered), str(data.get("chat_id", "")), str(data.get("owner_id", "")), str(data.get("job_id", "")), data.get("pages_meta", {}))
 
 async def execute_series(plan: SeriesPlan, *, generate, checkpoint: SeriesCheckpoint | None = None, save_checkpoint=None, deliver=None, max_input_bytes=None, anchor_selector=None):
     """Run missing pages only. Persist generated artifacts before delivery and resume delivery separately."""
@@ -137,7 +141,7 @@ async def execute_series(plan: SeriesPlan, *, generate, checkpoint: SeriesCheckp
                         v=save_checkpoint(state)
                         if inspect.isawaitable(v): await v
                 except Exception as exc:
-                    state.failures[page.number]=f"delivery {type(exc).__name__}: {exc}"
+                    state.failures[page.number]=f"delivery {type(exc).__name__}"
                     if save_checkpoint:
                         v=save_checkpoint(state)
                         if inspect.isawaitable(v): await v

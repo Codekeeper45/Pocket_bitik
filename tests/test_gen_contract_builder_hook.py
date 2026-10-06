@@ -17,7 +17,7 @@ class BuilderContractHookTests(unittest.IsolatedAsyncioTestCase):
     async def test_builder_calls_bounded_extractor_and_returns_rendered_tuple(self):
         contract = {"task_type": "creation", "prompt": "Mira standing beside a red bicycle; sign says \"OPEN LATE\".",
                    "participants": ["Mira"], "participant_count": 1, "required_text": ["OPEN LATE"],
-                   "immutable_requirements": ["Mira", "\"OPEN LATE\""], "refs": []}
+                   "immutable_requirements": ['Mira beside a bicycle, include the exact sign text "OPEN LATE"'], "refs": []}
         llm = SimpleNamespace(chat=SimpleNamespace(completions=SimpleNamespace(create=unittest.mock.Mock(
             side_effect=[response("IDEA: scene\nASPECT: 1:1\nREFS: \nPROMPT: Mira standing beside a red bicycle; sign says \"OPEN LATE\"."), response(json.dumps(contract))]))))
         with patch.object(bot, "get_active_model", return_value=(llm, "model-x", "test")), \
@@ -29,7 +29,7 @@ class BuilderContractHookTests(unittest.IsolatedAsyncioTestCase):
         rendered = json.loads(result[0])
         self.assertEqual(rendered["participant_count"], 1)
         self.assertEqual(rendered["participants"], ["Mira"])
-        self.assertIn('"OPEN LATE"', result[0])
+        self.assertIn('OPEN LATE', rendered['required_text'])
         self.assertEqual(llm.chat.completions.create.call_count, 2)
         self.assertNotIn("response_format", llm.chat.completions.create.call_args_list[0].kwargs)
         self.assertEqual(llm.chat.completions.create.call_args_list[1].kwargs["max_tokens"], min(bot.ASK_MAX_TOKENS, 1200))

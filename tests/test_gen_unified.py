@@ -2,6 +2,7 @@
 import asyncio
 import base64
 import os
+import json
 import unittest
 from types import SimpleNamespace
 from unittest.mock import patch, Mock
@@ -291,6 +292,8 @@ class TestMockedToolLoop(unittest.IsolatedAsyncioTestCase):
             return SimpleNamespace(choices=[SimpleNamespace(message=msg)])
         def create(**kw):
             calls[0] += 1
+            if 'response_format' in kw:
+                return response(SimpleNamespace(content=json.dumps({'prompt':'A gold key on blue.','immutable_requirements':['gold key']}),tool_calls=None))
             return response(tool_msg if calls[0] == 1 else final_msg)
         llm = SimpleNamespace(chat=SimpleNamespace(completions=SimpleNamespace(create=create)))
         catalog = []
@@ -301,7 +304,7 @@ class TestMockedToolLoop(unittest.IsolatedAsyncioTestCase):
             prompt, refs, idea, aspect = await bot._build_gen_prompt(
                 "gold key", catalog=catalog, chat_id=123, msg_by_id={}
             )
-        self.assertEqual(prompt, "A gold key on blue.")
+        self.assertEqual(json.loads(prompt)['prompt'], "A gold key on blue.")
         self.assertEqual(refs, [])
         self.assertEqual(idea, "golden key")
         self.assertEqual(aspect, "1:1")
@@ -316,14 +319,14 @@ class TestMockedToolLoop(unittest.IsolatedAsyncioTestCase):
         final_msg = SimpleNamespace(content="IDEA: scene\nASPECT: 1:1\nREFS: 1 (subject)\nPROMPT: Image #1 subject.", tool_calls=None)
         def response(msg):
             return SimpleNamespace(choices=[SimpleNamespace(message=msg)])
-        llm = SimpleNamespace(chat=SimpleNamespace(completions=SimpleNamespace(create=lambda **kw: response(tool_msg if "tools" in kw else final_msg))))
+        llm = SimpleNamespace(chat=SimpleNamespace(completions=SimpleNamespace(create=lambda **kw: response(SimpleNamespace(content=json.dumps({'prompt':'Image #1 subject.','immutable_requirements':['edit'],'refs':[{'ref_id':'1','role':'subject'}]}),tool_calls=None) if 'response_format' in kw else (tool_msg if "tools" in kw else final_msg)))))
         cat = [{"idx": 1, "mid": 7, "bytes": b"img", "thumb": b"img", "desc": "photo"}]
         with patch.object(bot, "active_model_supports_vision", return_value=True), \
              patch.object(bot, "get_active_model", return_value=(llm, "test-model", "test")), \
              patch.object(bot, "MODEL_TOOLS_SUPPORT", {}), \
              patch.object(bot, "_run_chat_read_context", return_value="Context."):
             result = await bot._build_gen_prompt("edit", catalog=cat, chat_id=123, msg_by_id={})
-        self.assertEqual(result[0], "Image #1 subject.")
+        self.assertEqual(json.loads(result[0])['prompt'], "Image #1 subject.")
         self.assertEqual(result[1], [(1, "subject")])
 
     def test_detect_pages_count(self):
