@@ -8232,7 +8232,10 @@ async def _gen_repair_regions(raw, mime, qa, user_prompt, final_prompt, gen_mode
 
 
 async def _gen_render_image(final_prompt, input_b64s, image_size, aspect_ratio, allow_repair, user_prompt, status_cb=None):
-    """Dispatch explicit independent layers; ordinary scenes retain the single-image path."""
+    """Layers disabled by default; emergency marker is checked on every request."""
+    from pathlib import Path
+    if os.environ.get('GEN_LAYERS_ENABLED', '0') != '1' or Path('GEN_LAYERS_DISABLED').exists():
+        return await _gen_one_image(final_prompt, input_b64s, image_size, aspect_ratio, allow_repair, user_prompt, status_cb)
     import io
     from PIL import Image
     from gen_image_layers import parse_plan, composite_layers, make_planner_prompt, LayerError
