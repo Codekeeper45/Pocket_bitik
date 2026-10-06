@@ -8498,13 +8498,21 @@ async def gen_command(event):
     user_tokens = (event.pattern_match.group(3) or "").split()  # @юзер (только эти) / !@юзер (исключить) — фильтр контекста
     include_users = [t.lstrip("@") for t in user_tokens if not t.startswith("!")]
     exclude_users = [t.lstrip("!").lstrip("@") for t in user_tokens if t.startswith("!")]
+    if set(include_users) & set(exclude_users):
+        await event.reply("❌ Один участник одновременно включён и исключён. Уточни фильтр.")
+        return
     include_ids, exclude_ids = set(), set()
+    failed_filters = []
     for u in include_users + exclude_users:
         try:
             uid = OWNER_ID if u.lower() in ("me", "self") else (await client.get_entity(u)).id
             (exclude_ids if u in exclude_users else include_ids).add(uid)
         except Exception as e:
+            failed_filters.append(u)
             log("GEN", f"Фильтр: не нашёл @{u}: {e}")
+    if failed_filters or include_ids & exclude_ids:
+        await event.reply("❌ Фильтр участников не разрешён или противоречив. Генерацию не запускаю.")
+        return
     user_prompt = event.pattern_match.group(4).strip()
     reply_msg = await event.get_reply_message() if getattr(event, "reply_to", None) else None
     topic_id = _get_topic_id(event)
@@ -8570,7 +8578,8 @@ async def gen_command(event):
                     flt_failed.append(u)
                     log("GEN", f"Фильтр: не нашёл @{u}: {e}")
             if flt_failed:
-                await set_status(f"⚠️ Не нашёл для фильтра: {', '.join('@' + u for u in flt_failed)} — игнорирую.")
+                await set_status(f"❌ Не удалось применить фильтр: {', '.join('@' + u for u in flt_failed)}. Генерацию не запускаю, чтобы не использовать чужой контекст.")
+                return
             _, raw_msgs = await _collect_history_parallel(event.chat_id, n, 0, reply_to=topic_id)
 
             def _ctx_keep(m):
