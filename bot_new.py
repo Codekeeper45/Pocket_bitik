@@ -3318,6 +3318,13 @@ def _sync_generate_image(prompt: str, input_images_b64: list = None, model: str 
         resp = requests.post(endpoint, headers=headers, json=body, timeout=(20, 600))
         if resp.status_code >= 500:
             resp.raise_for_status()
+        _moderation_markers = (
+            "не могу создать", "не могу сгенерировать", "не могу нарисовать",
+            "нарушает", "политик", "безопасност", "ограничени", "откровенн",
+            "сексуал", "компрометир", "унизительн", "violence", "sexual",
+            "policy", "safety", "content restrictions", "protective limitations",
+            "防护限制", "违反"
+        )
         if not resp.ok:
             try:
                 error = resp.json().get("error") or {}
@@ -3326,11 +3333,11 @@ def _sync_generate_image(prompt: str, input_images_b64: list = None, model: str 
             except Exception:
                 detail, error_code = resp.text, ""
             s = str(detail)
-            if error_code == "content_policy_violation":
-                raise GenRejected(f"HTTP {resp.status_code}: {s[:200]}")
+            low = s.lower()
+            if error_code == "content_policy_violation" or any(m in low for m in _moderation_markers):
+                raise GenRejected(f"HTTP {resp.status_code} (модерация): {s[:200]}")
             if error_code in {"upstream_text_reply", "no_image_generated", "image_tool_error"}:
                 raise GenTransient(f"HTTP {resp.status_code} ({error_code}): {s[:200]}")
-            low = s.lower()
             if any(mk in low for mk in _GEN_DAILY_MARKERS):
                 raise GenExhausted(f"HTTP {resp.status_code}: {s[:200]}")
             if (resp.status_code == 429 or any(mk in low for mk in _GEN_TRANSIENT_MARKERS)
@@ -3344,8 +3351,9 @@ def _sync_generate_image(prompt: str, input_images_b64: list = None, model: str 
         if not b64_out:
             error = data.get("error") or {}
             err = error.get("message") or "пустой ответ"
-            if error.get("code") == "content_policy_violation":
-                raise GenRejected(f"шлюз не вернул изображение: {err}")
+            err_low = str(err).lower()
+            if error.get("code") == "content_policy_violation" or any(m in err_low for m in _moderation_markers):
+                raise GenRejected(f"шлюз не вернул изображение (модерация): {err}")
             raise GenTransient(f"шлюз не вернул изображение: {err}")
         raw = base64.b64decode(b64_out)
         return raw, (items[0].get("media_type") or _img_mime_from_bytes(raw[:16]))
@@ -4213,24 +4221,27 @@ _IMAGE_REPAIR_SYSTEM = (
 
 
 def _sync_repair_image_prompt(bad_prompt: str, user_prompt: str) -> str:
-    """Правка отклонённого промпта через DeepSeek (в сторону соответствия правилам провайдера).
-    При недоступности DeepSeek возвращает исходный — repair-цикл тогда завершится отказом."""
-    if deepseek_client is None:
+    """Правка отклонённого промпта через DeepSeek или активную LLM (в сторону соответствия правилам провайдера)."""
+    client = deepseek_client
+    model = DEEPSEEK_MODEL
+    if client is None:
+        client, model, _ = get_active_model()
+    if client is None:
         return bad_prompt
     try:
-        resp = deepseek_client.chat.completions.create(
-            model=DEEPSEEK_MODEL,
+        resp = client.chat.completions.create(
+            model=model,
             messages=[
                 {"role": "system", "content": _IMAGE_REPAIR_SYSTEM},
                 {"role": "user", "content": f"Изначальный запрос пользователя: {user_prompt}\n\nОтклонённый промпт:\n{bad_prompt}"},
             ],
-            max_tokens=ASK_MAX_TOKENS,  # reasoning-модель: малый бюджет → пустой content (см. _sync_image_prompt)
+            max_tokens=ASK_MAX_TOKENS,
             temperature=0.7,
         )
         out = _strip_think((resp.choices[0].message.content or "").strip())
         return out or bad_prompt
     except Exception as e:
-        log("GEN", f"DeepSeek-repair не получился ({e})")
+        log("GEN", f"Prompt-repair не получился ({e})")
         return bad_prompt
 
 
@@ -7397,7 +7408,23 @@ async def ask_command(event):
         # inline_ids — dict {msg_id: idx}, где idx = детерминированная позиция в хронологии (0..K-1).
         inline_ids = None
         if direct_vision:
-            photo_ids = [m.id for m in ordered if getattr(m, "photo", None) and getattr(m, "id", None) is not None]
+            def _is_img_msg(m):
+                if getattr(m, "photo", None):
+                    return True
+                doc = getattr(m, "document", None)
+                if doc and str(getattr(getattr(m, "file", None), "mime_type", "")).startswith("image/"):
+                    return True
+                return False
+            # Если в выборке нет фото, но якорь был реплаем на фото — подтягиваем родительское фото
+            if not any(_is_img_msg(m) for m in ordered) and anchor and getattr(anchor, "reply_to_msg_id", None):
+                try:
+                    parent_m = await client.get_messages(event.chat_id, ids=anchor.reply_to_msg_id)
+                    if parent_m and _is_img_msg(parent_m):
+                        ordered.insert(0, parent_m)
+                        log("ASK", f"-g: подтянул родительское фото #{parent_m.id} для реплая")
+                except Exception as e:
+                    log("ASK", f"-g: не удалось подтянуть родительское фото: {e}")
+            photo_ids = [m.id for m in ordered if _is_img_msg(m) and getattr(m, "id", None) is not None]
             recent = photo_ids[-DIRECT_VISION_MAX_IMAGES:]  # ordered хронологичен → хвост = свежие
             inline_ids = {mid: i for i, mid in enumerate(recent)}
             log("ASK", f"-g: фото в выборке {len(photo_ids)}, инлайню {len(inline_ids)} свежих (лимит {DIRECT_VISION_MAX_IMAGES})")
@@ -7930,7 +7957,7 @@ async def _gen_one_image(final_prompt, input_b64s, image_size, aspect_ratio, all
     gateway_pool = gen_model.startswith("gpt-image-2.5")
     # Gateway owns the bounded cross-account retry budget (3 attempts total).
     transient_left = 0 if gateway_pool else 2
-    repair_left = 0 if gateway_pool else (2 if allow_repair else 0)
+    repair_left = 2 if allow_repair else 0
     attempt = 0
     size = _clamp_resolution(image_size, GEN_IMAGE_RES)  # primary может не уметь 4K → опускаем (фолбэк восстановит запрошенное)
     if size != image_size:
