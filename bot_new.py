@@ -8071,7 +8071,7 @@ async def _gen_send_image(chat, raw, mime, final_prompt, prompt_by_ai, reply_to,
     return sent
 
 
-@client.on(events.NewMessage(pattern=r"(?s)^[./]gen(?:\s+(\d+))?((?:\s+-(?:vertical|horizontal|square|sq|4k|2k|1k|x\d+|noimg|ni|raw|m|r|i|c|v|h|improve|creative))+)?((?:\s+!?@\w+)+)?[ \t\r\n]+(.+)$"))
+@client.on(events.NewMessage(pattern=r"(?s)^[./]gen(?:\s+(\d+))?((?:\s+-(?:vertical|horizontal|square|sq|4k|2k|1k|x\d+|p\d+|pages|noimg|ni|raw|m|r|i|c|v|h|improve|creative))+)?((?:\s+!?@\w+)+)?[ \t\r\n]+(.+)$"))
 async def gen_command(event):
     """Генерация изображений (GPT Image 2 via OpenRouter). Промпт как есть, либо его строит/улучшает DeepSeek
     из контекста (N последних сообщений / текст reply / флаг -i). Фото в сообщении/reply → image-to-image."""
