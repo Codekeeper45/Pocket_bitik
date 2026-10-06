@@ -32,7 +32,7 @@ class BuilderContractHookTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn('OPEN LATE', rendered['required_text'])
         self.assertEqual(llm.chat.completions.create.call_count, 2)
         self.assertNotIn("response_format", llm.chat.completions.create.call_args_list[0].kwargs)
-        self.assertEqual(llm.chat.completions.create.call_args_list[1].kwargs["max_tokens"], min(bot.ASK_MAX_TOKENS, 1200))
+        self.assertEqual(llm.chat.completions.create.call_args_list[1].kwargs["max_tokens"], 4000)
 
 
 if __name__ == "__main__":

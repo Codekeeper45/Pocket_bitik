@@ -4052,7 +4052,11 @@ async def _build_gen_prompt(user_prompt: str, context_text: str = None, image_de
             "plus each distinct non-negotiable constraint verbatim. Put observed appearance only in "
             "known_appearance; label uncertain/inferred appearance only as hypotheses. refs must map "
             "each selected ref_id exactly to an explicit role (subject, style, composition, or object); "
-            "do not invent IDs. Return valid JSON only.")},
+            "do not invent IDs. task_type MUST be creation, edit, or series (not create). "
+            "aspect MUST be null, 1:1, 9:16, 16:9, 4:3, or 3:4. "
+            "known_appearance,hypotheses,immutable_requirements MUST be arrays of strings, "
+            "not objects. refs MUST be an array of objects with ref_id and role. "
+            "fictional_interpretation MUST be boolean. Return valid JSON only.")},
         {"role": "user", "content": json.dumps({"user_request": user_prompt, "final_prompt": raw_prompt,
             "parsed_aspect": parsed[3], "selected_refs": [{"ref_id": str(k), "role": role or "subject"} for k, role in parsed[1]]}, ensure_ascii=False)},
     ]
@@ -4062,10 +4066,17 @@ async def _build_gen_prompt(user_prompt: str, context_text: str = None, image_de
         try:
             if not llm:
                 raise _gen_prompt.ContractError("no active model available for scene contract extraction")
+            # Contract extraction is bounded JSON, not a high-effort chat turn.
+            # Bypass reasoning adapters that inflate 1200 tokens to 40000.
+            contract_client = getattr(llm, '_c', llm)
+            if hasattr(contract_client, 'with_options'):
+                contract_client = contract_client.with_options(max_retries=0, timeout=90)
+            contract_kwargs = dict(model=model_id, messages=contract_messages,
+                                   max_tokens=4000, temperature=0)
+            if not isinstance(llm, _CliproxyReasoningClient):
+                contract_kwargs['response_format'] = {"type": "json_object"}
             response = await asyncio.wait_for(asyncio.to_thread(
-                llm.chat.completions.create, model=model_id, messages=contract_messages,
-                max_tokens=min(ASK_MAX_TOKENS, 1200), temperature=0,
-                response_format={"type": "json_object"}), timeout=20)
+                contract_client.chat.completions.create, **contract_kwargs), timeout=95)
             extracted = _extract_content(response.choices[0].message)
             contract = _gen_prompt.extract_contract(extracted)
             if user_prompt not in contract.immutable_requirements:
@@ -4084,6 +4095,8 @@ async def _build_gen_prompt(user_prompt: str, context_text: str = None, image_de
             errors.append(exc)
             contract = None
             if attempt == 0:
+                reason = str(exc)[:200] if isinstance(exc, _gen_prompt.ContractError) else type(exc).__name__
+                contract_messages.append({'role': 'user', 'content': 'Validation failed: '+reason+'. Return a corrected complete JSON contract matching the schema.'})
                 continue
     if contract is None:
         raise _gen_prompt.ContractError('scene contract extraction failed after one retry: ' + type(errors[-1]).__name__) from errors[-1]
@@ -9043,7 +9056,12 @@ async def gen_command(event):
         except Exception:
             pass
 
-    # User commands are retained; only service statuses may be cleaned up.
+    # Owner requested command cleanup after inputs and status are secured.
+    if status and event.out:
+        try:
+            await event.delete()
+        except Exception:
+            log('GEN', 'Command cleanup failed; generation continues')
 
     async def set_status(text):
         if not status:
