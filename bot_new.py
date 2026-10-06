@@ -3307,21 +3307,17 @@ def _sync_generate_image(prompt: str, input_images_b64: list = None, model: str 
     # Маршрутизация на наш собственный шлюз chatgpt2api
     if "gpt-image-2.5" in target_model or "chatgpt2api" in target_model or (CHATGPT2API_AUTH_KEY and target_model.startswith("gpt-image-")):
         cg_model = target_model.split("/")[-1] if "/" in target_model else target_model
-        # Преобразование aspect_ratio / size в пиксели (1024x1024, 1536x1024, 1024x1536)
-        if aspect_ratio == "16:9" or aspect_ratio == "horizontal":
-            res_str = "1536x1024"
-        elif aspect_ratio == "9:16" or aspect_ratio == "vertical":
-            res_str = "1024x1536"
-        else:
-            res_str = "1024x1024"
+        from gen_provider import gateway_dimensions
+        width, height = gateway_dimensions(aspect_ratio)
+        res_str = f'{width}x{height}'
 
         # Image-to-image (редактирование по референсу)
         if input_images_b64 and len(input_images_b64) > 0:
             endpoint = f"{CHATGPT2API_BASE_URL.rstrip('/')}/images/edits"
-            ref_urls = []
-            for ref_b64 in input_images_b64:
-                mime_type = _img_mime_from_bytes(base64.b64decode(ref_b64)[:16])
-                ref_urls.append(f"data:{mime_type};base64,{ref_b64}")
+            from gen_references import provider_inputs
+            from gen_provider import GATEWAY_PROFILE
+            prompt, packed_refs = provider_inputs(prompt, input_images_b64, GATEWAY_PROFILE)
+            ref_urls = list(packed_refs)
             body = {
                 "model": cg_model,
                 "prompt": prompt,
@@ -3339,6 +3335,9 @@ def _sync_generate_image(prompt: str, input_images_b64: list = None, model: str 
                 "response_format": "b64_json"
             }
 
+        from gen_provider import GATEWAY_PROFILE
+        if len(json.dumps(body, ensure_ascii=False).encode('utf-8')) > GATEWAY_PROFILE.max_bytes:
+            raise ValueError('generation payload exceeds configured limit')
         headers = {
             "Authorization": f"Bearer {CHATGPT2API_AUTH_KEY}",
             "Content-Type": "application/json"
@@ -3372,7 +3371,8 @@ def _sync_generate_image(prompt: str, input_images_b64: list = None, model: str 
             if (resp.status_code == 429 or any(mk in low for mk in _GEN_TRANSIENT_MARKERS)
                     or "由于我这边发生了错误，我未能生成图片" in s):
                 raise GenTransient(f"HTTP {resp.status_code}: {s[:200]}")
-            raise GenRejected(f"HTTP {resp.status_code}: {s[:200]}")
+            from gen_provider import classify_provider_error
+            raise classify_provider_error(resp.status_code, error_code)
 
         data = resp.json()
         items = data.get("data") or []
@@ -4029,6 +4029,40 @@ async def _build_gen_prompt(user_prompt: str, context_text: str = None, image_de
         prompt_text, refs, idea, aspect = _parse_gen_prompt_out(fb, working_catalog or None)
         return prompt_text or user_prompt, refs, idea, aspect
     parsed = _parse_gen_prompt_out(_strip_think(out).strip(), working_catalog or None)
+    raw_prompt = parsed[0]
+    # A second, bounded call turns the final prompt into a validated scene contract.
+    # The original request is authoritative; extraction may organize facts, never invent them.
+    if llm and raw_prompt:
+        try:
+            import gen_prompt as _gen_prompt
+            contract_messages = [
+                {"role": "system", "content": (
+                    "Extract a scene contract as JSON only with keys: task_type,prompt,participants,"
+                    "participant_count,known_appearance,hypotheses,action,composition,required_text,"
+                    "style,aspect,refs,immutable_requirements,fictional_interpretation. "
+                    "Use only facts explicit in source. Preserve exact user names and quoted text; "
+                    "do not infer unknown appearances. participants and required_text are arrays; "
+                    "immutable_requirements lists verbatim non-negotiable user constraints. refs is [].")},
+                {"role": "user", "content": json.dumps({"user_request": user_prompt, "final_prompt": raw_prompt,
+                    "parsed_aspect": parsed[3], "selected_refs": parsed[1]}, ensure_ascii=False)},
+            ]
+            response = await asyncio.wait_for(asyncio.to_thread(
+                llm.chat.completions.create, model=model_id, messages=contract_messages,
+                max_tokens=min(ASK_MAX_TOKENS, 1200), temperature=0,
+                response_format={"type": "json_object"}), timeout=20)
+            extracted = _extract_content(response.choices[0].message)
+            contract = _gen_prompt.extract_contract(extracted)
+            # Enforce source-backed immutable literals and count before accepting the rendering.
+            quoted = re.findall(r'["“](.+?)["”]', user_prompt)
+            if any(q not in contract.prompt and q not in contract.required_text and q not in contract.immutable_requirements for q in quoted):
+                raise _gen_prompt.ContractError("quoted user text was not preserved")
+            if contract.participant_count is not None and contract.participants and contract.participant_count != len(contract.participants):
+                raise _gen_prompt.ContractError("participant count mismatch")
+            # User's explicit aspect stays authoritative; model aspect is only a suggestion otherwise.
+            rendered = _gen_prompt.render_prompt(contract, user_aspect=parsed[3])
+            parsed = (rendered, parsed[1], parsed[2], parsed[3])
+        except Exception as exc:
+            log("GEN", f"Scene contract extraction/validation skipped; retaining original prompt ({type(exc).__name__})")
     if catalog is not None and working_catalog is not catalog:
         catalog[:] = working_catalog
     # Validate IDs returned by model against the exact available catalog; no fabricated IDs.
@@ -4054,7 +4088,8 @@ def _gen_remap_selected_refs(input_b64s: list, input_roles: list, catalog: list,
         if not it:
             continue
         mid = it.get("mid")
-        if mid and mid in used_mids:
+        source_key = (it.get('chat'), mid)
+        if mid and source_key in used_mids:
             continue
         blob = it.get("ref")
         if not blob and it.get("bytes"):
@@ -4067,7 +4102,7 @@ def _gen_remap_selected_refs(input_b64s: list, input_roles: list, catalog: list,
         out.append(b64)
         total += len(blob)
         if mid:
-            used_mids.add(mid)
+            used_mids.add(source_key)
         actual_n = len(out)
         roles.append((actual_n, role or "subject"))
         selected_out.append(int(idx))
@@ -4172,35 +4207,37 @@ def _detect_pages_count(user_prompt: str, toks: list = None) -> int:
     return 1
 
 
-def _parse_gen_multipage_out(out: str, pages_count: int) -> list:
-    """Парсит ответ планировщика многостраничных историй (PAGE 1:, PAGE 2:, ...) на список словарей страниц."""
-    out = (out or "").strip()
-    page_blocks = re.split(r"(?im)^\s*(?:---|#+)?\s*PAGE\s+(\d+)\s*[:—\-]*\s*", out)
-    pages = []
-    if len(page_blocks) > 1:
-        i = 1
-        while i < len(page_blocks):
-            try:
-                p_num = int(page_blocks[i])
-            except ValueError:
-                p_num = len(pages) + 1
-            p_text = page_blocks[i + 1].strip()
-            m_idea = re.search(r"(?im)^\s*IDEA:\s*(.+)$", p_text)
-            idea = m_idea.group(1).strip() if m_idea else None
-            m_asp = re.search(r"(?im)^\s*ASPECT:\s*([0-9]+:[0-9]+)", p_text)
-            asp = m_asp.group(1) if m_asp and m_asp.group(1) in ("9:16", "16:9", "1:1") else None
-            m_prompt = re.search(r"(?is)PROMPT:\s*(.+)$", p_text)
-            if m_prompt:
-                prompt = m_prompt.group(1).strip()
-            else:
-                prompt = re.sub(r"(?im)^\s*(IDEA|REFS|ASPECT):.*$", "", p_text).strip()
-            pages.append({"page": p_num, "idea": idea, "prompt": prompt, "aspect": asp})
-            i += 2
+def _parse_gen_multipage_out(out: str, pages_count: int, user_aspect=None) -> list:
+    """Parse strictly without altering story prompt bytes beyond boundary whitespace."""
     from gen_series import parse_multipage_plan
-    payload = {'pages': [{'number': p['page'], 'prompt': p['prompt'], 'aspect': p['aspect']} for p in pages]}
-    plan = parse_multipage_plan(json.dumps(payload), pages_count)
-    ideas = {p['page']: p['idea'] for p in pages}
-    return [{'page': p.number, 'idea': ideas.get(p.number), 'prompt': p.prompt, 'aspect': p.aspect} for p in plan.pages]
+    text = (out or "").strip()
+    try:
+        obj = json.loads(text)
+        if isinstance(obj, dict) and isinstance(obj.get("pages"), list):
+            pages = obj["pages"]
+            plan = parse_multipage_plan(text, pages_count, user_aspect=user_aspect)
+            ideas = {item.get("number"): item.get("idea") for item in pages if isinstance(item, dict)}
+            return [{"page": p.number, "idea": ideas.get(p.number), "prompt": p.prompt, "aspect": p.aspect,
+                     "refs": p.refs, "bible": plan.bible, "plan_id": plan.plan_id} for p in plan.pages]
+    except json.JSONDecodeError:
+        pass
+    matches = list(re.finditer(r"(?im)^\\s*(?:---|#+)?\\s*PAGE\\s+(\\d+)\\s*[:—\\-]*\\s*", text))
+    if not matches or text[:matches[0].start()].strip():
+        raise ValueError("expected structured JSON or PAGE N blocks")
+    raw_pages = []
+    for i, m in enumerate(matches):
+        block = text[m.end():matches[i+1].start() if i+1 < len(matches) else len(text)].strip()
+        idea_m = re.search(r"(?im)^\\s*IDEA:\\s*(.+)$", block)
+        aspect_m = re.search(r"(?im)^\\s*ASPECT:\\s*([0-9]+:[0-9]+)\\s*$", block)
+        prompt_m = re.search(r"(?ims)^\\s*PROMPT:\\s*(.*)$", block)
+        prompt = prompt_m.group(1).strip() if prompt_m else re.sub(r"(?im)^\\s*(?:IDEA|ASPECT|REFS):.*$", "", block).strip()
+        raw_pages.append({"number": int(m.group(1)), "idea": idea_m.group(1).strip() if idea_m else None,
+                          "prompt": prompt, "aspect": aspect_m.group(1) if aspect_m else None, "refs": []})
+    payload = {"pages": [{k: p[k] for k in ("number", "prompt", "aspect", "refs")} for p in raw_pages]}
+    plan = parse_multipage_plan(json.dumps(payload), pages_count, user_aspect=user_aspect)
+    ideas = {p["number"]: p["idea"] for p in raw_pages}
+    return [{"page": p.number, "idea": ideas.get(p.number), "prompt": p.prompt, "aspect": p.aspect,
+             "refs": p.refs, "bible": plan.bible, "plan_id": plan.plan_id} for p in plan.pages]
 
 
 _GEN_MULTIPAGE_SYSTEM = (
@@ -8163,8 +8200,15 @@ def _clamp_resolution(size, supported):
     return max(le, key=lambda s: _RES_RANK[s]) if le else min(ok, key=lambda s: _RES_RANK[s])
 
 
-_GEN_VISUAL_QA_PROMPT = '''Оцени именно ПРИЛОЖЕННОЕ ГОТОВОЕ изображение, а не референс. Сопоставь с исходными требованиями пользователя и промптом генерации. Не требуй фотореализма: намеренная стилизация, мультяшность, живописная условность и необычная анатомия в явно стилизованной работе сами по себе не дефекты. Не угадывай личность/имя неизвестного человека. Найди только очевидные существенные ошибки изображения: сломанные/лишние части тела, грубо искажённые предметы, нечитаемый обязательный текст, пропущенное ключевое требование. Мелкие, спорные или стилевые особенности игнорируй. Верни только JSON вида {"findings":[{"id":"f1","category":"anatomy|fidelity|technical|composition|identity|text|seam|style|other","affected_subject":null,"requirement_id":null,"severity":"high|medium|low","issue":"...","location":"...","confidence":0.0,"bbox":[0.1,0.1,0.2,0.2]}]}; если существенных дефектов нет, findings=[] . Для каждой локальной ошибки укажи bbox точной проблемной области в нормализованных координатах [лево,верх,право,низ] от 0 до 1; координаты относятся именно к приложенному изображению. Найди ВСЕ видимые дефектные зоны за один проход, включая лица среднего плана, не прикрывай мутации словом стилизация. Для глобальной ошибки сюжета bbox=null, не придумывай область. Учитывай исходный запрос как приоритетный.'''
+_GEN_VISUAL_QA_PROMPT = '''Проведи тщательную проверку приложенного финального изображения по исходному запросу и промпту. Осматривай всё изображение систематически, включая мелкие/средние объекты, кисти, пальцы, контакт предметов и выполнение действий (не считай действие выполненным, если нужный контакт/перенос не виден). При сомнении не выдумывай дефект; но и не называй явную поломку стилизацией. Верни ТОЛЬКО JSON {"findings":[{"id":"f1","category":"anatomy|fidelity|technical|composition|identity|text|seam|style|other","affected_subject":null,"requirement_id":null,"severity":"high|medium|low|critical","description":"конкретный наблюдаемый дефект","location":"краткая область","confidence":0.0,"bbox":[0.1,0.1,0.2,0.2]}]}. Каждый объект обязан содержать все перечисленные поля; null разрешён только для subject/requirement_id/bbox. Для конкретной локальной ошибки bbox обязателен: нормализованные [left,top,right,bottom], 0..1, строго ненулевой площади; для глобального дефекта bbox=null. Перечисли все обнаруженные отдельные проблемы. Без существенных дефектов верни findings=[].'''
 
+
+_GEN_QA_MAX_FINDINGS = 64
+
+
+
+
+# Canonical generation pipeline follows.
 
 def get_image_desc_client():
     if active_model_supports_vision() and (MODEL_REGISTRY.get(ACTIVE_MODEL) or (None,))[0] == 'cliproxy':
@@ -8174,47 +8218,54 @@ def get_image_desc_client():
     return _client_for_media_model(model_), model_
 
 async def _gen_visual_qa(raw: bytes, user_prompt: str, final_prompt: str):
-    """Single-pass localized QA; failure is distinct from verified clean output."""
+    """Fail-closed visual QA using the invocation's pinned client and model."""
     import json
-    request = (f"Исходный запрос пользователя:\n{user_prompt[:3000]}\n\n"
-               f"Промпт генерации:\n{final_prompt[:5000]}\n\n{_GEN_VISUAL_QA_PROMPT}")
+    from gen_runtime import CURRENT
+    from gen_qa import parse_findings
+    invocation = CURRENT.get()
+    if invocation:
+        try:
+            invocation.consume_qa()
+        except (TimeoutError, RuntimeError):
+            return None
+        if invocation.qa_route is None:
+            invocation.qa_route = get_image_desc_client()
+        client, model = invocation.qa_route
+    else:
+        client, model = get_image_desc_client()
+    if client is None or not model:
+        return None
+    request = (f"Исходный запрос пользователя:\\n{user_prompt[:3000]}\\n\\n"
+               f"Промпт генерации:\\n{final_prompt[:5000]}\\n\\n{_GEN_VISUAL_QA_PROMPT}")
     try:
-        text = await describe_image(raw, prompt=request, detail="high")
-        start, end = text.find("{"), text.rfind("}")
+        import base64
+        from gen_provider import validate_image
+        image = validate_image(raw)
+        content = [{'type': 'text', 'text': request}, {'type': 'image_url', 'image_url': {'url': f'data:{image.mime_type};base64,' + base64.b64encode(raw).decode(), 'detail': 'high'}}]
+        response = await asyncio.to_thread(client.chat.completions.create, model=model, messages=[{'role': 'user', 'content': content}], max_tokens=5000, temperature=0, timeout=60)
+        text = response.choices[0].message.content
+        start, end = text.find('{'), text.rfind('}')
         if start < 0 or end < start:
-            raise ValueError("no JSON object")
-        data = json.loads(text[start:end + 1])
-        findings = data.get("findings")
-        if not isinstance(findings, list):
-            raise ValueError("findings is not a list")
-        clean = []
-        for item in findings:
-            if not isinstance(item, dict):
-                continue
-            severity = item.get("severity")
-            confidence = item.get("confidence")
-            import math
-            if severity not in ("high", "medium", "low") or isinstance(confidence, bool) or not isinstance(confidence, (int, float)) or not math.isfinite(confidence):
-                raise ValueError('invalid finding severity/confidence')
-            finding = {"category": item.get('category', 'other'), "id": item.get('id', str(len(clean)+1)), "affected_subject": item.get('affected_subject'), "requirement_id": item.get('requirement_id'), "severity": severity, "issue": str(item.get("issue", ""))[:300],
-                       "location": str(item.get("location", "unspecified"))[:160],
-                       "confidence": max(0.0, min(1.0, float(confidence)))}
-            from gen_regions_geometry import validate_bbox
-            if validate_bbox(item.get('bbox')) is not None:
-                finding['bbox'] = validate_bbox(item['bbox'])
-            clean.append(finding)
-        if findings and not clean:
-            raise ValueError('nonempty findings contained no valid entries')
-        return {"findings": clean}
+            raise ValueError('no JSON object')
+        parsed = parse_findings(json.loads(text[start:end + 1]), limit=64)
+        if parsed.status == 'unavailable' or parsed.overflow:
+            raise ValueError(parsed.error or 'finding safety cap exceeded')
+        return {'findings': [dict(f, issue=f['description']) for f in parsed.findings]}
     except Exception as e:
-        log("GEN", f"Visual QA недоступен/невалиден: {type(e).__name__}: {str(e)[:180]}")
+        log('GEN', f'Visual QA unavailable/invalid: {type(e).__name__}: {str(e)[:180]}')
         return None
 
 
 def _gen_repair_findings(qa):
+    if not isinstance(qa, dict) or not isinstance(qa.get('findings'), list):
+        return []
+    from gen_qa import parse_findings
+    canonical = {'findings': [{k:v for k,v in f.items() if k != 'issue'} if isinstance(f, dict) else f for f in qa['findings']]}
+    parsed = parse_findings(canonical, limit=64)
+    if parsed.status == 'unavailable' or parsed.overflow:
+        return []
     keys = ('лиц', 'глаз', 'зуб', 'рот', 'пальц', 'рук', 'анатом', 'мутац', 'челюст', 'бров', 'лоб', 'face', 'eye', 'teeth', 'mouth', 'hand', 'finger', 'brow', 'forehead')
-    return [f for f in (qa or {}).get('findings', []) if f['confidence'] >= 0.65 and
-            (f.get('category') == 'anatomy' or (f.get('category', 'other') == 'other' and (f['severity'] == 'high' or (f['severity'] == 'medium' and any(k in f['issue'].lower() for k in keys)))))]
+    return [dict(f, issue=f['description']) for f in parsed.findings if f['confidence'] >= 0.65 and (f['category'] == 'anatomy' or (f['category'] == 'other' and (f['severity'] in ('high', 'critical') or (f['severity'] == 'medium' and any(k in f['description'].lower() for k in keys)))))]
 
 
 async def _gen_repair_regions(raw, mime, qa, user_prompt, final_prompt, gen_model, size, status_cb=None):
@@ -8238,7 +8289,7 @@ async def _gen_repair_regions(raw, mime, qa, user_prompt, final_prompt, gen_mode
             continue
         crop, mapping = prepare_context_crop(candidate, box, context=.15)
         b = io.BytesIO(); crop.save(b, format='PNG')
-        local_issues = '; '.join(f['issue'] for f in region['findings'])
+        local_issues = '; '.join(f.get('issue', f.get('evidence', '')) for f in region['findings'])
         if status_cb:
             await status_cb(f'🔧 Ремонт области {index}/{min(len(regions), budget)} с запасом…')
         prompt = ('Repair this cropped image only: ' + local_issues + '. Preserve subject identity, pose, style, clothes, lighting, exact framing and edge context. '
@@ -8258,10 +8309,23 @@ async def _gen_repair_regions(raw, mime, qa, user_prompt, final_prompt, gen_mode
             # Validate seams and identity against the original user contract, NOT the repair prompt.
             after = await _gen_visual_qa(proposed_bytes.getvalue(), user_prompt, final_prompt + '\nComposite validation: inspect the repaired box ' + str(region['box']) + ' in original pixel coordinates. Report visible seams, halos, sharpness/texture or lighting discontinuities, changed identity, and all remaining face/hand defects. Do not treat compositing artifacts as intentional style.')
             seam_keys = ('шов', 'швы', 'ореол', 'стык', 'seam', 'halo', 'discontinuity', 'identity', 'личност')
-            seam_bad = after and any(f['confidence'] >= .65 and f['severity'] in ('medium', 'high') and any(k in f['issue'].lower() for k in seam_keys) for f in after['findings'])
+            seam_bad = after and any(f['confidence'] >= .65 and f['severity'] in ('medium', 'high') and any(k in f.get('issue', f.get('evidence', '')).lower() for k in seam_keys) for f in after['findings'])
             from gen_pair_qa import compare_images
-            route = get_image_desc_client()
+            from gen_runtime import CURRENT
+            invocation = CURRENT.get()
+            route = invocation.qa_route if invocation and invocation.qa_route else get_image_desc_client()
             baseline = io.BytesIO(); candidate.save(baseline, format='PNG')
+            crop_baseline = io.BytesIO(); candidate.crop(box).save(crop_baseline, format='PNG')
+            crop_candidate = io.BytesIO(); mapped_patch.save(crop_candidate, format='PNG')
+            crop_pair_ok = await compare_images(crop_baseline.getvalue(), crop_candidate.getvalue(),
+                'Fix exactly: ' + local_issues + '. Preserve pose and framing.', client=route[0], model=route[1]) if route else False
+            from PIL import ImageChops
+            outside_diff = ImageChops.difference(candidate, proposed)
+            outside_diff.paste(0, box)
+            outside_ok = outside_diff.getbbox() is None
+            if not crop_pair_ok or not outside_ok:
+                log('GEN', 'Crop comparison or pixel preservation failed; reverting')
+                continue
             paired_ok = await compare_images(baseline.getvalue(), proposed_bytes.getvalue(),
                 'Target defects: ' + local_issues + '. ORIGINAL USER REQUIREMENTS: ' + user_prompt,
                 client=route[0], model=route[1]) if route else False
@@ -8353,9 +8417,51 @@ async def _gen_provider_call(prompt, inputs, model, size, aspect):
     raw, mime = await _GEN_PROVIDER_GATE.run(_sync_generate_image, prompt, inputs, model, size, aspect, timeout=620)
     from gen_provider import validate_image
     validated = validate_image(raw)
+    if invocation:
+        from gen_provider import capability_notice
+        invocation.timings['capability_notices'] = capability_notice(aspect, size, validated.pixel_size)
+        invocation.timings['actual_model'] = model
     return validated.data, validated.mime_type
 
 async def _gen_one_image(final_prompt, input_b64s, image_size, aspect_ratio, allow_repair, user_prompt, status_cb=None):
+    from gen_runtime import CURRENT, Invocation
+    parent = CURRENT.get()
+    invocation = Invocation(max_seconds=min(900, parent.remaining_seconds()) if parent else 900,
+                            parent=parent, qa_route=parent.qa_route if parent else None)
+    token = CURRENT.set(invocation)
+    try:
+        return await _gen_one_image_recorded(final_prompt, input_b64s, image_size, aspect_ratio, allow_repair, user_prompt, status_cb)
+    finally:
+        if parent:
+            # Per-task snapshots remain separate; single/series sequential caller sees final status.
+            parent.qa = invocation.qa
+            parent.result = invocation.result
+            parent.timings.update(invocation.timings)
+        CURRENT.reset(token)
+
+async def _gen_one_image_recorded(final_prompt, input_b64s, image_size, aspect_ratio, allow_repair, user_prompt, status_cb=None):
+    """Compatibility tuple adapter over the recorded production result path."""
+    import contextvars
+    from gen_contracts import GenerationResult, QAResult, ProviderError
+    from gen_runtime import CURRENT
+    started = time.monotonic()
+    try:
+        result = await _gen_one_image_impl(final_prompt, input_b64s, image_size, aspect_ratio, allow_repair, user_prompt, status_cb)
+    except ProviderError as exc:
+        if status_cb:
+            await status_cb({'authentication':'❌ Авторизация генератора недоступна.', 'invalid_request':'❌ Генератор не поддержал параметры запроса.', 'timeout':'❌ Время ожидания генератора истекло.'}.get(exc.kind, '❌ Ошибка провайдера: ' + exc.kind))
+        return None, exc.kind, None, False
+    invocation = CURRENT.get()
+    if invocation and result[0] is not None:
+        from gen_provider import validate_image
+        im = validate_image(result[0])
+        qa = invocation.qa
+        findings = tuple((qa or {}).get('findings', []))
+        state = 'unavailable' if qa is None else ('fail' if any(f.get('severity') in ('high','critical') for f in findings) else 'warnings' if findings else 'pass')
+        invocation.result = GenerationResult(image=im.data, actual_model=invocation.timings.get('actual_model'), actual_provider='chatgpt2api' if 'gpt-image' in str(invocation.timings.get('actual_model')) else 'openrouter', pixel_size=im.pixel_size, source_prompt=user_prompt, actual_prompt=result[2] or final_prompt, qa=QAResult(state, findings), remaining_findings=findings, calls={'generation':invocation.generation_calls,'qa':invocation.qa_calls}, timings={'total':time.monotonic()-started})
+    return result
+
+async def _gen_one_image_impl(final_prompt, input_b64s, image_size, aspect_ratio, allow_repair, user_prompt, status_cb=None):
     """Один цикл генерации с ретраями (transient тем же промптом / фолбэк на Fast / repair при модерации).
     Возвращает (raw, mime, used_prompt, used_fallback) при успехе или (None, reason, None, used_fallback)
     при отказе (reason: 'moderation' | 'overload' | 'exhausted'). status_cb — необязательный апдейтер статуса.
@@ -8387,20 +8493,24 @@ async def _gen_one_image(final_prompt, input_b64s, image_size, aspect_ratio, all
             raw, mime = await _gen_provider_call(fp, input_b64s or None, gen_model, size, aspect_ratio)
             qa = await _gen_visual_qa(raw, user_prompt, fp)
             if allow_repair and qa:
-                severe = [f for f in qa['findings'] if f.get('severity') == 'high' and f.get('confidence', 0) >= .8]
-                if severe and (len(severe) > 2 or any(not f.get('bbox') for f in severe)):
+                from gen_policy import action_for
+                action = action_for(qa['findings'])
+                if action == 'regenerate_once':
                     try:
                         newer, newer_mime = await _gen_provider_call(fp, input_b64s or None, gen_model, size, aspect_ratio)
                         from gen_pair_qa import compare_images
-                        route = get_image_desc_client()
-                        if route and await compare_images(raw, newer, user_prompt, client=route[0], model=route[1]):
-                            raw, mime = newer, newer_mime
-                            qa = await _gen_visual_qa(raw, user_prompt, fp)
+                        from gen_runtime import CURRENT
+                        invocation = CURRENT.get()
+                        route = invocation.qa_route if invocation and invocation.qa_route else get_image_desc_client()
+                        newer_qa = await _gen_visual_qa(newer, user_prompt, fp)
+                        targets = [{'issue': f.get('issue') or f.get('description'), 'id': f.get('id')} for f in qa['findings']]
+                        if newer_qa is not None and route and await compare_images(raw, newer, json.dumps(targets,ensure_ascii=False) + '\nRequirements: ' + user_prompt, client=route[0], model=route[1]):
+                            raw, mime, qa = newer, newer_mime, newer_qa
                     except Exception as exc:
                         log('GEN', f'Whole candidate rejected/unavailable: {type(exc).__name__}')
             if qa and qa['findings']:
                 for finding in qa['findings']:
-                    log('GEN', f"Visual QA {finding['severity']} {finding['confidence']:.2f} @ {finding['location']}: {finding['issue']}")
+                    log('GEN', f"Visual QA {finding['severity']} {finding['confidence']:.2f} @ {finding['location']}: {finding.get('issue', finding.get('evidence', ''))}")
                 if allow_repair and _gen_repair_findings(qa):
                     try:
                         raw, mime = await _gen_repair_regions(raw, mime, qa, user_prompt, fp, gen_model, size, status_cb)
@@ -8479,6 +8589,9 @@ async def _gen_send_image(chat, raw, mime, final_prompt, prompt_by_ai, reply_to,
     with Image.open(io.BytesIO(raw)) as im:
         dimensions = f'{im.width}×{im.height}'
     verification = status_text(invocation.qa if invocation else None)
+    notices = invocation.timings.get('capability_notices', []) if invocation else []
+    if notices:
+        verification += '\n' + '\n'.join(notices)
     if "webp" in mime:
         raw = await _webp_to_png(raw)  # webp Telegram шлёт стикером — конвертим
     bio = io.BytesIO(raw)
@@ -8489,6 +8602,8 @@ async def _gen_send_image(chat, raw, mime, final_prompt, prompt_by_ai, reply_to,
         bio.name = "gen.jpg"
     else:
         bio.name = "gen.webp"  # не сконвертившийся webp — хотя бы честное расширение
+    from gen_delivery import record
+    record(artifact_key, chat=chat, reply_to=reply_to, path=artifact, status='pending')
     sent = None
     idea_line = f'{dimensions} · {verification}\n' + (f"💡 {str(idea).strip()}\n" if idea and str(idea).strip() else '')
     if prompt_by_ai:  # промпт от ИИ — СВЁРНУТОЙ цитатой и БЕЗ обрезки; идея — видимой строкой над ней
@@ -8519,7 +8634,47 @@ async def _gen_send_image(chat, raw, mime, final_prompt, prompt_by_ai, reply_to,
             await client.send_message(chat, refs_line, parse_mode="md", reply_to=getattr(sent, "id", None), link_preview=False)
         except Exception as e:
             log("GEN", f"Строка референсов не отправилась: {e}")
+    record(artifact_key, chat=chat, reply_to=reply_to, path=artifact, status='delivered', message_id=getattr(sent, 'id', None))
+    try:
+        await client.send_message(chat, f'Оригинал без сжатия: `.genfile {artifact_key}` (хранится 24 ч)', reply_to=getattr(sent,'id',None))
+    except Exception:
+        pass
     return sent
+
+
+@client.on(events.NewMessage(pattern=r'^[./]genfile\s+([A-Za-z0-9_-]+)$'))
+async def gen_original_file(event):
+    if not event.out or event.sender_id != me_id:
+        return
+    from gen_delivery import lookup
+    try:
+        entry = lookup(event.pattern_match.group(1), event.chat_id)
+        await client.send_file(event.chat_id, entry['path'], force_document=True, reply_to=event.id)
+    except (ValueError, PermissionError, FileNotFoundError):
+        await event.reply('Оригинал недоступен, истёк срок хранения или другой чат.')
+
+
+@client.on(events.NewMessage(pattern=r'^[./](genjobs|gencancel|gendrain|genintake)(?:\s+([A-Za-z0-9_-]+))?$'))
+async def gen_job_control(event):
+    if not event.out:
+        return
+    from gen_runtime import JOBS
+    await JOBS.startup()
+    action, jid = event.pattern_match.group(1), event.pattern_match.group(2)
+    if action == 'genjobs':
+        entries = [r for r in JOBS.jobs.values() if str(r.chat_id) == str(event.chat_id)]
+        await event.reply('\n'.join(r.job_id + ': ' + r.status for r in entries[-20:]) or 'Задач в этом чате нет.')
+    elif action == 'gencancel':
+        rec = JOBS.jobs.get(jid)
+        if not rec or str(rec.chat_id) != str(event.chat_id):
+            await event.reply('Задача этого чата не найдена.'); return
+        await event.reply('Отменена.' if await JOBS.cancel(jid) else 'Задача уже завершена.')
+    elif action == 'gendrain':
+        drained = await JOBS.drain(timeout=1)
+        await event.reply('Приём закрыт. Активных задач нет.' if drained else 'Приём закрыт. Текущие задачи продолжаются.')
+    else:
+        await JOBS.resume_intake()
+        await event.reply('Приём задач открыт.')
 
 
 _GEN_ACTIVE_JOBS = {}
@@ -8535,7 +8690,7 @@ def _track_gen_activity(fn):
             except Exception as exc:
                 log('GEN', f'Activity tracking unavailable: {type(exc).__name__}')
         from gen_runtime import CURRENT, Invocation
-        invocation = Invocation(max_generation_calls=40, max_seconds=3600)
+        invocation = Invocation(max_generation_calls=80, max_qa_calls=240, max_seconds=3600)
         token = CURRENT.set(invocation)
         _GEN_ACTIVE_JOBS[key] = {'chat': event.chat_id, 'message': event.id, 'started': time.time(), 'job_id': invocation.job_id}
         publish()
@@ -8547,7 +8702,13 @@ def _track_gen_activity(fn):
                     publish()
         beat = asyncio.create_task(heartbeat())
         try:
-            return await asyncio.wait_for(fn(event), timeout=3600)
+            from gen_runtime import run_event
+            async def queued_work():
+                return await fn(event)
+            rec = await run_event(event.chat_id, queued_work, deadline=3600)
+            if rec.status in ('failed', 'cancelled', 'interrupted'):
+                await event.reply('Задача ' + rec.job_id + ': ' + rec.status + '. Результат не подтверждён.')
+            return rec
         finally:
             beat.cancel()
             CURRENT.reset(token)
@@ -8566,8 +8727,8 @@ async def gen_command(event):
     is_owner = event.out
     if not is_owner and event.sender_id not in ALLOWED_USERS:
         return
-    if openrouter_client is None:
-        await event.reply("⚠️ Генерация недоступна: нет `OPENROUTER_API_KEY` в .env.")
+    if openrouter_client is None and not CHATGPT2API_AUTH_KEY:
+        await event.reply("⚠️ Ни один маршрут генерации не настроен.")
         return
     n = int(event.pattern_match.group(1)) if event.pattern_match.group(1) else 0
     toks = (event.pattern_match.group(2) or "").split()
@@ -8803,17 +8964,23 @@ async def gen_command(event):
             counter = {"done": 0, "ok": 0, "exhausted": False}
             sem = asyncio.Semaphore(GEN_BATCH_CONCURRENCY)
 
-            async def _gen_and_send(idx, fp, by_ai, idea_i=None):
+            async def _gen_and_send(idx, fp, by_ai, idea_i=None, refs_snapshot=(), aspect_snapshot=None, refs_line_snapshot=None):
+                from gen_runtime import CURRENT, Invocation
+                parent_invocation = CURRENT.get()
+                packet_invocation = Invocation(max_generation_calls=4, max_qa_calls=12,
+                    max_seconds=min(900, parent_invocation.remaining_seconds()) if parent_invocation else 900,
+                    parent=parent_invocation, qa_route=parent_invocation.qa_route if parent_invocation else None)
+                CURRENT.set(packet_invocation)  # Context is local to this asyncio task.
                 async with sem:
                     if counter["exhausted"]:  # дневной лимит уже исчерпан — не тратим квоту на обречённый запрос
                         counter["done"] += 1
                         return
                     raw_i, mime_i, used_fp, _fb = await _gen_render_image(
-                        fp, input_b64s, image_size, aspect_ratio, (by_ai or ai_prompt), user_prompt)
+                        fp, list(refs_snapshot), image_size, aspect_snapshot, (by_ai or ai_prompt), user_prompt)
                     counter["done"] += 1
                     if raw_i is not None:
                         try:
-                            await _gen_send_image("me", raw_i, mime_i, used_fp, by_ai, None, refs_line=gen_refs_line, idea=idea_i)
+                            await _gen_send_image("me", raw_i, mime_i, used_fp, by_ai, None, refs_line=refs_line_snapshot, idea=idea_i)
                             counter["ok"] += 1
                         except Exception as e:
                             log("GEN", f"Вариант {idx + 1}: отправка в Избранное не удалась: {e}")
@@ -8848,13 +9015,12 @@ async def gen_command(event):
                     log("GEN", f"Ориентация от модели: {asp_i}")
                 log("GEN", f"Вариант {i + 1}/{batch_count}: промпт by_ai={by_ai} refs={len(sel) if i == 0 else '—'} idea={idea_i or '—'} len={len(fp)}")
                 prompts.append(fp)
-                tasks.append(asyncio.create_task(_gen_and_send(i, fp, by_ai, idea_i)))
+                tasks.append(asyncio.create_task(_gen_and_send(i, fp, by_ai, idea_i, tuple(input_b64s), aspect_ratio, gen_refs_line)))
                 if i + 1 < batch_count:
                     await set_status(f"🧠 Промпты {i + 1}/{batch_count} · 🎨 {counter['done']}/{batch_count} готово…")
             await asyncio.gather(*tasks)
             if counter["exhausted"]:
-                await set_status(f"⚠️ {counter['ok']} готово, но дневной лимит бесплатной модели исчерпан "
-                                 f"(50 запросов/день; провальные тоже считаются). Остальное — завтра или подними лимит. 📌")
+                await set_status(f"⚠️ Отправлено {counter['ok']} вариантов. Провайдер сообщил о нехватке квоты или баланса; остальные остановлены.")
             else:
                 await set_status(f"✅ {counter['ok']}/{batch_count} вариантов отправлено тебе в Избранное (Saved Messages) 📌")
             await asyncio.sleep(8)
@@ -8868,63 +9034,81 @@ async def gen_command(event):
         pages_count = _detect_pages_count(user_prompt, toks)
         if pages_count > 1:
             await set_status(f"🎨 Многостраничный сюжет ({pages_count} стр.): составляю сценарий…")
+            import json as _series_json
+            from pathlib import Path as _SeriesPath
+            from gen_series import parse_multipage_plan, SeriesCheckpoint, execute_series
+            from gen_runtime import ARTIFACTS as _SERIES_ARTIFACTS, CURRENT as _SERIES_CURRENT
+            from gen_jobs import JobStore as _SeriesJobStore
+            _series_store = _SeriesJobStore(_SeriesPath("gen_series_jobs.json"))
             pages_plan = await _build_multipage_prompts(
                 user_prompt, pages_count, context_text=context_text,
                 image_desc=image_desc, catalog=catalog, chat_id=event.chat_id,
                 initial_refs=input_b64s, include_ids=include_ids, exclude_ids=exclude_ids
             )
-            page_results = []
+            _series_plan = parse_multipage_plan(_series_json.dumps({"pages": [
+                {"number": p["page"], "prompt": p["prompt"], "aspect": p.get("aspect"), "refs": p.get("refs", [])}
+                for p in pages_plan]}, ensure_ascii=False), pages_count, user_aspect=aspect_ratio)
+            _invocation = _SERIES_CURRENT.get()
+            _job_id = _invocation.job_id if _invocation else __import__('uuid').uuid4().hex
+            _checkpoint = SeriesCheckpoint(_series_plan.plan_id)
+            _checkpoint.chat_id = str(event.chat_id)
+            _checkpoint.owner_id = str(event.sender_id)
+            _checkpoint.job_id = _job_id
+            _checkpoint.pages_meta = {str(p["page"]): {"idea": p.get("idea"), "prompt": p["prompt"], "aspect": p.get("aspect")} for p in pages_plan}
+            async def _save_series_checkpoint(state):
+                await _series_store.save({"job_id": _job_id, "chat_id": state.chat_id, "owner_id": state.owner_id,
+                    "plan": [{"number": p.number, "prompt": p.prompt, "aspect": p.aspect, "refs": list(p.refs)} for p in _series_plan.pages],
+                    "bible": _series_plan.bible, "version": _series_plan.version, "checkpoint": state.to_json(),
+                    "pages_meta": state.pages_meta})
+            await _save_series_checkpoint(_checkpoint)
+            _page_info = {p["page"]: p for p in pages_plan}
             failure_reason = None
-            anchor_b64 = None
-
-            for p_info in pages_plan:
-                p_idx = p_info["page"]
+            async def _series_generate(page, bible, anchor, max_input_bytes):
+                nonlocal failure_reason
+                p_idx = page.number
+                p_info = _page_info[p_idx]
                 p_idea = p_info.get("idea") or f"Страница {p_idx}"
-                p_prompt = p_info.get("prompt") or user_prompt
-                p_asp = aspect_ratio or p_info.get("aspect") or "9:16"
-
+                p_prompt = page.prompt
+                p_asp = page.aspect or "9:16"
                 await set_status(f"🎨 Генерирую страницу {p_idx}/{pages_count}…")
-                # Для сохранения персонажей между страницами: передаем кадр первой страницы как референс
                 p_inputs = list(input_b64s or [])
-                if anchor_b64:
-                    p_inputs = [anchor_b64] + p_inputs
+                if anchor:
+                    p_inputs = [base64.b64encode(anchor).decode("ascii")] + p_inputs
                     p_prompt += "\n\nStrict character consistency: maintain identical facial features, hairstyles, eye colors, outfits, and art style from the reference image."
-
                 raw_p, mime_p, used_fp, used_fb = await _gen_render_image(
                     p_prompt, p_inputs, image_size, p_asp,
                     True, user_prompt, set_status
                 )
-                if raw_p:
-                    page_results.append((raw_p, mime_p, used_fp, p_idea, p_idx))
-                    if anchor_b64 is None:
-                        anchor_b64 = base64.b64encode(raw_p).decode("ascii")
-                else:
+                if not raw_p:
                     failure_reason = mime_p
-                    log("GEN", f"Страница {p_idx}/{pages_count} не сгенерирована ({mime_p})")
-                    break
-
+                    raise RuntimeError(f"generation {mime_p}")
+                artifact_path = _SERIES_ARTIFACTS.save(f"{_job_id}_series_{p_idx}", raw_p, ".png" if "png" in mime_p else ".jpg")
+                return {"artifact": str(artifact_path), "mime": mime_p, "prompt": used_fp, "idea": p_idea}
+            async def _series_deliver(page, result):
+                nonlocal reply_target_id
+                p_idx = page.number
+                raw_p = _SeriesPath(result["artifact"]).read_bytes()
+                sent = await _gen_send_image(event.chat_id, raw_p, result["mime"], result["prompt"], True,
+                    reply_target_id, refs_line=gen_refs_line if p_idx == pages_count else None,
+                    idea=f"[{p_idx}/{pages_count}] {result['idea']}")
+                if sent and getattr(sent, "id", None):
+                    reply_target_id = sent.id
+                result["message_id"] = getattr(sent, "id", None)
+            _checkpoint = await execute_series(_series_plan, generate=_series_generate, checkpoint=_checkpoint,
+                save_checkpoint=_save_series_checkpoint, deliver=_series_deliver,
+                anchor_selector=lambda results: results.get(1) and _SeriesPath(results[1]["artifact"]).read_bytes())
+            page_results = list(_checkpoint.completed.items())
             if not page_results:
                 await set_status("❌ Не удалось сгенерировать страницы истории.")
                 return
-
-            await set_status(f"📤 Отправляю готовые страницы ({len(page_results)}/{pages_count})…")
-            reply_anchor = reply_target_id
-            for raw_p, mime_p, prompt_p, idea_p, p_num in page_results:
-                page_label = f"[{p_num}/{pages_count}]"
-                sent_msg = await _gen_send_image(
-                    event.chat_id, raw_p, mime_p, prompt_p, True, reply_anchor,
-                    refs_line=gen_refs_line if p_num == len(page_results) else None,
-                    idea=f"{page_label} {idea_p}" if idea_p else page_label
-                )
-                if sent_msg and hasattr(sent_msg, "id"):
-                    reply_anchor = sent_msg.id
-
-            if len(page_results) < pages_count:
+            if _checkpoint.failures:
+                _bad_page = min(_checkpoint.failures)
+                _why = _checkpoint.failures[_bad_page]
                 try:
                     await client.send_message(
                         event.chat_id,
-                        f"⚠️ Страница {len(page_results) + 1} из {pages_count} не сгенерирована. Причина: { {'moderation': 'отказ модерации провайдера', 'exhausted': 'нехватка квоты или баланса', 'overload': 'временный сбой или перегрузка'}.get(failure_reason, 'генерация не завершена') }. Отправлены {len(page_results)} из {pages_count} страниц.",
-                        reply_to=reply_anchor
+                        f"⚠️ Серия {_job_id}: страница {_bad_page}/{pages_count}, {_why}. Продолжить: `.genresume {_job_id}`",
+                        reply_to=reply_target_id
                     )
                 except Exception as e:
                     log("GEN", f"Не удалось отправить уведомление о сбое страницы: {e}")
@@ -8977,11 +9161,13 @@ async def gen_command(event):
             return
         log("GEN", f"Готово за {time.time() - t0:.1f}с · {len(raw) / 1024:.0f} КБ · {mime} · prompt_by_ai={prompt_by_ai} · модель={'fast(запасная)' if used_fb else 'pro'}")
         await _gen_send_image(event.chat_id, raw, mime, used_fp, prompt_by_ai, reply_target_id, refs_line=gen_refs_line, idea=gen_idea)
-        await status.delete()
+        try:
+            await status.delete()
+        except Exception:
+            pass  # Successful delivery is not undone by status cleanup failure.
     except Exception as e:
-        log("GEN", f"Ошибка /gen: {e}")
-        traceback.print_exc()
-        await set_status(f"❌ Генерация не удалась: {e}\nПопробуй ещё раз: `/gen {user_prompt[:200]}`")
+        log("GEN", f"Ошибка /gen: {type(e).__name__}")
+        await set_status("❌ Генерация или доставка не завершена. Тип ошибки: " + type(e).__name__ + ". Подробности доступны оператору в журнале.")
 
 
 @client.on(events.NewMessage(outgoing=True, pattern=r"^[./]auto_reply$", from_users="me"))
@@ -17609,6 +17795,10 @@ async def main():
     if not _scheduler_started:
         asyncio.create_task(scheduler_loop())  # один раз на процесс
         _scheduler_started = True
+    from gen_runtime import JOBS
+    interrupted_gen = await JOBS.startup()
+    if interrupted_gen:
+        log('GEN', f'Interrupted generation jobs: {len(interrupted_gen)}; explicit resume only')
     asyncio.create_task(_index_watchdog_loop())  # авто-резюм с чекпоинта: сразу при старте + периодически (самолечение)
     log("BOOT", "Userbot запущен.")
     await client.run_until_disconnected()

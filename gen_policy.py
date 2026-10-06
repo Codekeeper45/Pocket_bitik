@@ -33,9 +33,10 @@ class GenerationBudget:
 def action_for(findings):
     """Return conservative action label from structured findings."""
     items = list(findings)
-    severe = [f for f in items if f.get("severity") in {"high","critical"}]
+    severe = [f for f in items if f.get("severity") in {"high","critical"} or
+              (f.get('category') in {'fidelity','identity','text'} and f.get('severity') == 'medium' and f.get('confidence',0) >= .75)]
     if not severe: return "keep"
-    local = all(f.get("bbox") is not None for f in severe)
+    local = all(f.get("bbox") is not None and f.get('category') in {'anatomy','technical','other'} for f in severe)
     return "repair" if local else "regenerate_once"
 
 __all__=["GenerationBudget","BudgetExceeded","action_for"]

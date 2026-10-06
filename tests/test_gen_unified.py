@@ -4,7 +4,7 @@ import base64
 import os
 import unittest
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import patch, Mock
 
 # bot_new reads lowercase Telegram credentials at module import; these are inert test values.
 os.environ.setdefault("api_id", "12345")
@@ -102,7 +102,12 @@ class TestUnifiedGenPrompt(unittest.TestCase):
     def test_gateway_receives_every_reference(self):
         response = SimpleNamespace(ok=True, status_code=200,
             json=lambda: {"data": [{"b64_json": base64.b64encode(b"output").decode()}]})
-        refs = [base64.b64encode(b"first").decode(), base64.b64encode(b"second").decode()]
+        import io
+        from PIL import Image
+        refs = []
+        for color in ('blue', 'green'):
+            buffer = io.BytesIO(); Image.new('RGB', (32,32), color).save(buffer, format='PNG')
+            refs.append(base64.b64encode(buffer.getvalue()).decode())
         with patch.object(bot, "CHATGPT2API_AUTH_KEY", "inert-test"), patch.object(bot.requests, "post", return_value=response) as post:
             bot._sync_generate_image("image #1 subject, image #2 style", input_images_b64=refs, model="gpt-image-2.5-sunburst")
         body = post.call_args.kwargs["json"]
@@ -153,20 +158,42 @@ if __name__ == "__main__":
 
 class TestMockedToolLoop(unittest.IsolatedAsyncioTestCase):
     async def test_visual_qa_checks_generated_bytes_and_parses_findings(self):
-        generated = b"generated-artifact"
-        response = '{"findings":[{"severity":"high","issue":"extra finger","location":"left hand","confidence":0.91}]}'
-        with patch.object(bot, "describe_image", return_value=response) as vision:
-            result = await bot._gen_visual_qa(generated, "draw a person", "a person in a coat")
+        import io
+        from PIL import Image
+        from gen_runtime import Invocation, CURRENT
+        from unittest.mock import Mock
+        b=io.BytesIO(); Image.new('RGB',(32,24),'navy').save(b,'PNG'); generated=b.getvalue()
+        response = '{"findings":[{"id":"f1","category":"anatomy","severity":"high","confidence":0.91,"bbox":[0.1,0.2,0.4,0.7],"affected_subject":"person","requirement_id":"hands","description":"extra finger","location":"left hand"}]}'
+        reply=SimpleNamespace(choices=[SimpleNamespace(message=SimpleNamespace(content=response))])
+        create=Mock(return_value=reply)
+        client=SimpleNamespace(chat=SimpleNamespace(completions=SimpleNamespace(create=create)))
+        invocation=Invocation()
+        with patch.object(bot, "get_image_desc_client", return_value=(client,'pinned-qa')) as route:
+            token=CURRENT.set(invocation)
+            try: result=await bot._gen_visual_qa(generated, "draw a person", "a person in a coat")
+            finally: CURRENT.reset(token)
         self.assertEqual(result["findings"][0]["severity"], "high")
-        self.assertEqual(vision.call_args.args[0], generated)
-        self.assertIn("draw a person", vision.call_args.kwargs["prompt"])
-        self.assertIn("a person in a coat", vision.call_args.kwargs["prompt"])
+        route.assert_called_once_with()
+        kw=create.call_args.kwargs
+        self.assertEqual(kw['model'],'pinned-qa')
+        payload=kw['messages'][0]['content']
+        self.assertIn('draw a person',payload[0]['text'])
+        self.assertIn('a person in a coat',payload[0]['text'])
+        import base64
+        self.assertEqual(payload[1]['image_url']['url'],'data:image/png;base64,'+base64.b64encode(generated).decode())
+        self.assertEqual(invocation.qa_calls,1)
 
     async def test_visual_qa_failure_is_nonfatal(self):
-        with patch.object(bot, "describe_image", side_effect=RuntimeError("offline")):
-            self.assertIsNone(await bot._gen_visual_qa(b"output", "brief", "prompt"))
-        with patch.object(bot, "describe_image", return_value="not json"):
-            self.assertIsNone(await bot._gen_visual_qa(b"output", "brief", "prompt"))
+        import io
+        from PIL import Image
+        from gen_runtime import Invocation, CURRENT
+        b=io.BytesIO();Image.new('RGB',(8,8)).save(b,'PNG');raw=b.getvalue()
+        for reply in (RuntimeError('offline'), SimpleNamespace(choices=[]), SimpleNamespace(choices=[SimpleNamespace(message=SimpleNamespace(content='not json'))])):
+            client=SimpleNamespace(chat=SimpleNamespace(completions=SimpleNamespace(create=Mock(side_effect=reply) if isinstance(reply,Exception) else Mock(return_value=reply))))
+            with patch.object(bot,'get_image_desc_client',return_value=(client,'qa')):
+                token=CURRENT.set(Invocation())
+                try:self.assertIsNone(await bot._gen_visual_qa(raw,'brief','prompt'))
+                finally:CURRENT.reset(token)
 
     async def test_visual_qa_auto_repair_replaces_image_on_success(self):
         from unittest.mock import AsyncMock
@@ -176,7 +203,7 @@ class TestMockedToolLoop(unittest.IsolatedAsyncioTestCase):
             b = io.BytesIO(); Image.new('RGB', (100, 100), color).save(b, format='PNG'); return b.getvalue()
         artifact = image('blue')
         b = io.BytesIO(); Image.new('RGB', (1024,1024), 'green').save(b,format='PNG'); repaired=b.getvalue()
-        qa_initial = {"findings": [{"severity": "high", "issue": "bad hand", "location": "left hand", "confidence": 0.9, "bbox": [0.2, 0.2, 0.4, 0.4]}]}
+        qa_initial = {"findings": [{"id":"hand-1","category":"anatomy","severity": "high", "description":"bad hand", "location": "left hand", "confidence": 0.9, "bbox": [0.2, 0.2, 0.4, 0.4],"affected_subject":"person","requirement_id":"hands"}]}
         qa_repaired = {"findings": []}
 
         with patch('gen_pair_qa.compare_images',AsyncMock(return_value=True)), \
@@ -184,20 +211,22 @@ class TestMockedToolLoop(unittest.IsolatedAsyncioTestCase):
              patch.object(bot, "GEN_IMAGE_MODEL", "gpt-image-2.5-sunburst"), \
              patch.object(bot, "_gen_rate_gate", new=AsyncMock()), \
              patch.object(bot, "_sync_generate_image", side_effect=[(artifact, "image/png"), (repaired, "image/png")]) as gen_call, \
-             patch.object(bot, "_gen_visual_qa", side_effect=[qa_initial, qa_repaired, qa_repaired]) as inspect_image:
+             patch.object(bot, "_gen_visual_qa", side_effect=[qa_initial, qa_repaired, qa_repaired, qa_repaired]) as inspect_image:
             result = await bot._gen_one_image("prompt", ["reference"], "2K", "1:1", True, "user req")
         output = Image.open(io.BytesIO(result[0]))
         self.assertEqual(output.getpixel((0, 0)), (0, 0, 255))
         self.assertEqual(output.getpixel((30, 30)), (0, 128, 0))
         self.assertEqual(result[1], "image/png")
         self.assertEqual(gen_call.call_count, 2)
-        self.assertEqual(inspect_image.call_count, 3)
+        self.assertEqual(inspect_image.call_count, 4)
         self.assertTrue(inspect_image.call_args.args[2].startswith('prompt'))
 
     async def test_visual_qa_preserves_original_when_repair_disabled(self):
         from unittest.mock import AsyncMock
-        artifact = b"generated-image"
-        qa = {"findings": [{"severity": "high", "issue": "bad hand", "location": "left", "confidence": 0.9}]}
+        import io
+        from PIL import Image
+        buf=io.BytesIO();Image.new('RGB',(64,64),'blue').save(buf,format='PNG');artifact=buf.getvalue()
+        qa = {"findings": [{"id":"hand-1","category":"anatomy","severity": "high", "description":"bad hand", "location": "left", "confidence": 0.9,"bbox":[.1,.1,.3,.3],"affected_subject":"person","requirement_id":"hands"}]}
         with patch.object(bot, "GEN_IMAGE_MODEL", "gpt-image-2.5-sunburst"), \
              patch.object(bot, "_gen_rate_gate", new=AsyncMock()), \
              patch.object(bot, "_sync_generate_image", return_value=(artifact, "image/png")) as gen_call, \
@@ -236,7 +265,9 @@ class TestMockedToolLoop(unittest.IsolatedAsyncioTestCase):
 
     async def test_transient_retry_preserves_prompt_and_refs(self):
         from unittest.mock import AsyncMock
-        response = (b"image", "image/png")
+        import io
+        from PIL import Image
+        buf=io.BytesIO();Image.new('RGB',(64,64),'blue').save(buf,format='PNG');response=(buf.getvalue(), 'image/png')
         with patch.object(bot, "GEN_IMAGE_MODEL", "other-image-model"), \
              patch.object(bot, "_gen_rate_gate", new=AsyncMock()), \
              patch.object(bot.asyncio, "sleep", new=AsyncMock()), \
@@ -244,7 +275,7 @@ class TestMockedToolLoop(unittest.IsolatedAsyncioTestCase):
              patch.object(bot, "GEN_IMAGE_INPUT", True), \
              patch.object(bot, "_sync_repair_image_prompt") as repair:
             result = await bot._gen_one_image("exact prompt", ["reference"], "2K", "1:1", True, "user brief")
-        self.assertEqual(result[:3], (b"image", "image/png", "exact prompt"))
+        self.assertEqual(result[:3], (response[0], "image/png", "exact prompt"))
         self.assertEqual(generate.call_count, 2)
         self.assertEqual(generate.call_args_list[0], generate.call_args_list[1])
         repair.assert_not_called()
@@ -313,30 +344,20 @@ class TestMockedToolLoop(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(bot._detect_pages_count(prompt, toks), expected)
 
     def test_parse_gen_multipage_out(self):
-        sample = """
-PAGE 1:
-IDEA: Зая сидит в кафе
-ASPECT: 9:16
-PROMPT: A manga page 1: Zaya sits in a cafe...
-
-PAGE 2:
-IDEA: Кими входит в кафе
-ASPECT: 9:16
-PROMPT: A manga page 2: Kimi enters the cafe...
-"""
+        import json
+        sample=json.dumps({"pages":[{"number":1,"prompt":"A manga page 1: Zaya sits in a cafe...","aspect":"9:16"},{"number":2,"prompt":"A manga page 2: Kimi enters the cafe...","aspect":"9:16"}]},ensure_ascii=False)
         parsed = bot._parse_gen_multipage_out(sample, 2)
         self.assertEqual(len(parsed), 2)
         self.assertEqual(parsed[0]["page"], 1)
-        self.assertIn("Зая", parsed[0]["idea"])
-        self.assertIn("cafe", parsed[0]["prompt"])
+        self.assertIsNone(parsed[0]["idea"])
+        self.assertIn("Zaya", parsed[0]["prompt"])
         self.assertEqual(parsed[1]["page"], 2)
-        self.assertIn("Кими", parsed[1]["idea"])
+        self.assertIsNone(parsed[1]["idea"])
         self.assertIn("Kimi", parsed[1]["prompt"])
 
     def test_parse_gen_multipage_fallback(self):
         sample = "IDEA: общая идея\nPROMPT: Sequential story prompt."
-        from gen_series import SeriesPlanError
-        with self.assertRaises(SeriesPlanError):
+        with self.assertRaises(ValueError):
             bot._parse_gen_multipage_out(sample, 3)
 
     def test_layered_staging_in_composition_rules(self):

@@ -34,9 +34,19 @@ def validate_image(data: bytes, *, max_bytes: int = 20_000_000, max_pixels: int 
             im.verify()
         with Image.open(BytesIO(raw)) as im:
             fmt = (im.format or "").upper()
+            if im.width * im.height > max_pixels:
+                raise ValueError('image dimensions exceed pixel limit')
             oriented = ImageOps.exif_transpose(im)
+            oriented.load()
             size = oriented.size
             if size[0] < 1 or size[1] < 1 or size[0] * size[1] > max_pixels: raise ValueError("image dimensions exceed pixel limit")
+            if im.getexif().get(274, 1) != 1:
+                normalized = BytesIO()
+                oriented.save(normalized, format='PNG')
+                raw = normalized.getvalue()
+                fmt = 'PNG'
+                if len(raw) > max_bytes:
+                    raise ValueError('normalized image exceeds byte limit')
     except ValueError: raise
     except Exception as exc: raise ValueError("provider returned invalid or unsupported image data") from exc
     mimes = {"PNG":"image/png", "JPEG":"image/jpeg", "WEBP":"image/webp", "GIF":"image/gif", "TIFF":"image/tiff"}
@@ -59,4 +69,22 @@ def classify_provider_error(status_code: Optional[int], code: str = "", message:
     else: kind = "transient"
     return ProviderError(kind, "Image provider request failed", status_code, kind in {"rate_limit", "timeout", "transient"})
 
-__all__ = ["ProviderProfile", "ValidatedImage", "validate_image", "classify_provider_error"]
+GATEWAY_PROFILE = ProviderProfile('chatgpt2api', ((1024,1024),(1536,1024),(1024,1536)), ('1:1','3:2','2:3'), True, False, 4_500_000, 10, 600)
+
+def gateway_dimensions(aspect):
+    # Native API capability is explicit; requested ratios are not relabeled.
+    if aspect in ('16:9','4:3','3:2','horizontal'): return (1536,1024)
+    if aspect in ('9:16','3:4','2:3','vertical'): return (1024,1536)
+    return (1024,1024)
+
+def capability_notice(requested_aspect, requested_tier, actual_size):
+    notices=[]
+    if requested_aspect and ':' in requested_aspect:
+        a,b=map(int,requested_aspect.split(':'))
+        if actual_size[0]*b != actual_size[1]*a:
+            notices.append(f'Формат {requested_aspect} недоступен нативно; фактически {actual_size[0]}×{actual_size[1]}, без обрезки')
+    if requested_tier in ('2K','4K') and max(actual_size)<int(requested_tier[0])*1000:
+        notices.append(f'{requested_tier} не получен нативно; апскейл не применялся')
+    return notices
+
+__all__ = ["ProviderProfile", "ValidatedImage", "validate_image", "classify_provider_error", "GATEWAY_PROFILE", "gateway_dimensions", "capability_notice"]
