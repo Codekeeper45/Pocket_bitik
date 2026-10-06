@@ -4026,46 +4026,71 @@ async def _build_gen_prompt(user_prompt: str, context_text: str = None, image_de
     if not out:
         log("GEN", "Активная модель не построила промпт — fallback без истории-рефов")
         fb = await asyncio.to_thread(_sync_image_prompt, user_prompt, context_text, image_desc, edit_mode, previous_prompts, 0.35)
-        prompt_text, refs, idea, aspect = _parse_gen_prompt_out(fb, working_catalog or None)
-        return prompt_text or user_prompt, refs, idea, aspect
-    parsed = _parse_gen_prompt_out(_strip_think(out).strip(), working_catalog or None)
-    raw_prompt = parsed[0]
-    # A second, bounded call turns the final prompt into a validated scene contract.
-    # The original request is authoritative; extraction may organize facts, never invent them.
-    if llm and raw_prompt:
-        try:
+        out = fb
+        if not out:
             import gen_prompt as _gen_prompt
-            contract_messages = [
-                {"role": "system", "content": (
-                    "Extract a scene contract as JSON only with keys: task_type,prompt,participants,"
-                    "participant_count,known_appearance,hypotheses,action,composition,required_text,"
-                    "style,aspect,refs,immutable_requirements,fictional_interpretation. "
-                    "Use only facts explicit in source. Preserve exact user names and quoted text; "
-                    "do not infer unknown appearances. participants and required_text are arrays; "
-                    "immutable_requirements lists verbatim non-negotiable user constraints. refs is [].")},
-                {"role": "user", "content": json.dumps({"user_request": user_prompt, "final_prompt": raw_prompt,
-                    "parsed_aspect": parsed[3], "selected_refs": parsed[1]}, ensure_ascii=False)},
-            ]
+            raise _gen_prompt.ContractError("prompt generation returned no structured source")
+        parsed = _parse_gen_prompt_out(fb, working_catalog or None)
+        raw_prompt = parsed[0]
+        if not raw_prompt:
+            import gen_prompt as _gen_prompt
+            raise _gen_prompt.ContractError("fallback prompt was empty")
+        llm, model_id, _label = get_active_model()
+    else:
+        parsed = _parse_gen_prompt_out(_strip_think(out).strip(), working_catalog or None)
+        raw_prompt = parsed[0]
+    # One retry is permitted for malformed/incomplete extraction; never degrade to an uncontracted prompt.
+    import gen_prompt as _gen_prompt
+    contract_messages = [
+        {"role": "system", "content": (
+            "Extract a scene contract as JSON only with keys: task_type,prompt,participants,"
+            "participant_count,known_appearance,hypotheses,action,composition,required_text,"
+            "style,aspect,refs,immutable_requirements,fictional_interpretation. "
+            "Use only facts explicit in source. Preserve exact user names and quoted text; "
+            "do not infer unknown appearances. participants and required_text are arrays; "
+            "immutable_requirements must include the entire user_request verbatim as one array item, "
+            "plus each distinct non-negotiable constraint verbatim. Put observed appearance only in "
+            "known_appearance; label uncertain/inferred appearance only as hypotheses. refs must map "
+            "each selected ref_id exactly to an explicit role (subject, style, composition, or object); "
+            "do not invent IDs. Return valid JSON only.")},
+        {"role": "user", "content": json.dumps({"user_request": user_prompt, "final_prompt": raw_prompt,
+            "parsed_aspect": parsed[3], "selected_refs": [{"ref_id": str(k), "role": role or "subject"} for k, role in parsed[1]]}, ensure_ascii=False)},
+    ]
+    errors = []
+    contract = None
+    for attempt in range(2):
+        try:
+            if not llm:
+                raise _gen_prompt.ContractError("no active model available for scene contract extraction")
             response = await asyncio.wait_for(asyncio.to_thread(
                 llm.chat.completions.create, model=model_id, messages=contract_messages,
                 max_tokens=min(ASK_MAX_TOKENS, 1200), temperature=0,
                 response_format={"type": "json_object"}), timeout=20)
             extracted = _extract_content(response.choices[0].message)
             contract = _gen_prompt.extract_contract(extracted)
-            # Enforce source-backed immutable literals and count before accepting the rendering.
-            quoted = re.findall(r'["“](.+?)["”]', user_prompt)
+            if user_prompt not in contract.immutable_requirements:
+                raise _gen_prompt.ContractError("verbatim user request missing from immutable_requirements")
+            quoted = re.findall(r'[\"“](.+?)[\"”]', user_prompt)
             if any(q not in contract.prompt and q not in contract.required_text and q not in contract.immutable_requirements for q in quoted):
                 raise _gen_prompt.ContractError("quoted user text was not preserved")
             if contract.participant_count is not None and contract.participants and contract.participant_count != len(contract.participants):
                 raise _gen_prompt.ContractError("participant count mismatch")
-            # User's explicit aspect stays authoritative; model aspect is only a suggestion otherwise.
-            rendered = _gen_prompt.render_prompt(contract, user_aspect=parsed[3])
-            parsed = (rendered, parsed[1], parsed[2], parsed[3])
+            selected = {str(k): role or "subject" for k, role in parsed[1]}
+            returned = {str(r["ref_id"]): r["role"] for r in contract.refs}
+            if returned != selected:
+                raise _gen_prompt.ContractError("contract refs do not match selected refs and roles")
+            break
         except Exception as exc:
-            log("GEN", f"Scene contract extraction/validation skipped; retaining original prompt ({type(exc).__name__})")
+            errors.append(exc)
+            contract = None
+            if attempt == 0:
+                continue
+    if contract is None:
+        raise _gen_prompt.ContractError('scene contract extraction failed after one retry: ' + type(errors[-1]).__name__) from errors[-1]
+    rendered = _gen_prompt.render_prompt(contract, user_aspect=parsed[3])
+    parsed = (rendered, parsed[1], parsed[2], parsed[3])
     if catalog is not None and working_catalog is not catalog:
         catalog[:] = working_catalog
-    # Validate IDs returned by model against the exact available catalog; no fabricated IDs.
     return parsed[0], _gen_validated_selection(working_catalog, [(k, role or "subject") for k, role in parsed[1]]), parsed[2], parsed[3]
 
 
@@ -9039,7 +9064,7 @@ async def gen_command(event):
             from gen_series import parse_multipage_plan, SeriesCheckpoint, execute_series
             from gen_runtime import ARTIFACTS as _SERIES_ARTIFACTS, CURRENT as _SERIES_CURRENT
             from gen_jobs import JobStore as _SeriesJobStore
-            _series_store = _SeriesJobStore(_SeriesPath("gen_series_jobs.json"))
+            _series_store = _SeriesJobStore(_SeriesPath("gen_series_state") / f"{_job_id}.json")
             pages_plan = await _build_multipage_prompts(
                 user_prompt, pages_count, context_text=context_text,
                 image_desc=image_desc, catalog=catalog, chat_id=event.chat_id,
@@ -9055,13 +9080,20 @@ async def gen_command(event):
             _checkpoint.owner_id = str(event.sender_id)
             _checkpoint.job_id = _job_id
             _checkpoint.pages_meta = {str(p["page"]): {"idea": p.get("idea"), "prompt": p["prompt"], "aspect": p.get("aspect")} for p in pages_plan}
+            _generation = {"user_prompt": user_prompt, "context_text": context_text, "image_desc": image_desc,
+                "input_b64s": input_b64s, "input_roles": input_roles, "image_size": image_size,
+                "aspect_ratio": aspect_ratio, "reply_target_id": reply_target_id,
+                "gen_refs_line": gen_refs_line}
             async def _save_series_checkpoint(state):
                 await _series_store.save({"job_id": _job_id, "chat_id": state.chat_id, "owner_id": state.owner_id,
                     "plan": [{"number": p.number, "prompt": p.prompt, "aspect": p.aspect, "refs": list(p.refs)} for p in _series_plan.pages],
                     "bible": _series_plan.bible, "version": _series_plan.version, "checkpoint": state.to_json(),
-                    "pages_meta": state.pages_meta})
+                    "pages_meta": state.pages_meta, "generation": _generation})
+                try: _series_store.path.chmod(0o600)
+                except OSError: pass
             await _save_series_checkpoint(_checkpoint)
             _page_info = {p["page"]: p for p in pages_plan}
+            _ref_catalog = {str(i): {"image": b64, "role": role} for i, (b64, role) in enumerate(zip(input_b64s, input_roles), 1)}
             failure_reason = None
             async def _series_generate(page, bible, anchor, max_input_bytes):
                 nonlocal failure_reason
@@ -9069,16 +9101,19 @@ async def gen_command(event):
                 p_info = _page_info[p_idx]
                 p_idea = p_info.get("idea") or f"Страница {p_idx}"
                 p_prompt = page.prompt
-                p_asp = page.aspect or "9:16"
-                await set_status(f"🎨 Генерирую страницу {p_idx}/{pages_count}…")
-                p_inputs = list(input_b64s or [])
+                selected_refs = [r for r in page.refs if r in _ref_catalog]
+                p_inputs = [_ref_catalog[r]["image"] for r in selected_refs]
+                selected_roles = [_ref_catalog[r]["role"] for r in selected_refs]
                 if anchor:
                     p_inputs = [base64.b64encode(anchor).decode("ascii")] + p_inputs
-                    p_prompt += "\n\nStrict character consistency: maintain identical facial features, hairstyles, eye colors, outfits, and art style from the reference image."
+                    selected_roles = ["page 1 anchor; preserve character and style identity"] + selected_roles
+                    p_prompt += "\n\nStrict character consistency: maintain identical facial features, hairstyles, eye colors, outfits, and art style from the reference image.\nReference roles: " + "; ".join(f"ref {i+1}: {role}" for i, role in enumerate(selected_roles))
+                await set_status(f"🎨 Генерирую страницу {p_idx}/{pages_count}…")
                 raw_p, mime_p, used_fp, used_fb = await _gen_render_image(
-                    p_prompt, p_inputs, image_size, p_asp,
+                    p_prompt, p_inputs, image_size, page.aspect or aspect_ratio,
                     True, user_prompt, set_status
                 )
+
                 if not raw_p:
                     failure_reason = mime_p
                     raise RuntimeError(f"generation {mime_p}")

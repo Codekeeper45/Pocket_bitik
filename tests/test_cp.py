@@ -1,6 +1,7 @@
 import sys
 import os
 import unittest
+import tests  # Install credential-free bootstrap under unittest discover -s tests.
 
 sys.path.append('/home/hermes/projects/Pocket_bitik')
 import bot_new
