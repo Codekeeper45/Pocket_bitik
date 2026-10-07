@@ -16,7 +16,7 @@ Exact existing generated prompts recovered from Telegram, not original deleted c
 - Toster 593435: ten named astronauts fixing toaster reactor.
 Other historical Toster prompts 593437, 593445, 593450 also recovered.
 Recovering a generated prompt is not equivalent to recovering every original reference/command.
-Artifacts and per-scene verdicts: qa_artifacts/originals_live_ledger.json.
+Artifacts and per-scene verdicts: qa_artifacts/originals_live_ledger.json. Both replay runs completed with real image outputs. Socrate: three requested tags read correctly, exact 115 people not verified; background faces and hands retain defects. Toster: ten named subjects visible, rod law badge reads rodlam and Vera badge partly obscured; hands retain artifacts. These are failed full-fidelity acceptance, not clean successes.
 
 ## Repair
 Live source pipeline_v2_live.png: one explicit hand edit generated but failed verification (QA timeout), original kept. No successful live repair asserted.
