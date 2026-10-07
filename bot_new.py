@@ -8302,7 +8302,7 @@ def _clamp_resolution(size, supported):
     return max(le, key=lambda s: _RES_RANK[s]) if le else min(ok, key=lambda s: _RES_RANK[s])
 
 
-_GEN_VISUAL_QA_PROMPT = '''Проведи тщательную проверку приложенного финального изображения по исходному запросу и промпту. Осматривай всё изображение систематически, включая мелкие/средние объекты, кисти, пальцы, контакт предметов и выполнение действий (не считай действие выполненным, если нужный контакт/перенос не виден). При сомнении не выдумывай дефект; но и не называй явную поломку стилизацией. Верни ТОЛЬКО JSON {"findings":[{"id":"f1","category":"anatomy|fidelity|technical|composition|identity|text|seam|style|other","affected_subject":null,"requirement_id":null,"severity":"high|medium|low|critical","description":"конкретный наблюдаемый дефект","location":"краткая область","confidence":0.0,"bbox":[0.1,0.1,0.2,0.2]}]}. Каждый объект обязан содержать все перечисленные поля; null разрешён только для subject/requirement_id/bbox. Для конкретной локальной ошибки bbox обязателен: нормализованные [left,top,right,bottom], 0..1, строго ненулевой площади; для глобального дефекта bbox=null. Перечисли все обнаруженные отдельные проблемы. Без существенных дефектов верни findings=[].'''
+_GEN_VISUAL_QA_PROMPT = '''Проведи тщательную проверку приложенного финального изображения по исходному запросу и промпту. Осматривай всё изображение систематически, включая мелкие/средние объекты, кисти, пальцы, контакт предметов и выполнение действий (не считай действие выполненным, если нужный контакт/перенос не виден). При сомнении не выдумывай дефект; но и не называй явную поломку стилизацией. Верни ТОЛЬКО JSON {"findings":[{"id":"f1","category":"anatomy|fidelity|technical|composition|identity|text|seam|style|other","affected_subject":null,"requirement_id":null,"severity":"high|medium|low|critical","description":"конкретный наблюдаемый дефект","location":"краткая область","confidence":0.0,"bbox":[0.1,0.1,0.2,0.2]}]}. Каждый объект обязан содержать все перечисленные поля; null разрешён только для subject/requirement_id/bbox. Для конкретной локальной ошибки bbox обязателен: нормализованные [left,top,right,bottom], 0..1, строго ненулевой площади; для глобального дефекта bbox=null, category только fidelity/composition/other и location строго global. category и severity должны содержать одно значение из перечисления, не строку с разделителями |. confidence число 0..1. Не добавляй поля вне схемы. Перечисли все обнаруженные отдельные проблемы. Без существенных дефектов верни findings=[].'''
 
 
 _GEN_QA_MAX_FINDINGS = 64
@@ -8328,7 +8328,7 @@ async def _gen_visual_qa(raw: bytes, user_prompt: str, final_prompt: str):
         return None
 
 
-async def _gen_visual_qa_impl(raw: bytes, user_prompt: str, final_prompt: str, _retry=False):
+async def _gen_visual_qa_impl(raw: bytes, user_prompt: str, final_prompt: str, _retry=False, _feedback=''):
     if _retry:
         final_prompt += '\nQA schema correction: all local findings require numeric normalized bbox [left,top,right,bottom]. Global findings must use category composition, fidelity or other and location global. Return all required fields exactly.'
     """Fail-closed visual QA using the invocation's pinned client and model."""
@@ -8348,6 +8348,8 @@ async def _gen_visual_qa_impl(raw: bytes, user_prompt: str, final_prompt: str, _
         client, model = get_image_desc_client()
     if client is None or not model:
         return None
+    if _feedback:
+        final_prompt += '\nValidator correction: ' + _feedback
     request = (f"Исходный запрос пользователя:\\n{user_prompt[:3000]}\\n\\n"
                f"Промпт генерации:\\n{final_prompt[:5000]}\\n\\n{_GEN_VISUAL_QA_PROMPT}")
     try:
@@ -8365,6 +8367,8 @@ async def _gen_visual_qa_impl(raw: bytes, user_prompt: str, final_prompt: str, _
             raise ValueError('no JSON object')
         parsed = parse_findings(json.loads(text[start:end + 1]), limit=64)
         if parsed.status == 'unavailable' or parsed.overflow:
+            if not _retry:
+                return await _gen_visual_qa_impl(raw, user_prompt, final_prompt, _retry=True, _feedback=parsed.error or 'finding safety cap exceeded')
             raise ValueError(parsed.error or 'finding safety cap exceeded')
         return {'findings': [dict(f, issue=f['description']) for f in parsed.findings]}
     except Exception as e:
