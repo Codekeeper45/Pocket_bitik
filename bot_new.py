@@ -4087,11 +4087,17 @@ async def _build_gen_prompt(user_prompt: str, context_text: str = None, image_de
                 contract_client = contract_client.with_options(max_retries=0, timeout=90)
             contract_kwargs = dict(model=model_id, messages=contract_messages,
                                    max_tokens=4000, temperature=0)
+            if isinstance(llm, _CliproxyReasoningClient):
+                # Override the high model default for schema extraction only.
+                contract_kwargs['reasoning_effort'] = 'low'
             if not isinstance(llm, _CliproxyReasoningClient):
                 contract_kwargs['response_format'] = {"type": "json_object"}
             response = await asyncio.wait_for(asyncio.to_thread(
                 contract_client.chat.completions.create, **contract_kwargs), timeout=95)
             extracted = _extract_content(response.choices[0].message)
+            if not extracted or not extracted.strip():
+                finish = getattr(response.choices[0], 'finish_reason', None)
+                raise _gen_prompt.ContractError('empty contract response; finish_reason=' + str(finish))
             contract = _gen_prompt.extract_contract(extracted)
             if user_prompt not in contract.immutable_requirements:
                 raise _gen_prompt.ContractError("verbatim user request missing from immutable_requirements")
@@ -4107,6 +4113,9 @@ async def _build_gen_prompt(user_prompt: str, context_text: str = None, image_de
             break
         except Exception as exc:
             errors.append(exc)
+            # Schema errors contain only validator-owned descriptions. Never log provider bodies.
+            detail = str(exc)[:200] if isinstance(exc, _gen_prompt.ContractError) else type(exc).__name__
+            log('GEN', f'Contract extraction attempt {attempt + 1}: {detail}')
             contract = None
             if attempt == 0:
                 reason = str(exc)[:200] if isinstance(exc, _gen_prompt.ContractError) else type(exc).__name__
@@ -9472,7 +9481,11 @@ async def gen_command(event):
         active = CURRENT.get()
         saved_key = active.timings.get('delivery_key') if active else None
         suffix = (' Файл сохранён. Проверить и повторить доставку: .genretry ' + saved_key) if saved_key else ''
-        await set_status('Генерация или доставка не завершена. Тип ошибки: ' + type(e).__name__ + '.' + suffix)
+        from gen_prompt import ContractError
+        if isinstance(e, ContractError):
+            await set_status('Не удалось подготовить описание сцены. Картинка ещё не генерировалась. Причина записана в журнале; запрос можно повторить.')
+        else:
+            await set_status('Генерация или доставка не завершена. Тип ошибки: ' + type(e).__name__ + '.' + suffix)
 
 
 @client.on(events.NewMessage(outgoing=True, pattern=r"^[./]del(?:\s+(\d+))?$", from_users="me"))
