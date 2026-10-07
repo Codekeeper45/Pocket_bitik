@@ -8545,6 +8545,15 @@ async def _gen_provider_call(prompt, inputs, model, size, aspect):
 
 async def _gen_one_image(final_prompt, input_b64s, image_size, aspect_ratio, allow_repair, user_prompt, status_cb=None):
     from gen_runtime import CURRENT, Invocation
+    # Explicit command format is authoritative for both provider and QA contract.
+    if aspect_ratio and isinstance(final_prompt, str):
+        try:
+            contract_data = json.loads(final_prompt)
+            if isinstance(contract_data, dict) and 'prompt' in contract_data:
+                contract_data['aspect'] = aspect_ratio
+                final_prompt = json.dumps(contract_data, ensure_ascii=False)
+        except (ValueError, TypeError):
+            pass
     parent = CURRENT.get()
     invocation = Invocation(max_seconds=min(900, parent.remaining_seconds()) if parent else 900,
                             parent=parent, qa_route=parent.qa_route if parent else None)
