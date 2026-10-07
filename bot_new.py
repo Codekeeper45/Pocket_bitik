@@ -8780,10 +8780,6 @@ async def _gen_send_image(chat, raw, mime, final_prompt, prompt_by_ai, reply_to,
         except Exception as e:
             log("GEN", f"Строка референсов не отправилась: {e}")
     record(artifact_key, chat=chat, reply_to=reply_to, path=artifact, status='delivered', message_id=getattr(sent, 'id', None))
-    try:
-        await client.send_message(chat, f'Оригинал без сжатия: `.genfile {artifact_key}` (хранится 24 ч)', reply_to=getattr(sent,'id',None))
-    except Exception:
-        pass
     return sent
 
 
