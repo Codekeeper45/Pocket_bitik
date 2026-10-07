@@ -4039,16 +4039,17 @@ async def _build_gen_prompt(user_prompt: str, context_text: str = None, image_de
             break
     if not out:
         log("GEN", "Активная модель не построила промпт — fallback без истории-рефов")
-        fb = await asyncio.to_thread(_sync_image_prompt, user_prompt, context_text, image_desc, edit_mode, previous_prompts, 0.35)
+        try:
+            fb = await asyncio.wait_for(asyncio.to_thread(_sync_image_prompt, user_prompt, context_text, image_desc, edit_mode, previous_prompts, 0.35), timeout=60)
+        except Exception as exc:
+            log('GEN', 'Prompt fallback unavailable: ' + type(exc).__name__)
+            fb = None
         out = fb
         if not out:
             import gen_prompt as _gen_prompt
-            raise _gen_prompt.ContractError("prompt generation returned no structured source")
-        parsed = _parse_gen_prompt_out(fb, working_catalog or None)
-        raw_prompt = parsed[0]
-        if not raw_prompt:
-            import gen_prompt as _gen_prompt
-            raise _gen_prompt.ContractError("fallback prompt was empty")
+            out = 'PROMPT: ' + user_prompt
+        parsed = _parse_gen_prompt_out(out, working_catalog or None)
+        raw_prompt = parsed[0] or user_prompt
         llm, model_id, _label = get_active_model()
     else:
         parsed = _parse_gen_prompt_out(_strip_think(out).strip(), working_catalog or None)
@@ -4122,7 +4123,13 @@ async def _build_gen_prompt(user_prompt: str, context_text: str = None, image_de
                 contract_messages.append({'role': 'user', 'content': 'Validation failed: '+reason+'. Return a corrected complete JSON contract matching the schema.'})
                 continue
     if contract is None:
-        raise _gen_prompt.ContractError('scene contract extraction failed after one retry: ' + type(errors[-1]).__name__) from errors[-1]
+        # Delivery-first: preserve the original request and known refs, not invented schema facts.
+        log('GEN', 'Contract extraction unavailable; using source-preserving delivery contract')
+        contract = _gen_prompt.build_contract_prompt(
+            user_prompt + '\n\nScene description: ' + (raw_prompt or user_prompt),
+            task_type='edit' if edit_mode else 'creation',
+            aspect=parsed[3], immutable_requirements=(user_prompt,),
+            refs=tuple({'ref_id': str(k), 'role': role or 'subject'} for k, role in parsed[1]))
     rendered = _gen_prompt.render_prompt(contract, user_aspect=parsed[3])
     parsed = (rendered, parsed[1], parsed[2], parsed[3])
     if catalog is not None and working_catalog is not catalog:
@@ -8313,6 +8320,17 @@ def get_image_desc_client():
     return _client_for_media_model(model_), model_
 
 async def _gen_visual_qa(raw: bytes, user_prompt: str, final_prompt: str):
+    """Quality checks never prevent delivery of an already generated image."""
+    try:
+        return await _gen_visual_qa_impl(raw, user_prompt, final_prompt)
+    except Exception as exc:
+        log('GEN', 'QA failed outside validator: ' + type(exc).__name__)
+        return None
+
+
+async def _gen_visual_qa_impl(raw: bytes, user_prompt: str, final_prompt: str, _retry=False):
+    if _retry:
+        final_prompt += '\nQA schema correction: all local findings require numeric normalized bbox [left,top,right,bottom]. Global findings must use category composition, fidelity or other and location global. Return all required fields exactly.'
     """Fail-closed visual QA using the invocation's pinned client and model."""
     import json
     from gen_runtime import CURRENT
@@ -8347,7 +8365,9 @@ async def _gen_visual_qa(raw: bytes, user_prompt: str, final_prompt: str):
             raise ValueError(parsed.error or 'finding safety cap exceeded')
         return {'findings': [dict(f, issue=f['description']) for f in parsed.findings]}
     except Exception as e:
-        log('GEN', f'Visual QA unavailable/invalid: {type(e).__name__}: {str(e)[:180]}')
+        log('GEN', f'Visual QA unavailable/invalid: {type(e).__name__}')
+        if isinstance(e, ValueError) and not _retry:
+            return await _gen_visual_qa_impl(raw, user_prompt, final_prompt, _retry=True)
         return None
 
 
@@ -8397,7 +8417,11 @@ async def _gen_repair_regions(raw, mime, qa, user_prompt, final_prompt, gen_mode
                 log('GEN', f'Region {index} not verified fixed; keeping original pixels'); continue
             response = Image.open(io.BytesIO(fixed))
             if response.size != mapping.canvas_size:
-                raise ValueError('repair returned unexpected canvas dimensions')
+                tw, th = mapping.canvas_size
+                if response.width * th != response.height * tw:
+                    raise ValueError('repair returned changed aspect/framing')
+                # Same-aspect provider resampling only; source framing remains fixed.
+                response = response.resize(mapping.canvas_size, Image.Resampling.LANCZOS)
             mapped_patch = extract_mapped_region(response, mapping, box)
             proposed = blend_patch(candidate, mapped_patch, box)
             proposed_bytes = io.BytesIO(); proposed.save(proposed_bytes, format='PNG')
@@ -8598,6 +8622,8 @@ async def _gen_one_image_impl(final_prompt, input_b64s, image_size, aspect_ratio
         used_fallback = True
         size = image_size
     fp = final_prompt
+    raw = None
+    mime = None
     while True:
         try:
             ensure_budget()
@@ -8640,6 +8666,9 @@ async def _gen_one_image_impl(final_prompt, input_b64s, image_size, aspect_ratio
                     invocation.timings['final_qa_unavailable'] = True
             return raw, mime, fp, used_fallback
         except TimeoutError as e:
+            if raw is not None:
+                log('GEN', 'Post-generation deadline reached; delivering available image')
+                return raw, mime, fp, used_fallback
             log("GEN", "Generation deadline reached; stopping without another provider call")
             return None, "overload", None, used_fallback
         except GenExhausted as e:
@@ -8700,10 +8729,18 @@ async def _gen_one_image_impl(final_prompt, input_b64s, image_size, aspect_ratio
                 continue
             return None, "overload", None, used_fallback
         except RuntimeError as e:
+            if raw is not None:
+                log('GEN', 'Post-generation processing failed; delivering available image')
+                return raw, mime, fp, used_fallback
             # Invocation generation-call budget is authoritative across QA repair calls too.
             if "generation call budget" in str(e).lower():
                 log("GEN", "Generation call budget reached; stopping without another provider call")
                 return None, "overload", None, used_fallback
+            raise
+        except Exception as exc:
+            if raw is not None:
+                log('GEN', 'Post-generation error ' + type(exc).__name__ + '; delivering available image')
+                return raw, mime, fp, used_fallback
             raise
 
 

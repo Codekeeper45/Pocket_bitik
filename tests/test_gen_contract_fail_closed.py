@@ -10,6 +10,9 @@ class ContractFailures(unittest.IsolatedAsyncioTestCase):
   llm=SimpleNamespace(chat=SimpleNamespace(completions=SimpleNamespace(create=create)))
   from gen_prompt import ContractError
   with patch.object(bot,'get_active_model',return_value=(llm,'offline-model','test')),patch.object(bot,'active_model_supports_vision',return_value=False),patch.object(bot,'MODEL_TOOLS_SUPPORT',{bot.ACTIVE_MODEL:False}):
-   with self.assertRaises(ContractError):await bot._build_gen_prompt('Preserve Mira and exact text "OPEN"',catalog=[])
+   result=await bot._build_gen_prompt('Preserve Mira and exact text "OPEN"',catalog=[])
+  contract=json.loads(result[0])
+  self.assertIn('Preserve Mira and exact text "OPEN"',contract['immutable_requirements'])
+  self.assertIn('Preserve Mira and exact text "OPEN"',contract['prompt'])
   self.assertEqual(create.call_count,3)
   self.assertEqual(sum('response_format' in c.kwargs for c in create.call_args_list),2)
