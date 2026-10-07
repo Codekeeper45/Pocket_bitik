@@ -8355,7 +8355,10 @@ async def _gen_visual_qa_impl(raw: bytes, user_prompt: str, final_prompt: str, _
         from gen_provider import validate_image
         image = validate_image(raw)
         content = [{'type': 'text', 'text': request}, {'type': 'image_url', 'image_url': {'url': f'data:{image.mime_type};base64,' + base64.b64encode(raw).decode(), 'detail': 'high'}}]
-        response = await asyncio.to_thread(client.chat.completions.create, model=model, messages=[{'role': 'user', 'content': content}], max_tokens=5000, temperature=0, timeout=60)
+        qa_kwargs = dict(model=model, messages=[{'role': 'user', 'content': content}], max_tokens=5000, temperature=0, timeout=90)
+        if 'gemini' in str(model).lower() and '8317' in str(getattr(client, 'base_url', '')):
+            qa_kwargs['extra_body'] = {'reasoning_effort': 'low'}
+        response = await asyncio.to_thread(client.chat.completions.create, **qa_kwargs)
         text = response.choices[0].message.content
         start, end = text.find('{'), text.rfind('}')
         if start < 0 or end < start:
