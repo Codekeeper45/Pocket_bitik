@@ -14514,8 +14514,11 @@ def _sync_embed_texts(texts: list) -> list:
             if isinstance(j, dict) and j.get("error"):
                 raise RuntimeError(f"200-wrapped provider error: {str(j.get('error'))[:200]}")
             break
-        except Exception:
+        except Exception as exc:
             j = None
+            if getattr(getattr(exc, 'response', None), 'status_code', None) in (401, 402, 403):
+                log('INDEX', 'Embeddings unavailable: authorization/billing; no retry')
+                raise
             if attempt == INDEX_EMBED_RETRIES:
                 raise
             time.sleep(min(30, 2 ** attempt) + random.random())
@@ -14541,6 +14544,9 @@ def _sync_embed_image(raw: bytes) -> list:
             break
         except Exception as e:
             last_err = e
+            if getattr(getattr(e, 'response', None), 'status_code', None) in (401, 402, 403):
+                log('INDEX', 'Image embeddings unavailable: authorization/billing; no retry')
+                raise
             if attempt == INDEX_EMBED_RETRIES:
                 raise
             time.sleep(min(30, 2 ** attempt) + random.random())
