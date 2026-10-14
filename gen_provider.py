@@ -55,6 +55,18 @@ def validate_image(data: bytes, *, max_bytes: int = 20_000_000, max_pixels: int 
     if expected_mime and expected_mime.split(";")[0].strip().lower() != mime: raise ValueError(f"MIME mismatch: header says {expected_mime}, bytes are {mime}")
     return ValidatedImage(raw, mime, size, fmt, len(raw))
 
+def transport_response_error(response):
+    """Detect transport HTML before treating it as an API/authentication response."""
+    from gen_contracts import ProviderError
+    text = getattr(response, 'text', '')[:16000]
+    if 'ERR_NGROK_725' in text:
+        return ProviderError('transport_quota', 'Gateway tunnel bandwidth exhausted (ERR_NGROK_725)', response.status_code, False)
+    content_type = getattr(response, 'headers', {}).get('Content-Type', '').lower()
+    if 'text/html' in content_type or text.lstrip().lower().startswith(('<!doctype html', '<html')):
+        return ProviderError('transport', 'Gateway returned HTML instead of image API JSON', response.status_code, response.status_code >= 500)
+    return None
+
+
 def classify_provider_error(status_code: Optional[int], code: str = "", message: str = ""):
     """Map errors conservatively; only explicit moderation indicators are moderation."""
     from gen_contracts import ProviderError

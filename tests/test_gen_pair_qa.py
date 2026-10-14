@@ -30,6 +30,15 @@ class PairQA(unittest.IsolatedAsyncioTestCase):
   content=kw['messages'][0]['content'];self.assertIn('fix hand',content[0]['text'])
   self.assertEqual([x['text'] for x in content if x['type']=='text'][1:3],['ORIGINAL','CANDIDATE'])
   self.assertTrue(all(x['image_url']['url'].startswith('data:image/png;base64,') for x in content if x['type']=='image_url'))
+ async def test_gemini_pair_qa_bounds_reasoning_through_public_tunnel(self):
+  from unittest.mock import Mock
+  create=Mock(return_value=self.response(self.passing()))
+  client=SimpleNamespace(base_url='https://example.trycloudflare.com/v1',chat=SimpleNamespace(completions=SimpleNamespace(create=create)))
+  self.assertTrue(await compare_images(self.png(),self.png(),'fix hand',client=client,model='gemini-3.8-flash-high'))
+  kw=create.call_args.kwargs
+  self.assertEqual(kw['extra_body'],{'reasoning_effort':'low'})
+  self.assertEqual(kw['max_tokens'],4000)
+  self.assertEqual(kw['timeout'],90)
  async def test_unknown_fields_fail_closed(self):
   raw=self.png();data=self.passing();data['unexpected']=True
   self.assertFalse(await compare_images(raw,raw,'fix hand',client=self.client(data),model='mock'))
