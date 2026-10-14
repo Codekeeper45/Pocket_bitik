@@ -1,0 +1,12 @@
+[Unit]
+Description=Pocket image gateway SSH forward to owner host
+After=network-online.target
+
+[Service]
+ExecStart=/usr/bin/ssh -N -o BatchMode=yes -o ExitOnForwardFailure=yes -o ServerAliveInterval=30 -o ServerAliveCountMax=3 -o ConnectTimeout=15 -p 2222 -L 127.0.0.1:3012:127.0.0.1:3011 server@127.0.0.1
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=default.target
+

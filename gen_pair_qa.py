@@ -46,8 +46,12 @@ async def compare_images(before, after, requirement, *, client, model, targets=N
                 if invocation.qa_calls >= 40:
                     return False
                 invocation.qa_calls += 1
+        remaining = invocation.remaining_seconds() if invocation and hasattr(invocation, 'remaining_seconds') else 90
+        timeout = min(90, remaining)
+        if timeout <= 0:
+            return False
         kwargs = dict(model=model, messages=[{'role': 'user', 'content': content}],
-                      max_tokens=4000, temperature=0, timeout=90)
+                      max_tokens=4000, temperature=0, timeout=timeout)
         # Match standalone QA on the same pinned Gemini route, including public tunnels.
         if 'gemini' in str(model).lower():
             kwargs['extra_body'] = {'reasoning_effort': 'low'}

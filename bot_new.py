@@ -8462,7 +8462,7 @@ async def _gen_repair_regions(raw, mime, qa, user_prompt, final_prompt, gen_mode
                 continue
             paired_ok = await compare_images(baseline.getvalue(), proposed_bytes.getvalue(),
                 'Target defects: ' + local_issues + '. ORIGINAL USER REQUIREMENTS: ' + user_prompt,
-                client=route[0], model=route[1], targets=[str(f.get('id') or f'region-{index}-{i}') for i, f in enumerate(region['findings'])]) if route else False
+                client=route[0], model=route[1], min_confidence=.7, targets=[str(f.get('id') or f'region-{index}-{i}') for i, f in enumerate(region['findings'])]) if route else False
             if after is None or seam_bad or not paired_ok:
                 log('GEN', f'Region {index} composite improvement unproven; reverting'); continue
             candidate = proposed; qa = after; accepted += 1

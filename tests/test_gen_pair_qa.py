@@ -43,6 +43,9 @@ class PairQA(unittest.IsolatedAsyncioTestCase):
   raw=self.png();data=self.passing();data['confidence']=.72
   self.assertFalse(await compare_images(raw,raw,'fix hand',client=self.client(data),model='mock'))
   self.assertTrue(await compare_images(raw,raw,'fix hand',client=self.client(data),model='mock',min_confidence=.65))
+  self.assertTrue(await compare_images(raw,raw,'fix hand',client=self.client(data),model='mock',min_confidence=.7))
+  data['confidence']=.69
+  self.assertFalse(await compare_images(raw,raw,'fix hand',client=self.client(data),model='mock',min_confidence=.7))
   data['identity_preserved']=False
   self.assertFalse(await compare_images(raw,raw,'fix hand',client=self.client(data),model='mock',min_confidence=.65))
  async def test_unknown_fields_fail_closed(self):
