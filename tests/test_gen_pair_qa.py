@@ -39,6 +39,12 @@ class PairQA(unittest.IsolatedAsyncioTestCase):
   self.assertEqual(kw['extra_body'],{'reasoning_effort':'low'})
   self.assertEqual(kw['max_tokens'],4000)
   self.assertEqual(kw['timeout'],90)
+ async def test_local_crop_threshold_does_not_relax_global_acceptance(self):
+  raw=self.png();data=self.passing();data['confidence']=.72
+  self.assertFalse(await compare_images(raw,raw,'fix hand',client=self.client(data),model='mock'))
+  self.assertTrue(await compare_images(raw,raw,'fix hand',client=self.client(data),model='mock',min_confidence=.65))
+  data['identity_preserved']=False
+  self.assertFalse(await compare_images(raw,raw,'fix hand',client=self.client(data),model='mock',min_confidence=.65))
  async def test_unknown_fields_fail_closed(self):
   raw=self.png();data=self.passing();data['unexpected']=True
   self.assertFalse(await compare_images(raw,raw,'fix hand',client=self.client(data),model='mock'))

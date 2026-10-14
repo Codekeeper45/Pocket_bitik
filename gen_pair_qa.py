@@ -3,10 +3,12 @@ import base64
 import json
 
 
-async def compare_images(before, after, requirement, *, client, model, targets=None):
+async def compare_images(before, after, requirement, *, client, model, targets=None, min_confidence=.8):
     import asyncio
     from gen_provider import validate_image
 
+    if type(min_confidence) not in (int, float) or not .65 <= min_confidence <= 1:
+        raise ValueError('min_confidence must be between .65 and 1')
     content = [{
         'type': 'text',
         'text': (
@@ -79,10 +81,16 @@ async def compare_images(before, after, requirement, *, client, model, targets=N
         else:
             # Legacy call sites infer one required target from the requirement/evidence.
             targets_ok = len(names) == 1 and len(set(names)) == 1
-        return (schema_ok and evidence_ok and targets_ok and
-                all(data.get(key) is True for key in keys) and
-                type(confidence) in (int, float) and .8 <= confidence <= 1)
-    except Exception:
+        accepted = (schema_ok and evidence_ok and targets_ok and
+                    all(data.get(key) is True for key in keys) and
+                    type(confidence) in (int, float) and min_confidence <= confidence <= 1)
+        if not accepted:
+            import logging
+            logging.getLogger(__name__).warning('Pair QA rejected: schema=%s evidence=%s targets=%s preservation=%s confidence=%s threshold=%s', schema_ok, evidence_ok, targets_ok, {key: data.get(key) for key in keys}, confidence, min_confidence)
+        return accepted
+    except Exception as exc:
+        import logging
+        logging.getLogger(__name__).warning('Pair QA unavailable: %s', type(exc).__name__)
         return False
 
 

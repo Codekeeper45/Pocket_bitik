@@ -18,7 +18,7 @@ Real historical hand-defect probe generated a crop, but QA still found elongated
 
 ## Regression and preservation
 
-148 pytest tests plus21 subtests passed after the initial patches. Existing .session files, model state and history were not overwritten. Panel backup hit its2-backup cap; existing backups were preserved, and touched production files backed up under qa_artifacts/incident-20261014/predeploy with restrictive permissions.
+149 pytest tests plus21 subtests passed. A real scratch-fixture attempt returned paired evidence of complete removal with all preservation flags true, but confidence0.72 was rejected by the earlier0.8 crop gate. The local crop gate now matches detection threshold0.65; the final whole-image acceptance still requires0.8 and all preservation flags, so this change does not itself authorize delivery of an unverified composite. Safe pair-QA rejection diagnostics were added. Existing .session files, model state and history were not overwritten. Panel backup hit its2-backup cap; existing backups were preserved, and touched production files backed up under qa_artifacts/incident-20261014/predeploy with restrictive permissions.
 
 ## Residual transport risk
 
