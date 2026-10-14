@@ -8452,7 +8452,7 @@ async def _gen_repair_regions(raw, mime, qa, user_prompt, final_prompt, gen_mode
             # unblended provider patch: feathering deliberately preserves old edge pixels.
             crop_candidate = io.BytesIO(); proposed.crop(box).save(crop_candidate, format='PNG')
             crop_pair_ok = await compare_images(crop_baseline.getvalue(), crop_candidate.getvalue(),
-                'Fix exactly: ' + local_issues + '. Preserve pose and framing.', client=route[0], model=route[1], targets=[str(f.get('id') or f'region-{index}-{i}') for i, f in enumerate(region['findings'])]) if route else False
+                'Fix exactly: ' + local_issues + '. Preserve pose and framing.', client=route[0], model=route[1], min_confidence=.65, targets=[str(f.get('id') or f'region-{index}-{i}') for i, f in enumerate(region['findings'])]) if route else False
             from PIL import ImageChops
             outside_diff = ImageChops.difference(candidate, proposed)
             outside_diff.paste(0, box)
