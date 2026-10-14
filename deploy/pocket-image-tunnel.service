@@ -1,0 +1,13 @@
+[Unit]
+Description=Pocket image gateway Cloudflare transport
+After=network-online.target pocket-image-forward.service
+Requires=pocket-image-forward.service
+
+[Service]
+ExecStart=/home/hermes/.local/bin/cloudflared tunnel --url http://127.0.0.1:3012 --no-autoupdate
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=default.target
+
