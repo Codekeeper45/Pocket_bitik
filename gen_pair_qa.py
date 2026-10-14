@@ -44,11 +44,12 @@ async def compare_images(before, after, requirement, *, client, model, targets=N
                 if invocation.qa_calls >= 40:
                     return False
                 invocation.qa_calls += 1
-        response = await asyncio.to_thread(
-            client.chat.completions.create, model=model,
-            messages=[{'role': 'user', 'content': content}],
-            max_tokens=1200, temperature=0, timeout=60
-        )
+        kwargs = dict(model=model, messages=[{'role': 'user', 'content': content}],
+                      max_tokens=4000, temperature=0, timeout=90)
+        # Match standalone QA on the same pinned Gemini route, including public tunnels.
+        if 'gemini' in str(model).lower():
+            kwargs['extra_body'] = {'reasoning_effort': 'low'}
+        response = await asyncio.to_thread(client.chat.completions.create, **kwargs)
         text = response.choices[0].message.content
         data = json.loads(text[text.index('{'):text.rindex('}') + 1])
         keys = ('identity_preserved', 'requirements_preserved', 'no_new_defects', 'no_seams')

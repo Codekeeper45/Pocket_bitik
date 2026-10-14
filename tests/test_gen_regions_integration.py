@@ -19,6 +19,18 @@ class RegionIntegration(unittest.IsolatedAsyncioTestCase):
   self.assertEqual(gen.call_count,2);self.assertNotEqual(result,first)
   im=Image.open(io.BytesIO(result));self.assertEqual(im.getpixel((500,500)),(0,0,255))
   self.assertTrue(inspect.call_args.args[2].startswith('original'))
+ async def test_crop_qa_compares_blended_candidate_that_will_be_committed(self):
+  original=raw('blue');f=finding([.1,.1,.2,.2]);seen=[]
+  async def pair(before,after,*args,**kwargs):
+   seen.append((Image.open(io.BytesIO(before)).convert('RGB'),Image.open(io.BytesIO(after)).convert('RGB')))
+   return True
+  with patch('gen_pair_qa.compare_images',side_effect=pair),patch.object(bot,'get_image_desc_client',return_value=(object(),'qa')),patch.object(bot,'_sync_generate_image',return_value=(raw('green'),'image/png')),patch.object(bot,'_gen_visual_qa',AsyncMock(return_value={'findings':[]})),patch.object(bot,'_gen_rate_gate',AsyncMock()):
+   result,_=await bot._gen_repair_regions(original,'image/png',{'findings':[f]},'user','original','model','2K')
+  self.assertNotEqual(result,original)
+  # Feathering preserves original edge pixels; the compared candidate must match
+  # the accepted composite exactly, rather than the raw green generated patch.
+  self.assertEqual(seen[0][1].getpixel((0,0)),seen[0][0].getpixel((0,0)))
+  self.assertNotEqual(seen[0][1].getpixel((seen[0][1].width//2,seen[0][1].height//2)),seen[0][0].getpixel((seen[0][1].width//2,seen[0][1].height//2)))
  async def test_seam_rejects_otherwise_improved_composite(self):
   original=raw('blue');f=finding([.1,.1,.2,.2])
   seam=global_finding('visible seam halo','global')

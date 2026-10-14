@@ -3358,6 +3358,12 @@ def _sync_generate_image(prompt: str, input_images_b64: list = None, model: str 
         }
         # Native gateway may try up to 3 accounts; allow its bounded request deadline to finish.
         resp = requests.post(endpoint, headers=headers, json=body, timeout=(20, 600))
+        from gen_provider import transport_response_error
+        if not resp.ok or 'text/html' in getattr(resp, 'headers', {}).get('Content-Type', '').lower():
+            transport_error = transport_response_error(resp)
+            if transport_error is not None:
+                log('GEN', f'Gateway transport failure: {transport_error}')
+                raise transport_error
         if resp.status_code >= 500:
             resp.raise_for_status()
         _moderation_markers = (
@@ -8358,7 +8364,7 @@ async def _gen_visual_qa_impl(raw: bytes, user_prompt: str, final_prompt: str, _
         image = validate_image(raw)
         content = [{'type': 'text', 'text': request}, {'type': 'image_url', 'image_url': {'url': f'data:{image.mime_type};base64,' + base64.b64encode(raw).decode(), 'detail': 'high'}}]
         qa_kwargs = dict(model=model, messages=[{'role': 'user', 'content': content}], max_tokens=5000, temperature=0, timeout=90)
-        if 'gemini' in str(model).lower() and '8317' in str(getattr(client, 'base_url', '')):
+        if 'gemini' in str(model).lower():
             qa_kwargs['extra_body'] = {'reasoning_effort': 'low'}
         response = await asyncio.to_thread(client.chat.completions.create, **qa_kwargs)
         text = response.choices[0].message.content
@@ -8442,7 +8448,9 @@ async def _gen_repair_regions(raw, mime, qa, user_prompt, final_prompt, gen_mode
             route = invocation.qa_route if invocation and invocation.qa_route else get_image_desc_client()
             baseline = io.BytesIO(); candidate.save(baseline, format='PNG')
             crop_baseline = io.BytesIO(); candidate.crop(box).save(crop_baseline, format='PNG')
-            crop_candidate = io.BytesIO(); mapped_patch.save(crop_candidate, format='PNG')
+            # Compare what will actually be committed (feathered composite), not the
+            # unblended provider patch: feathering deliberately preserves old edge pixels.
+            crop_candidate = io.BytesIO(); proposed.crop(box).save(crop_candidate, format='PNG')
             crop_pair_ok = await compare_images(crop_baseline.getvalue(), crop_candidate.getvalue(),
                 'Fix exactly: ' + local_issues + '. Preserve pose and framing.', client=route[0], model=route[1], targets=[str(f.get('id') or f'region-{index}-{i}') for i, f in enumerate(region['findings'])]) if route else False
             from PIL import ImageChops
