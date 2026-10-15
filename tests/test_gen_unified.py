@@ -255,7 +255,7 @@ class TestMockedToolLoop(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result, 'gray bunny')
         paid.assert_not_called()
 
-    async def test_gateway_does_not_stack_retries_or_use_paid_fallback(self):
+    async def test_gateway_retries_once_then_does_not_use_paid_fallback(self):
         from unittest.mock import AsyncMock
         for failure, reason in [(bot.GenTransient('pool failed'), 'overload'),
                                 (bot.GenExhausted('pool quota'), 'exhausted')]:
@@ -268,7 +268,10 @@ class TestMockedToolLoop(unittest.IsolatedAsyncioTestCase):
                     result = await bot._gen_one_image('exact', ['ref'], '2K', '1:1', True, 'brief')
                 self.assertEqual(result[1], reason)
                 self.assertFalse(result[3])
-                self.assertEqual(generate.call_count, 1)
+                expected_calls = 2 if type(failure) is bot.GenTransient else 1
+                self.assertEqual(generate.call_count, expected_calls)
+                if expected_calls == 2:
+                    self.assertEqual(generate.call_args_list[0], generate.call_args_list[1])
 
     async def test_transient_retry_preserves_prompt_and_refs(self):
         from unittest.mock import AsyncMock

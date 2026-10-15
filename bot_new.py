@@ -8618,7 +8618,7 @@ async def _gen_one_image_impl(final_prompt, input_b64s, image_size, aspect_ratio
     gateway_pool = gen_model.startswith("gpt-image-2.5")
     # Exactly one same-provider retry is allowed; fallback is a single separate attempt.
     # Gateway owns bounded cross-account retries internally; do not stack another layer.
-    transient_left = 0 if gateway_pool else 1
+    transient_left = 1
     attempt = 0
     # One fixed absolute deadline covers generation, retries, QA, and repair. Provider
     # gate calls retain their own timeout but are never started past this budget.
