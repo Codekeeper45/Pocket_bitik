@@ -119,8 +119,9 @@ class TestUnifiedGenPrompt(unittest.TestCase):
             bot._sync_generate_image("image #1 subject, image #2 style", input_images_b64=refs, model="gpt-image-2.5-sunburst")
         body = post.call_args.kwargs["json"]
         self.assertEqual(len(body["images"]), 2)
-        self.assertTrue(body["images"][0].endswith(refs[0]))
-        self.assertTrue(body["images"][1].endswith(refs[1]))
+        # Gateway edit contract stores image_url objects with normalized data URLs.
+        self.assertEqual(body["images"][0]["image_url"], "data:image/png;base64," + refs[0])
+        self.assertEqual(body["images"][1]["image_url"], "data:image/png;base64," + refs[1])
         self.assertNotIn("image", body)
 
     def test_bad_link_reference_stops_generation(self):

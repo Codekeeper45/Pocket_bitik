@@ -177,7 +177,7 @@ OPENROUTER_VISION_MODEL = "google/gemini-3.1-flash-lite"  # дефолт vision 
 # заменены на дешёвые STT (проверено живьём: HTTP 200, ogg напрямую). Gemini для STT дорог.
 OPENROUTER_AUDIO_MODEL = "nvidia/parakeet-tdt-0.6b-v3"
 OPENROUTER_AUDIO_FALLBACK = "mistralai/voxtral-mini-transcribe"  # запасная, если Parakeet не отвечает
-OPENROUTER_IMAGE_MODEL = "gpt-image-2.5-sunburst"  # /gen: text→image и image→image (ChatGPT2API шлюз / OpenAI GPT Image 2.5)
+OPENROUTER_IMAGE_MODEL = os.getenv('GEN_DEFAULT_MODEL', 'gpt-image-2')  # verified CliProxy text/image generation default
 OPENROUTER_IMAGE_FALLBACK = "google/gemini-3.1-flash-image"  # запасная при сбое/перегрузке основной (4K не умеет → авто-даунгрейд до 2K)
 GEN_IMAGE_MAX_INPUT = 3_000_000  # лимит входного запроса ~4.5 МБ; base64 ×1.33 → входное фото до ~3 МБ
 GEN_CTX_IMG_MAX = 16        # /gen: суммарный потолок каталога (свежие+индекс) для vision-промптера; он же describe-пул свежих
@@ -3357,7 +3357,20 @@ def _sync_generate_image(prompt: str, input_images_b64: list = None, model: str 
             "Content-Type": "application/json"
         }
         # Native gateway may try up to 3 accounts; allow its bounded request deadline to finish.
-        resp = requests.post(endpoint, headers=headers, json=body, timeout=(20, 600))
+        job_base = os.getenv('GEN_JOB_BASE_URL', '').strip()
+        try:
+            with open(os.getenv('GEN_JOB_CONFIG_PATH', 'image_job_transport.json'), encoding='utf-8') as job_config:
+                configured_base = json.load(job_config).get('base_url', '')
+                if configured_base.startswith('https://'):
+                    job_base = configured_base.rstrip('/')
+        except FileNotFoundError:
+            pass
+        if job_base:
+            from gen_job_transport import post_image_job
+            route = '/images/edits' if input_images_b64 else '/images/generations'
+            resp = post_image_job(job_base, route, body, headers)
+        else:
+            resp = requests.post(endpoint, headers=headers, json=body, timeout=(20, 600))
         from gen_provider import transport_response_error
         if not resp.ok or 'text/html' in getattr(resp, 'headers', {}).get('Content-Type', '').lower():
             transport_error = transport_response_error(resp)
@@ -8593,6 +8606,7 @@ async def _gen_one_image_recorded(final_prompt, input_b64s, image_size, aspect_r
     try:
         result = await _gen_one_image_impl(final_prompt, input_b64s, image_size, aspect_ratio, allow_repair, user_prompt, status_cb)
     except ProviderError as exc:
+        log('GEN', f'Provider failure kind={exc.kind} status={getattr(exc, "status_code", None)}: {str(exc)[:300]}')
         if status_cb:
             await status_cb({'authentication':'❌ Авторизация генератора недоступна.', 'invalid_request':'❌ Генератор не поддержал параметры запроса.', 'timeout':'❌ Время ожидания генератора истекло.'}.get(exc.kind, '❌ Ошибка провайдера: ' + exc.kind))
         return None, exc.kind, None, False
@@ -8616,7 +8630,9 @@ async def _gen_one_image_impl(final_prompt, input_b64s, image_size, aspect_ratio
             await status_cb(text)
     gen_model = GEN_IMAGE_MODEL
     used_fallback = False
-    gateway_pool = gen_model.startswith("gpt-image-2.5")
+    # Configured GPT image gateway owns its pool; never silently route refs to
+    # a stale OpenRouter fallback/capability record.
+    gateway_pool = bool(CHATGPT2API_AUTH_KEY and gen_model.startswith('gpt-image-')) or gen_model.startswith('gpt-image-2.5')
     # Exactly one same-provider retry is allowed; fallback is a single separate attempt.
     # Gateway owns bounded cross-account retries internally; do not stack another layer.
     transient_left = 1
@@ -9528,8 +9544,15 @@ async def gen_command(event):
                                  "Генерация не завершена; точная причина записана в журнале. "
                                  "Это не обязательно дневной лимит, повтор завтра может не помочь.")
             else:
-                await set_status("❌ Шлюз не смог завершить генерацию.\n"
-                                 "Это может быть временный сбой, а не лимит запросов. Причина записана в журнале.")
+                reason = {
+                    'transport': 'Соединение со шлюзом прервано. Генератор не вернул изображение.',
+                    'transport_quota': 'Исчерпана квота транспорта до генератора.',
+                    'authentication': 'Шлюз отклонил ключ доступа к генератору.',
+                    'invalid_request': 'Генератор отклонил параметры или референсы запроса.',
+                    'timeout': 'Истекло время ожидания результата генератора.',
+                    'quota': 'Провайдер сообщил о нехватке квоты или баланса.',
+                }.get(mime, 'Генератор не вернул изображение после ограниченных попыток.')
+                await set_status('❌ ' + reason + '\nПодробности записаны в журнале.')
             return
         log("GEN", f"Готово за {time.time() - t0:.1f}с · {len(raw) / 1024:.0f} КБ · {mime} · prompt_by_ai={prompt_by_ai} · модель={'fast(запасная)' if used_fb else 'pro'}")
         await _gen_send_image(event.chat_id, raw, mime, used_fp, prompt_by_ai, reply_target_id, refs_line=gen_refs_line, idea=gen_idea)
