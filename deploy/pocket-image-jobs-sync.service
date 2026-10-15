@@ -1,0 +1,8 @@
+[Unit]
+Description=Refresh Serverix image job endpoint after tunnel changes
+After=pocket-image-jobs-tunnel.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/python3 /home/hermes/projects/Pocket_bitik/sync_image_job_tunnel.py
+UMask=0077

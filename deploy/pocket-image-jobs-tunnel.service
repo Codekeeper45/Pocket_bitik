@@ -1,0 +1,12 @@
+[Unit]
+Description=Cloudflare transport for short Pocket image job requests
+After=network.target pocket-image-jobs.service
+
+[Service]
+Type=simple
+ExecStart=/home/hermes/.local/bin/cloudflared tunnel --url http://127.0.0.1:8318 --no-autoupdate
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=default.target

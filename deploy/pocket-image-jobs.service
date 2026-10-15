@@ -1,0 +1,15 @@
+[Unit]
+Description=Pocket image async jobs over local CliProxy
+After=network.target
+
+[Service]
+Type=simple
+WorkingDirectory=/home/hermes/projects/Pocket_bitik
+ExecStart=/usr/bin/python3 /home/hermes/projects/Pocket_bitik/image_job_bridge.py
+Restart=always
+RestartSec=5
+UMask=0077
+NoNewPrivileges=true
+
+[Install]
+WantedBy=default.target

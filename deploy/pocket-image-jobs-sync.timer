@@ -1,0 +1,10 @@
+[Unit]
+Description=Keep image job endpoint synchronized
+
+[Timer]
+OnBootSec=45
+OnUnitActiveSec=60
+Unit=pocket-image-jobs-sync.service
+
+[Install]
+WantedBy=timers.target
