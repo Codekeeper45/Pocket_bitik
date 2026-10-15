@@ -65,6 +65,24 @@ class RetryAccountingTests(unittest.TestCase):
         self.assertEqual(classify_provider_error(429).kind, "rate_limit")
         self.assertEqual(classify_provider_error(500).kind, "transient")
 
+    def test_gateway_upstream_error_is_transient_for_both_image_apis(self):
+        source = (ROOT / "bot_new.py").read_text()
+        start = source.index("def _sync_generate_image")
+        end = source.index("async def _webp_to_png", start)
+        image_transport = source[start:end]
+        self.assertEqual(image_transport.count('"upstream_error"'), 2)
+        self.assertIn("HTTP {resp.status_code} ({error_code})", image_transport)
+
+    def test_gateway_pool_uses_one_configured_retry_then_native_fallback(self):
+        source = impl_source()
+        self.assertIn("transient_left = 0 if gateway_pool else 1", source)
+        self.assertIn("OPENROUTER_IMAGE_FALLBACK", source)
+        # The gateway retry is deliberately disabled while the gateway internally
+        # retries across accounts; upstream_error should trigger that path.
+        self.assertIn('"upstream_error"', (ROOT / "bot_new.py").read_text())
+        self.assertIn("attempt = 0", source)
+        self.assertIn("remaining() <= wait", source)
+
 
 if __name__ == "__main__":
     unittest.main()
