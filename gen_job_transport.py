@@ -18,7 +18,7 @@ def post_image_job(base_url, endpoint, body, headers, *, timeout=660, session=re
     for attempt in range(3):
         try:
             response = session.post(job_url, headers=request_headers, json=payload, timeout=(15, 30))
-            if response.status_code not in (502, 503, 504):
+            if response.status_code not in (502, 503, 504, 520, 522, 524, 530):
                 break
         except requests.RequestException:
             if attempt == 2:
@@ -26,7 +26,7 @@ def post_image_job(base_url, endpoint, body, headers, *, timeout=660, session=re
                 raise ProviderError('timeout', 'Image job submission outcome unknown; not replaying generation', 504, False)
         if attempt < 2:
             sleep(2)
-    if response.status_code in (502, 503, 504, 520, 522, 524):
+    if response.status_code in (502, 503, 504, 520, 522, 524, 530):
         from gen_contracts import ProviderError
         raise ProviderError('transport', 'Image job submission unavailable; outcome unknown, not replaying generation', response.status_code, False)
     if response.status_code != 202:
