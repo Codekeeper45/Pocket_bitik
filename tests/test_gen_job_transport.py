@@ -15,7 +15,7 @@ class JobTransportTests(unittest.TestCase):
         s = Mock()
         s.post.return_value = response(202, {'id': 'abc123'})
         final = response(200, {'data': [{'b64_json': 'test'}]})
-        s.get.side_effect = [requests.Timeout(), response(524, html=True), response(202), final]
+        s.get.side_effect = [requests.Timeout(), response(530, html=True), response(202), final]
         self.assertIs(post_image_job('https://test/v1','/images/edits',{}, {},session=s,sleep=lambda _:None), final)
         self.assertEqual(s.post.call_count, 1)
         self.assertEqual(s.get.call_count, 4)

@@ -42,7 +42,7 @@ def post_image_job(base_url, endpoint, body, headers, *, timeout=660, session=re
             continue  # polling never replays a generation
         if response.status_code == 202:
             continue
-        if response.status_code in (502, 503, 504, 520, 522, 524) and 'text/html' in response.headers.get('Content-Type', '').lower():
+        if response.status_code >= 500 and 'text/html' in response.headers.get('Content-Type', '').lower():
             continue
         return response
     from gen_contracts import ProviderError
