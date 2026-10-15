@@ -46,3 +46,6 @@ gen_series_state/
 gen_activity.json
 gen_jobs.json
 gen_series_jobs.json
+
+# Private local backups
+.private-backups/
