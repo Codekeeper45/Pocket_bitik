@@ -3335,7 +3335,7 @@ def _sync_generate_image(prompt: str, input_images_b64: list = None, model: str 
             body = {
                 "model": cg_model,
                 "prompt": target_prompt,
-                "images": ref_urls,
+                "images": [{"image_url": u} if isinstance(u, str) else u for u in ref_urls],
                 "size": res_str,
                 "response_format": "b64_json"
             }
@@ -3381,6 +3381,7 @@ def _sync_generate_image(prompt: str, input_images_b64: list = None, model: str 
             except Exception:
                 detail, error_code = resp.text, ""
             s = str(detail)
+            log("GEN", f"Gateway response error HTTP {resp.status_code} ({error_code}): {s[:300]}")
             low = s.lower()
             if error_code == "content_policy_violation" or any(m in low for m in _moderation_markers):
                 raise GenRejected(f"HTTP {resp.status_code} (модерация): {s[:200]}")
