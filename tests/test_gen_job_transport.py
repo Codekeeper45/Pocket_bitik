@@ -34,6 +34,24 @@ class JobTransportTests(unittest.TestCase):
         s.get.return_value = response(400, {'error': {'code':'invalid_type'}})
         self.assertEqual(post_image_job('https://test/v1','/images/edits',{}, {},session=s,sleep=lambda _:None).status_code,400)
 
+    def test_submit_530_retries_same_key(self):
+        s = Mock()
+        s.post.side_effect = [response(530, html=True), response(202, {'id':'abc123'})]
+        s.get.return_value = response(200)
+        post_image_job('https://test/v1', '/images/edits', {}, {}, session=s, sleep=lambda _:None)
+        self.assertEqual(s.post.call_count, 2)
+        self.assertEqual(s.post.call_args_list[0].kwargs['headers']['Idempotency-Key'], s.post.call_args_list[1].kwargs['headers']['Idempotency-Key'])
+
+    def test_unknown_submit_outcome_is_not_outer_retryable(self):
+        from gen_contracts import ProviderError
+        s = Mock()
+        s.post.side_effect = requests.Timeout()
+        with self.assertRaises(ProviderError) as exc:
+            post_image_job('https://test/v1', '/images/edits', {}, {}, session=s, sleep=lambda _:None)
+        self.assertFalse(exc.exception.retryable)
+        self.assertEqual(s.post.call_count, 3)
+        s.get.assert_not_called()
+
     def test_auth_rejection_not_retried(self):
         s=Mock()
         s.post.return_value=response(401)
