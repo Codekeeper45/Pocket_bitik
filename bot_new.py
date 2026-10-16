@@ -4033,7 +4033,9 @@ async def _build_gen_prompt(user_prompt: str, context_text: str = None, image_de
                             query = " ".join(str(args.get("query") or "").split())[:240]
                             # Public concepts only: never forward chat excerpts, images, or user-supplied private text.
                             public_terms = ["official", "artwork", "character", "visual style", "background", "meme", "template", "style", "canon"]
-                            if not query or not any(term in query.lower() for term in public_terms):
+                            private_handles = re.findall(r'@([A-Za-z0-9_]{3,})', (user_prompt or '')+' '+(context_text or ''))
+                            leaks_identity = '@' in query or bool(re.search(r'(?:t\.me/|\+?\d{9,})', query)) or any(h.lower() in query.lower() for h in private_handles)
+                            if leaks_identity or not query or not any(term in query.lower() for term in public_terms):
                                 result = "Запрос отклонён: используй только конкретный публичный визуальный концепт (персонаж/стиль/фон/мем)."
                             else:
                                 new_refs = await search_and_fetch(query, lambda q: tavily_search(q, tavily_api_key), limit=3)
@@ -8374,6 +8376,14 @@ def _gen_refs_line(chat_ent, catalog: list, used_idxs: list, reasons: dict = Non
     for k in used_idxs:
         it = by_idx.get(k)
         mid = it.get("mid") if it else None
+        if it and it.get('source_url'):
+            from urllib.parse import urlsplit
+            url = str(it['source_url'])
+            if urlsplit(url).scheme in ('http','https'):
+                safe_url = url.replace('(', '%28').replace(')', '%29')
+                why = (reasons or {}).get(k) or it.get('source_role') or 'визуальный источник'
+                parts.append(f'[Web #{k}]({safe_url}): {why}')
+            continue
         if not mid:
             continue
         try:
@@ -8382,7 +8392,7 @@ def _gen_refs_line(chat_ent, catalog: list, used_idxs: list, reasons: dict = Non
             continue
         why = (reasons or {}).get(k)
         parts.append(f"{link} — {why}" if why else link)
-    return ("📎 Референсы (фото из чата): " + " · ".join(parts)) if parts else None
+    return ("📎 Источники референсов: " + " · ".join(parts)) if parts else None
 
 
 # Глобальный rate-gate для image-API: разносим вызовы во времени, чтобы не ловить RPM-429
