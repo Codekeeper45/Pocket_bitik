@@ -8083,7 +8083,7 @@ async def _gen_fetch_link_refs(event, prompt):
     for mt in matches:
         chat_ref, tail = mt.group(0), ''
         try:
-            link = parse_telegram_link(mt.group(0).rstrip('.,);'))
+            link = parse_telegram_link(mt.group(0).rstrip('.,);:!?'))
             msg_id = link.message_id
             peer = int(link.chat) if link.chat.startswith('-100') else link.chat
             fetched = await client.get_messages(peer, ids=[msg_id])
