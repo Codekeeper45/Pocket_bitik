@@ -4102,7 +4102,10 @@ async def _build_gen_prompt(user_prompt: str, context_text: str = None, image_de
                     elif _gen_is_own_generation(m):
                         result = "Это предыдущий результат этого юзербота, а не исходный референс. Найди исходную загрузку; для правки результата пользователь должен явно приложить его или ответить на него."
                     else:
-                        result = await _run_chat_inspect_image(chat_id, args, msg_by_id)
+                        try:
+                            result = await asyncio.wait_for(_run_chat_inspect_image(chat_id, args, msg_by_id), timeout=75)
+                        except asyncio.TimeoutError:
+                            result = 'Visual inspection timed out. Do not loop on the same photo; choose another available source or inspect attached catalog pixels directly.'
                     if mid and scoped_ok and not _gen_is_own_generation(m) and mid not in used_ids and len(working_catalog) < GEN_CTX_IMG_MAX:
                         try:
                             if m and (_is_attached_photo(m) or _is_attached_image_doc(m)):
