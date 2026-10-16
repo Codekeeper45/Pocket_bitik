@@ -10,3 +10,6 @@ class SourceLinksTests(unittest.TestCase):
   self.assertIn('https://example.org/a.jpg',result)
   self.assertNotIn('not-used',result)
   self.assertIn('style',result)
+  avatar=ns['_gen_refs_line'](object(),[{'idx':3,'profile_url':'https://t.me/tester'}],[3],{3:'subject'})
+  self.assertIn('https://t.me/tester',avatar)
+  self.assertIn('subject',avatar)

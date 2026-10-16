@@ -8379,7 +8379,7 @@ def _gen_refs_line(chat_ent, catalog: list, used_idxs: list, reasons: dict = Non
         it = by_idx.get(k)
         mid = it.get("mid") if it else None
         if it and it.get('profile_url'):
-            parts.append(f"[Аватар #{k}]({it['profile_url']})" + (f": {roles[k]}" if roles.get(k) else ''))
+            parts.append(f"[Аватар #{k}]({it['profile_url']})" + (f": {(reasons or {})[k]}" if (reasons or {}).get(k) else ''))
             continue
         if it and it.get('source_url'):
             from urllib.parse import urlsplit
