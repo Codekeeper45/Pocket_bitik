@@ -3555,6 +3555,8 @@ async def _gen_ref_img(raw: bytes, max_side: int = GEN_CTX_REF_SIDE) -> bytes:
 # ЗАМЫСЕЛ ПОЛЬЗОВАТЕЛЯ в технически точный визуальный текст и не подменяет его своим. Единственное
 # «творческое» решение — когда пользователь сам оставил замысел открытым («придумай»); и тогда выбор
 # оформляется явно в строке IDEA, чтобы юзер видел, что именно будет нарисовано.
+from gen_art_direction import ART_DIRECTION_RULES as _GEN_ART_DIRECTION_RULES
+
 _GEN_INTENT_CORE = (
     "Ты — промпт-инженер генератора изображений. Твоя работа НЕ придумывать картинку вместо пользователя, а "
     "ТОЧНО довести его ЗАМЫСЕЛ до генератора: взять то, что человек описал, и разложить на конкретные, "
@@ -3789,7 +3791,7 @@ _GEN_OUTPUT_FOOTER = (
 def _gen_unified_system(has_catalog: bool, edit_mode: bool, has_tools: bool = False) -> str:
     """Единая system-строка промптера /gen. Режимов нет — собирается из нужных блоков по контексту.
     has_catalog — доступны кандидаты-референсы (REFS); edit_mode — на вход реальные картинки на правку."""
-    parts = [_GEN_INTENT_CORE, _GEN_PROMPT_CRAFT, _GEN_ENSEMBLE_RULES, _GEN_COMPOSITION_RULES, _GEN_TEXT_RULES, _GEN_QUALITY_NOTE]
+    parts = [_GEN_INTENT_CORE, _GEN_ART_DIRECTION_RULES, _GEN_PROMPT_CRAFT, _GEN_ENSEMBLE_RULES, _GEN_COMPOSITION_RULES, _GEN_TEXT_RULES, _GEN_QUALITY_NOTE]
     if edit_mode:
         parts.append(_GEN_EDIT_RULES)
     if has_catalog:

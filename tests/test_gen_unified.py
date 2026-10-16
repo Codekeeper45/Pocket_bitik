@@ -32,6 +32,27 @@ class TestUnifiedGenPrompt(unittest.TestCase):
             self.assertIn("Не добавляй объятия", system)
             self.assertIn("исходный запрос неизвестен", system)
 
+    def test_curated_art_direction_is_additive_and_prompted_on_all_paths(self):
+        for catalog in (False, True):
+            for edit in (False, True):
+                system = bot._gen_unified_system(catalog, edit)
+                self.assertIn("АРТ-ДИРЕКШН ДЛЯ НЕЗАДАННЫХ ДЕТАЛЕЙ", system)
+                self.assertIn("один главный герой с читаемым силуэтом", system)
+                self.assertIn("Освещение мотивируй одним понятным источником", system)
+                self.assertIn("узнаваемую личность", system)
+                self.assertIn("явные пожелания к стилю", system)
+                self.assertIn("не переводить все запросы в аниме", system.lower())
+
+    def test_raw_bypass_remains_before_prompt_builder(self):
+        import inspect
+        source = inspect.getsource(bot.gen_command)
+        self.assertIn('raw = any(t in ("-r", "-raw") for t in toks)', source)
+        command_body = source[source.find("async def gen_command"):]
+        self.assertIn("final_prompt, prompt_by_ai, gen_idea = user_prompt, False, None", command_body)
+        self.assertIn("ai_prompt = not raw", command_body)
+        self.assertIn("if ai_prompt:", command_body)
+        self.assertIn("if n > 0 and not raw:", command_body)
+
     def test_prompt_craft_in_every_unified_path(self):
         for catalog in (False, True):
             for edit in (False, True):
