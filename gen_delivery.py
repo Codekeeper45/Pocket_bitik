@@ -23,6 +23,29 @@ def record(key,*,chat,reply_to,path,status,message_id=None,caption=None):
   if time.time()-p.stat().st_mtime>86400:p.unlink(missing_ok=True)
  return obj
 
+def _ledger_path():
+ return ROOT/'outputs.jsonl'
+
+def record_output(*,chat,message_id,media_id=None,artifact_key=None):
+ """Append confirmed output identity; records are durable across artifact cleanup."""
+ if message_id is None:return None
+ ROOT.mkdir(parents=True,exist_ok=True)
+ obj={'chat':str(chat),'message_id':str(message_id),'media_id':str(media_id) if media_id is not None else None,'artifact_key':artifact_key,'updated':time.time(),'provenance':'generated'}
+ with open(_ledger_path(),'a',encoding='utf-8') as f:
+  f.write(json.dumps(obj,ensure_ascii=False)+'\n');f.flush();os.fsync(f.fileno())
+ return obj
+
+def known_output(chat,message_id,media_id=None):
+ if message_id is None:return False
+ try:
+  with open(_ledger_path(),encoding='utf-8') as f:
+   for line in f:
+    try:o=json.loads(line)
+    except (ValueError,TypeError):continue
+    if str(o.get('chat'))==str(chat) and (str(o.get('message_id'))==str(message_id) or (media_id is not None and o.get('media_id') is not None and str(o['media_id'])==str(media_id))):return True
+ except FileNotFoundError:pass
+ return False
+
 def lookup(key,chat):
  marker(key);obj=json.loads((ROOT/(key+'.json')).read_text())
  if str(obj['chat'])!=str(chat):raise PermissionError('artifact belongs to another chat')
