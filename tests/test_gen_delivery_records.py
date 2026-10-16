@@ -8,6 +8,22 @@ import bot_new as bot
 import gen_delivery as delivery
 from gen_runtime import ARTIFACTS
 class DeliveryRecovery(unittest.IsolatedAsyncioTestCase):
+ def test_output_ledger_and_conservative_provenance(self):
+  with tempfile.TemporaryDirectory() as d,patch.object(delivery,'ROOT',Path(d)):
+   delivery.record_output(chat=123,message_id=456,media_id=789,artifact_key='abc')
+   self.assertTrue(delivery.known_output('123',456))
+   self.assertTrue(delivery.known_output(123,999,789))
+   self.assertFalse(delivery.known_output(124,456))
+   self.assertTrue(bot._gen_is_own_generation(SimpleNamespace(out=True,chat_id=123,id=456,media=None,raw_text='')))
+   self.assertFalse(bot._gen_is_own_generation(SimpleNamespace(out=True,chat_id=123,id=457,media=None,raw_text='')))
+   self.assertFalse(bot._gen_is_own_generation(SimpleNamespace(out=True,chat_id=123,id=458,media=None,raw_text='ordinary image caption')))
+
+ def test_catalog_label_distinguishes_provenance(self):
+  base={'idx':1}
+  self.assertIn('сгенерировано этим ботом',bot._gen_catalog_ref_label({**base,'provenance':'generated'}))
+  self.assertIn('загружено пользователем',bot._gen_catalog_ref_label({**base,'provenance':'upload'}))
+  self.assertIn('источник неизвестен',bot._gen_catalog_ref_label(base))
+
  async def test_send_timeout_not_duplicated_and_recorded(self):
   buffer=io.BytesIO();Image.new('RGB',(32,32),'blue').save(buffer,format='PNG')
   with tempfile.TemporaryDirectory() as d,patch.object(delivery,'ROOT',Path(d)/'records'),patch.object(ARTIFACTS,'root',Path(d)),patch.object(bot.client,'send_file',AsyncMock(side_effect=TimeoutError('private-secret'))) as send:

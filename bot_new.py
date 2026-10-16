@@ -3873,8 +3873,9 @@ def _gen_catalog_ref_label(it: dict, include_missing_desc: bool = True) -> str:
             src.append("image")
         if src:
             flags.append("hit:" + "+".join(src))
-    if it.get("from_owner"):
-        flags.append("фото запросившего/прошлая генерация")
+    provenance = it.get("provenance", "unknown")
+    flags.append({"generated": "сгенерировано этим ботом", "upload": "загружено пользователем",
+                  "unknown": "источник неизвестен"}.get(provenance, "источник неизвестен"))
     if flags:
         head += " [" + " · ".join(flags) + "]"
 
@@ -4035,9 +4036,11 @@ async def _build_gen_prompt(user_prompt: str, context_text: str = None, image_de
                     scoped_ok = (not include_ids or sender_id in include_ids) and sender_id not in (exclude_ids or ())
                     if not m or not scoped_ok:
                         result = "Сообщение не найдено или недоступно в заданной области поиска."
+                    elif _gen_is_own_generation(m):
+                        result = "Это предыдущий результат этого юзербота, а не исходный референс. Найди исходную загрузку; для правки результата пользователь должен явно приложить его или ответить на него."
                     else:
                         result = await _run_chat_inspect_image(chat_id, args, msg_by_id)
-                    if mid and scoped_ok and mid not in used_ids and len(working_catalog) < GEN_CTX_IMG_MAX:
+                    if mid and scoped_ok and not _gen_is_own_generation(m) and mid not in used_ids and len(working_catalog) < GEN_CTX_IMG_MAX:
                         try:
                             if m and (_is_attached_photo(m) or _is_attached_image_doc(m)):
                                 raw = await asyncio.wait_for(m.download_media(bytes), timeout=GEN_MEDIA_DL_TIMEOUT)
@@ -8105,12 +8108,20 @@ async def _gen_collect_input_images(event, reply_msg, extra_msgs=None):
 
 
 def _gen_is_own_generation(m) -> bool:
-    """Своя прошлая генерация /gen: исходящее (юзербот шлёт от владельца) с подписью 💡/🎨.
-    Такие фото ЗАПРЕЩЕНЫ как референсы (и их промпты не показываем модели) — иначе бот
-    зацикливается на вариациях самого себя вместо свежих образов."""
+    """Conservative own-output detection: durable delivery identity or explicit legacy markers."""
+    try:
+        from gen_delivery import known_output
+        media = getattr(m, "media", None)
+        media_id = getattr(getattr(media, "photo", None), "id", None)
+        chat = getattr(m, "chat_id", None)
+        if known_output(chat, getattr(m, "id", None), media_id):
+            return True
+    except Exception:
+        pass
     if not getattr(m, "out", False):
         return False
-    return (getattr(m, "raw_text", None) or "").lstrip().startswith(("💡", "🎨"))
+    text = (getattr(m, "raw_text", None) or "").lstrip()
+    return text.startswith(("💡", "🎨")) or "gen-artifact:" in text
 
 
 async def _gen_history_catalog(ordered, want_vision: bool, limit: int = GEN_CTX_IMG_MAX, timeout: float = GEN_CATALOG_TIMEOUT, progress_cb=None) -> list:
@@ -8196,6 +8207,7 @@ async def _gen_history_catalog(ordered, want_vision: bool, limit: int = GEN_CTX_
             continue
         raw, thumb = res
         sid = getattr(m, "sender_id", None)
+        own_generation = _gen_is_own_generation(m)
         catalog.append({"idx": 0, "mid": getattr(m, "id", None), "bytes": raw, "thumb": thumb,
                         "caption": (m.raw_text or "").strip(), "desc": None,
                         "visual_desc": None,
@@ -8203,7 +8215,8 @@ async def _gen_history_catalog(ordered, want_vision: bool, limit: int = GEN_CTX_
                         "author": "me" if getattr(m, "out", False) else (f"user:{sid}" if sid else None),
                         "nearby_text": _nearby_text(m),
                         "cache_key": "gen:" + _media_key(m),
-                        "from_owner": bool(getattr(m, "out", False)),  # моё фото / прошлая генерация — для пометки «не повторяй»
+                        "provenance": "generated" if own_generation else ("upload" if not getattr(m, "out", False) else "unknown"),
+                        "from_owner": bool(getattr(m, "out", False)),
                         "_m": m})
 
     if catalog:  # ген-формат ТИП/СУТЬ/ЛЮДИ нужен text-mode, а vision-mode — для junk-фильтра и привязки label→image
@@ -8826,6 +8839,13 @@ async def _gen_send_image(chat, raw, mime, final_prompt, prompt_by_ai, reply_to,
         try:
             result = await client.send_file(*args, **kwargs)
             record(artifact_key, chat=chat, reply_to=reply_to, path=artifact, status='delivered', message_id=getattr(result,'id',None))
+            try:
+                from gen_delivery import record_output
+                media = getattr(result, 'media', None)
+                record_output(chat=chat, message_id=getattr(result,'id',None),
+                              media_id=getattr(getattr(media, 'photo', None), 'id', None), artifact_key=artifact_key)
+            except Exception as exc:
+                log('GEN', f'Image delivered; provenance ledger unavailable: {type(exc).__name__}')
             return result
         except Exception:
             record(artifact_key, chat=chat, reply_to=reply_to, path=artifact, status='ambiguous')
@@ -8898,6 +8918,10 @@ async def gen_retry_file(event):
             await event.reply('Отправка не подтверждена. Файл сохранён; новая генерация не запускалась.')
             return
         record(entry['key'], chat=event.chat_id, reply_to=entry['reply_to'], path=entry['path'], status='delivered', message_id=sent.id)
+        from gen_delivery import record_output
+        media = getattr(sent, 'media', None)
+        record_output(chat=event.chat_id, message_id=sent.id,
+                      media_id=getattr(getattr(media, 'photo', None), 'id', None), artifact_key=entry['key'])
     except (ValueError, PermissionError, FileNotFoundError):
         await event.reply('Результат недоступен в этом чате или истёк срок хранения.')
 
@@ -16605,6 +16629,7 @@ async def _gen_fetch_ref_items(chat_id: int, media_hits: list, exclude_mids=None
                 "nearby_text": await _gen_nearby_text_from_db(chat_id, m.id),
                 "cache_key": cached_key,
                 "index_chat_id": chat_id,
+                "provenance": "generated" if _gen_is_own_generation(m) else ("upload" if not getattr(m, "out", False) else "unknown"),
                 "from_owner": bool(getattr(m, "out", False)), "from_index": True}
 
     items = []
