@@ -4,7 +4,16 @@ async def fetch_avatar(client, chat_id, target, idx, inspect_image):
     if not target:
         raise ValueError('participant identifier required')
     entity = await client.get_entity(int(target) if target.lstrip('-').isdigit() else target)
-    await client.get_permissions(chat_id, entity)
+    try:
+        await client.get_permissions(chat_id, entity)
+    except Exception as exc:
+        if type(exc).__name__ != 'ChatAdminRequiredError':
+            raise
+        # Hidden member lists require admin rights. A real message by this sender
+        # in the exact current chat is sufficient scoped evidence, not a global lookup.
+        messages = await client.get_messages(chat_id, from_user=entity, limit=1)
+        if not any(getattr(m, 'sender_id', None) == entity.id for m in messages):
+            raise ValueError('participant not evidenced in current chat') from exc
     # Resolve fresh profile state: entity.photo is the currently displayed main avatar.
     entity = await client.get_entity(entity)
     raw = await client.download_profile_photo(entity, file=bytes, download_big=True)

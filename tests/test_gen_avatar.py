@@ -16,6 +16,18 @@ class AvatarTests(unittest.IsolatedAsyncioTestCase):
   c=SimpleNamespace(get_entity=AsyncMock(return_value=SimpleNamespace(id=1)),get_permissions=AsyncMock(side_effect=ValueError('not member')),download_profile_photo=AsyncMock())
   with self.assertRaises(ValueError):await fetch_avatar(c,99,'123',1,None)
   c.download_profile_photo.assert_not_awaited()
+ async def test_hidden_members_with_scoped_message(self):
+  error=type('ChatAdminRequiredError',(Exception,),{})
+  entity=SimpleNamespace(id=123,username='tester',photo=SimpleNamespace(photo_id=987))
+  c=SimpleNamespace(get_entity=AsyncMock(return_value=entity),get_permissions=AsyncMock(side_effect=error()),get_messages=AsyncMock(return_value=[SimpleNamespace(sender_id=123)]),download_profile_photo=AsyncMock(return_value=b'main'))
+  r=await fetch_avatar(c,99,'123',7,lambda raw:(raw,'image/jpeg',10,10))
+  self.assertEqual(r['avatar_kind'],'current_main')
+  c.get_messages.assert_awaited_once_with(99,from_user=entity,limit=1)
+ async def test_hidden_members_without_evidence(self):
+  error=type('ChatAdminRequiredError',(Exception,),{})
+  c=SimpleNamespace(get_entity=AsyncMock(return_value=SimpleNamespace(id=123)),get_permissions=AsyncMock(side_effect=error()),get_messages=AsyncMock(return_value=[]),download_profile_photo=AsyncMock())
+  with self.assertRaises(ValueError):await fetch_avatar(c,99,'123',1,None)
+  c.download_profile_photo.assert_not_awaited()
  async def test_missing_main(self):
   c=SimpleNamespace(get_entity=AsyncMock(return_value=SimpleNamespace(id=1)),get_permissions=AsyncMock(),download_profile_photo=AsyncMock(return_value=None))
   with self.assertRaises(ValueError):await fetch_avatar(c,99,'1',1,None)
