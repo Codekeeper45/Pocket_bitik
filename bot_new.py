@@ -4060,7 +4060,7 @@ async def _build_gen_prompt(user_prompt: str, context_text: str = None, image_de
                 elif name == "chat_get_avatar":
                     try:
                         target = str(args.get('user') or '').strip()
-                        entity = await client.get_entity(target)
+                        entity = await client.get_entity(int(target) if target.lstrip('-').isdigit() else target)
                         await client.get_permissions(chat_id, entity)
                         photos = await client.get_profile_photos(entity, limit=1)
                         if not photos: raise ValueError('no avatar')
@@ -4149,7 +4149,9 @@ async def _build_gen_prompt(user_prompt: str, context_text: str = None, image_de
         raw_prompt = parsed[0]
     if web_refs_selected:
         role_map = {'identity':'subject','style':'style','background':'composition','template':'composition'}
-        merged = dict(parsed[1])
+        web_ids = {int(r['idx']) for r in external_refs}
+        # External refs may not silently acquire identity/clothing roles via freeform REFS.
+        merged = {idx:role for idx,role in parsed[1] if idx not in web_ids}
         for idx, role in web_refs_selected:
             merged[idx] = role_map[role]
         parsed = (parsed[0], list(merged.items()), parsed[2], parsed[3])
@@ -4391,7 +4393,7 @@ def _detect_pages_count(user_prompt: str, toks: list = None) -> int:
         if t.lower() in ("--pages", "-pages", "-p") and i + 1 < len(toks) and toks[i + 1].isdigit():
             return max(1, min(10, int(toks[i + 1])))
 
-    m_num = re.search(r"(?i)\b(?:манга|комикс|истори[яи]|стрип|сюжет|глав[аы])?\s*(?:на|из|в)?\s*([2-9]|10)\s*(?:страниц[ыае]?|кадр[а-я]*|полос[ыае]?)\b", user_prompt)
+    m_num = re.search(r"(?i)\b(?:манга|комикс|истори[яи]|стрип|сюжет|глав[аы])?\s*(?:на|из|в)?\s*([2-9]|10)\s*(?:страниц[ыае]?|полос[ыае]?)\b", user_prompt)
     if m_num:
         return int(m_num.group(1))
 
@@ -4401,7 +4403,7 @@ def _detect_pages_count(user_prompt: str, toks: list = None) -> int:
         "2-х": 2, "3-х": 3, "4-х": 4, "5-ти": 5, "6-ти": 6, "10-ти": 10,
         "2": 2, "3": 3, "4": 4, "5": 5, "6": 6, "7": 7, "8": 8, "9": 9, "10": 10
     }
-    m_word = re.search(r"(?i)\b(?:на|из|в)?\s*(две|три|четыре|пять|шесть|семь|восемь|девять|десять|двух|трех|трёх|четырех|четырёх|пяти|шести|семи|восьми|девяти|десяти|2-х|3-х|4-х|5-ти|6-ти|10-ти)\s*(?:страниц[ыае]?|кадр[а-я]*|полос[ыае]?)\b", user_prompt)
+    m_word = re.search(r"(?i)\b(?:на|из|в)?\s*(две|три|четыре|пять|шесть|семь|восемь|девять|десять|двух|трех|трёх|четырех|четырёх|пяти|шести|семи|восьми|девяти|десяти|2-х|3-х|4-х|5-ти|6-ти|10-ти)\s*(?:страниц[ыае]?|полос[ыае]?)\b", user_prompt)
     if m_word:
         return word_map.get(m_word.group(1).lower(), 1)
 
