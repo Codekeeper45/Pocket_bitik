@@ -4035,7 +4035,7 @@ async def _build_gen_prompt(user_prompt: str, context_text: str = None, image_de
                             public_terms = ["official", "artwork", "character", "visual style", "background", "meme", "template", "style", "canon"]
                             private_handles = re.findall(r'@([A-Za-z0-9_]{3,})', (user_prompt or '')+' '+(context_text or ''))
                             leaks_identity = '@' in query or bool(re.search(r'(?:t\.me/|\+?\d{9,})', query)) or any(h.lower() in query.lower() for h in private_handles)
-                            if leaks_identity or not query or not any(term in query.lower() for term in public_terms):
+                            if leaks_identity or not query:
                                 result = "Запрос отклонён: используй только конкретный публичный визуальный концепт (персонаж/стиль/фон/мем)."
                             else:
                                 new_refs = await search_and_fetch(query, lambda q: tavily_search(q, tavily_api_key), limit=3)
