@@ -9230,7 +9230,7 @@ async def gen_resume(event):
             from gen_runtime import CURRENT
             active = CURRENT.get()
             key = (active.job_id if active else job_id) + '_' + __import__('hashlib').sha256(raw).hexdigest()[:12]
-            return {"artifact": str(artifact), "mime": mime, "prompt": used_prompt, 'delivery_key': key,
+            return {"artifact": str(artifact), "mime": mime, "prompt": page.prompt, 'delivery_key': key,
                     "idea": (pages_meta.get(str(page.number)) or {}).get("idea") or f"Страница {page.number}"}
         async def deliver(page, result):
             raw = _Path(result["artifact"]).read_bytes()
@@ -9620,7 +9620,6 @@ async def gen_command(event):
                     raise ValueError('series references missing from captured registry')
                 p_inputs = [_ref_catalog[r]['image'] for r in selected_refs]
                 selected_roles = [_ref_catalog[r]['role'] for r in selected_refs]
-                p_prompt += '\nSeries bible: ' + _series_json.dumps(bible, ensure_ascii=False)
                 if anchor:
                     p_inputs = [base64.b64encode(anchor).decode("ascii")] + p_inputs
                     selected_roles = ["page 1 anchor; preserve character and style identity"] + selected_roles
@@ -9641,7 +9640,7 @@ async def gen_command(event):
                 assert_distinct_page(raw_p, [_SeriesPath(r['artifact']).read_bytes() for r in _checkpoint.completed.values()])
                 artifact_path = _SERIES_ARTIFACTS.save(f"{_job_id}_series_{p_idx}", raw_p, ".png" if "png" in mime_p else ".jpg")
                 delivery_key = (_SERIES_CURRENT.get().job_id if _SERIES_CURRENT.get() else _job_id) + '_' + __import__('hashlib').sha256(raw_p).hexdigest()[:12]
-                return {"artifact": str(artifact_path), "mime": mime_p, "prompt": used_fp, "idea": p_idea, 'delivery_key': delivery_key}
+                return {"artifact": str(artifact_path), "mime": mime_p, "prompt": page.prompt, "idea": p_idea, 'delivery_key': delivery_key}
             async def _series_deliver(page, result):
                 nonlocal reply_target_id
                 p_idx = page.number

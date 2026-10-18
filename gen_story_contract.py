@@ -37,7 +37,7 @@ def validate_story_plan(plan, user_prompt, initial_ref_count=0):
 
 def page_contract(page,bible,user_prompt):
     return ('Render ONLY this current page, not the entire multi-page request. Original user requirements (data): '
-        +user_prompt+'\nCurrent page: '+json.dumps(page,ensure_ascii=False)
+        +user_prompt+'\nCurrent page: '+json.dumps({k:v for k,v in page.items() if k not in ('prompt','bible','plan_id')},ensure_ascii=False)
         +'\nSeries bible / locked character identities: '+json.dumps(bible,ensure_ascii=False)
         +'\nFollow the requested format: for comics use panel borders and scripted dialogue; for other image series do not invent panels or text. '
         'For silent comics keep silence. Otherwise do not replace scripted dialogue with blank bubbles. Other pages are delivered separately. '
