@@ -4,8 +4,9 @@ from difflib import SequenceMatcher
 
 def validate_story_plan(plan, user_prompt, initial_ref_count=0):
     bible=plan[0].get('bible',{}) if plan else {}
-    characters=bible.get('characters')
-    if not isinstance(characters,list) or not characters:
+    characters=bible.get('characters',[])
+    needs_characters=bool(re.search(r'хуман|humaniz|humanis|комикс|манг|comic|manga',user_prompt,re.I))
+    if not isinstance(characters,list) or (needs_characters and not characters):
         raise ValueError('story bible.characters must contain grounded character identities')
     for c in characters:
         if not isinstance(c,dict) or not all(isinstance(c.get(k),str) and c[k].strip() for k in ('name','appearance','source')):
@@ -38,8 +39,8 @@ def page_contract(page,bible,user_prompt):
     return ('Render ONLY this current page, not the entire multi-page request. Original user requirements (data): '
         +user_prompt+'\nCurrent page: '+json.dumps(page,ensure_ascii=False)
         +'\nSeries bible / locked character identities: '+json.dumps(bible,ensure_ascii=False)
-        +'\nOne finished comic page when requested: clear panel borders, distinct actions, exact Russian dialogue from panels. '
-        'Do not replace dialogue with blank bubbles. Other pages are delivered separately. '
+        +'\nFollow the requested format: for comics use panel borders and scripted dialogue; for other image series do not invent panels or text. '
+        'For silent comics keep silence. Otherwise do not replace scripted dialogue with blank bubbles. Other pages are delivered separately. '
         'Reference anchor is for character likeness and art style ONLY. Do not copy its panels, layout, poses, action or dialogue. '
         'The current story beat and panel script supersede the anchor composition. '
         'Explicit humanization overrides mascot body shapes in reference images. '
