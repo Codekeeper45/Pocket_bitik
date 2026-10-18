@@ -37,6 +37,14 @@
 
 ## 🚀 Установка по шагам
 
+### Быстрый старт (переносимая установка)
+
+Требуется Python 3.11+ (Windows/macOS/Linux). После клонирования/распаковки выполните `python setup_wizard.py` (на macOS/Linux при необходимости `python3 setup_wizard.py`). Мастер предложит создать `.venv` и установить `requirements.txt`, затем безопасно запросит Telegram `api_id` и `api_hash` и API key через скрытый ввод. Укажите URL OpenAI-compatible API с `/v1`, ID модели и отдельно подтвердите поддержку vision для этой модели. Создаётся `.env` с правами 0600; существующий `.env` не заменяется без точного подтверждения `OVERWRITE`. После сохранения мастер запускает вход в Telegram; код и пароль 2FA вводятся в терминале Telethon.
+
+Для custom route в Telegram выберите `/model custom-openai`. OpenAI-compatible означает только chat-completions совместимость: изображения поддерживаются лишь при явном включении `OPENAI_COMPAT_VISION=true` и если именно ваш backend/model принимает image input. Это не обеспечивает генерацию изображений, OCR, распознавание аудио, TTS или tool calling.
+
+Если установку зависимостей в мастере пропустить, выполните её отдельно в окружении Python: `python -m venv .venv` и затем `.venv/bin/pip install -r requirements.txt` (Windows: `.venv\\Scripts\\pip.exe`). Никогда не помещайте ключи в аргументы командной строки.
+
 > Команды ниже нужно вводить в **терминале** (командной строке).
 > - **Windows:** нажмите «Пуск» → наберите `PowerShell` → откройте «Windows PowerShell».
 > - **macOS:** «Программы» → «Утилиты» → «Терминал».
@@ -132,7 +140,7 @@ pip install -r requirements.txt
 5. Нажмите кнопку **«Create application»** внизу.
 6. Откроется страница, где будут два значения (возможно, придётся чуть прокрутить вниз):
    - **`App api_id`** — это **число** (например, `12345678`).
-   - **`App api_hash`** — это **длинная строка** из букв и цифр (например, `REDACTED_ROTATE_REQUIRED`).
+   - **`App api_hash`** — это **длинная строка** из букв и цифр (например, `YOUR_TELEGRAM_API_HASH`).
 
    Скопируйте оба в заметку — они понадобятся в Шаге 8. **Никому их не показывайте.**
 
@@ -220,7 +228,7 @@ DEEPSEEK_MODEL=deepseek-v4-pro
 Например, должно получиться так (значения — ВЫДУМАННЫЕ, подставьте свои):
 ```ini
 api_id=12345678
-api_hash=REDACTED_ROTATE_REQUIRED
+api_hash=YOUR_TELEGRAM_API_HASH
 DEEPSEEK_API_KEY=sk-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
 DEEPSEEK_MODEL=deepseek-v4-pro
 ```

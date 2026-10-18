@@ -550,6 +550,16 @@ for _orslug, _orid, _orlabel, _orctx, _orsafe in [
 ]:
     MODEL_REGISTRY[_orslug] = ("openrouter", _orid, _orlabel, _orctx, _orsafe)
 
+# User-configured OpenAI-compatible text route. Treat vision as opt-in for the
+# exact model; chat compatibility alone does not imply image/audio support.
+_compat_enabled = os.getenv("OPENAI_COMPAT_ENABLED", "").strip().lower() in {"1", "true", "yes"}
+_compat_key = os.getenv("OPENAI_COMPAT_API_KEY", "").strip()
+_compat_model = os.getenv("OPENAI_COMPAT_MODEL", "").strip()
+_compat_base = os.getenv("OPENAI_COMPAT_BASE_URL", "").strip().rstrip("/")
+_compat_vision = os.getenv("OPENAI_COMPAT_VISION", "false").strip().lower() in {"1", "true", "yes"}
+if _compat_enabled and _compat_key and _compat_model and _compat_base:
+    MODEL_REGISTRY["custom-openai"] = ("openai_compat", _compat_model, "Custom OpenAI-compatible", 128000, 1.15)
+
 # Алиасы для быстрого выбора (Claude Thinking по умолчанию)
 MODEL_REGISTRY["cp-gemini-flash"] = MODEL_REGISTRY["cp-gemini-3.8-flash-high"]
 MODEL_REGISTRY["cp-gemini-pro"] = MODEL_REGISTRY["cp-gemini-3.1-pro-high"]
@@ -1461,6 +1471,7 @@ class _OpenAIReasoningClient:
 
 
 openai_client = _OpenAIReasoningClient(openai_api_key) if openai_api_key else None
+openai_compat_client = OpenAI(api_key=_compat_key, base_url=_compat_base) if _compat_enabled and _compat_key and _compat_base else None
 
 
 class _FireworksReasoningClient:
@@ -2230,16 +2241,18 @@ _model_state = load_json(MODEL_STATE_PATH, {})
 # Кастомные модели для ответов (OpenRouter / NanoGPT, заданы через /model) — восстанавливаем в реестр,
 # чтобы они стали полноценными записями и пережили рестарт.
 CUSTOM_MODELS = _model_state.get("custom_models", {})  # {id: {"provider", "label", "ctx", "safety", "vision"}}
+if "custom-openai" in MODEL_REGISTRY:
+    CUSTOM_MODELS["custom-openai"] = {"provider": "openai_compat", "label": "Custom OpenAI-compatible", "ctx": 128000, "safety": 1.15, "vision": _compat_vision}
 for _cid, _ci in CUSTOM_MODELS.items():
     _c_prov = _ci.get("provider") or ("nanogpt" if _ci.get("nanogpt") else ("seekai" if _ci.get("seekai") else ("tokenharbor" if _ci.get("tokenharbor") else ("atria" if _ci.get("atria") else ("plusvibe" if _ci.get("plusvibe") else "openrouter")))))
     MODEL_REGISTRY[_cid] = (
         _c_prov,
-        _cid,
+        (_compat_model if _cid == 'custom-openai' and _compat_enabled else _cid),
         (_ci.get("label") or _cid),
         int(_ci.get("ctx") or 128000),
         float(_ci.get("safety") or (1.15 if _c_prov in ("nanogpt", "seekai", "tokenharbor", "atria", "plusvibe") else 1.3))
     )
-ACTIVE_MODEL = _model_state.get("active", "deepseek-pro")
+ACTIVE_MODEL = _model_state.get("active") or ("custom-openai" if "custom-openai" in MODEL_REGISTRY else "deepseek-pro")
 if ACTIVE_MODEL not in MODEL_REGISTRY:
     ACTIVE_MODEL = "deepseek-pro"
 MODEL_TOOLS_SUPPORT = _model_state.get("tools_support", {})  # {slug: True|False} — обучается на лету
@@ -2295,6 +2308,8 @@ def _client_for_provider(provider):
         return modelgate_client
     if provider == "openai":
         return openai_client
+    if provider == "openai_compat":
+        return openai_compat_client
     if provider == "google":
         return google_client
     if provider == "zai":
@@ -2369,6 +2384,8 @@ def _model_supports_vision(slug):
                       # модель отвечает «изображения нет»). Для -g не годится; фото в /ask и так через OCR/медиа-модель.
     if provider == "openai":
         return True   # gpt-5.x / o3 принимают картинки напрямую (официальный API)
+    if provider == "openai_compat":
+        return _compat_vision
     if provider == "google":
         return True   # Gemini Flash видят картинки напрямую (нативный inlineData)
     if provider == "zai":

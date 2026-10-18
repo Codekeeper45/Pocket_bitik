@@ -49,3 +49,6 @@ gen_series_jobs.json
 
 # Private local backups
 .private-backups/
+# Local private QA artifacts
+last_series_planner_response.txt
+qa-rootfix/
