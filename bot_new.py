@@ -4427,16 +4427,16 @@ def _parse_gen_multipage_out(out: str, pages_count: int, user_aspect=None) -> li
                      "refs": p.refs, "bible": plan.bible, "plan_id": plan.plan_id} for p in plan.pages]
     except json.JSONDecodeError:
         pass
-    matches = list(re.finditer(r"(?im)^\\s*(?:---|#+)?\\s*PAGE\\s+(\\d+)\\s*[:—\\-]*\\s*", text))
+    matches = list(re.finditer(r"(?im)^\s*(?:---|#+)?\s*PAGE\s+(\d+)\s*[:—\-]*\s*", text))
     if not matches or text[:matches[0].start()].strip():
         raise ValueError("expected structured JSON or PAGE N blocks")
     raw_pages = []
     for i, m in enumerate(matches):
         block = text[m.end():matches[i+1].start() if i+1 < len(matches) else len(text)].strip()
-        idea_m = re.search(r"(?im)^\\s*IDEA:\\s*(.+)$", block)
-        aspect_m = re.search(r"(?im)^\\s*ASPECT:\\s*([0-9]+:[0-9]+)\\s*$", block)
-        prompt_m = re.search(r"(?ims)^\\s*PROMPT:\\s*(.*)$", block)
-        prompt = prompt_m.group(1).strip() if prompt_m else re.sub(r"(?im)^\\s*(?:IDEA|ASPECT|REFS):.*$", "", block).strip()
+        idea_m = re.search(r"(?im)^\s*IDEA:\s*(.+)$", block)
+        aspect_m = re.search(r"(?im)^\s*ASPECT:\s*([0-9]+:[0-9]+)\s*$", block)
+        prompt_m = re.search(r"(?ims)^\s*PROMPT:\s*(.*)$", block)
+        prompt = prompt_m.group(1).strip() if prompt_m else re.sub(r"(?im)^\s*(?:IDEA|ASPECT|REFS):.*$", "", block).strip()
         raw_pages.append({"number": int(m.group(1)), "idea": idea_m.group(1).strip() if idea_m else None,
                           "prompt": prompt, "aspect": aspect_m.group(1) if aspect_m else None, "refs": []})
     payload = {"pages": [{k: p[k] for k in ("number", "prompt", "aspect", "refs")} for p in raw_pages]}
