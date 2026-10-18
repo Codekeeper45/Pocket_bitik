@@ -1124,6 +1124,10 @@ CHAT_INSPECT_IMAGE_TOOL = {
                 "question": {
                     "type": "string",
                     "description": "Опционально: что конкретно нужно разглядеть на изображении (например, 'прочитай текст', 'что за мем?')."
+                },
+                "decision_only": {
+                    "type": "boolean",
+                    "description": "Для быстрой дешёвой проверки наличия конкретного объекта/персонажа/признака передай true и question в форме да/нет. Decider реально смотрит картинку, возвращает вероятность. Для OCR и свободного описания оставь false."
                 }
             },
             "required": ["message_id"]
@@ -4498,12 +4502,17 @@ async def _build_multipage_prompts(user_prompt: str, pages_count: int, context_t
                     {"role": "system", "content": system_text},
                     {"role": "user", "content": content if active_model_supports_vision() else user_req}
                 ],
-                max_tokens=ASK_MAX_TOKENS,
-                timeout=90,
+                max_tokens=max(24000, pages_count * 6000),
+                response_format={"type": "json_object"},
+                timeout=180,
                 temperature=0.35
             )
             if resp and getattr(resp, "choices", None):
                 out = _extract_content(resp.choices[0].message)
+                log('GEN', f'Series planner finish={resp.choices[0].finish_reason} output_chars={len(out or "")}')
+                from pathlib import Path as _PlanPath
+                _PlanPath('last_series_planner_response.txt').write_text(out or '', encoding='utf-8')
+                _PlanPath('last_series_planner_response.txt').chmod(0o600)
         except Exception as e:
             log("GEN", f"Многостраничный планировщик LLM завершился с ошибкой: {e}")
 
@@ -4516,7 +4525,7 @@ async def _build_multipage_prompts(user_prompt: str, pages_count: int, context_t
             messages=[{'role': 'system', 'content': system_text}, {'role': 'user', 'content': user_req},
                       {'role': 'assistant', 'content': out or ''},
                       {'role': 'user', 'content': 'Correct plan schema once: ' + str(err) + '. Return exactly all unique pages 1..N, not repeated prompts.'}],
-            max_tokens=ASK_MAX_TOKENS, temperature=.2, timeout=90)
+            max_tokens=max(24000, pages_count * 6000), response_format={"type": "json_object"}, temperature=.2, timeout=180)
         return validate_story_plan(_parse_gen_multipage_out(_extract_content(repaired.choices[0].message), pages_count), user_prompt, len(initial_refs or []))
 
 
@@ -5906,6 +5915,23 @@ JEV_SYSTEMONE_URL = os.environ.get("JEV_ENDPOINT", "https://farming-oven-import-
 
 def _jev_sync_choice(state: str, instructions: str, options: dict, timeout: float = 4.5) -> dict:
     """Синхронный вызов Jev choice (TypeSafe System One) с отказоустойчивым перебором туннеля, локального шлюза и апстрима."""
+    # Cheap typed decisions use the bot's existing OpenRouter billing account.
+    import os
+    key = os.getenv("OPENROUTER_API_KEY", "").strip()
+    if key:
+        request = urllib.request.Request("https://openrouter.ai/api/alpha/decisions",
+            data=json.dumps({"model": "perplexity/pplx-decider-flash-v1.2", "state": state,
+                "questions": {"pick": {"type": "choice", "instructions": instructions,
+                    "criteria": {**options, "not_found": "No supplied block contains relevant evidence"}}}}).encode(),
+            headers={"Authorization": "Bearer " + key, "Content-Type": "application/json"})
+        try:
+            with urllib.request.urlopen(request, timeout=max(timeout, 12)) as response:
+                answer = json.loads(response.read()).get("answers", {}).get("pick", {})
+                if answer.get("choice"):
+                    answer["decision_model"] = "perplexity/pplx-decider-flash-v1.2"
+                    return answer
+        except Exception as exc:
+            log("ASK", "Decider unavailable; trying Jev: " + type(exc).__name__)
     endpoints = [
         JEV_SYSTEMONE_URL,
         "http://127.0.0.1:8321/v1/systemone",
@@ -5954,7 +5980,7 @@ async def _run_chat_ant_search(chat_id, args: dict, msg_by_id: dict = None, incl
     if not query:
         return "Ошибка: поисковый запрос не может быть пустым."
 
-    limit = max(15, min(int(args.get("limit") or 60), 120))
+    limit = max(15, min(int(args.get("limit") or 300), 1200))
     messages = []
     try:
         async for m in client.iter_messages(chat_id, limit=limit):
@@ -5997,12 +6023,12 @@ async def _run_chat_ant_search(chat_id, args: dict, msg_by_id: dict = None, incl
                 sender = _label_for(m, getattr(m, "sender", None))
                 txt = (m.raw_text or "").replace("\n", " ").strip()
                 if txt:
-                    snippets.append(f"{sender}: {txt[:80]}")
+                    snippets.append(f"#{m.id} {sender}: {txt[:400]}")
                 elif m.photo:
                     snippets.append(f"{sender}: [Фото]")
                 elif m.document:
                     snippets.append(f"{sender}: [Документ]")
-            summary = "; ".join(snippets[:5])
+            summary = "; ".join(snippets)
             block_descriptions.append(f"Блок {idx} (#{first_id}..#{last_id}): {summary}")
             options[key] = f"Блок {idx} (#{first_id}..#{last_id})"
 
@@ -6011,10 +6037,14 @@ async def _run_chat_ant_search(chat_id, args: dict, msg_by_id: dict = None, incl
 
         try:
             choice_result = await asyncio.to_thread(_jev_sync_choice, state_text, instructions, options)
-            picked_key = choice_result.get("choice") or "block_1"
+            picked_key = choice_result.get("choice")
+            if not picked_key or picked_key == "not_found":
+                return "В просмотренном окне релевантных фрагментов не найдено. Попробуй другие ключевые слова или большую глубину."
             confidence = choice_result.get("confidence")
-            conf_val = f"{float(confidence)*100:.0f}%" if confidence is not None else "высокая"
-            confidence_str = f"{conf_val} (Jev System One)"
+            if confidence is None:
+                confidence = (choice_result.get("probabilities") or {}).get(picked_key)
+            conf_val = f"{float(confidence)*100:.0f}%" if confidence is not None else "уверенность не указана"
+            confidence_str = f"{conf_val} ({choice_result.get('decision_model', 'Jev System One')})"
 
             block_idx = 0
             if picked_key.startswith("block_") and picked_key[6:].isdigit():
@@ -6215,6 +6245,14 @@ async def _run_chat_inspect_image(chat_id, args: dict, msg_by_id: dict = None) -
     if not img_bytes:
         return f"Не удалось получить байты изображения из сообщения #{mid}."
 
+    # Targeted yes/no visual checks use cheap real-image inference, not caption guesses.
+    if question and args.get('decision_only'):
+        try:
+            from gen_decider import inspect as _decision_inspect
+            result = await asyncio.to_thread(_decision_inspect, img_bytes, question)
+            return json.dumps({'message_id': mid, **result}, ensure_ascii=False)
+        except Exception as exc:
+            log('MEDIA', 'Decider visual check unavailable; escalating: ' + type(exc).__name__)
     prompt = question if question else "Опиши подробно, что изображено на картинке. Если есть текст — прочитай и процитируй его."
 
     desc = None
