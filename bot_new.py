@@ -4468,7 +4468,14 @@ _GEN_MULTIPAGE_SYSTEM = (
     "Only explicitly matched identity evidence may define a character. If source appearance is unknown, "
     "label source as original interpretation and design a coherent non-conflicting identity, never claim canon. "
     "For every provided INPUT IMAGE include its numeric string in refs and clarify its identity/style/color role. "
-    "All panels/prompts must agree with the bible, requested humanization and user wording."
+    "All panels/prompts must agree with the bible, requested humanization and user wording. "
+    "QUALITY: unless explicitly requested otherwise, use 2-4 panels per comic page, one readable action per panel, "
+    "at most two short speech balloons per panel, each preferably under 12 words. "
+    "Compose a clear reading order with generous gutters and space for lettering; vary shot scale to serve the story. "
+    "Avoid cramped hand-object interactions and tiny text-heavy props unless essential to the request. "
+    "Use distinct silhouettes, motivated light, controlled color palette and expressive readable poses. "
+    "Write each page prompt compactly: scene, panel actions/dialogue and visual direction, not JSON or production notes. "
+    "Do not duplicate the whole story or character bible in page prompts. Give idea in Russian. "
 )
 
 async def _build_multipage_prompts(user_prompt: str, pages_count: int, context_text: str = None,
