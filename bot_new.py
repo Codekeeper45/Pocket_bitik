@@ -9674,8 +9674,8 @@ async def gen_command(event):
                 # его фото+облик (иначе на «нарисуй всех вместе»/косвенных падежах берутся общие рефы и внешности путаются).
                 # Модель сама решает, кого рисовать. Сид семантический → устойчив к склонениям и «всех чатерсов».
                 try:
-                    if seed_names:
-                        await set_status(f"🧠 Добираю референсы по персонажам ({len(seed_names)})…")
+                    if seed_names or (user_prompt and not noimg):
+                        await set_status("🧠 Агент проверяет актуальные референсы в чате…")
                         seen_mids = recent_mids | {it["mid"] for it in idx_items if it.get("mid")}
                         enrich_items, enrich_ctx = await _gen_agentic_enrich(event.chat_id, user_prompt, seed_names, exclude_mids=seen_mids)
                         if enrich_ctx:
@@ -17071,10 +17071,30 @@ async def _gen_fetch_ref_items(chat_id: int, media_hits: list, exclude_mids=None
 
 GEN_AGENTIC_TOOLS = [
     {"type": "function", "function": {
+        "name": "chat_search",
+        "description": "Ищет актуальные сообщения и стикеры в ТЕКУЩЕМ живом чате Telegram по ключевым словам. "
+                       "Используй для поиска свежих референсов, стикеров и обсуждений персонажа прямо в чате.",
+        "parameters": {"type": "object", "properties": {
+            "query": {"type": "string", "description": "Поисковый запрос в чате."},
+            "filter": {"type": "string", "enum": ["all", "photo", "document"], "description": "Фильтр медиа: photo (фото), document (стикеры/файлы), all (все)."}}, "required": ["query"]}}},
+    {"type": "function", "function": {
+        "name": "chat_read_context",
+        "description": "Считывает сообщения ВОКРУГ конкретного сообщения (#id) в текущем чате. "
+                       "Полезно, если найден стикер или сообщение, и нужно понять кто на нем или что обсуждалось.",
+        "parameters": {"type": "object", "properties": {
+            "message_id": {"type": "integer", "description": "ID сообщения в чате."},
+            "before": {"type": "integer", "description": "Сколько сообщений до (по умолчанию 3)."},
+            "after": {"type": "integer", "description": "Сколько сообщений после (по умолчанию 3)."}}, "required": ["message_id"]}}},
+    {"type": "function", "function": {
+        "name": "chat_ant_search",
+        "description": "Смысловой поиск по смыслу через Jev в живой недавней истории чата. "
+                       "Помогает найти сообщения или стикеры, если точные ключевые слова неизвестны.",
+        "parameters": {"type": "object", "properties": {
+            "query": {"type": "string", "description": "Что ищем по смыслу."}}, "required": ["query"]}}},
+    {"type": "function", "function": {
         "name": "character",
-        "description": "Заземляет ОДНОГО персонажа для генерации: находит его собственные фото (добавляет в референсы) "
-                       "и возвращает его облик. Вызови по КАЖДОМУ персонажу, которого рисуешь, чтобы он вышел по канону, "
-                       "а не был скопирован с общего кадра.",
+        "description": "Справочник внешности персонажа: возвращает каноничный облик и описание из досье памяти базы. "
+                       "Используй для общей информации о персонаже (кто это, как выглядит в каноне).",
         "parameters": {"type": "object", "properties": {
             "name": {"type": "string", "description": "Имя или прозвище персонажа."}}, "required": ["name"]}}},
     {"type": "function", "function": {
@@ -17143,13 +17163,19 @@ async def _gen_agentic_enrich(chat_id: int, user_prompt: str, seed_names: list, 
         mids_txt = ", ".join(f"msg {h['msg_id']}" for h in chosen) or "фото не нашёл"
         return f"{name} → рефы: {mids_txt}; облик: {_idx_snip(look, 220) or '—'}"
 
-    sys = ("Ты собираешь визуальные РЕФЕРЕНСЫ (фото) и ОБЛИК персонажей для генерации картинки. "
-           "Релевантные запросу персонажи чата (по памяти): " + ", ".join(seed_names) + ". "
-           "Определи, КОГО реально нужно нарисовать по запросу (это могут быть эти и/или названные в самом запросе, "
-           "в т.ч. в косвенных падежах), и по КАЖДОМУ вызови character(name) — это добавит его фото в референсы и "
-           "вернёт облик, чтобы он вышел по канону, а не был скопирован с общего кадра. Для сцен «X и Y вместе» можешь "
-           "уточнить connections(entity) или детали через search(query). НЕ пиши промпт и НЕ отвечай текстом — только "
-           "вызывай инструменты; когда прошёлся по нужным персонажам, заверши без вызова.")
+    seeds_str = ", ".join(seed_names) if seed_names else "нет в базе"
+    sys = ("Ты агент подготовки визуальных РЕФЕРЕНСОВ (фото/стикеров) и ОБЛИКА персонажей для генерации картинки. "
+           f"База знаний чата (лор и досье из памяти): {seeds_str}. "
+           "Помни: база данных — это фоновый справочник («кто есть кто»), но она может быть неполной или устаревшей. "
+           "Используй живые инструменты чата для поиска АКТУАЛЬНЫХ стикеров, фото и референсов: "
+           "chat_search(query, filter) — ищи персонажа, его свежие стикеры или фразы прямо в живом чате Telegram; "
+           "chat_read_context(message_id) — читай переписку вокруг найденных сообщений/стикеров; "
+           "chat_ant_search(query) — смысловой поиск через Jev, если точные слова неизвестны; "
+           "character(name) — каноничное досье/облик из базы знаний чата; "
+           "search(query) / connections(entity) — лор и связи персонажей. "
+           "Любая найденная в чате картинка или стикер персонажа автоматически добавится в пул кандидатов. "
+           "Проверяй информацию сам: не доверяй слепо старой базе, если в живом чате есть более точные или свежие референсы. "
+           "НЕ пиши промпт и НЕ отвечай текстом — только вызывай инструменты; когда прошёлся по нужным персонажам, заверши без вызова.")
     messages = [{"role": "system", "content": sys},
                 {"role": "user", "content": f"Запрос генерации: {user_prompt}"}]
     try:
@@ -17168,6 +17194,7 @@ async def _gen_agentic_enrich(chat_id: int, user_prompt: str, seed_names: list, 
             if _reasoning:
                 assistant_dict["reasoning_content"] = _reasoning
             messages.append(assistant_dict)
+            live_msgs_map = {}
             for tc in msg.tool_calls:
                 try:
                     args = json.loads(tc.function.arguments or "{}")
@@ -17181,9 +17208,23 @@ async def _gen_agentic_enrich(chat_id: int, user_prompt: str, seed_names: list, 
                     res = await _index_tool_search(chat_id, args.get("query", ""), args.get("kind", "all"))
                 elif nm == "connections":
                     res = await _index_tool_connections(chat_id, args.get("entity"))
+                elif nm == "chat_search":
+                    res = await _run_chat_search(chat_id, args, msg_by_id=live_msgs_map)
+                elif nm == "chat_read_context":
+                    res = await _run_chat_read_context(chat_id, args, msg_by_id=live_msgs_map)
+                elif nm == "chat_ant_search":
+                    res = await _run_chat_ant_search(chat_id, args, msg_by_id=live_msgs_map)
                 else:
                     res = f"Неизвестный инструмент: {nm}"
                 messages.append({"role": "tool", "tool_call_id": tc.id, "content": (res or "")[:4000]})
+            for mid, m in live_msgs_map.items():
+                if mid not in seen_ref and _index_is_image_msg(m):
+                    seen_ref.add(mid)
+                    primary_hits.append({
+                        "msg_id": mid,
+                        "visual_description": m.raw_text or "",
+                        "source": "live_chat_tool"
+                    })
     except Exception as e:
         log("GEN", f"Агентный добор: сбой tool-loop ({e}) — использую собранное частично")
     ref_hits = primary_hits + extra_hits
