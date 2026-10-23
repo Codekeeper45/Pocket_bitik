@@ -30,7 +30,9 @@ class DeliveryTests(unittest.IsolatedAsyncioTestCase):
             old = store.save("old", b"123")
             os.utime(old, (time.time() - 10, time.time() - 10)); store.prune()
             self.assertFalse(old.exists())
-            first = store.save("one", b"12345"); store.save("two", b"abcde")
+            first = store.save("one", b"12345")
+            time.sleep(0.02)
+            store.save("two", b"abcde")
             self.assertFalse(first.exists())
 
 if __name__ == "__main__": unittest.main()
