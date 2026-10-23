@@ -96,7 +96,7 @@ class DeliveryFirstIntegration(unittest.IsolatedAsyncioTestCase):
         for name in ('_gen_provider_call', '_gen_one_image_impl', '_gen_one_image_recorded',
                      '_gen_one_image', '_gen_render_image', '_gen_send_image',
                      '_gen_remap_selected_refs', '_gen_role_number_remap', '_gen_actual_role_instruction',
-                     '_gen_page_reference_snapshot',
+                     '_gen_page_reference_snapshot', '_gen_series_refs_line', '_gen_refs_line',
                      '_detect_pages_count', 'gen_command', 'gen_resume', '_track_gen_activity'):
             load_bot_function(name, namespace)
         namespace.update(namespace_overrides or {})

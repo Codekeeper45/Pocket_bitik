@@ -93,6 +93,8 @@ Fields: task_type (creation/edit/series), output_kind (single_image/independent_
 output_count (positive integer files), prompt (scene description), panels_per_image (positive integer or null),
 explicit_text (verbatim strings), refs ([{ref_id: stable source ID, roles: [subject/style/clothing/background/pose/composition/object]}]),
 aspect (null/1:1/9:16/16:9/4:3/3:4), constraints (strings), layers (boolean, default false).
+idea (short human-readable scene caption, not rendering instructions),
+ideas (one distinct human-readable caption per file for multiple outputs).
 Optional: scenes (one distinct scene string per file), participant_count (nonnegative integer).
 Understand the user's meaning and negations; panels are not files. Distinguish independent images from a continuous series.
 Explicit command parameters override your choices. Preserve the scene, exact text and source identities.
@@ -118,6 +120,8 @@ class IntentPlan:
     source_prompt: str = ""
     fallback_used: bool = False
     raw: bool = False
+    idea: str = ""
+    ideas: tuple[str, ...] = ()
 
 
 def _intent_integer(value, name, minimum=1):
@@ -165,7 +169,7 @@ def _intent_object(value):
             raise ContractError("expected a JSON intent plan") from exc
     if not isinstance(value, dict):
         raise ContractError("intent plan must be an object")
-    allowed = {"task_type", "output_kind", "output_count", "prompt", "panels_per_image", "explicit_text", "refs", "aspect", "constraints", "layers", "scenes", "participant_count"}
+    allowed = {"task_type", "output_kind", "output_count", "prompt", "panels_per_image", "explicit_text", "refs", "aspect", "constraints", "layers", "scenes", "participant_count", "idea", "ideas"}
     if set(value) - allowed:
         raise ContractError("unknown intent plan fields")
     return dict(value)
@@ -227,6 +231,14 @@ def parse_intent_plan(out, user_request=None, explicit_count=None, edit_mode=Fal
         if type(layers) is not bool:
             raise ContractError("layers must be boolean")
         scenes = _intent_strings(data.get("scenes", ()), "scenes")
+        idea = data.get("idea", "")
+        if not isinstance(idea, str):
+            raise ContractError("idea must be a string")
+        ideas = _intent_strings(data.get("ideas", ()), "ideas")
+        if ideas and len(ideas) != count:
+            if count_override is None:
+                raise ContractError("ideas must match output_count")
+            ideas = ()
         if scenes and len(scenes) != count:
             if count_override is None:
                 raise ContractError("scenes must match output_count")
@@ -235,7 +247,8 @@ def parse_intent_plan(out, user_request=None, explicit_count=None, edit_mode=Fal
                           panels_per_image=panels, explicit_text=_intent_strings(data.get("explicit_text", ()), "explicit_text"),
                           refs=_intent_refs(data.get("refs", ())), aspect=aspect,
                           constraints=_intent_strings(data.get("constraints", ()), "constraints"),
-                          layers=layers, scenes=scenes, participant_count=participants, source_prompt=source)
+                          layers=layers, scenes=scenes, participant_count=participants, source_prompt=source,
+                          idea=idea.strip(), ideas=ideas)
 
     if not raw:
         try:
@@ -263,6 +276,16 @@ def parse_intent_plan(out, user_request=None, explicit_count=None, edit_mode=Fal
 def intent_plan_to_dict(plan: IntentPlan) -> dict:
     """Return detached, JSON-serializable state for CURRENT.timings or diagnostics."""
     return asdict(plan)
+
+
+def intent_idea(plan: IntentPlan, output_number: int = 1) -> str:
+    if plan.ideas and output_number <= len(plan.ideas):
+        return plan.ideas[output_number - 1]
+    if plan.idea and plan.output_count == 1:
+        return plan.idea
+    if plan.scenes and output_number <= len(plan.scenes):
+        return plan.scenes[output_number - 1]
+    return plan.idea or plan.prompt
 
 
 def intent_instructions(plan: IntentPlan) -> str:
@@ -315,4 +338,4 @@ def render_intent_prompt(plan: IntentPlan, *, output_number: int | None = None) 
 
 
 __all__ = ["SceneContract", "ContractError", "extract_contract", "contract_to_dict", "render_prompt", "build_contract_prompt",
-           "IntentPlan", "INTENT_PLAN_INSTRUCTIONS", "parse_intent_plan", "intent_plan_to_dict", "intent_instructions", "render_intent_prompt"]
+           "IntentPlan", "INTENT_PLAN_INSTRUCTIONS", "parse_intent_plan", "intent_plan_to_dict", "intent_idea", "intent_instructions", "render_intent_prompt"]

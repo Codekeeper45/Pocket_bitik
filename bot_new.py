@@ -4347,7 +4347,7 @@ async def _build_gen_prompt(user_prompt: str, context_text: str = None, image_de
             for part in message['content'] if part.get('type') == 'image_url')
     if catalog is not None:
         catalog[:] = working_catalog
-    return _gen_prompt.render_intent_prompt(plan), _gen_validated_selection(working_catalog, selected), legacy[2], plan.aspect or legacy[3]
+    return _gen_prompt.render_intent_prompt(plan), _gen_validated_selection(working_catalog, selected), (legacy[2] if plan.fallback_used and legacy[2] else _gen_prompt.intent_idea(plan)), plan.aspect or legacy[3]
 
 
 def _gen_remap_selected_refs(input_b64s: list, input_roles: list, catalog: list, selected: list) -> tuple:
@@ -4401,7 +4401,11 @@ def _gen_remap_selected_refs(input_b64s: list, input_roles: list, catalog: list,
     out = [base64.b64encode(ref.data).decode('ascii') for ref in packed.refs]
     roles = [(ref.api_index, ' + '.join(ref.roles)) for ref in packed.refs]
     if invocation:
-        invocation.timings['reference_registry'] = {'references': registry.manifest(packed.refs),
+        manifest = registry.manifest(packed.refs)
+        submitted_sources = invocation.timings.get('submitted_reference_sources', {})
+        for reference, metadata in zip(packed.refs, manifest):
+            metadata['source_links'] = submitted_sources.get(reference.digest, [])
+        invocation.timings['reference_registry'] = {'references': manifest,
             'input_count': len(out), 'input_bytes': sum(len(ref.data) for ref in packed.refs),
             'status': packed.status, 'issues': issues + [asdict(issue) for issue in packed.issues],
             'missing_required': list(packed.required_missing)}
@@ -8298,6 +8302,10 @@ async def _gen_collect_input_images(event, reply_msg, extra_msgs=None):
     (включая альбом реплая) и из extra_msgs (ссылки — ТОЛЬКО указанное фото, без альбома).
     Возвращает (list_b64, skipped): максимум 10 фото, суммарно ≤ GEN_IMAGE_MAX_INPUT сырых байт
     (лимит запроса API 4.5 МБ); лишние пропускаются."""
+    from gen_runtime import CURRENT
+    invocation = CURRENT.get()
+    if invocation:
+        invocation.timings['submitted_reference_sources'] = {}
     sources, seen = [], set()
     def source_key(msg):
         return (getattr(msg, "chat_id", None) or event.chat_id, msg.id)
@@ -8354,6 +8362,15 @@ async def _gen_collect_input_images(event, reply_msg, extra_msgs=None):
                 continue
         total += len(img)
         out.append(base64.b64encode(img).decode("utf-8"))
+        if invocation and source_key(m) != (event.chat_id, event.id):
+            try:
+                entity = await m.get_chat()
+                link = (f'tg://openmessage?user_id={entity.id}&message_id={m.id}'
+                        if getattr(m, 'is_private', False) else build_msg_link(entity, m.id))
+                digest = __import__('hashlib').sha256(img).hexdigest()
+                invocation.timings['submitted_reference_sources'].setdefault(digest, []).append(f'[#{m.id}]({link})')
+            except Exception:
+                pass
     if sources:
         log("GEN", f"Референсы: найдено {len(sources)} фото → взято {len(out)} ({total / 1024:.0f} КБ), пропущено {skipped}")
     return out, skipped
@@ -8539,28 +8556,27 @@ async def _merge_catalog_refs(input_b64s: list, catalog: list, sel: list) -> tup
     return out, used
 
 
-def _gen_refs_line(chat_ent, catalog: list, used_idxs: list, reasons: dict = None) -> str:
+def _gen_refs_line(chat_ent, catalog: list, used_idxs: list, reasons: dict = None, source_links=()) -> str:
     """Строка «Референсы:» со ссылками на сообщения, чьи фото реально ушли в генерацию (markdown).
     reasons — {idx: «зачем взят»} от промптера (из REFS: 3 (лицо Димы), …), добавляется к ссылке."""
-    if not (chat_ent and catalog and used_idxs):
-        return None
     by_idx = {it["idx"]: it for it in catalog}
-    parts = []
+    parts = list(dict.fromkeys(source_links))
     for k in used_idxs:
         it = by_idx.get(k)
         mid = it.get("mid") if it else None
         if it and it.get('profile_url'):
-            parts.append(f"[Аватар #{k}]({it['profile_url']})" + (f": {(reasons or {})[k]}" if (reasons or {}).get(k) else ''))
+            identity = it.get('participant_id') or it['profile_url'].rsplit('/', 1)[-1]
+            parts.append(f"[Аватар {identity}]({it['profile_url']})" + (f": {(reasons or {})[k]}" if (reasons or {}).get(k) else ''))
             continue
-        if it and it.get('source_url'):
+        if it and (it.get('source_page_url') or it.get('source_url') or it.get('image_url')):
             from urllib.parse import urlsplit
-            url = str(it['source_url'])
+            url = str(it.get('source_page_url') or it.get('source_url') or it['image_url'])
             if urlsplit(url).scheme in ('http','https'):
                 safe_url = url.replace('(', '%28').replace(')', '%29')
                 why = (reasons or {}).get(k) or it.get('source_role') or 'визуальный источник'
                 parts.append(f'[Web #{k}]({safe_url}): {why}')
             continue
-        if not mid:
+        if not mid or not chat_ent:
             continue
         try:
             link = f"[#{k}]({build_msg_link(chat_ent, mid)})"
@@ -8569,6 +8585,21 @@ def _gen_refs_line(chat_ent, catalog: list, used_idxs: list, reasons: dict = Non
         why = (reasons or {}).get(k)
         parts.append(f"{link} — {why}" if why else link)
     return ("📎 Источники референсов: " + " · ".join(parts)) if parts else None
+
+
+def _gen_series_refs_line(generation, selected_refs):
+    sources = generation.get('reference_sources', {})
+    selected = set(selected_refs)
+    lines = []
+    for reference in generation.get('reference_registry', {}).get('references', []):
+        index = str(reference['api_index'])
+        aliases = {index, reference['ref_id'], *reference.get('aliases', ())}
+        line = (sources.get(index) or '').removeprefix('📎 Источники референсов: ')
+        if selected.intersection(aliases) and line and line not in lines:
+            lines.append(line)
+    if 'series:anchor' in selected and generation.get('anchor_source'):
+        lines.append(generation['anchor_source'])
+    return '📎 Источники референсов: ' + ' · '.join(lines) if lines else None
 
 
 # Глобальный rate-gate для image-API: разносим вызовы во времени, чтобы не ловить RPM-429
@@ -9202,6 +9233,10 @@ async def _gen_send_image(chat, raw, mime, final_prompt, prompt_by_ai, reply_to,
                 record(artifact_key, chat=chat, reply_to=reply_to, path=artifact, status='ambiguous')
                 raise
         display_prompt = final_prompt
+        if isinstance(final_prompt, str) and '\n\nScene:\n' in final_prompt:
+            section = 'This image:\n' if '\n\nThis image:\n' in final_prompt else 'Scene:\n'
+            display_prompt = final_prompt.split('\n\n' + section, 1)[1]
+            display_prompt = re.split(r'\n\n(?:Output: \d+ of |Original user request \(verbatim\):\n|Explicit text:\n|Constraints:\n|Aspect: |Reference roles:\n)', display_prompt, maxsplit=1)[0]
         if isinstance(final_prompt, str) and "{" in final_prompt:
             try:
                 start = final_prompt.find("{")
@@ -9422,6 +9457,12 @@ async def gen_resume(event):
                 record['checkpoint'] = checkpoint.to_json()
                 save_series_state(_Path('gen_series_state') / f'{job_id}.json', record)
             pages_meta = record.get("pages_meta") or {}
+            if generation.get('intent_plan'):
+                from gen_prompt import IntentPlan, intent_idea
+                saved_intent = IntentPlan(**generation['intent_plan'])
+                for page in plan.pages:
+                    metadata = pages_meta.setdefault(str(page.number), {})
+                    metadata['idea'] = metadata.get('idea') or intent_idea(saved_intent, page.number)
             refs = generation["input_b64s"]
             roles = generation["input_roles"]
             ref_catalog = {str(i): {"image": value, "role": roles[i-1] if i-1 < len(roles) else "subject"}
@@ -9481,11 +9522,18 @@ async def gen_resume(event):
                 active = CURRENT.get()
                 key = (active.job_id if active else job_id) + '_' + __import__('hashlib').sha256(raw).hexdigest()[:12]
                 return {"artifact": str(artifact), "mime": mime, "prompt": page.prompt, 'delivery_key': key,
-                        "idea": (pages_meta.get(str(page.number)) or {}).get("idea") or f"Страница {page.number}"}
+                        "refs_line": _gen_series_refs_line(generation, selected),
+                        "idea": (pages_meta.get(str(page.number)) or {}).get("idea") or generation['user_prompt']}
             async def deliver(page, result):
                 raw = _Path(result["artifact"]).read_bytes()
-                await _gen_send_image(event.chat_id, raw, result["mime"], result["prompt"], True,
-                                      generation["reply_target_id"], idea=f"[{page.number}/{len(plan.pages)}] {result['idea']}", delivery_key=result.get('delivery_key'))
+                sent = await _gen_send_image(event.chat_id, raw, result["mime"], result["prompt"], True,
+                                      generation["reply_target_id"], refs_line=result.get('refs_line', _gen_series_refs_line(generation, page.refs)), idea=f"[{page.number}/{len(plan.pages)}] {result['idea']}", delivery_key=result.get('delivery_key'))
+                result['message_id'] = getattr(sent, 'id', None)
+                if page.number == 1 and result['message_id']:
+                    try:
+                        generation['anchor_source'] = f"[Страница 1]({build_msg_link(await event.get_chat(), sent.id)})"
+                    except Exception:
+                        pass
             result = await execute_series(plan, generate=generate, checkpoint=checkpoint,
                                           save_checkpoint=save_checkpoint, deliver=deliver,
                                           anchor_selector=lambda results: results.get(1) and _Path(results[1]["artifact"]).read_bytes())
@@ -9801,7 +9849,7 @@ async def gen_command(event):
                     if counter["exhausted"]:  # дневной лимит исчерпан — не строим и не шлём остаток
                         log("GEN", f"Дневной лимит исчерпан — останавливаю пакет на варианте {i + 1}/{batch_count}")
                         break
-                    cat_i = (catalog or None) if i == 0 else None  # каталог (и картинки vision) — только 1-му варианту
+                    cat_i = catalog if i == 0 else None  # каталог (и картинки vision) — только 1-му варианту
                     if raw:
                         fp, sel, idea_i, asp_i = user_prompt, [], None, aspect_ratio
                     else:
@@ -9813,12 +9861,13 @@ async def gen_command(event):
                         input_roles = [r for _, r in actual_roles]
                         fp = _gen_role_number_remap(fp, idx_map)
                         fp += "\n\n" + _gen_actual_role_instruction(actual_roles)
-                        try:
-                            gen_refs_line = _gen_refs_line(await event.get_chat(), catalog, _used, reasons=dict(sel))
-                        except Exception:
-                            gen_refs_line = None
                         from gen_runtime import CURRENT
                         active = CURRENT.get()
+                        try:
+                            gen_refs_line = _gen_refs_line(await event.get_chat(), catalog, _used, reasons=dict(sel),
+                                source_links=[link for reference in (active.timings.get('reference_registry', {}) if active else {}).get('references', []) for link in reference.get('source_links', [])])
+                        except Exception:
+                            gen_refs_line = None
                         if active:
                             from copy import deepcopy
                             batch_qa_refs = tuple(active.qa_references)
@@ -9856,7 +9905,7 @@ async def gen_command(event):
 
         # ── многостраничная последовательная генерация (при запросе N страниц) ──
         from gen_runtime import CURRENT as _PLAN_CURRENT
-        from gen_prompt import parse_intent_plan, intent_plan_to_dict, render_intent_prompt
+        from gen_prompt import parse_intent_plan, intent_plan_to_dict, render_intent_prompt, intent_idea
         from dataclasses import replace as _plan_replace
         prepared = None
         if ai_prompt:
@@ -9888,6 +9937,17 @@ async def gen_command(event):
             input_b64s, actual_roles, _used, idx_map = _gen_remap_selected_refs(input_b64s, input_roles, catalog, selected)
             input_roles = [role for _, role in actual_roles]
             _reference_registry = _plan_invocation.timings.get('reference_registry', {}) if _plan_invocation else {}
+            reference_sources = {}
+            for reference in _reference_registry.get('references', []):
+                reference_sources[str(reference['api_index'])] = _gen_refs_line(None, [], [], source_links=reference.get('source_links', []))
+            if _used:
+                chat_entity = await event.get_chat()
+                for api_index in set(idx_map.values()):
+                    reference_sources[str(api_index)] = _gen_refs_line(chat_entity, catalog,
+                        [idx for idx in _used if idx_map[idx] == api_index], reasons=dict(selected),
+                        source_links=[reference_sources[str(api_index)].removeprefix('📎 Источники референсов: ')] if reference_sources.get(str(api_index)) else [])
+            gen_refs_line = _gen_series_refs_line({'reference_registry': _reference_registry, 'reference_sources': reference_sources},
+                                                [reference['ref_id'] for reference in _reference_registry.get('references', [])])
             _intent = _plan_replace(_intent, output_count=pages_count, refs=tuple(
                 {'ref_id': reference['ref_id'], 'roles': reference['roles']} for reference in _reference_registry.get('references', [])))
             if _reference_registry.get('issues'):
@@ -9896,6 +9956,7 @@ async def gen_command(event):
             from gen_series import series_plan_from_intent
             _series_plan = series_plan_from_intent(_intent)
             pages_plan = [{'page': page.number, 'prompt': page.prompt, 'aspect': page.aspect,
+                'idea': intent_idea(_intent, page.number),
                 'refs': list(page.refs), 'bible': _series_plan.bible} for page in _series_plan.pages]
             _invocation = _SERIES_CURRENT.get()
             _job_id = _invocation.job_id if _invocation else __import__('uuid').uuid4().hex
@@ -9911,6 +9972,7 @@ async def gen_command(event):
                     "input_b64s": input_b64s, "input_roles": input_roles, "image_size": image_size,
                     "aspect_ratio": aspect_ratio, "reply_target_id": reply_target_id,
                     "gen_refs_line": gen_refs_line, "intent_plan": intent_plan_to_dict(_intent),
+                    "reference_sources": reference_sources,
                     "reference_registry": _reference_registry}
                 async def _save_series_checkpoint(state):
                     save_series_state(_series_store.path, {"job_id": _job_id, "chat_id": state.chat_id, "owner_id": state.owner_id,
@@ -9971,17 +10033,23 @@ async def gen_command(event):
                     assert_distinct_page(raw_p, [_SeriesPath(r['artifact']).read_bytes() for r in _checkpoint.completed.values()])
                     artifact_path = _SERIES_ARTIFACTS.save(f"{_job_id}_series_{p_idx}", raw_p, ".png" if "png" in mime_p else ".jpg")
                     delivery_key = (_SERIES_CURRENT.get().job_id if _SERIES_CURRENT.get() else _job_id) + '_' + __import__('hashlib').sha256(raw_p).hexdigest()[:12]
-                    return {"artifact": str(artifact_path), "mime": mime_p, "prompt": page.prompt, "idea": p_idea, 'delivery_key': delivery_key}
+                    return {"artifact": str(artifact_path), "mime": mime_p, "prompt": page.prompt, "idea": p_idea, 'delivery_key': delivery_key,
+                            'refs_line': _gen_series_refs_line(_generation, selected_refs)}
                 async def _series_deliver(page, result):
                     nonlocal reply_target_id
                     p_idx = page.number
                     raw_p = _SeriesPath(result["artifact"]).read_bytes()
                     sent = await _gen_send_image(event.chat_id, raw_p, result["mime"], result["prompt"], True,
-                        reply_target_id, refs_line=gen_refs_line if p_idx == pages_count else None,
+                        reply_target_id, refs_line=result.get('refs_line'),
                         idea=f"[{p_idx}/{pages_count}] {result['idea']}", delivery_key=result.get('delivery_key'))
                     if sent and getattr(sent, "id", None):
                         reply_target_id = sent.id
                     result["message_id"] = getattr(sent, "id", None)
+                    if p_idx == 1 and result['message_id']:
+                        try:
+                            _generation['anchor_source'] = f"[Страница 1]({build_msg_link(await event.get_chat(), sent.id)})"
+                        except Exception:
+                            pass
                 _checkpoint = await execute_series(_series_plan, generate=_series_generate, checkpoint=_checkpoint,
                     save_checkpoint=_save_series_checkpoint, deliver=_series_deliver,
                     anchor_selector=lambda results: results.get(1) and _SeriesPath(results[1]["artifact"]).read_bytes())
@@ -10022,9 +10090,10 @@ async def gen_command(event):
             input_roles = [r for _, r in actual_roles]
             final_prompt = _gen_role_number_remap(final_prompt, idx_map)
             final_prompt += "\n\n" + _gen_actual_role_instruction(actual_roles)
-            if _used:
+            source_links = [link for reference in (_plan_invocation.timings.get('reference_registry', {}) if _plan_invocation else {}).get('references', []) for link in reference.get('source_links', [])]
+            if _used or source_links:
                 try:
-                    gen_refs_line = _gen_refs_line(await event.get_chat(), catalog, _used, reasons=dict(sel))
+                    gen_refs_line = _gen_refs_line(await event.get_chat(), catalog, _used, reasons=dict(sel), source_links=source_links)
                 except Exception:
                     gen_refs_line = None
             log("GEN", f"Промпт: by_ai={prompt_by_ai} · режим={'edit' if edit_mode else ('improve' if improve else 'creative')} · ref-вложений={'есть' if image_desc else 'нет'} · из истории refs={len(_used)} · idea={gen_idea or '—'} · len={len(final_prompt)}")
