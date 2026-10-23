@@ -29,7 +29,7 @@ Only source-defined routing was inspected: configured generation/media routes re
 | `bot_new.py` | One structured agent plan drives single/series routing; file count comes from the model or explicit flags, never natural-language regex. Removed obligatory post-prompt contract extraction. One schema repair then verbatim-source fallback. Registered IDs, actual attachment manifests, role merging, capacity reselection/fallback, bounded image context and tool deltas. Tool errors stay in the conversation. Selected subject/style inputs reach QA; QA binds exact image digest; final unavailable QA never reuses an old assessment. Targeted regeneration receives evidence and invariants; category-based seam checks replace language substrings. Model-selected optional layers preserve complete composites or fall back to ordinary rendering. Remaining deadlines cover provider waiting. Batch tasks cancel/join on interruption. Shared series and delivery locks, durable delivery outcomes, Saved Messages normalization, stable resume delivery keys. |
 | `gen_prompt.py` | `IntentPlan`, compact schema instructions, structural validation, explicit overrides, source-preserving fallback, multi-role refs and conditional edit/text/group/panel/series renderer instructions. Legacy scene contracts remain readable. |
 | `gen_references.py` | Namespaced stable IDs plus legacy aliases, merged provenance/roles for identical bytes, bounded protected working sets, actual-payload packing with compression and explicit missing/capacity diagnostics. Attachment indices assigned after packing; source IDs survive normalization. |
-| `gen_web_references.py` | Separate image/page URLs, author/title and unverified provenance, exact sanitized-query authorization, bounded source-page reader using pinned SSRF-safe transport, page tool and multi-role selection schemas. |
+| `gen_web_references.py` | Separate image/page URLs, author/title and unverified provenance, typed model-sanitizer outputs at the search boundary, bounded source-page reader using pinned SSRF-safe transport, page tool and multi-role selection schemas. |
 | `gen_contracts.py` | Optional QA image digest, preserving existing positional fields. |
 | `gen_qa.py` | Status validation before findings, honest unavailable results, digest binding, selected-target comparison and rejection of new/worsened substantial defects. |
 | `gen_policy.py` | Evidence/category/severity/confidence-based targets, bounded repairs, explicit repair instructions and original constraints. |
@@ -62,12 +62,12 @@ Changed assertions intentionally replace obsolete requirements (semantic regex c
 
 ## Verification and measured context
 
-- Final full-suite result (`python -m pytest tests -q`): **411 passed, 57 subtests passed, 19 warnings, 34.68 seconds**. Warnings are the existing Pillow `getdata` deprecation exercised by more integration cases.
+- Initial implementation full-suite result (`python -m pytest tests -q`): **411 passed, 57 subtests passed, 19 warnings, 34.68 seconds**. The follow-up verification below supersedes this result. Warnings are the existing Pillow `getdata` deprecation exercised by more integration cases.
 - Focused lifecycle verification: **83 passed**, covering actual handler execution and durable recovery.
 - `python -m py_compile bot_new.py gen_*.py` and `git diff --check` pass.
 - Valid structured plans require one model completion instead of the old prompt completion plus mandatory extraction. A schema error permits one correction; capacity reselection and public-query sanitization are optional extra calls, recorded separately.
 - Context tests measure image parts in actual mocked request messages. Existing images are not appended again after tools; retained visual history is bounded and the latest inspected source remains selectable while its source record is retained. `planner_calls`, `planner_image_parts`, `planner_image_transmissions`, and `web_privacy_calls` are available per invocation. Repeated API requests still retransmit retained history; this is not represented as zero image cost.
-- Public-query sanitization uses the already authorized model, only when web search is requested, with an invocation-local cache. Structural approval prevents bypassing that boundary; semantic privacy is still a model decision, not a mathematical guarantee or a keyword whitelist.
+- Public-query sanitization uses the already authorized model, only when web search is requested, with an invocation-local cache. The transport accepts an internal sanitizer-result type rather than raw tool strings; semantic privacy is still a model decision, not a mathematical guarantee or a keyword whitelist.
 
 Exact offline measurements against `caf6fa5`, using AST-extracted baseline functions and mocked model/tool responses (Unicode characters, not tokens):
 
@@ -80,6 +80,30 @@ Exact offline measurements against `caf6fa5`, using AST-extracted baseline funct
 | Image transmissions across the two planner requests | 7 | 5 |
 
 The final-context image-part reduction is 40%; transmissions decrease 28.57% in that synthetic scenario. These measurements do not establish token billing, production latency, or visual-quality improvements.
+
+## Integration review follow-up — October 23, 2026
+
+Continued the existing implementation at `b20db50`; no rewrite. Read the parent's `new-diff-independent-review.md`, `PARENT_INTEGRATION_REVIEW.md`, runtime/live baseline notes, and all eleven steps of the approved plan. Changes in this follow-up are limited to source, regression tests, and this report.
+
+### Confirmed findings resolved
+
+1. **Batch snapshot mismatch:** later variants receive the captured reference manifest, cannot discover new references, and retain the captured source IDs/roles in their plans. Their attachment mappings render from an explicit snapshot rather than mutable invocation state. The actual command plus real builder regression uses two same-role references, makes later planner responses select an unattached source, and checks that bytes, stable IDs, API indices, and child registries stay aligned.
+2. **Mixed original-plus-anchor QA:** both initial series execution and resume construct a page-local reference/QA snapshot after final attachment packing. It contains the actual decoded attachment bytes, including the resized `series:anchor` with normalized `subject` and `style` roles. The regression executes a partial three-page series and resumes it, checking original and anchor evidence in the actual generation child's QA inputs.
+3. **Provably pre-send retry:** failed Saved Messages identity resolution durably records `not_started`. Both normal delivery and retry persist `sending` before calling Telegram. Only `not_started` bypasses reconciliation; legacy `pending`, `sending`, and ambiguous records remain conservative. Earlier uncertain states cannot be downgraded to `not_started`. Tests cover recovery after identity resolution, on-disk state during sending, repeated retry without duplicate delivery, cancellation, and refusal to retry uncertain unmarked sends.
+
+### Remaining parent code point resolved
+
+Removed the `public_terms` self-approval parameter and its call sites. The existing model sanitizer now returns `SanitizedPublicQuery`; public search rejects raw strings and tool-supplied approval dictionaries. Structural query validation is explicitly not a privacy proof. The existing sanitizer cache, call measurement, safe URL/DNS/redirect transport, and failure-to-generation fallback remain intact. Tests cover the removed parameter, forged approval fields, and the actual builder-to-sanitizer-to-search path.
+
+The other parent code points were already implemented and remain covered: stable reference labels in multimodal planning, stable IDs persisted in series checkpoints, resume errors recorded on the invocation rather than falsely completed, and actual command execution with mocked planner/provider/delivery. The full suite also retains the earlier runtime regressions for cancellation cleanup, shared series locks, checkpoint send phases, deadline/capacity accounting, Saved Messages scope, and post-send persistence failures.
+
+### Follow-up verification
+
+- Full repository suite: `python -m pytest -q` — **422 passed, 60 subtests passed, 22 warnings**. All warnings are the existing Pillow `getdata` deprecation.
+- Focused web provenance/transport suite: **29 passed**.
+- The three primary regressions were also exercised against AST-loaded pre-fix handler/builder functions from `b20db50`: missing later batch mapping, missing mixed-page anchor evidence, and `pending` instead of `not_started` reproduce offline.
+- Syntax compilation of changed Python files and `git diff --check` pass.
+- Tests use fake clients/providers and network guards. No live requests, secrets inspection, push, deployment, or production changes were performed. Temporary `*_HANDOFF.md` and `PARENT*.md` notes are excluded from the commit.
 
 ## Remaining acceptance and limitations
 

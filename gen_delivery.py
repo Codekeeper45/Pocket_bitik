@@ -48,6 +48,8 @@ def record(key,*,chat,reply_to,path,status,message_id=None,caption=None,self_id=
  if old and normalize_chat(old['chat'],self_id=self_id)!=normalize_chat(chat,self_id=self_id):raise PermissionError('artifact belongs to another chat')
  if old.get('status')=='delivered' and old.get('message_id') is not None:
   return old
+ if status=='not_started' and old and old.get('status')!='not_started':
+  return old
  if message_id is None:message_id=old.get('message_id')
  if str(chat)=='me' and self_id is not None:chat=int(normalize_chat(chat,self_id=self_id))
  obj={**old,'key':key,'chat':chat,'reply_to':reply_to,'path':str(path),'status':status,'message_id':message_id,'updated':time.time()}

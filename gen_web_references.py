@@ -126,15 +126,13 @@ def inspect_image(data: bytes) -> tuple[bytes,str,int,int]:
         out=io.BytesIO(); im.save(out,format="JPEG",quality=88,optimize=True)
         return out.getvalue(), "image/jpeg", im.width, im.height
 
-def guard_public_query(query: str, *, public_terms=()) -> str | None:
-    """Authorize an exact public concept query, not a keyword-bearing private prompt.
+class SanitizedPublicQuery(str):
+    """Internal model-sanitizer output, not proof that its semantic decision is correct."""
 
-    public_terms is a trusted caller's approved public-query list, never tool-supplied
-    approval or a list of generic words. This checks provenance, not language meaning;
-    the agent/caller must extract public concepts without private context beforehand.
-    Missing approval fails closed without preventing generation from other sources.
-    """
-    if not isinstance(query, str) or isinstance(public_terms, str) or public_terms is None:
+
+def guard_public_query(query: str) -> str | None:
+    """Validate transport shape only; this does not establish semantic privacy."""
+    if not isinstance(query, str):
         return None
     normalized = " ".join(query.split())
     if not normalized or len(normalized) > 240:
@@ -143,14 +141,15 @@ def guard_public_query(query: str, *, public_terms=()) -> str | None:
         return None
     if "@" in normalized or "://" in normalized:
         return None
-    approved = {" ".join(term.split()) for term in public_terms if isinstance(term, str)}
-    return normalized if normalized in approved else None
+    return normalized
 
 
-async def search_and_fetch(query: str, search_fn, *, fetch_fn=None, limit=MAX_FETCHES, public_terms=()) -> list[dict]:
-    """Fetch images only after exact public-query authorization; legacy result keys remain."""
+async def search_and_fetch(query: SanitizedPublicQuery, search_fn, *, fetch_fn=None, limit=MAX_FETCHES) -> list[dict]:
+    """Accept only sanitizer outputs, never raw tool strings or claimed approval fields."""
     import asyncio
-    query = guard_public_query(query, public_terms=public_terms)
+    if not isinstance(query, SanitizedPublicQuery):
+        return []
+    query = guard_public_query(query)
     if not query: return []
     if isinstance(limit, bool) or not isinstance(limit, int) or limit < 0:
         raise ValueError("limit must be a nonnegative integer")

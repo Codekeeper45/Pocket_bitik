@@ -89,10 +89,14 @@ class DeliveryFirstIntegration(unittest.IsolatedAsyncioTestCase):
             OPENROUTER_IMAGE_FALLBACK='', _clamp_resolution=lambda size, maximum: size,
             _GEN_PROVIDER_GATE=GlobalRateGate(1), _sync_generate_image=provider,
             _gen_rate_gate=AsyncMock(), _gen_visual_qa=AsyncMock(return_value=None),
+            active_model_supports_vision=lambda: True,
+            _index_memory_allowed=lambda owner: False, describe_image=AsyncMock(return_value=None),
+            GEN_CTX_IMG_MAX=8,
         )
         for name in ('_gen_provider_call', '_gen_one_image_impl', '_gen_one_image_recorded',
                      '_gen_one_image', '_gen_render_image', '_gen_send_image',
                      '_gen_remap_selected_refs', '_gen_role_number_remap', '_gen_actual_role_instruction',
+                     '_gen_page_reference_snapshot',
                      '_detect_pages_count', 'gen_command', 'gen_resume', '_track_gen_activity'):
             load_bot_function(name, namespace)
         namespace.update(namespace_overrides or {})
@@ -227,6 +231,132 @@ class DeliveryFirstIntegration(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(restored.delivered, {1, 2, 3})
         self.assertEqual(restored.completed[1], first_artifact)
         self.assertFalse(restored.failures)
+
+    async def test_mixed_original_and_anchor_qa_initial_and_resume(self):
+        outputs = self.distinct_provider_results()
+        original = base64.b64encode(outputs[2][0]).decode()
+        observations = []
+        async def qa(*args, **kwargs):
+            observations.append(copy.deepcopy(runtime.CURRENT.get().qa_references))
+            return None
+        plan = self.independent_plan()
+        plan['output_kind'] = 'series'
+        plan['refs'] = [{'ref_id': 'submitted:1', 'roles': ['subject']}]
+        context = await self.run_handler(intent_plan=plan, flags='',
+            provider_results=[outputs[0], outputs[1], TimeoutError(), outputs[2]],
+            namespace_overrides={'_gen_collect_input_images': AsyncMock(return_value=([original], 0)),
+                                 '_gen_visual_qa': qa})
+        self.assertEqual(context.record.status, 'partial', context.messages)
+        _, record, _ = self.saved_series()
+        resumed, event = await self.resume_handler(context, record['job_id'])
+        self.assertEqual(resumed.status, 'delivered', event.reply.call_args_list)
+        self.assertEqual(len(observations), 3)
+        from gen_references import resize_image
+        for refs in observations[1:]:
+            self.assertEqual([ref['ref_id'] for ref in refs], [observations[0][0]['ref_id'], 'series:anchor'])
+            self.assertEqual(refs[0]['data'], outputs[2][0])
+            self.assertEqual(refs[1]['data'], resize_image(outputs[0][0]))
+            self.assertEqual(refs[1]['roles'], ['subject', 'style'])
+
+    async def test_batch_real_builder_preserves_captured_reference_mapping(self):
+        import bot_new as bot
+        originals = [base64.b64encode(raw).decode() for raw, mime in self.distinct_provider_results()[:2]]
+        payload = dict(task_type='creation', output_kind='single_image', output_count=1,
+                       prompt='Two distinct characters', refs=[
+                           {'ref_id': 'submitted:1', 'roles': ['subject']},
+                           {'ref_id': 'submitted:2', 'roles': ['subject']}])
+        changed = {**payload, 'refs': [{'ref_id': 'web:unattached', 'roles': ['subject']}]}
+        def plan_response(**kwargs):
+            plan = payload if planner.call_count == 1 else changed
+            return SimpleNamespace(choices=[SimpleNamespace(
+                message=SimpleNamespace(content=json.dumps(plan), tool_calls=[]))])
+        planner = Mock(side_effect=plan_response)
+        llm = SimpleNamespace(chat=SimpleNamespace(completions=SimpleNamespace(create=planner)))
+        observed = []
+        async def render(prompt, inputs, *args):
+            observed.append((prompt, inputs, copy.deepcopy(runtime.CURRENT.get().timings['reference_registry'])))
+            self.assertNotIn('web:unattached', str(runtime.CURRENT.get().timings['intent_plan']))
+            return self.distinct_provider_results()[0] + (prompt, False)
+        with patch.object(bot, 'get_active_model', return_value=(llm, 'fake', 'fake')), \
+                patch.object(bot, 'active_model_supports_vision', return_value=False):
+            context = await self.run_handler(flags='-x3', namespace_overrides={
+                'GEN_BATCH_MAX': 4, 'GEN_BATCH_CONCURRENCY': 2,
+                '_gen_collect_input_images': AsyncMock(return_value=(originals, 0)),
+                '_build_gen_prompt': bot._build_gen_prompt, '_gen_render_image': render})
+        self.assertEqual(len(observed), 3, context.messages)
+        for prompt, inputs, registry in observed:
+            self.assertEqual(inputs, originals)
+            self.assertIn('Stable source to API attachment mapping: ', prompt)
+            mapping = prompt.split('Stable source to API attachment mapping: ')[-1]
+            self.assertEqual([ref['ref_id'] for ref in json.loads(mapping)],
+                             [ref['ref_id'] for ref in observed[0][2]['references']])
+            self.assertEqual([ref['api_index'] for ref in json.loads(mapping)], [1, 2])
+            self.assertEqual(registry['input_count'], 2)
+        for call in planner.call_args_list[1:]:
+            self.assertNotIn('tools', call.kwargs)
+            self.assertIn('submitted:2', str(call.kwargs['messages']))
+
+    async def test_presend_resolution_failure_can_retry_without_history(self):
+        context = await self.run_handler()
+        context.client.get_me.side_effect = TimeoutError()
+        invocation = runtime.Invocation()
+        token = runtime.CURRENT.set(invocation)
+        try:
+            with patch.object(runtime, 'ARTIFACTS', self.artifacts), chdir(self.root):
+                with self.assertRaises(TimeoutError):
+                    await context.namespace['_gen_send_image']('me', context.raw, 'image/png', 'test', False, None)
+                key = invocation.timings['delivery_key']
+                entry = json.loads((delivery.ROOT / (key + '.json')).read_text())
+                self.assertEqual(entry['status'], 'not_started')
+                context.client.get_me.side_effect = None
+                context.client.send_file.reset_mock()
+                async def send(*args, **kwargs):
+                    self.assertEqual(json.loads((delivery.ROOT / (key + '.json')).read_text())['status'], 'sending')
+                    return SimpleNamespace(id=99)
+                context.client.send_file.side_effect = send
+                retry = load_bot_function('gen_retry_file', context.namespace)
+                event = SimpleNamespace(out=True, sender_id=42, chat_id=42, reply=AsyncMock(),
+                    pattern_match=SimpleNamespace(group=lambda number: key))
+                with patch.object(delivery, 'reconcile', AsyncMock(side_effect=AssertionError('history queried'))):
+                    await retry(event)
+                    await retry(event)
+                context.client.send_file.assert_awaited_once()
+                self.assertEqual(json.loads((delivery.ROOT / (key + '.json')).read_text())['status'], 'delivered')
+        finally:
+            runtime.CURRENT.reset(token)
+
+    async def test_retry_unknown_sends_remain_conservative(self):
+        client = SimpleNamespace(send_file=AsyncMock(), get_messages=AsyncMock())
+        retry = load_bot_function('gen_retry_file', dict(client=client, OWNER_ID=42))
+        artifact = self.artifacts.save('unknown', b'image', '.png')
+        with chdir(self.root):
+            for status in ('pending', 'sending', 'ambiguous'):
+                with self.subTest(status=status):
+                    delivery.record(status, chat=123, reply_to=None, path=artifact, status=status)
+                    delivery.record(status, chat=123, reply_to=None, path=artifact, status='not_started')
+                    self.assertEqual(delivery.lookup(status, 123)['status'], status)
+                    event = SimpleNamespace(out=True, sender_id=42, chat_id=123, reply=AsyncMock(),
+                        pattern_match=SimpleNamespace(group=lambda number: status))
+                    await retry(event)
+                    client.send_file.assert_not_awaited()
+                    event.reply.assert_awaited_once()
+
+    async def test_retry_cancellation_never_restores_not_started(self):
+        artifact = self.artifacts.save('cancelled', b'image', '.png')
+        delivery.record('cancelled', chat=123, reply_to=None, path=artifact, status='not_started')
+        async def cancel_send(*args, **kwargs):
+            self.assertEqual(delivery.lookup('cancelled', 123)['status'], 'sending')
+            raise asyncio.CancelledError()
+        client = SimpleNamespace(send_file=AsyncMock(side_effect=cancel_send))
+        retry = load_bot_function('gen_retry_file', dict(client=client, OWNER_ID=42))
+        event = SimpleNamespace(out=True, sender_id=42, chat_id=123, reply=AsyncMock(),
+            pattern_match=SimpleNamespace(group=lambda number: 'cancelled'))
+        with chdir(self.root):
+            with self.assertRaises(asyncio.CancelledError):
+                await retry(event)
+            self.assertEqual(delivery.lookup('cancelled', 123)['status'], 'ambiguous')
+            await retry(event)
+        client.send_file.assert_awaited_once()
 
     async def test_actual_ai_resume_stops_on_uncertain_page_delivery(self):
         context = await self.run_handler(prompt='Make three independent landscapes.',

@@ -7,7 +7,7 @@ from unittest.mock import AsyncMock, Mock, patch
 
 import pytest
 
-from gen_web_references import (MAX_PAGE_BYTES, UnsafeURL, _safe_fetch, guard_public_query,
+from gen_web_references import (MAX_PAGE_BYTES, UnsafeURL, SanitizedPublicQuery, _safe_fetch, guard_public_query,
                                 page_tool_schema, read_source_page, search_and_fetch)
 from tests.test_gen_reference_registry import image_bytes
 
@@ -21,8 +21,7 @@ def test_page_and_image_urls_are_distinct_and_unverified():
         fetched.append(url)
         return image_bytes(), "https://cdn.example.org/final.png"
 
-    refs = asyncio.run(search_and_fetch("public artwork", lambda query: rows, fetch_fn=fetch,
-                                       public_terms=("public artwork",)))
+    refs = asyncio.run(search_and_fetch(SanitizedPublicQuery("public artwork"), lambda query: rows, fetch_fn=fetch))
     assert fetched == ["https://cdn.example.org/art.png"]
     assert refs[0]["image_url"] == refs[0]["source_url"] == "https://cdn.example.org/final.png"
     assert refs[0]["source_page_url"] == "https://example.org/page"
@@ -33,8 +32,7 @@ def test_page_and_image_urls_are_distinct_and_unverified():
 def test_private_queries_without_handles_never_reach_search():
     calls = []
     for query in ("Our secret clubhouse slogan", "My friend lives at 12 Green Road", "private chat quote"):
-        result = asyncio.run(search_and_fetch(query, lambda value: calls.append(value),
-                                             public_terms=("public artwork",)))
+        result = asyncio.run(search_and_fetch(query, lambda value: calls.append(value)))
         assert result == []
     assert calls == []
 
@@ -45,25 +43,39 @@ def test_missing_public_approval_fails_closed():
     assert calls == []
 
 
-def test_public_terms_are_not_a_keyword_bypass():
+@pytest.mark.parametrize('query', ['public artwork',
+    {'query': 'private quote', 'public_terms': ['private quote']},
+    {'query': 'private quote', 'sanitized': True}])
+def test_transport_requires_internal_sanitizer_result(query):
+    calls = []
+    assert asyncio.run(search_and_fetch(query, lambda value: calls.append(value))) == []
+    assert not calls
+
+
+def test_self_approval_parameter_is_removed():
+    import inspect
+    assert 'public_terms' not in inspect.signature(guard_public_query).parameters
+    assert 'public_terms' not in inspect.signature(search_and_fetch).parameters
+
+
+def test_public_keywords_are_not_a_sanitizer_bypass():
     calls = []
     query = "official artwork private chat quote"
-    assert asyncio.run(search_and_fetch(query, lambda value: calls.append(value),
-                                       public_terms=("official artwork",))) == []
+    assert asyncio.run(search_and_fetch(query, lambda value: calls.append(value))) == []
     assert not calls
 
 
 def test_legacy_image_only_result_has_no_invented_page():
-    refs = asyncio.run(search_and_fetch("public style", lambda query: {"images": ["https://example.org/a.png"]},
-                                       fetch_fn=lambda url: (image_bytes(), url), public_terms=("public style",)))
+    refs = asyncio.run(search_and_fetch(SanitizedPublicQuery("public style"), lambda query: {"images": ["https://example.org/a.png"]},
+                                       fetch_fn=lambda url: (image_bytes(), url)))
     assert refs[0]["source_page_url"] is None
     assert refs[0]["image_url"] == refs[0]["source_url"]
 
 
 def test_guard_does_not_truncate_or_accept_handles_and_urls():
     for query in ("@private_user", "https://example.org/?secret=value", "x" * 241):
-        assert guard_public_query(query, public_terms=(query,)) is None
-    assert guard_public_query(" public   artwork ", public_terms=("public artwork",)) == "public artwork"
+        assert guard_public_query(query) is None
+    assert guard_public_query(" public   artwork ") == "public artwork"
 
 
 def test_page_schema_and_fetched_evidence_are_not_official_verification():
@@ -161,10 +173,10 @@ def test_search_failure_is_nonblocking_and_zero_limit_does_not_search():
     def failed_search(query):
         raise RuntimeError("unavailable")
 
-    assert asyncio.run(search_and_fetch("public art", failed_search, public_terms=("public art",))) == []
+    assert asyncio.run(search_and_fetch(SanitizedPublicQuery("public art"), failed_search)) == []
     calls = []
-    assert asyncio.run(search_and_fetch("public art", lambda query: calls.append(query),
-                                       limit=0, public_terms=("public art",))) == []
+    assert asyncio.run(search_and_fetch(SanitizedPublicQuery("public art"), lambda query: calls.append(query),
+                                       limit=0)) == []
     assert calls == []
 
 
@@ -222,7 +234,8 @@ def test_bot_dispatcher_only_transports_sanitized_public_query(sanitizer_result,
         else:
             search.assert_awaited_once()
             assert search.await_args.args[0] == approved
-            assert search.await_args.kwargs["public_terms"] == (approved,)
+            assert isinstance(search.await_args.args[0], SanitizedPublicQuery)
+            assert 'public_terms' not in search.await_args.kwargs
             transport.assert_called_once_with(approved, "inert-test-key")
             assert private_quote not in str(transport.call_args_list)
     finally:
