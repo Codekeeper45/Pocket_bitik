@@ -14,6 +14,20 @@ class GenerationJobsTests(unittest.IsolatedAsyncioTestCase):
         self.jobs = GenerationJobs(store=JobStore(Path(self.tmp.name) / "jobs.json"), gate=GlobalRateGate(2), default_deadline=2)
         await self.jobs.startup()
 
+    async def test_swallowed_provider_error_is_failed_not_completed(self):
+        from gen_runtime import CURRENT, Invocation
+        invocation = Invocation()
+        token = CURRENT.set(invocation)
+        try:
+            async def work():
+                CURRENT.get().error = 'upstream_500'
+                return None
+            rec = await self.jobs.run_event('c', work)
+            self.assertEqual(rec.status, 'failed')
+            self.assertEqual(rec.error, 'upstream_500')
+        finally:
+            CURRENT.reset(token)
+
     async def test_global_concurrency_limit(self):
         active = peak = 0; lock = threading.Lock()
         def work():

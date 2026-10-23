@@ -269,10 +269,10 @@ class GenerationJobs:
             rec.status = "completed"
             from gen_runtime import CURRENT
             invocation = CURRENT.get()
-            if invocation and invocation.result is not None:
-                recorded_error = getattr(invocation.result, 'error', None)
+            if invocation:
+                recorded_error = invocation.error or getattr(invocation.result, 'error', None)
                 if recorded_error:
-                    rec.status = 'failed'; rec.error = recorded_error.kind
+                    rec.status = 'failed'; rec.error = getattr(recorded_error, 'kind', str(recorded_error))
         except asyncio.CancelledError:
             rec.status = "cancelled"; rec.error = "cancelled (provider thread may have completed)"; raise
         except Exception as exc:

@@ -15,6 +15,7 @@ class Invocation:
  generation_calls: int = 0
  qa: dict | None = None
  result: object | None = None
+ error: str | None = None
  qa_route: tuple | None = None
  qa_calls: int = 0
  max_qa_calls: int = 12

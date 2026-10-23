@@ -3765,6 +3765,16 @@ _GEN_EDIT_RULES = (
 )
 
 _GEN_REF_RULES = (
+    "КАНОН И ФАНАРТ. Различай официальный дизайн, авторский дизайн локального персонажа и фанатскую интерпретацию. "
+    "Подпись, популярность и свежесть поста не доказывают каноничность. Для публичного персонажа без конкретного "
+    "заданного источника быстро найди оригинал через web_image_search, предпочитай официальный сайт автора/издателя "
+    "или официальный арт; проверь изображение и происхождение, не объявляй случайный результат каноном. "
+    "Для персонажей и локальных мемов чата, аватарок участников, конкретных стикеров и заданных реплик ищи сначала "
+    "в чате. Не отправляй приватные имена и переписку в веб-поиск. Если пользователь указал конкретный фанарт или "
+    "стикер, именно он задаёт внешность в этой сцене, даже если отличается от канона; не подменяй официальным дизайном. "
+    "Фанарт допустим как стиль или композиция, но его изменения внешности не переноси в канонического героя без просьбы. "
+    "Если официальный источник не подтверждён, так и обозначь, не выдумывай статус. Аниме-стилизация не меняет личность, "
+    "цвет волос и отличительные черты выбранного героя.\n"
     "РЕФЕРЕНСЫ. Каждое входное изображение пронумеровано (REF #N, в блоке выше или на картинке сразу после "
     "подписи). У каждого выбранного референса есть РОЛЬ, и роль должна быть названа в промпте явно:\n"
     "• subject — внешность/лицо/персонаж/объект, которого нужно сохранить или изобразить;\n"
@@ -3939,7 +3949,9 @@ def _gen_source_quote(request):
     match = re.search(r'(?:где\s+(?:он[ао]?\s+)?говорит|(?:стикер[а-я]*|картинк[а-я]*)\s+с\s+(?:фразой|текстом))\s*[:«"“]?(.+)', request or '', re.I)
     if not match:
         return None
-    text = re.split(r'[»"”\n]|\s+а\s+|[.;]', match.group(1), maxsplit=1, flags=re.I)[0].strip()
+    tail = match.group(1)
+    text = (re.split(r'[»"”\n]', tail, maxsplit=1)[0] if re.search(r'[»"”]', tail)
+            else re.split(r'\s+а\s+|[.;\n]', tail, maxsplit=1, flags=re.I)[0]).strip()
     return text if text else None
 
 
@@ -8839,6 +8851,8 @@ async def _gen_one_image(final_prompt, input_b64s, image_size, aspect_ratio, all
             # Per-task snapshots remain separate; single/series sequential caller sees final status.
             parent.qa = invocation.qa
             parent.result = invocation.result
+            if invocation.error:
+                parent.error = invocation.error
             parent.timings.update(invocation.timings)
         CURRENT.reset(token)
 
@@ -8854,8 +8868,13 @@ async def _gen_one_image_recorded(final_prompt, input_b64s, image_size, aspect_r
         log('GEN', f'Provider failure kind={exc.kind} status={getattr(exc, "status_code", None)}: {str(exc)[:300]}')
         if status_cb:
             await status_cb({'authentication':'❌ Авторизация генератора недоступна.', 'invalid_request':'❌ Генератор не поддержал параметры запроса.', 'timeout':'❌ Время ожидания генератора истекло.'}.get(exc.kind, '❌ Ошибка провайдера: ' + exc.kind))
+        invocation = CURRENT.get()
+        if invocation:
+            invocation.error = exc.kind
         return None, exc.kind, None, False
     invocation = CURRENT.get()
+    if invocation and result[0] is None:
+        invocation.error = str(result[1] or 'generation_failed')
     if invocation and result[0] is not None:
         from gen_provider import validate_image
         im = validate_image(result[0])
@@ -18538,6 +18557,8 @@ async def main():
         asyncio.create_task(scheduler_loop())  # один раз на процесс
         _scheduler_started = True
     from gen_runtime import JOBS
+    _GEN_ACTIVE_JOBS.clear()
+    save_json('gen_activity.json', {'pid': os.getpid(), 'updated': time.time(), 'jobs': {}})
     interrupted_gen = await JOBS.startup()
     if interrupted_gen:
         log('GEN', f'Interrupted generation jobs: {len(interrupted_gen)}; explicit resume only')
