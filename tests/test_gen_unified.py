@@ -174,7 +174,7 @@ class TestUnifiedGenPrompt(unittest.TestCase):
 
     def test_prompt_builder_keeps_ref_candidates_mutable_for_empty_catalog(self):
         import inspect
-        source = inspect.getsource(bot._build_gen_prompt)
+        source = inspect.getsource(bot._build_gen_prompt_unchecked)
         self.assertIn("catalog[:] = working_catalog", source)
         self.assertIn("tool_budget = 16", source)
         self.assertIn("_run_chat_inspect_image", source)

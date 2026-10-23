@@ -62,8 +62,19 @@ class BridgeTests(unittest.TestCase):
         try: self.assertEqual(restarted.get('secret-token',jid),(503,{'error':{'message':'job interrupted by process restart'}}))
         finally: restarted.close()
     def test_concurrency_cap(self):
-        jobs=[self.submit(key=str(i))[1]['id'] for i in range(12)]
-        self.assertEqual(len(set(jobs)),12); self.assertEqual(self.submit(key='overflow')[0],429)
+        # Keep work pending deterministically; a sleep races fast test hosts.
+        release=threading.Event()
+        original=self.fake.post
+        def blocked(*args,**kwargs):
+            release.wait(5)
+            return original(*args,**kwargs)
+        self.fake.post=blocked
+        try:
+            jobs=[self.submit(key=str(i))[1]['id'] for i in range(12)]
+            self.assertEqual(len(set(jobs)),12)
+            self.assertEqual(self.submit(key='overflow')[0],429)
+        finally:
+            release.set()
     def test_auth_validation_and_persisted_state_contains_no_token(self):
         self.fake.get=lambda *a,**k: Response(401,{})
         self.assertEqual(self.submit(key='bad')[0],401)
