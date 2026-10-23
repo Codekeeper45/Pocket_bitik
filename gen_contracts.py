@@ -31,6 +31,7 @@ class QAResult:
     findings: tuple[dict[str, Any], ...] = ()
     overflow: bool = False
     error: Optional[str] = None
+    image_digest: Optional[str] = None
     def __post_init__(self):
         if self.status not in {"pass", "warnings", "unavailable", "fail"}: raise ValueError("invalid QA status")
 

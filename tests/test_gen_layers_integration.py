@@ -27,6 +27,10 @@ class LayerIntegration(unittest.IsolatedAsyncioTestCase):
         self.layer_flag = patch.dict(os.environ, {'GEN_LAYERS_ENABLED': '1'})
         self.layer_flag.start()
         self.addCleanup(self.layer_flag.stop)
+        from gen_runtime import CURRENT, Invocation
+        self.invocation = Invocation()
+        self.token = CURRENT.set(self.invocation)
+        self.addCleanup(CURRENT.reset, self.token)
 
     async def test_disabled_layers_use_one_generation(self):
         f = AsyncMock(return_value=(b'one', 'image/png', 'p', False))
@@ -37,6 +41,7 @@ class LayerIntegration(unittest.IsolatedAsyncioTestCase):
         planner.assert_not_called()
 
     async def test_layers_make_separate_calls_and_final_qa(self):
+        self.invocation.timings['intent_plan'] = {'layers': True}
         f=AsyncMock(side_effect=[(png(),'image/png','bg',False),(png(True),'image/png','asset',False)])
         qa=AsyncMock(return_value={'findings':[]})
         with patch.object(bot,'get_active_model',return_value=(self.planner(),'model','test')),patch.object(bot,'_gen_one_image',f),patch.object(bot,'_gen_visual_qa',qa):
@@ -44,11 +49,14 @@ class LayerIntegration(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(mime,'image/png'); self.assertEqual(f.await_count,2)
         self.assertEqual(Image.open(io.BytesIO(raw)).size,(1536,1024))
         qa.assert_awaited_once()
-    async def test_opaque_asset_and_unavailable_qa_fail_closed(self):
+    async def test_opaque_asset_falls_back_and_unavailable_qa_preserves_composite(self):
+        self.invocation.timings['intent_plan'] = {'layers': True}
         for alpha,qa_result in [(False,{'findings':[]}),(True,None)]:
             with self.subTest(alpha=alpha):
-                f=AsyncMock(side_effect=[(png(),'image/png','bg',False),(png(alpha),'image/png','asset',False)])
+                f=AsyncMock(side_effect=[(png(),'image/png','bg',False),(png(alpha),'image/png','asset',False),(png(),'image/png','ordinary fallback',False)])
                 with patch.object(bot,'get_active_model',return_value=(self.planner(),'model','test')),patch.object(bot,'_gen_one_image',f),patch.object(bot,'_gen_visual_qa',AsyncMock(return_value=qa_result)):
                     result=await bot._gen_render_image('A B',[],'2K',None,True,'по слоям A B')
-                self.assertIsNone(result[0]);self.assertEqual(result[1],'layers_failed')
+                self.assertIsNotNone(result[0])
+                self.assertEqual(result[1], 'image/png')
+                self.assertEqual(f.await_count, 2 if alpha else 3)
 if __name__=='__main__': unittest.main()

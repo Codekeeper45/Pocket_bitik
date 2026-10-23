@@ -7,6 +7,7 @@ from __future__ import annotations
 import asyncio
 import inspect
 import json
+import math
 import os
 import tempfile
 import time
@@ -82,20 +83,35 @@ class GlobalRateGate:
         if delay:
             await asyncio.sleep(delay)
 
-    async def run(self, fn: Callable[..., Any], *args: Any, timeout: Optional[float] = None) -> Any:
+    async def run(self, fn: Callable[..., Any], *args: Any, timeout: Optional[float] = None,
+                  before_start: Optional[Callable[[], None]] = None) -> Any:
+        if timeout is None:
+            return await self._run(fn, args, None, before_start)
+        if not math.isfinite(timeout):
+            raise ValueError("timeout must be finite")
+        if timeout <= 0:
+            raise TimeoutError("job deadline reached")
+        expires = time.monotonic() + timeout
+        return await asyncio.wait_for(self._run(fn, args, expires, before_start), timeout)
+
+    async def _run(self, fn: Callable[..., Any], args: tuple[Any, ...], expires: Optional[float],
+                   before_start: Optional[Callable[[], None]]) -> Any:
         await self.semaphore.acquire()
         try:
             await self.enter_rate()
+            if expires is not None and time.monotonic() >= expires:
+                raise TimeoutError("job deadline reached")
+            if before_start is not None:
+                before_start()
             if asyncio.iscoroutinefunction(fn):
-                call = fn(*args)
-                return await asyncio.wait_for(call, timeout) if timeout else await call
+                return await fn(*args)
             # Shield the thread future: task cancellation/timeout does not release real capacity
             # until the blocking provider call actually exits.
             fut = asyncio.create_task(asyncio.to_thread(fn, *args))
             self._inflight_threads.add(fut)
             fut.add_done_callback(self._inflight_threads.discard)
             try:
-                return await asyncio.wait_for(asyncio.shield(fut), timeout) if timeout else await asyncio.shield(fut)
+                return await asyncio.shield(fut)
             except (asyncio.CancelledError, asyncio.TimeoutError):
                 # Caller exits promptly; unfinished blocking work retains its slot.
                 held_by_future = True
@@ -185,6 +201,7 @@ class GenerationJobs:
         self._started = False
         self._startup_lock = asyncio.Lock()
         self._reserved = 0
+        self._delivery_locks: dict[str, asyncio.Lock] = {}
 
     async def startup(self) -> list[str]:
         async with self._startup_lock:
@@ -198,7 +215,8 @@ class GenerationJobs:
         interrupted = []
         for jid, raw in old.items():
             if raw.get("status") in {"queued", "running", "delivering"}:
-                raw["status"] = "interrupted"; raw["error"] = "process restarted; explicit resume required"
+                raw["status"] = "delivery_uncertain" if raw["status"] == "delivering" else "interrupted"
+                raw["error"] = "process restarted; explicit resume required"
                 raw["updated_at"] = raw["heartbeat_at"] = time.time(); interrupted.append(jid)
             self.jobs[jid] = JobRecord(**{k: raw[k] for k in JobRecord.__dataclass_fields__ if k in raw})
         await self._persist()
@@ -211,6 +229,14 @@ class GenerationJobs:
     async def submit(self, chat_id: str | int, work: Callable[..., Any], *args: Any,
                      artifact_store: Optional[ArtifactStore] = None, context_budget: Optional[ContextBudget] = None,
                      deadline: Optional[float] = None) -> JobRecord:
+        from gen_runtime import CURRENT
+        seconds = self.default_deadline if deadline is None else deadline
+        if not math.isfinite(seconds) or seconds < 0:
+            raise ValueError("deadline must be finite and nonnegative")
+        invocation = CURRENT.get()
+        if invocation:
+            seconds = min(seconds, invocation.remaining_seconds())
+        expires = time.monotonic() + seconds
         if not self._started:
             await self.startup()
         chat = str(chat_id)
@@ -225,7 +251,7 @@ class GenerationJobs:
             if chat not in self._chat_rotation: self._chat_rotation.append(chat)
             self._changed.set()
             await self._persist()
-        task = asyncio.create_task(self._execute(rec, work, args, artifact_store, context_budget, deadline or self.default_deadline))
+        task = asyncio.create_task(self._execute(rec, work, args, artifact_store, context_budget, expires))
         self._active.add(task); task.add_done_callback(self._active.discard)
         self._tasks[rec.job_id] = task
         return rec
@@ -256,23 +282,34 @@ class GenerationJobs:
         return rec
 
     async def _execute(self, rec: JobRecord, work: Callable[..., Any], args: tuple[Any, ...],
-                       artifact_store: Optional[ArtifactStore], budget: Optional[ContextBudget], deadline: float) -> None:
-        expires = time.monotonic() + deadline
+                       artifact_store: Optional[ArtifactStore], budget: Optional[ContextBudget], expires: float) -> None:
         try:
-            await asyncio.wait_for(self._fair_turn(rec), timeout=deadline)
+            await asyncio.wait_for(self._fair_turn(rec), timeout=max(0, expires - time.monotonic()))
             rec.status = "running"; rec.updated_at = rec.heartbeat_at = time.time(); rec.attempts += 1; await self._persist()
-            if budget: budget.consume_call()
-            remaining = max(.001, expires - time.monotonic())
-            result = await asyncio.wait_for(self.gate.run(work, *args, timeout=remaining), timeout=remaining)
+            remaining = expires - time.monotonic()
+            if remaining <= 0:
+                raise TimeoutError("job deadline reached")
+            result = await self.gate.run(work, *args, timeout=remaining,
+                                         before_start=budget.consume_call if budget else None)
             if isinstance(result, bytes) and artifact_store:
                 rec.artifact_path = str(artifact_store.save(rec.job_id, result))
-            rec.status = "completed"
+            from gen_series import SeriesCheckpoint
+            rec.status = "incomplete" if result is None else "completed"
+            if isinstance(result, SeriesCheckpoint):
+                rec.delivered = bool(result.completed) and not result.failures and set(result.completed) == result.delivered
+                rec.status = "delivered" if rec.delivered else "partial" if result.completed else "incomplete"
+            elif isinstance(result, dict) and result.get('status') in {'delivered', 'partial', 'incomplete'}:
+                rec.status = result['status']
+                rec.delivered = rec.status == 'delivered'
+                if result.get('artifact_path'):
+                    rec.artifact_path = str(result['artifact_path'])
             from gen_runtime import CURRENT
             invocation = CURRENT.get()
             if invocation:
                 recorded_error = invocation.error or getattr(invocation.result, 'error', None)
-                if recorded_error:
-                    rec.status = 'failed'; rec.error = getattr(recorded_error, 'kind', str(recorded_error))
+                if recorded_error and not rec.delivered:
+                    if rec.status != 'partial': rec.status = 'failed'
+                    rec.error = getattr(recorded_error, 'kind', str(recorded_error))
         except asyncio.CancelledError:
             rec.status = "cancelled"; rec.error = "cancelled (provider thread may have completed)"; raise
         except Exception as exc:
@@ -290,22 +327,52 @@ class GenerationJobs:
                     self._changed.set()
             rec.updated_at = rec.heartbeat_at = time.time(); await self._persist()
 
-    async def retry_delivery(self, job_id: str, deliver: Callable[[Path], Awaitable[Any] | Any], *, attempts: int = 3) -> Any:
+    async def retry_delivery(self, job_id: str, deliver: Callable[[Path], Awaitable[Any] | Any], *,
+                             attempts: int = 3, reconcile: Optional[Callable[[JobRecord], Awaitable[Any] | Any]] = None) -> Any:
+        """Retry saved bytes only after readback proves absence (None), or confirms delivery.
+
+        The reconciliation callback must raise for unknown outcomes, return None
+        only for established absence, and otherwise return the confirmed message.
+        """
+        async with self._delivery_locks.setdefault(job_id, asyncio.Lock()):
+            return await self._retry_delivery(job_id, deliver, attempts=attempts, reconcile=reconcile)
+
+    async def _retry_delivery(self, job_id, deliver, *, attempts, reconcile):
         rec = self.jobs[job_id]
-        if rec.status not in {"completed", "delivery_failed"} or not rec.artifact_path:
+        if rec.delivered:
+            return None
+        if rec.status not in {"completed", "delivery_failed", "delivery_uncertain"} or not rec.artifact_path:
             raise RuntimeError("no saved artifact available for delivery")
         path = Path(rec.artifact_path)
         for n in range(max(1, attempts)):
+            if rec.status in {"delivery_failed", "delivery_uncertain"}:
+                if reconcile is None:
+                    raise RuntimeError("delivery outcome uncertain; reconciliation required")
+                existing = reconcile(rec)
+                if inspect.isawaitable(existing): existing = await existing
+                if existing is not None:
+                    if not existing:
+                        raise RuntimeError("reconciliation must prove absence with None")
+                    rec.status = "delivered"; rec.delivered = True; rec.error = None
+                    rec.updated_at = rec.heartbeat_at = time.time(); await self._persist()
+                    return existing
+            if not path.is_file():
+                raise FileNotFoundError("saved artifact unavailable")
             rec.status = "delivering"; rec.attempts += 1; rec.heartbeat_at = time.time(); await self._persist()
             try:
                 value = deliver(path)
                 if inspect.isawaitable(value): value = await value
-                rec.status = "delivered"; rec.delivered = True; rec.error = None; rec.updated_at = time.time(); await self._persist()
-                return value
+            except asyncio.CancelledError:
+                rec.status = "delivery_uncertain"; rec.error = "cancelled during delivery"
+                rec.updated_at = time.time(); await self._persist()
+                raise
             except Exception as exc:
                 rec.status = "delivery_failed"; rec.error = type(exc).__name__; rec.updated_at = time.time(); await self._persist()
-                if n + 1 == max(1, attempts): raise
+                if reconcile is None or n + 1 == max(1, attempts): raise
                 await asyncio.sleep(min(2 ** n, 8))
+            else:
+                rec.status = "delivered"; rec.delivered = True; rec.error = None; rec.updated_at = time.time(); await self._persist()
+                return value
 
     async def cancel(self, job_id: str) -> bool:
         rec = self.jobs[job_id]

@@ -35,20 +35,20 @@ class ActualReferenceRegistryTests(unittest.TestCase):
                          [hashlib.sha256(first).hexdigest(), hashlib.sha256(catalog_img).hexdigest()])
         self.assertEqual(selected, [7, 8])
         self.assertEqual(mapping, {7: 2, 8: 1})
-        self.assertEqual(roles, [(1, "submitted"), (2, "primary")])
+        self.assertEqual(roles, [(1, "subject"), (2, "subject")])
         refs = invocation.timings["reference_registry"]["references"]
-        self.assertEqual([r["source_type"] for r in refs], ["submitted", "catalog"])
+        self.assertEqual([r["provenance"][0]["source_type"] for r in refs], ["submitted", "catalog"])
+        self.assertEqual(len(refs[0]['provenance']), 2)
         self.assertNotIn("owner", refs[0])
-        self.assertEqual((refs[1]["chat_id"], refs[1]["message_id"], refs[1]["caption"]), (-1005, 33, "caption"))
+        origin = refs[1]['provenance'][0]
+        self.assertEqual((origin["chat_id"], origin["message_id"], origin["caption"]), (-1005, 33, "caption"))
         self.assertEqual(refs[0]["mime"], "image/png")
 
-    def test_missing_or_oversized_selected_ref_fails(self):
+    def test_missing_or_invalid_selected_ref_does_not_block_fallback(self):
         import bot_new
-        with self.assertRaisesRegex(KeyError, "unavailable"):
-            bot_new._gen_remap_selected_refs([], [], [], [(99, "subject")])
+        self.assertEqual(bot_new._gen_remap_selected_refs([], [], [], [(99, "subject")])[0], [])
         huge = b"x" * (bot_new.GEN_IMAGE_MAX_INPUT + 1)
-        with self.assertRaisesRegex(ValueError, "exceeds"):
-            bot_new._gen_remap_selected_refs([], [], [{"idx": 1, "bytes": huge}], [(1, "subject")])
+        self.assertEqual(bot_new._gen_remap_selected_refs([], [], [{"idx": 1, "bytes": huge}], [(1, "subject")])[0], [])
 
     def test_make_reference_records_hash_mime_and_size(self):
         raw = png((7, 8, 9))

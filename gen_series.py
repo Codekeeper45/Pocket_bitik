@@ -2,10 +2,38 @@
 from __future__ import annotations
 from dataclasses import dataclass, field
 from hashlib import sha256
+from contextlib import asynccontextmanager
+import asyncio
 import json
 import re
 
 class SeriesPlanError(ValueError): pass
+
+
+_SERIES_JOB_LOCKS = {}
+
+
+@asynccontextmanager
+async def series_job_lock(job_id: str):
+    """Share a lock across initial execution and resume in the same event loop.
+
+    Acquire using the original job ID BEFORE loading its checkpoint, and hold
+    through reconciliation, generation, delivery and the final save. Execution
+    does not acquire this non-reentrant lock itself. Separate processes require
+    external coordination. Entries are removed once all holders/waiters leave.
+    """
+    if not isinstance(job_id, str) or not re.fullmatch(r"[A-Za-z0-9_-]{1,128}", job_id):
+        raise SeriesPlanError("invalid series job id")
+    key = (asyncio.get_running_loop(), job_id)
+    entry = _SERIES_JOB_LOCKS.setdefault(key, [asyncio.Lock(), 0])
+    entry[1] += 1
+    try:
+        async with entry[0]:
+            yield
+    finally:
+        entry[1] -= 1
+        if not entry[1]:
+            del _SERIES_JOB_LOCKS[key]
 
 
 def validate_series_job(record: dict, *, job_id: str, owner_id: str, chat_id: str) -> dict:
@@ -62,6 +90,33 @@ class SeriesPlan:
     plan_id: str = ""
 
 
+def series_plan_from_intent(intent) -> SeriesPlan:
+    """Adapt the single agent plan to the existing checkpoint/execution interface.
+
+    Only output_count determines file count. Panels never expand into pages.
+    Independent outputs carry no continuity bible. Raw plans use raw-1 metadata
+    to preserve prompt whitespace and permit explicitly independent repeats.
+    No planner/API calls occur.
+    """
+    from gen_prompt import IntentPlan, intent_plan_to_dict, render_intent_prompt
+    if not isinstance(intent, IntentPlan):
+        raise SeriesPlanError("expected an IntentPlan")
+    refs = tuple(ref["ref_id"] for ref in intent.refs)
+    pages = tuple(SeriesPage(number, render_intent_prompt(intent, output_number=number), intent.aspect, refs)
+                  for number in range(1, intent.output_count + 1))
+    data = intent_plan_to_dict(intent)
+    bible = {"constraints": data["constraints"], "refs": data["refs"]} if intent.output_kind == "series" else {}
+    version = "1"
+    if intent.raw:
+        if intent.output_kind not in ("single_image", "independent_images") or (intent.output_kind == "single_image" and intent.output_count != 1):
+            raise SeriesPlanError("raw plans require single or independent images")
+        bible = {"raw": True, "output_kind": intent.output_kind}
+        version = "raw-1"
+    canonical = json.dumps({"pages": [page.__dict__ for page in pages], "bible": bible, "version": version},
+                           sort_keys=True, ensure_ascii=False)
+    return SeriesPlan(pages, bible, version, sha256(canonical.encode()).hexdigest())
+
+
 def parse_multipage_plan(output: str, pages_count: int, *, user_aspect=None, repair=None) -> SeriesPlan:
     if type(pages_count) is not int or pages_count < 1: raise SeriesPlanError("pages_count must be positive")
     def parse(text):
@@ -81,6 +136,12 @@ def parse_multipage_plan(output: str, pages_count: int, *, user_aspect=None, rep
             for i, m in enumerate(matches):
                 raw_pages.append({"number": int(m.group(1)), "prompt": text[m.end():matches[i+1].start() if i+1 < len(matches) else len(text)].strip()})
         if len(raw_pages) != pages_count: raise SeriesPlanError(f"expected exactly {pages_count} pages, got {len(raw_pages)}")
+        if not isinstance(bible,dict) or any(not isinstance(key, str) for key in bible): raise SeriesPlanError("bible must be an object with string keys")
+        raw_mode = version == "raw-1"
+        if raw_mode and (bible.get("raw") is not True or bible.get("output_kind") not in ("single_image", "independent_images")
+                         or (bible.get("output_kind") == "single_image" and pages_count != 1)):
+            raise SeriesPlanError("invalid raw plan metadata")
+        allow_duplicate_prompts = raw_mode and bible["output_kind"] == "independent_images"
         pages=[]; seen=set()
         for item in raw_pages:
             if not isinstance(item, dict) or type(item.get("number")) is not int: raise SeriesPlanError("each page needs an integer number")
@@ -88,14 +149,13 @@ def parse_multipage_plan(output: str, pages_count: int, *, user_aspect=None, rep
             if n in seen: raise SeriesPlanError(f"duplicate page {n}")
             if not isinstance(p,str) or not p.strip(): raise SeriesPlanError(f"page {n} prompt is empty")
             normalized=" ".join(p.split()).casefold()
-            if normalized in {" ".join(x.prompt.split()).casefold() for x in pages}: raise SeriesPlanError("duplicate page story prompt")
+            if not allow_duplicate_prompts and normalized in {" ".join(x.prompt.split()).casefold() for x in pages}: raise SeriesPlanError("duplicate page story prompt")
             aspect = user_aspect or item.get("aspect")
             if aspect not in (None,"1:1","9:16","16:9","4:3","3:4"): raise SeriesPlanError(f"invalid aspect on page {n}")
             refs=item.get("refs",[])
             if not isinstance(refs,list) or any(not isinstance(r,str) or not r for r in refs): raise SeriesPlanError(f"invalid refs on page {n}")
-            pages.append(SeriesPage(n,p.strip(),aspect,tuple(dict.fromkeys(refs)))); seen.add(n)
+            pages.append(SeriesPage(n,p if raw_mode else p.strip(),aspect,tuple(dict.fromkeys(refs)))); seen.add(n)
         if seen != set(range(1,pages_count+1)): raise SeriesPlanError("pages must be numbered 1..N without gaps")
-        if not isinstance(bible,dict) or any(not isinstance(k, str) for k in bible): raise SeriesPlanError("bible must be an object with string keys")
         # Snapshot canonical JSON data so downstream page generation cannot mutate
         # the planner-owned object and silently change series continuity.
         try:
@@ -124,6 +184,13 @@ class SeriesCheckpoint:
     owner_id: str = ""
     job_id: str = ""
     pages_meta: dict = field(default_factory=dict)
+    delivery_phases: dict = field(default_factory=dict)
+
+    def delivery_phase(self, number: int) -> str:
+        """Legacy completed pages without a phase are unknown, never unsent."""
+        if number in self.delivered:
+            return "delivered"
+        return self.delivery_phases.get(number, "unknown")
 
     def to_json(self) -> str:
         """Serialize checkpoint metadata/artifact references; bytes become base64."""
@@ -134,7 +201,9 @@ class SeriesCheckpoint:
             if isinstance(v, (list, tuple)): return [encode(x) for x in v]
             if v is None or type(v) in (str, int, float, bool): return v
             raise SeriesPlanError(f"unsupported checkpoint value: {type(v).__name__}")
-        return json.dumps({"schema":1,"plan_id":self.plan_id,"completed":encode(self.completed),"failures":encode(self.failures),"delivered":sorted(self.delivered),"chat_id":self.chat_id,"owner_id":self.owner_id,"job_id":self.job_id,"pages_meta":self.pages_meta}, sort_keys=True)
+        phases = dict(self.delivery_phases)
+        phases.update({number: "delivered" for number in self.delivered})
+        return json.dumps({"schema":1,"plan_id":self.plan_id,"completed":encode(self.completed),"failures":encode(self.failures),"delivered":sorted(self.delivered),"chat_id":self.chat_id,"owner_id":self.owner_id,"job_id":self.job_id,"pages_meta":self.pages_meta,"delivery_phases":encode(phases)}, sort_keys=True)
 
     @classmethod
     def from_json(cls, raw: str, *, plan: SeriesPlan):
@@ -162,64 +231,102 @@ class SeriesCheckpoint:
             raise SeriesPlanError("invalid checkpoint delivery markers")
         pages_meta = data.get("pages_meta", {})
         if not isinstance(pages_meta, dict): raise SeriesPlanError("invalid page metadata")
-        return cls(plan.plan_id, completed, failures, set(delivered), str(data.get("chat_id", "")), str(data.get("owner_id", "")), str(data.get("job_id", "")), pages_meta)
+        raw_phases = data.get("delivery_phases", {})
+        if not isinstance(raw_phases, dict): raise SeriesPlanError("invalid delivery phases")
+        phases = {}
+        for number, phase in raw_phases.items():
+            if not re.fullmatch(r"[1-9][0-9]*", number) or int(number) not in completed:
+                raise SeriesPlanError("delivery phase requires a completed page")
+            if phase not in ("not_started", "sending", "delivered"):
+                raise SeriesPlanError("invalid delivery phase")
+            number = int(number)
+            if (phase == "delivered") != (number in delivered):
+                raise SeriesPlanError("conflicting delivery phase and marker")
+            phases[number] = phase
+        phases.update({number: "delivered" for number in delivered})
+        return cls(plan.plan_id, completed, failures, set(delivered), str(data.get("chat_id", "")), str(data.get("owner_id", "")), str(data.get("job_id", "")), pages_meta, phases)
 
-async def execute_series(plan: SeriesPlan, *, generate, checkpoint: SeriesCheckpoint | None = None, save_checkpoint=None, deliver=None, max_input_bytes=None, anchor_selector=None):
-    """Run missing pages only. Persist generated artifacts before delivery and resume delivery separately."""
+async def execute_series(plan: SeriesPlan, *, generate, checkpoint: SeriesCheckpoint | None = None, save_checkpoint=None, deliver=None, max_input_bytes=None, anchor_selector=None, reconcile_delivery=None):
+    """Run missing pages, persisting not_started -> sending -> delivered.
+
+    Hold series_job_lock around load and this call. For sending/legacy unknown
+    pages, reconcile_delivery(page, artifact) must return True (already sent),
+    False (confirmed absent), or None (uncertain). No callback means no resend.
+    Callbacks may be synchronous or asynchronous. Cancellation propagates;
+    ordinary failures return a checkpoint with failures and preserved artifacts.
+    """
     import inspect
     state=checkpoint or SeriesCheckpoint(plan.plan_id)
     if state.plan_id != plan.plan_id: raise SeriesPlanError("checkpoint belongs to a different immutable plan")
-    results=dict(state.completed)
-    anchor=anchor_selector(results) if anchor_selector and results else None
+    async def invoke(callback, *args, **kwargs):
+        value = callback(*args, **kwargs)
+        return await value if inspect.isawaitable(value) else value
+
+    async def persist():
+        if save_checkpoint:
+            await invoke(save_checkpoint, state)
+
+    anchor=anchor_selector(state.completed) if anchor_selector and state.completed else None
     for page in plan.pages:
-        if page.number in results:
-            state.failures.pop(page.number, None)
-            if deliver and page.number not in state.delivered:
-                try:
-                    v=deliver(page, results[page.number])
-                    if inspect.isawaitable(v): await v
-                    state.delivered.add(page.number)
-                    if save_checkpoint:
-                        v=save_checkpoint(state)
-                        if inspect.isawaitable(v): await v
-                except Exception as exc:
-                    state.failures[page.number]=f"delivery {type(exc).__name__}"
-                    if save_checkpoint:
-                        v=save_checkpoint(state)
-                        if inspect.isawaitable(v): await v
-                    return state
-            continue
+        stage = "generation"
         try:
-            kwargs={"page":page,"bible":plan.bible,"anchor":anchor,"max_input_bytes":max_input_bytes}
-            result=generate(**kwargs)
-            if inspect.isawaitable(result): result=await result
-            results[page.number]=result
-            state.completed=dict(results); state.failures.pop(page.number,None)
-            if anchor is None and anchor_selector: anchor=anchor_selector(results)
-            if save_checkpoint:
-                v=save_checkpoint(state)
-                if inspect.isawaitable(v): await v
-            if deliver:
-                try:
-                    v=deliver(page,result)
-                    if inspect.isawaitable(v): await v
-                    state.delivered.add(page.number)
-                    if save_checkpoint:
-                        v=save_checkpoint(state)
-                        if inspect.isawaitable(v): await v
-                except Exception as exc:
-                    state.failures[page.number]=f"delivery {type(exc).__name__}: {exc}"
-                    if save_checkpoint:
-                        v=save_checkpoint(state)
-                        if inspect.isawaitable(v): await v
+            if page.number not in state.completed:
+                result = await invoke(generate, page=page, bible=plan.bible, anchor=anchor, max_input_bytes=max_input_bytes)
+                state.completed[page.number] = result
+                state.delivery_phases[page.number] = "not_started"
+                state.failures.pop(page.number, None)
+                stage = "checkpoint"
+                await persist()
+                if anchor is None and anchor_selector:
+                    anchor = anchor_selector(state.completed)
+            result = state.completed[page.number]
+            if page.number in state.delivered:
+                retry_save = bool(state.failures.get(page.number))
+                state.failures.pop(page.number, None)
+                if retry_save:
+                    stage = "checkpoint"
+                    await persist()
+                continue
+            if not deliver:
+                state.failures.pop(page.number, None)
+                continue
+            stage = "delivery reconciliation"
+            phase = state.delivery_phase(page.number)
+            if phase != "not_started":
+                confirmed = await invoke(reconcile_delivery, page, result) if reconcile_delivery else None
+                if confirmed is not True and confirmed is not False:
+                    state.failures[page.number] = "delivery reconciliation required"
+                    stage = "checkpoint"
+                    await persist()
                     return state
+                if confirmed is True:
+                    state.delivered.add(page.number)
+                    state.delivery_phases[page.number] = "delivered"
+                    state.failures.pop(page.number, None)
+                    stage = "checkpoint"
+                    await persist()
+                    continue
+                state.delivery_phases[page.number] = "not_started"
+                stage = "checkpoint"
+                await persist()
+            state.delivery_phases[page.number] = "sending"
+            stage = "checkpoint"
+            await persist()
+            stage = "delivery"
+            await invoke(deliver, page, result)
+            state.delivered.add(page.number)
+            state.delivery_phases[page.number] = "delivered"
+            state.failures.pop(page.number, None)
+            stage = "checkpoint"
+            await persist()
         except Exception as exc:
-            phase = 'delivery ' if page.number in results else 'generation '
-            state.completed=dict(results); state.failures[page.number]=f"{phase}{type(exc).__name__}"
-            if save_checkpoint:
-                v=save_checkpoint(state)
-                if inspect.isawaitable(v): await v
+            state.failures[page.number] = f"{stage} {type(exc).__name__}"
+            if stage != "checkpoint":
+                try:
+                    await persist()
+                except Exception as save_error:
+                    state.failures[page.number] += f"; checkpoint {type(save_error).__name__}"
             return state
     return state
 
-__all__=["SeriesPlanError","SeriesPage","SeriesPlan","parse_multipage_plan","SeriesCheckpoint","execute_series","validate_series_job","series_state_path","save_series_state","load_series_state"]
+__all__=["SeriesPlanError","SeriesPage","SeriesPlan","parse_multipage_plan","series_plan_from_intent","SeriesCheckpoint","execute_series","series_job_lock","validate_series_job","series_state_path","save_series_state","load_series_state"]

@@ -1,6 +1,7 @@
 import asyncio
 import tempfile
 import unittest
+from unittest.mock import Mock
 from pathlib import Path
 
 from gen_series import (parse_multipage_plan, execute_series, SeriesCheckpoint,
@@ -40,7 +41,10 @@ class IncrementalSeriesHandlerTests(unittest.TestCase):
             self.assertEqual(first.completed[1], b'image-1')
             self.assertIn('delivery RuntimeError', first.failures[1])
             reloaded = SeriesCheckpoint.from_json(Path(td, 'checkpoint.json').read_text(), plan=plan)
-            second = asyncio.run(execute_series(plan, generate=generate, checkpoint=reloaded, save_checkpoint=save, deliver=deliver))
+            reconcile = Mock(return_value=False)
+            second = asyncio.run(execute_series(plan, generate=generate, checkpoint=reloaded, save_checkpoint=save,
+                                               deliver=deliver, reconcile_delivery=reconcile))
+            reconcile.assert_called_once()
             self.assertEqual(calls, [1, 2])
             self.assertEqual(set(second.delivered), {1, 2})
             self.assertEqual(sends, [1, 1, 2])

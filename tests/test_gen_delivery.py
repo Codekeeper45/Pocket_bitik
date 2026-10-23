@@ -3,6 +3,7 @@ import tempfile
 import time
 import unittest
 from pathlib import Path
+from unittest.mock import AsyncMock
 
 from gen_jobs import ArtifactStore, GenerationJobs, GlobalRateGate, JobStore
 
@@ -19,7 +20,14 @@ class DeliveryTests(unittest.IsolatedAsyncioTestCase):
                 sent.append(path.read_bytes())
                 if len(sent) == 1: raise TimeoutError()
                 return "accepted"
-            self.assertEqual(await jobs.retry_delivery(rec.job_id, deliver, attempts=2), "accepted")
+            async def verified_absence(record):
+                self.assertEqual(record.status, 'delivery_failed')
+                self.assertEqual(sent, [b"fixture-output-bytes"])
+                return None
+            reconcile = AsyncMock(side_effect=verified_absence)
+            self.assertEqual(await jobs.retry_delivery(rec.job_id, deliver, attempts=2,
+                                                       reconcile=reconcile), "accepted")
+            reconcile.assert_awaited_once_with(rec)
             self.assertEqual(generated, [1])
             self.assertEqual(sent, [b"fixture-output-bytes"] * 2)
             self.assertTrue(rec.delivered)

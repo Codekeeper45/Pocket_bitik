@@ -27,7 +27,7 @@ class RetryAccountingTests(unittest.TestCase):
 
     def test_retry_budget_not_reset_on_fallback_and_attempt_accounted(self):
         source = impl_source()
-        self.assertIn("transient_left = 1", source)
+        self.assertIn("transient_left = 0 if gateway_pool else 1", source)
         self.assertNotIn("transient_left = 2", source)
         self.assertIn("invocation.generation_calls >= invocation.max_generation_calls", source)
         self.assertIn("ensure_budget()", source)
@@ -73,12 +73,10 @@ class RetryAccountingTests(unittest.TestCase):
         self.assertEqual(image_transport.count('"upstream_error"'), 2)
         self.assertIn("HTTP {resp.status_code} ({error_code})", image_transport)
 
-    def test_gateway_pool_uses_one_configured_retry_then_native_fallback(self):
+    def test_gateway_pool_does_not_stack_outer_retries(self):
         source = impl_source()
-        self.assertIn("transient_left = 1", source)
+        self.assertIn("transient_left = 0 if gateway_pool else 1", source)
         self.assertIn("OPENROUTER_IMAGE_FALLBACK", source)
-        # Gateway's upstream_error is eligible for exactly one bounded retry,
-        # then the single external image fallback path; no retry budget reset.
         self.assertIn('"upstream_error"', (ROOT / "bot_new.py").read_text())
         self.assertIn("attempt = 0", source)
         self.assertIn("remaining() <= wait", source)

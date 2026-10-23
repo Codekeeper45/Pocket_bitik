@@ -12,9 +12,8 @@ class DeliveryFirst(unittest.IsolatedAsyncioTestCase):
     async def test_no_prompt_service_still_preserves_request(self):
         with patch.object(bot,'get_active_model',return_value=(None,'offline','offline')),patch.object(bot,'_sync_image_prompt',side_effect=RuntimeError('offline')):
             result=await bot._build_gen_prompt('Two friends and exact text HELLO',catalog=[])
-        contract=json.loads(result[0])
-        self.assertIn('Two friends and exact text HELLO',contract['prompt'])
-        self.assertEqual(contract['immutable_requirements'],['Two friends and exact text HELLO'])
+        self.assertIn('Two friends and exact text HELLO',result[0])
+        self.assertIn('Original user request (verbatim):',result[0])
 
     async def test_qa_route_failure_cannot_block_generated_bytes(self):
         raw=png()

@@ -23,7 +23,7 @@ class TestReferenceDisambiguationClean(unittest.TestCase):
 
 
 class SourceGateTests(unittest.IsolatedAsyncioTestCase):
-    async def test_unverified_source_never_stops_and_still_generates(self):
+    async def test_unverified_source_prompt_builder_preserves_request(self):
         llm = NS(chat=NS(completions=NS(create=Mock(return_value=NS(choices=[NS(message=NS(content='PROMPT: anime character hugging alon\nREFS:\nIDEA: hug\nASPECT: 1:1', tool_calls=[]))])))))
         with patch.object(bot, 'get_active_model', return_value=(llm, 'fake', 'fake')), patch.object(bot, 'active_model_supports_vision', return_value=False):
             prompt, refs, idea, asp = await bot._build_gen_prompt(

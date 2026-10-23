@@ -15,7 +15,13 @@ class ReferencesTest(unittest.TestCase):
     def test_dedup_scoped_and_stable_ids_chat_pair(self):
         raw=image_bytes(); a=make_reference(10,7,raw,role='subject',priority=4)
         reg=ReferenceRegistry(); self.assertIs(reg.add(a),a)
-        self.assertIs(reg.add(make_reference(20,7,raw)),a) # hash duplicate
+        duplicate=make_reference(20,7,raw,role='clothing')
+        merged=reg.add(duplicate)
+        self.assertEqual(merged.ref_id,a.ref_id)
+        self.assertEqual(merged.roles,('subject','clothing'))
+        self.assertEqual({origin.chat_id for origin in merged.provenance},{10,20})
+        self.assertEqual(a.roles,('subject',))
+        self.assertIs(reg.resolve(duplicate.ref_id),merged)
         other=reg.add(make_reference(20,7,image_bytes(color='blue')))
         self.assertEqual(len(reg.refs),2)
         self.assertEqual([r.chat_id for r in filter_refs(reg.refs,chat_id=20)],[20])
