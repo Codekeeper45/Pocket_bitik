@@ -73,4 +73,20 @@ class EvidenceTests(unittest.IsolatedAsyncioTestCase):
         search.assert_awaited_once_with(99,'media_image','vector',48)
         self.assertEqual(result['mid'],12)
 
+    async def test_preflight_falls_back_to_jev_chat_search(self):
+        c=SourceCriterion('hero','image_text','hello friends')
+        chosen={'idx':1,'mid':55,'bytes':b'pixels','source_pixel_evidence':{'visible_text':'hello friends','appearance':'human'}}
+        jev_cand={'idx':1,'mid':55,'bytes':b'pixels','source':'jev_chat_ant_search'}
+        with patch.object(bot,'get_image_desc_client',return_value=(None,'m')), \
+             patch.object(evidence,'extract_criterion',AsyncMock(return_value=c)), \
+             patch.object(bot,'_index_embed_query',AsyncMock(return_value='vector')), \
+             patch.object(bot,'_index_vector_search',AsyncMock(return_value=[])), \
+             patch.object(bot,'_jev_find_chat_source_candidates',AsyncMock(return_value=[jev_cand])) as jev_search, \
+             patch.object(evidence,'confirm_source',AsyncMock(side_effect=[(None,[]),(None,[]),(chosen,[])])), \
+             patch.object(evidence,'append_trace'):
+            cat=[]
+            result=await bot._gen_source_preflight('full scene request',cat,chat_id=99)
+        jev_search.assert_awaited_once()
+        self.assertEqual(result['mid'],55)
+
 if __name__=='__main__':unittest.main()

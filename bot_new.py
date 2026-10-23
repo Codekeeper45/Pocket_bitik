@@ -3927,6 +3927,107 @@ def _gen_catalog_ref_label(it: dict, include_missing_desc: bool = True) -> str:
     return head + (": " + "; ".join(fields) if fields else "")
 
 
+def _jev_rank_source_candidates(candidates: list, quote: str) -> list:
+    """Uses Jev choice to prioritize candidates that match quote in text/caption."""
+    if len(candidates) <= 1:
+        return candidates
+    text_candidates = [c for c in candidates if (c.get('caption') or c.get('desc'))]
+    if not text_candidates:
+        return candidates
+    state_lines = []
+    options = {}
+    for idx, c in enumerate(text_candidates, 1):
+        cap = (c.get('caption') or c.get('desc') or '').strip()
+        state_lines.append(f"Вариант {idx} (mid #{c.get('mid', 0)}): {cap[:300]}")
+        options[f"opt_{idx}"] = f"Вариант {idx}"
+    state = "\n".join(state_lines)
+    instructions = f"В каком варианте упоминается, содержится или наиболее близка реплика: «{quote}»?"
+    try:
+        res = _jev_sync_choice(state, instructions, options, timeout=3.5)
+        choice = res.get('choice')
+        confidence = float(res.get('confidence') or (res.get('probabilities') or {}).get(choice or '', 0))
+        if choice and choice.startswith('opt_') and confidence >= 0.6:
+            chosen_idx = int(choice[4:]) - 1
+            if 0 <= chosen_idx < len(text_candidates):
+                winner = text_candidates[chosen_idx]
+                return [winner] + [c for c in candidates if c is not winner]
+    except Exception:
+        pass
+    return candidates
+
+
+async def _jev_find_chat_source_candidates(client_obj, chat_id, quote, is_image_fn, next_idx_start=1, limit=120) -> list:
+    """Finds image candidates in recent chat history using Jev semantic block choice."""
+    if not client_obj or not chat_id:
+        return []
+    messages = []
+    try:
+        async for m in client_obj.iter_messages(chat_id, limit=limit):
+            if not m or getattr(m, 'action', None) is not None:
+                continue
+            messages.append(m)
+    except Exception as e:
+        log("GEN", f"Jev chat source search message scan failed: {e}")
+        return []
+    if not messages:
+        return []
+    chronological = list(reversed(messages))
+    chunk_size = 7
+    chunks = [chronological[i:i + chunk_size] for i in range(0, len(chronological), chunk_size)]
+    block_descriptions = []
+    options = {}
+    for idx, ch in enumerate(chunks, 1):
+        key = f"block_{idx}"
+        snippets = []
+        for m in ch:
+            txt = (m.raw_text or "").replace("\n", " ").strip()
+            is_img = is_image_fn(m)
+            mtag = " [Картинка/Стикер]" if is_img else ""
+            if txt:
+                snippets.append(f"#{m.id}{mtag}: {txt[:160]}")
+            elif mtag:
+                snippets.append(f"#{m.id}{mtag}")
+        summary = "; ".join(snippets)
+        block_descriptions.append(f"Блок {idx}: {summary}")
+        options[key] = f"Блок {idx}"
+
+    state_text = "\n".join(block_descriptions)
+    instructions = f"В каком блоке сообщений содержится или обсуждается картинка/стикер с текстом или репликой: «{quote}»?"
+    try:
+        res = await asyncio.to_thread(_jev_sync_choice, state_text, instructions, options, 4.0)
+        choice = res.get('choice')
+        confidence = float(res.get('confidence') or (res.get('probabilities') or {}).get(choice or '', 0))
+        if choice and choice.startswith('block_') and confidence >= 0.5:
+            block_idx = int(choice[6:]) - 1
+            if 0 <= block_idx < len(chunks):
+                winning_chunk = chunks[block_idx]
+                candidates = []
+                cur_idx = next_idx_start
+                for m in winning_chunk:
+                    if not is_image_fn(m):
+                        continue
+                    try:
+                        raw = await asyncio.wait_for(m.download_media(bytes), timeout=12)
+                        if not raw or len(raw) > 8_000_000:
+                            continue
+                    except Exception:
+                        continue
+                    candidates.append({
+                        'idx': cur_idx,
+                        'mid': m.id,
+                        'bytes': raw,
+                        'thumb': raw,
+                        'caption': m.raw_text or '',
+                        'sender_id': getattr(m, 'sender_id', None),
+                        'source': 'jev_chat_ant_search'
+                    })
+                    cur_idx += 1
+                return candidates
+    except Exception as e:
+        log("GEN", f"Jev chat source search failed: {e}")
+    return []
+
+
 async def _gen_source_preflight(user_prompt, catalog, initial_refs=None, chat_id=None,
                                 include_ids=None, exclude_ids=None):
     from gen_reference_evidence import (extract_criterion, confirm_source,
@@ -3971,8 +4072,14 @@ async def _gen_source_preflight(user_prompt, catalog, initial_refs=None, chat_id
                 'caption':msg.raw_text or '', 'sender_id':sender, 'source':'source_phrase_recovery'})
             next_idx += 1
             if len(candidates)>=8: break
+        candidates = _jev_rank_source_candidates(candidates, criterion.quote)
         chosen, recovered = await confirm_source(criterion,candidates,initial_refs,cl,model)
         trace.extend(recovered)
+        if chosen is None:
+            jev_cands = await _jev_find_chat_source_candidates(client, chat_id, criterion.quote, _index_is_image_msg, next_idx_start=next_idx)
+            if jev_cands:
+                chosen, jev_trace = await confirm_source(criterion, jev_cands, initial_refs, cl, model)
+                trace.extend(jev_trace)
         if chosen and chosen not in working and not chosen.get('explicit'):
             working.append(chosen)
     record = {'kind':criterion.kind,'subject':criterion.subject,'candidates':trace,
