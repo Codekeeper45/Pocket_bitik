@@ -4192,6 +4192,8 @@ async def _build_gen_prompt(user_prompt: str, context_text: str = None, image_de
         except Exception as e:
             log("GEN", f"Промптер /gen или чат-инструмент завершился с ошибкой: {e}")
             break
+    if source_quote and not verified_source_ids:
+        raise GenSourceUnconfirmed('Не нашёл и не подтвердил картинку с указанной репликой. Пришли стикер или ссылку: другого персонажа вместо него не генерирую.')
     if not out:
         log("GEN", "Активная модель не построила промпт — fallback без истории-рефов")
         try:
@@ -5819,6 +5821,10 @@ async def _run_chat_search(chat_id, args: dict, msg_by_id: dict = None, include_
             results = visual + results
         except Exception as exc:
             log('GEN', 'Image-text candidate search unavailable: ' + type(exc).__name__)
+
+    if args.get('_image_text_query') and user_ent:
+        sender_filter = user_ent if isinstance(user_ent, int) else getattr(user_ent, 'id', None)
+        results = [m for m in results if getattr(m, 'sender_id', None) == sender_filter]
 
     if from_user and not user_ent:
         # Never broaden an unresolved sender filter into an unfiltered chat search.

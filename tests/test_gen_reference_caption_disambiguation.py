@@ -25,22 +25,6 @@ class TestReferenceDisambiguationClean(unittest.TestCase):
         self.assertFalse(bot._gen_quote_matches(quote, 'ну или просто Зайка'))
         self.assertIsNone(bot._gen_source_quote('Напиши на картинке Привет'))
 
-    def test_catalog_combination_keeps_fresh_chat_media_over_stale_index(self):
-        fresh_items = [{'mid': 100 + i, 'idx': i} for i in range(1, 9)]
-        stale_index = [{'mid': 200 + i, 'idx': i + 8} for i in range(1, 9)]
-        cap = 10
-        combined = fresh_items + stale_index
-        seen = set()
-        deduped = []
-        for it in combined:
-            m = it.get('mid')
-            if m not in seen:
-                seen.add(m)
-                deduped.append(it)
-        result = deduped[:cap]
-        # First 8 must be fresh items, only remaining 2 are filled by index
-        self.assertEqual([x['mid'] for x in result[:8]], [101, 102, 103, 104, 105, 106, 107, 108])
-        self.assertEqual([x['mid'] for x in result[8:]], [201, 202])
 
 class SourceGateTests(unittest.IsolatedAsyncioTestCase):
     async def test_unverified_model_selection_is_rejected(self):
@@ -50,6 +34,27 @@ class SourceGateTests(unittest.IsolatedAsyncioTestCase):
         with patch.object(bot, 'get_active_model', return_value=(llm, 'fake', 'fake')), patch.object(bot, 'active_model_supports_vision', return_value=False):
             with self.assertRaises(bot.GenSourceUnconfirmed):
                 await bot._build_gen_prompt('Стикер с фразой «Я Зая но можно просто Зайка»', catalog=[{'idx':1,'mid':11,'caption':'Я Зая но можно просто Зайка','desc':'wrong art'}], chat_id=99)
+
+    async def test_verified_tool_source_survives_full_catalog(self):
+        import json
+        from unittest.mock import patch, Mock, AsyncMock
+        from types import SimpleNamespace as NS
+        tc = NS(id='inspect1', type='function', function=NS(name='chat_inspect_image', arguments='{"message_id":77}'))
+        def response(msg): return NS(choices=[NS(message=msg)])
+        calls = [0]
+        def create(**kw):
+            if 'response_format' in kw:
+                return response(NS(content=json.dumps({'prompt':'hug','immutable_requirements':['hug']})))
+            calls[0] += 1
+            return response(NS(content=None,tool_calls=[tc]) if calls[0]==1 else NS(content='IDEA: hug\nASPECT: 1:1\nREFS: 2:subject\nPROMPT: hug',tool_calls=[]))
+        llm = NS(chat=NS(completions=NS(create=create)))
+        image = NS(id=77,sender_id=2,raw_text='',date=None,sender=None,download_media=AsyncMock(return_value=b'pixels'))
+        catalog=[{'idx':1,'mid':11,'caption':'wrong','desc':'wrong'}]
+        with patch.object(bot,'get_active_model',return_value=(llm,'fake','fake')), patch.object(bot,'active_model_supports_vision',return_value=False), patch.object(bot,'MODEL_TOOLS_SUPPORT',{}), patch.object(bot,'GEN_CTX_IMG_MAX',1), patch.object(bot,'_gen_is_own_generation',return_value=False), patch.object(bot,'_is_attached_photo',return_value=True), patch.object(bot,'_downscale_img',AsyncMock(return_value=b'thumb')), patch.object(bot,'_label_for',return_value='user'), patch.object(bot,'_run_chat_inspect_image',AsyncMock(return_value='Я Зая, но можно просто Зайка.')) as inspect:
+            result=await bot._build_gen_prompt('Стикер с фразой «Я Зая но можно просто Зайка»',catalog=catalog,chat_id=99,msg_by_id={77:image})
+        self.assertIn((2,'subject'), result[1])
+        self.assertEqual(catalog[-1]['mid'],77)
+        self.assertTrue(inspect.await_args.args[1]['pixels_only'])
 
 if __name__ == '__main__':
     unittest.main()
