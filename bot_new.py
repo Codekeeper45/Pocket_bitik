@@ -8651,8 +8651,17 @@ async def _gen_visual_qa_impl(raw: bytes, user_prompt: str, final_prompt: str, _
         return None
     if _feedback:
         final_prompt += '\nValidator correction: ' + _feedback
-    request = (f"Исходный запрос пользователя:\\n{user_prompt[:3000]}\\n\\n"
-               f"Промпт генерации:\\n{final_prompt[:5000]}\\n\\n{_GEN_VISUAL_QA_PROMPT}")
+    literal_text_rule = (
+        'Explicit user-requested strings are authoritative: judge spelling, case, language '
+        'and script exactly as requested, even when the generation prompt differs. '
+        'Mixed Latin/Cyrillic names are not a defect. Do not invent a uniform Cyrillic '
+        'requirement or translate/transliterate literal text. Report actual deviations '
+        'from requested text, not deviations from an imagined language convention. '
+        'For example, requested Flowery must remain Flowery even beside Cyrillic names; '
+        'Флауэри is not an acceptable substitute unless the user requested it.'
+    )
+    request = (f"Исходный запрос пользователя / требования текущего изображения:\\n{user_prompt}\\n\\n"
+               f"Промпт генерации:\\n{final_prompt[:5000]}\\n\\n{_GEN_VISUAL_QA_PROMPT}\\n\\n{literal_text_rule}")
     try:
         import base64
         from gen_provider import validate_image
@@ -9456,8 +9465,12 @@ async def gen_resume(event):
                     raise ValueError("series anchor and references exceed byte budget")
                 prompt += '\nReference attachment mapping: ' + _json.dumps(
                     _gen_page_reference_snapshot(inputs, selected, page_roles), ensure_ascii=False)
+                from gen_qa import page_requirements
+                requirements = page_requirements(
+                    {**(pages_meta.get(str(page.number)) or {}), 'page': page.number, 'prompt': page.prompt},
+                    bible, generation['user_prompt'], generation.get('intent_plan'))
                 rendered = await _gen_render_image(prompt, inputs, generation["image_size"], page.aspect or generation["aspect_ratio"],
-                                                   True, generation['user_prompt'], None)
+                                                   True, requirements, None)
                 raw, mime, used_prompt, _fallback = rendered
                 if not raw:
                     raise RuntimeError(f"generation {mime}")
@@ -9943,9 +9956,12 @@ async def gen_command(event):
                     p_prompt += '\nReference attachment mapping: ' + _series_json.dumps(
                         _gen_page_reference_snapshot(p_inputs, selected_refs, selected_roles), ensure_ascii=False)
                     await set_status(f"🎨 Генерирую страницу {p_idx}/{pages_count}…")
+                    from gen_qa import page_requirements
+                    requirements = page_requirements({**p_info, 'prompt': page.prompt}, bible, user_prompt,
+                                                     _generation.get('intent_plan'))
                     raw_p, mime_p, used_fp, used_fb = await _gen_render_image(
                         p_prompt, p_inputs, image_size, page.aspect or aspect_ratio,
-                        True, user_prompt, set_status
+                        True, requirements, set_status
                     )
 
                     if not raw_p:

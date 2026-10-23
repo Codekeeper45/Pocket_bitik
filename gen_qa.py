@@ -8,6 +8,35 @@ from gen_contracts import QAResult
 CATEGORIES = {"fidelity", "technical", "anatomy", "composition", "identity", "text", "seam", "style", "other"}
 SEVERITIES = {"low", "medium", "high", "critical"}
 
+def page_requirements(page, bible, user_prompt, intent_plan=None):
+    """Scope image QA and repairs without losing original identity/text constraints."""
+    import json
+    intent_plan = intent_plan or {}
+    current_page = {key: value for key, value in page.items() if key != 'bible'}
+    scenes = intent_plan.get('scenes') or []
+    number = current_page.get('page')
+    if isinstance(number, int) and 1 <= number <= len(scenes):
+        current_page['prompt'] = scenes[number - 1]
+    return (
+        'Evaluate ONLY the current page/file. The current_page is the scene/action/dialogue '
+        'checklist for this image. Other pages/files are delivered separately: never report '
+        'their absent scenes, characters, actions or text as missing from this page. '
+        'global_request_context is context, NOT a whole-request checklist for each image. '
+        'Any embedded original request in a page or generation prompt is also context only; '
+        'the numbered current scene / This image section takes precedence for scene scope. '
+        'Preserve its applicable global identity, appearance, style and exact-text constraints, '
+        'including constraints explicitly required on every page. The series bible locks '
+        'identities, but does not require every character to appear on every page. '
+        'For text assigned to this page, explicit user strings override paraphrases in the '
+        'plan/bible: preserve spelling, case, language and script exactly; mixed Latin and '
+        'Cyrillic names are valid when requested. Do not translate or transliterate them '
+        'to impose uniform script.\n'
+        + json.dumps({'current_page': current_page, 'series_bible': bible,
+                      'shared_constraints': intent_plan.get('constraints', []),
+                      'explicit_text_spellings_not_a_per_page_checklist': intent_plan.get('explicit_text', []),
+                      'global_request_context': user_prompt}, ensure_ascii=False)
+    )
+
 @dataclass(frozen=True)
 class Acceptance:
     accepted: bool
@@ -128,4 +157,4 @@ def accept_repair(before: QAResult, after: QAResult, *, target_finding_id: str, 
     if any(f.get("requirement_id") in protected for f in after.findings if f.get("severity") in {"high", "critical"}): return Acceptance(False, "protected requirement affected")
     return Acceptance(True, "target improved without new severe findings", True)
 
-__all__ = ["Acceptance", "parse_findings", "qa_for_image", "accept_repair"]
+__all__ = ["Acceptance", "page_requirements", "parse_findings", "qa_for_image", "accept_repair"]
