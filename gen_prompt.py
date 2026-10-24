@@ -254,10 +254,13 @@ def parse_intent_plan(out, user_request=None, explicit_count=None, edit_mode=Fal
         # A scalar has one unambiguous, lossless meaning: one verbatim inscription.
         if isinstance(explicit_text, str):
             explicit_text = [explicit_text] if explicit_text else []
+        constraints = data.get("constraints", ())
+        if isinstance(constraints, str):
+            constraints = [constraints]
         return IntentPlan(task_type=task, output_kind=kind, output_count=count, prompt=prompt,
                           panels_per_image=panels, explicit_text=_intent_strings(explicit_text, "explicit_text"),
                           refs=_intent_refs(data.get("refs", ())), aspect=aspect,
-                          constraints=_intent_strings(data.get("constraints", ()), "constraints"),
+                          constraints=_intent_strings(constraints, "constraints"),
                           layers=layers, scenes=scenes, participant_count=participants, source_prompt=source,
                           idea=idea.strip(), ideas=ideas)
 
