@@ -17530,12 +17530,16 @@ async def _gen_fetch_ref_items(chat_id: int, media_hits: list, exclude_mids=None
                 "provenance": "generated" if _gen_is_own_generation(m) else ("upload" if not getattr(m, "out", False) else "unknown"),
                 "from_owner": bool(getattr(m, "out", False)), "from_index": True}
 
-    items = []
-    try:
-        res = await asyncio.wait_for(asyncio.gather(*[_dl(m) for m in msgs]), timeout=GEN_CATALOG_TIMEOUT)
-        items = [it for it in res if it]
-    except asyncio.TimeoutError:
-        log("GEN", "Реф-фетч: скачивание превысило тайм-бюджет")
+    tasks = [asyncio.create_task(_dl(m)) for m in msgs]
+    done, pending = await asyncio.wait(tasks, timeout=GEN_CATALOG_TIMEOUT)
+    for task in pending:
+        task.cancel()
+    if pending:
+        await asyncio.gather(*pending, return_exceptions=True)
+        log("GEN", f"Реф-фетч: тайм-бюджет, сохранены завершённые {len(done)}/{len(tasks)}")
+    # Preserve retrieval order, and never discard already downloaded sources
+    # merely because another candidate timed out.
+    items = [task.result() for task in tasks if task in done and not task.cancelled() and task.exception() is None and task.result()]
     if not items:
         return []
     described = await _gen_describe_candidates_bounded(items, timeout=GEN_CATALOG_TIMEOUT)
