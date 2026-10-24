@@ -3399,7 +3399,7 @@ def _sync_generate_image(prompt: str, input_images_b64: list = None, model: str 
                 log('GEN', f'Gateway transport failure: {transport_error}')
                 raise transport_error
         if resp.status_code >= 500:
-            resp.raise_for_status()
+            raise GenTransient(f'Image gateway HTTP {resp.status_code}: provider failed to complete generation')
         _moderation_markers = (
             "не могу создать", "не могу сгенерировать", "не могу нарисовать",
             "нарушает", "политик", "безопасност", "ограничени", "откровенн",
@@ -4305,6 +4305,14 @@ async def _build_gen_prompt(user_prompt: str, context_text: str = None, image_de
     diagnostic_invocation = CURRENT.get()
     if diagnostic_invocation:
         diagnostic_invocation.timings['planner_response'] = out or ''
+        # Keep exact response and source metadata for diagnosing schema/reference loss.
+        from pathlib import Path
+        diagnostic_dir = Path('gen_artifacts/planner')
+        diagnostic_dir.mkdir(parents=True, exist_ok=True)
+        (diagnostic_dir / (diagnostic_invocation.job_id + '.json')).write_text(json.dumps({
+            'response': out or '',
+            'sources': [{key: item.get(key) for key in ('idx', 'ref_id', 'members', 'profile_url', 'mid')}
+                        for item in working_catalog]}, ensure_ascii=False), encoding='utf-8')
     plan = _gen_prompt.parse_intent_plan(out, user_prompt, edit_mode=edit_mode,
         fallback_prompt=legacy[0] if legacy_format else None,
         fallback_refs=fallback_refs)
