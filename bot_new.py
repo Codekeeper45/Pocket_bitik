@@ -17407,10 +17407,9 @@ async def _gen_fetch_ref_items(chat_id: int, media_hits: list, exclude_mids=None
     described = await _gen_describe_candidates_bounded(items, timeout=GEN_CATALOG_TIMEOUT)
     if described < len(items):
         log("GEN", f"Реф-фетч: visual-desc превысил тайм-бюджет — готово {described}/{len(items)}")
-    junk = [it for it in items if _gen_desc_kind(it.get("visual_desc") or it.get("desc")) in ("скриншот", "мем")]
-    if junk:
-        items = [it for it in items if it not in junk]
-        log("GEN", f"Реф-фетч: исключено {len(junk)} скриншотов/мемов")
+    # Meme, sticker and screenshot may be the explicitly requested source.
+    # Keep candidates for semantic reranking instead of dropping by media category.
+    # Caption and inspected pixels remain separate evidence.
     before = len(items)
     # без свежего visual-desc / stage5-описания / подписи реранкеру нечего оценивать — кандидат остаётся чистым вектор-шумом
     items = [it for it in items if it.get("visual_desc") or (it.get("index_desc") or "").strip()

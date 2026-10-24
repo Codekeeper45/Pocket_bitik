@@ -89,6 +89,7 @@ def build_contract_prompt(user_prompt: str, *, task_type="creation", participant
     return extract_contract(values)
 
 INTENT_PLAN_INSTRUCTIONS = """Return one JSON object, not a prose answer or a second contract.
+For historical refs, search/read/inspect: catalog similarity is not identity. Caption and requested lettering are not observed pixel text.
 Fields: task_type (creation/edit/series), output_kind (single_image/independent_images/series),
 output_count (positive integer files), prompt (scene description), panels_per_image (positive integer or null),
 explicit_text (JSON array of verbatim strings, e.g. ["Спокойной ночи"], never a scalar string), refs ([{ref_id: stable source ID, roles: [subject/style/clothing/background/pose/composition/object]}]),
