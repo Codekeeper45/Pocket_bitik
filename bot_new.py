@@ -4078,7 +4078,8 @@ async def _build_gen_prompt(user_prompt: str, context_text: str = None, image_de
     web_refs_selected = []
 
     def _tools_for_gen():
-        tools = []
+        from gen_participants import tool_schema as participant_tool_schema
+        tools = [participant_tool_schema()]
         for spec in CHAT_TOOLS:
             item = json.loads(json.dumps(spec))
             if item["function"]["name"] == "chat_search":
@@ -4183,6 +4184,11 @@ async def _build_gen_prompt(user_prompt: str, context_text: str = None, image_de
                                 if row.get('source_page_url') == page.get('requested_source_page_url'):
                                     row['page_evidence'] = page
                         result = json.dumps(page, ensure_ascii=False)
+                    elif name == "chat_list_participants":
+                        from gen_participants import discover_participants
+                        result = await discover_participants(client, chat_id,
+                            limit=args.get('limit', 100), scan_limit=args.get('scan_limit', 3000),
+                            include_ids=include_ids, exclude_ids=exclude_ids)
                     elif name == "chat_get_avatar":
                         try:
                             from gen_avatar import fetch_avatar

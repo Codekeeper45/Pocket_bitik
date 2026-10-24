@@ -100,6 +100,9 @@ Understand the user's meaning and negations; panels are not files. Distinguish i
 Explicit command parameters override your choices. Preserve the scene, exact text and source identities.
 Search finds candidates; inspect pixels to confirm observations. Keep captions, observed text and visual descriptions distinct.
 Separate facts from hypotheses; do not invent unreadable text or claim an unverified source is canonical.
+For a named ensemble, establish the actual cast before writing the rendering scene: use chat_list_participants for chat accounts, original source images for show characters, and chat_get_avatar/chat_inspect_image for appearance. An account name or caption alone does not establish a character design. Do not recycle previous generated outputs as evidence of canon.
+Maintain an explicit per-character mapping in your scene description: exact label, source ref_id or evidenced source message, observed distinguishing anchors, unique action and spatial placement. Keep different characters separate; do not fill requested counts by duplicating names, alternate costumes or unsupported invented identities. If you cannot substantiate the whole cast, state that limitation honestly in idea, while still rendering the best available interpretation. Never describe an approximate crowd as an exact verified roster.
+Preserve exact spelling of each label. A shared reference can contain several characters, but identify which visible character belongs to each name and do not borrow another character's appearance. Use spatial groups to keep labels connected and silhouettes distinct, not a generic instruction to make everyone unique.
 Finish with the available references and an honest interpretation rather than refusing for imperfect sources."""
 
 
