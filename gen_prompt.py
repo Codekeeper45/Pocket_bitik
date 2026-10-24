@@ -153,6 +153,7 @@ def _intent_refs(value):
         roles = _intent_strings(item.get("roles", ()), "roles")
         if "role" in item:
             roles += _intent_strings([item["role"]], "role")
+        roles = tuple('subject' if role == 'identity' else role for role in roles)
         if not roles or any(role not in ("subject", "style", "clothing", "background", "pose", "composition", "object") for role in roles):
             raise ContractError("unsupported reference role")
         target = merged.setdefault(ref_id, {"ref_id": ref_id, "roles": []})
