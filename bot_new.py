@@ -2781,7 +2781,7 @@ def count_tokens(text: str) -> int:
 
 
 def _save_model_state():
-    save_json(MODEL_STATE_PATH, {"active": ACTIVE_MODEL, "tools_support": MODEL_TOOLS_SUPPORT, "active_media": ACTIVE_MEDIA_MODEL, "custom_models": CUSTOM_MODELS, "active_voice": ACTIVE_VOICE, "voice_auto": VOICE_AUTO, "voice_style_prompt": VOICE_STYLE_PROMPT, "tts_engine": TTS_ENGINE, "fish_voice": FISH_VOICE, "fish_favorites": FISH_FAVORITES, "reasoning_effort": REASONING_EFFORT, "gen_image_model": GEN_IMAGE_MODEL, "gen_image_res": GEN_IMAGE_RES, "gen_image_input": GEN_IMAGE_INPUT, "gen_prompt_model": GEN_PROMPT_MODEL, "gen_prompt_tools_support": GEN_PROMPT_TOOLS_SUPPORT})
+    save_json(MODEL_STATE_PATH, {"active": ACTIVE_MODEL, "tools_support": MODEL_TOOLS_SUPPORT, "active_media": ACTIVE_MEDIA_MODEL, "custom_models": CUSTOM_MODELS, "active_voice": ACTIVE_VOICE, "voice_auto": VOICE_AUTO, "voice_style_prompt": VOICE_STYLE_PROMPT, "tts_engine": TTS_ENGINE, "fish_voice": FISH_VOICE, "fish_favorites": FISH_FAVORITES, "reasoning_effort": REASONING_EFFORT, "gen_image_model": GEN_IMAGE_MODEL, "gen_image_res": GEN_IMAGE_RES, "gen_image_input": GEN_IMAGE_INPUT, "gen_prompt_model": GEN_PROMPT_MODEL, "gen_prompt_provider": GEN_PROMPT_PROVIDER, "gen_prompt_tools_support": GEN_PROMPT_TOOLS_SUPPORT})
 
 
 def _set_tools_support(slug, ok):
