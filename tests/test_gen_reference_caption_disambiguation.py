@@ -25,7 +25,7 @@ class TestReferenceDisambiguationClean(unittest.TestCase):
 class SourceGateTests(unittest.IsolatedAsyncioTestCase):
     async def test_unverified_source_prompt_builder_preserves_request(self):
         llm = NS(chat=NS(completions=NS(create=Mock(return_value=NS(choices=[NS(message=NS(content='PROMPT: anime character hugging alon\nREFS:\nIDEA: hug\nASPECT: 1:1', tool_calls=[]))])))))
-        with patch.object(bot, 'get_active_model', return_value=(llm, 'fake', 'fake')), patch.object(bot, 'active_model_supports_vision', return_value=False):
+        with patch.object(bot, 'get_gen_planner_model', return_value=(llm, 'fake', 'fake')), patch.object(bot, 'active_model_supports_vision', return_value=False):
             prompt, refs, idea, asp = await bot._build_gen_prompt(
                 'Стикер с фразой «Я Зая но можно просто Зайка»',
                 catalog=[{'idx': 1, 'mid': 11, 'caption': 'Я Зая но можно просто Зайка', 'desc': 'wrong art'}],
@@ -47,7 +47,7 @@ class SourceGateTests(unittest.IsolatedAsyncioTestCase):
         llm = NS(chat=NS(completions=NS(create=create)))
         image = NS(id=77, sender_id=2, raw_text='', date=None, sender=None, download_media=AsyncMock(return_value=b'pixels'))
         catalog = [{'idx': 1, 'mid': 11, 'caption': 'wrong', 'desc': 'wrong'}]
-        with patch.object(bot, 'get_active_model', return_value=(llm, 'fake', 'fake')), \
+        with patch.object(bot, 'get_gen_planner_model', return_value=(llm, 'fake', 'fake')), \
              patch.object(bot, 'active_model_supports_vision', return_value=False), \
              patch.object(bot, 'MODEL_TOOLS_SUPPORT', {}), \
              patch.object(bot, 'GEN_CTX_IMG_MAX', 1), \
