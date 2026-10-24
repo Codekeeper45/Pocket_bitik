@@ -93,7 +93,7 @@ Fields: task_type (creation/edit/series), output_kind (single_image/independent_
 output_count (positive integer files), prompt (scene description), panels_per_image (positive integer or null),
 explicit_text (verbatim strings), refs ([{ref_id: stable source ID, roles: [subject/style/clothing/background/pose/composition/object]}]),
 aspect (null/1:1/9:16/16:9/4:3/3:4), constraints (strings), layers (boolean, default false).
-idea (short human-readable scene caption, not rendering instructions),
+idea (one concise human-readable sentence describing the scene, ideally under 180 characters; never copy the user request or rendering instructions),
 ideas (one distinct human-readable caption per file for multiple outputs).
 Optional: scenes (one distinct scene string per file), participant_count (nonnegative integer).
 Understand the user's meaning and negations; panels are not files. Distinguish independent images from a continuous series.
@@ -101,6 +101,7 @@ Explicit command parameters override your choices. Preserve the scene, exact tex
 Search finds candidates; inspect pixels to confirm observations. Keep captions, observed text and visual descriptions distinct.
 Separate facts from hypotheses; do not invent unreadable text or claim an unverified source is canonical.
 For a named ensemble, establish the actual cast before writing the rendering scene: use chat_list_participants for chat accounts, original source images for show characters, and chat_get_avatar/chat_inspect_image for appearance. An account name or caption alone does not establish a character design. Do not recycle previous generated outputs as evidence of canon.
+For large casts, use chat_get_avatar_sheet in batches to inspect many account avatars within the tool and reference budget. A sheet is identity evidence only, not the requested scene layout; keep cell-to-account mapping and use actual exact names for final captions, not account ID numbers.
 Maintain an explicit per-character mapping in your scene description: exact label, source ref_id or evidenced source message, observed distinguishing anchors, unique action and spatial placement. Keep different characters separate; do not fill requested counts by duplicating names, alternate costumes or unsupported invented identities. If you cannot substantiate the whole cast, state that limitation honestly in idea, while still rendering the best available interpretation. Never describe an approximate crowd as an exact verified roster.
 Preserve exact spelling of each label. A shared reference can contain several characters, but identify which visible character belongs to each name and do not borrow another character's appearance. Use spatial groups to keep labels connected and silhouettes distinct, not a generic instruction to make everyone unique.
 Finish with the available references and an honest interpretation rather than refusing for imperfect sources."""
@@ -282,6 +283,9 @@ def intent_plan_to_dict(plan: IntentPlan) -> dict:
 
 
 def intent_idea(plan: IntentPlan, output_number: int = 1) -> str:
+    # A schema fallback preserves the request for rendering, not as a public caption.
+    if plan.fallback_used and not plan.idea and not plan.ideas:
+        return ''
     if plan.ideas and output_number <= len(plan.ideas):
         return plan.ideas[output_number - 1]
     if plan.idea and plan.output_count == 1:

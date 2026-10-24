@@ -4079,7 +4079,8 @@ async def _build_gen_prompt(user_prompt: str, context_text: str = None, image_de
 
     def _tools_for_gen():
         from gen_participants import tool_schema as participant_tool_schema
-        tools = [participant_tool_schema()]
+        from gen_avatar_sheet import tool_schema as avatar_sheet_schema
+        tools = [participant_tool_schema(), avatar_sheet_schema()]
         for spec in CHAT_TOOLS:
             item = json.loads(json.dumps(spec))
             if item["function"]["name"] == "chat_search":
@@ -4189,6 +4190,13 @@ async def _build_gen_prompt(user_prompt: str, context_text: str = None, image_de
                         result = await discover_participants(client, chat_id,
                             limit=args.get('limit', 100), scan_limit=args.get('scan_limit', 3000),
                             include_ids=include_ids, exclude_ids=exclude_ids)
+                    elif name == "chat_get_avatar_sheet":
+                        from gen_avatar_sheet import fetch_avatar_sheet
+                        from gen_web_references import inspect_image
+                        sheet = await fetch_avatar_sheet(client, chat_id, args.get('users'), next_idx, inspect_image)
+                        working_catalog.append(sheet)
+                        next_idx += 1
+                        result = json.dumps({'reference_alias':'catalog:'+str(sheet['idx']), 'members':sheet['members'], 'unavailable':sheet['unavailable']}, ensure_ascii=False)
                     elif name == "chat_get_avatar":
                         try:
                             from gen_avatar import fetch_avatar
@@ -4290,6 +4298,10 @@ async def _build_gen_prompt(user_prompt: str, context_text: str = None, image_de
     legacy_format = bool(re.search(r'(?im)^\s*PROMPT:', out or ''))
     fallback_refs = tuple({'ref_id': 'catalog:' + str(idx), 'roles': [role]}
                           for idx, role in legacy[1] if role in ('subject', 'style', 'clothing', 'background', 'pose', 'composition', 'object'))
+    from gen_runtime import CURRENT
+    diagnostic_invocation = CURRENT.get()
+    if diagnostic_invocation:
+        diagnostic_invocation.timings['planner_response'] = out or ''
     plan = _gen_prompt.parse_intent_plan(out, user_prompt, edit_mode=edit_mode,
         fallback_prompt=legacy[0] if legacy_format else None,
         fallback_refs=fallback_refs)
@@ -8574,6 +8586,12 @@ def _gen_refs_line(chat_ent, catalog: list, used_idxs: list, reasons: dict = Non
     for k in used_idxs:
         it = by_idx.get(k)
         mid = it.get("mid") if it else None
+        if it and it.get('members'):
+            for member in it['members']:
+                if member.get('profile_url'):
+                    label = member.get('user') or str(member.get('participant_id'))
+                    parts.append(f"[Аватар {label}]({member['profile_url']})")
+            continue
         if it and it.get('profile_url'):
             identity = it.get('participant_id') or it['profile_url'].rsplit('/', 1)[-1]
             parts.append(f"[Аватар {identity}]({it['profile_url']})" + (f": {(reasons or {})[k]}" if (reasons or {}).get(k) else ''))
