@@ -4519,8 +4519,12 @@ def _gen_page_reference_snapshot(inputs, ref_ids, roles):
     references, qa_references = [], []
     invocation = CURRENT.get()
     previous = invocation.timings.get('reference_registry', {}).get('references', []) if invocation else []
-    identities = {alias: ref.get('identity_mapping', []) for ref in previous
-                  for alias in [ref['ref_id'], *ref.get('aliases', [])]}
+    identities = dict(invocation.timings.get('page_identity_registry', {})) if invocation else {}
+    identities.update({alias: ref.get('identity_mapping', []) for ref in previous
+                       for alias in [ref['ref_id'], *ref.get('aliases', [])]
+                       if ref.get('identity_mapping')})
+    if invocation:
+        invocation.timings['page_identity_registry'] = identities
     for index, (encoded, ref_id, role) in enumerate(zip(inputs, ref_ids, roles, strict=True), 1):
         normalized = ['subject', 'style'] if ref_id == 'series:anchor' else [
             part.strip() for part in role.split('+') if part.strip() in REFERENCE_ROLES] or ['subject']

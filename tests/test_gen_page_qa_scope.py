@@ -46,6 +46,21 @@ class PageQAScopeTests(unittest.IsolatedAsyncioTestCase):
         finally:
             CURRENT.reset(token)
 
+    async def test_disjoint_pages_keep_second_identity(self):
+        invocation = Invocation()
+        token = CURRENT.set(invocation)
+        try:
+            inputs, _, _, _ = bot._gen_remap_selected_refs([], [], [
+                {'idx': 1, 'bytes': png('red'), 'members': [{'label': 'first'}]},
+                {'idx': 2, 'bytes': png('blue'), 'members': [{'label': 'second'}]}],
+                [(1, 'subject'), (2, 'subject')])
+            bot._gen_page_reference_snapshot(inputs[:1], ['catalog:1'], ['subject'])
+            bot._gen_page_reference_snapshot(inputs[1:], ['catalog:2'], ['subject'])
+            self.assertEqual(invocation.qa_references[0]['identity_mapping'], [{'label': 'second'}])
+            self.assertEqual(len(invocation.qa_references), 1)
+        finally:
+            CURRENT.reset(token)
+
     async def test_full_ensemble_prompt_reaches_visual_qa(self):
         create = Mock(return_value=response({'findings': []}))
         route = SimpleNamespace(chat=SimpleNamespace(completions=SimpleNamespace(create=create)))
