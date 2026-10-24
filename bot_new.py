@@ -4674,15 +4674,11 @@ _IMAGE_REPAIR_SYSTEM = (
 
 
 def _sync_repair_image_prompt(bad_prompt: str, user_prompt: str) -> str:
-    """Правка отклонённого промпта через активную LLM (Gemini Cliproxy) или DeepSeek."""
-    client, model = None, None
-    if (MODEL_REGISTRY.get(ACTIVE_MODEL) or (None,))[0] == "cliproxy":
-        client, model, _ = get_active_model()
+    """Правка промпта через OpenRouter; прямой DeepSeek здесь не используется."""
+    client = openrouter_client
+    model = OPENROUTER_VISION_MODEL
     if client is None:
-        client, model = deepseek_client, DEEPSEEK_MODEL
-    if client is None:
-        client, model, _ = get_active_model()
-    if client is None:
+        log('GEN', 'Prompt repair unavailable: OpenRouter is not configured')
         return bad_prompt
     try:
         resp = client.chat.completions.create(
