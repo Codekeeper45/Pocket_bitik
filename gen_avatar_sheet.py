@@ -43,5 +43,5 @@ async def fetch_avatar_sheet(client, chat_id, users, idx, inspect_image):
 
 def tool_schema():
     return {'type':'function','function':{'name':'chat_get_avatar_sheet',
-        'description':'Fetch and visually show up to 12 current-chat participant avatars in a labeled contact sheet. Use batches for large casts, with account IDs from chat_list_participants. Each sheet can be one provider reference. Inspect each cell; do not merge identities or reproduce the contact-sheet grid in final artwork.',
-        'parameters':{'type':'object','properties':{'users':{'type':'array','items':{'type':'string'},'minItems':1,'maxItems':12}},'required':['users'],'additionalProperties':False}}}
+        'description':'Fetch up to 120 current-chat participant avatars, automatically divided into labeled sheets of 12. Supply the complete selected roster in one call using account IDs from chat_list_participants. Each sheet is a provider reference. Inspect each cell; preserve identity mappings, not the grid layout.',
+        'parameters':{'type':'object','properties':{'users':{'type':'array','items':{'type':'string'},'minItems':1,'maxItems':120}},'required':['users'],'additionalProperties':False}}}

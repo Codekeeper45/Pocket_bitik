@@ -4134,7 +4134,7 @@ async def _build_gen_prompt(user_prompt: str, context_text: str = None, image_de
         try:
             from gen_runtime import CURRENT
             invocation = CURRENT.get()
-            timeout = min(90, invocation.remaining_seconds()) if invocation else 90
+            timeout = min(180, invocation.remaining_seconds()) if invocation else 180
             if timeout <= 0:
                 break
             kwargs = dict(model=model_id, messages=messages, max_tokens=24000, temperature=0.35, timeout=timeout)
@@ -4218,10 +4218,19 @@ async def _build_gen_prompt(user_prompt: str, context_text: str = None, image_de
                     elif name == "chat_get_avatar_sheet":
                         from gen_avatar_sheet import fetch_avatar_sheet
                         from gen_web_references import inspect_image
-                        sheet = await fetch_avatar_sheet(client, chat_id, args.get('users'), next_idx, inspect_image)
-                        working_catalog.append(sheet)
-                        next_idx += 1
-                        result = json.dumps({'reference_alias':'catalog:'+str(sheet['idx']), 'members':sheet['members'], 'unavailable':sheet['unavailable']}, ensure_ascii=False)
+                        users = args.get('users')
+                        if not isinstance(users, list) or not 1 <= len(users) <= 120:
+                            raise ValueError('provide 1 to 120 participant identifiers')
+                        batches = []
+                        for start in range(0, len(users), 12):
+                            try:
+                                sheet = await fetch_avatar_sheet(client, chat_id, users[start:start+12], next_idx, inspect_image)
+                                working_catalog.append(sheet)
+                                next_idx += 1
+                                batches.append({'reference_alias':'catalog:'+str(sheet['idx']), 'members':sheet['members'], 'unavailable':sheet['unavailable']})
+                            except Exception as exc:
+                                batches.append({'unavailable_users':users[start:start+12], 'error':type(exc).__name__})
+                        result = json.dumps({'sheets': batches}, ensure_ascii=False)
                     elif name == "chat_get_avatar":
                         try:
                             from gen_avatar import fetch_avatar
