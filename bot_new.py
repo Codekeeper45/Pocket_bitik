@@ -8763,7 +8763,7 @@ async def _gen_visual_qa_impl(raw: bytes, user_prompt: str, final_prompt: str, _
         'Флауэри is not an acceptable substitute unless the user requested it.'
     )
     request = (f"Исходный запрос пользователя / требования текущего изображения:\\n{user_prompt}\\n\\n"
-               f"Промпт генерации:\\n{final_prompt[:5000]}\\n\\n{_GEN_VISUAL_QA_PROMPT}\\n\\n{literal_text_rule}")
+               f"Промпт генерации:\\n{final_prompt}\\n\\n{_GEN_VISUAL_QA_PROMPT}\\n\\n{literal_text_rule}")
     try:
         import base64
         from gen_provider import validate_image

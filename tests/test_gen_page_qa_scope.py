@@ -32,6 +32,19 @@ class PageQAScopeTests(unittest.IsolatedAsyncioTestCase):
     setUp = command_tests.GenCommandE2ETests.setUp
     _stop_patches = command_tests.GenCommandE2ETests._stop_patches
 
+    async def test_full_ensemble_prompt_reaches_visual_qa(self):
+        create = Mock(return_value=response({'findings': []}))
+        route = SimpleNamespace(chat=SimpleNamespace(completions=SimpleNamespace(create=create)))
+        invocation = Invocation(qa_route=(route, 'offline-vision'))
+        prompt = 'Source mappings and poses. ' * 300 + 'LAST_IDENTITY_SOURCE_ANCHOR'
+        token = CURRENT.set(invocation)
+        try:
+            await bot._gen_visual_qa_impl(png('blue'), 'Check all participants', prompt)
+        finally:
+            CURRENT.reset(token)
+        payload = create.call_args.kwargs['messages'][0]['content'][0]['text']
+        self.assertIn(prompt, payload)
+
     async def test_initial_and_resumed_series_send_page_local_qa_with_global_constraints(self):
         source = ('Два отдельных файла: первый — чаепитие; второй — шахматы. '
                   'На обоих подписи "Flowery" и "Ториэль"; Flowery носит красный шарф. '
