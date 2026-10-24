@@ -23,7 +23,10 @@ async def fetch_avatar(client, chat_id, target, idx, inspect_image):
     blob, mime, width, height = inspect_image(raw)
     username = getattr(entity, 'username', None)
     url = 'https://t.me/' + username if username else 'tg://user?id=' + str(entity.id)
-    return {'idx': idx, 'bytes': blob, 'thumb': blob, 'mime': mime,
+    display_name = ' '.join(str(x) for x in (getattr(entity, 'first_name', ''), getattr(entity, 'last_name', '')) if x).strip()
+    label = username or display_name or None
+    return {'username': username, 'display_name': display_name, 'label': label,
+            'idx': idx, 'bytes': blob, 'thumb': blob, 'mime': mime,
             'caption': 'Current participant avatar ' + target,
             'provenance': 'profile_avatar', 'profile_url': url,
             'participant_id': entity.id, 'avatar_photo_id': photo_id, 'avatar_kind': 'current_main',

@@ -3954,7 +3954,7 @@ def _gen_catalog_ref_label(it: dict, include_missing_desc: bool = True) -> str:
 
     fields = []
     if it.get('members'):
-        fields.append('avatar_cells (numeric image labels -> exact account identifiers): ' +
+        fields.append('avatar_cells (CELL -> identity; use label for visible names, never participant_id or CELL; null label means unresolved): ' +
                       json.dumps(it['members'], ensure_ascii=False))
     if it.get('web_ref'):
         fields.append('web_provenance (unverified): ' + json.dumps({key: it.get(key) for key in
@@ -8632,7 +8632,10 @@ def _gen_refs_line(chat_ent, catalog: list, used_idxs: list, reasons: dict = Non
         if it and it.get('members'):
             for member in it['members']:
                 if member.get('profile_url'):
-                    label = member.get('user') or str(member.get('participant_id'))
+                    label = member.get('label') or member.get('username') or member.get('display_name')
+                    if not label:
+                        candidate = str(member.get('user') or '')
+                        label = candidate if candidate and not candidate.lstrip('-').isdigit() else 'участника'
                     parts.append(f"[Аватар {label}]({member['profile_url']})")
             continue
         if it and it.get('profile_url'):

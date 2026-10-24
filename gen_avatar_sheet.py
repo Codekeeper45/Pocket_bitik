@@ -30,8 +30,10 @@ async def fetch_avatar_sheet(client, chat_id, users, idx, inspect_image):
         image = ImageOps.contain(image, (306, 306))
         sheet.paste(image, (x+(320-image.width)//2, y+(306-image.height)//2))
         # Numeric labels avoid transliteration/truncation of names; mapping below is exact.
-        draw.text((x+10, y+315), str(item['participant_id']), fill='black')
-        members.append({'cell': position+1, 'user': user, 'participant_id': item['participant_id'],
+        draw.text((x+10, y+315), 'CELL '+str(position+1), fill='black')
+        members.append({'cell': position+1, 'user': user, 'label': item.get('label'),
+            'username': item.get('username'), 'display_name': item.get('display_name'),
+            'participant_id': item['participant_id'],
             'profile_url': item['profile_url'], 'avatar_photo_id': item['avatar_photo_id']})
     output = BytesIO(); sheet.save(output, format='PNG')
     return {'idx': idx, 'bytes': output.getvalue(), 'thumb': output.getvalue(), 'mime': 'image/png',
