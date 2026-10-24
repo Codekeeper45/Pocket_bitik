@@ -292,7 +292,7 @@ def intent_idea(plan: IntentPlan, output_number: int = 1) -> str:
         return plan.idea
     if plan.scenes and output_number <= len(plan.scenes):
         return plan.scenes[output_number - 1]
-    return plan.idea or plan.prompt
+    return plan.idea or ''
 
 
 def intent_instructions(plan: IntentPlan) -> str:
