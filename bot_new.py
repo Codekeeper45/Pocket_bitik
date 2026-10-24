@@ -17100,7 +17100,11 @@ async def _gen_rerank_index_items(prompt: str, items: list, limit: int) -> list:
         lines.append(line)
     req = (
         "Выбери лучшие визуальные референсы для генерации изображения. "
-        "Оцени именно то, что видно на фото, а не лорный/контекстный смысл. "
+        "Ты видишь только сохранённые описания, не сами пиксели: это предварительный отбор кандидатов, не подтверждение личности или канона. "
+        "Приоритет у источников, где явно описаны запрошенные персонажи и их отличительные черты. "
+        "Красивый интерьер или похожее настроение не заменяют референс внешности героя. "
+        "Сохраняй покрытие разных запрошенных героев вместо нескольких почти одинаковых картинок одного героя. "
+        "Не считай подпись доказательством внешности: реальные пиксели будут проверены отдельно. "
         f"Запрос пользователя: {prompt}\n\nКандидаты:\n" + "\n".join(lines) +
         f"\n\nВерни JSON строго вида {{\"ids\":[msg_id,...]}}: до {limit} msg_id, только подходящие визуально. "
         "Если подходящих нет, верни пустой список."
@@ -17327,9 +17331,17 @@ async def _gen_agentic_enrich(chat_id: int, user_prompt: str, seed_names: list, 
                 {"role": "user", "content": f"Запрос генерации: {user_prompt}"}]
     try:
         for _it in range(GEN_AGENTIC_MAX_ITERS):
-            resp = await asyncio.to_thread(
+            from gen_runtime import CURRENT
+            invocation = CURRENT.get()
+            # Preparation is optional: reserve time for planning, rendering and delivery.
+            remaining = invocation.remaining_seconds() if invocation else 900
+            timeout = min(60, max(0, remaining - 300))
+            if timeout <= 0:
+                break
+            resp = await asyncio.wait_for(asyncio.to_thread(
                 llm.chat.completions.create, model=model_id, messages=messages,
-                max_tokens=1500, temperature=0.3, tools=GEN_AGENTIC_TOOLS, tool_choice="auto")
+                max_tokens=1500, temperature=0.3, tools=GEN_AGENTIC_TOOLS, tool_choice="auto",
+                timeout=timeout), timeout=timeout)
             msg = resp.choices[0].message
             if not getattr(msg, "tool_calls", None):
                 break
