@@ -6258,6 +6258,16 @@ async def _run_chat_ant_search(chat_id, args: dict, msg_by_id: dict = None, incl
         return "Ошибка: поисковый запрос не может быть пустым."
 
     limit = max(15, min(int(args.get("limit") or 300), 1200))
+    historical = []
+    historical_desc = {}
+    try:
+        hits = await asyncio.wait_for(_index_media_hybrid_hits(chat_id, query, 32, for_gen=True), timeout=25)
+        mids = [int(h.get('msg_id') or h.get('key')) for h in hits if h.get('msg_id') or h.get('key')]
+        historical_desc = {int(h.get('msg_id') or h.get('key')): str(h.get('visual_description') or h.get('image_description') or '')[:600] for h in hits if h.get('msg_id') or h.get('key')}
+        if mids:
+            historical = [m for m in await client.get_messages(chat_id, ids=mids) if m]
+    except Exception as exc:
+        log('ASK', 'Jev historical candidate retrieval unavailable: ' + type(exc).__name__)
     messages = []
     try:
         async for m in client.iter_messages(chat_id, limit=limit):
@@ -6275,6 +6285,13 @@ async def _run_chat_ant_search(chat_id, args: dict, msg_by_id: dict = None, incl
         log("ASK", f"chat_ant_search сбор сообщений не удался: {e}")
         return f"Ошибка при сборе сообщений чата: {e}"
 
+    seen = {m.id for m in messages}
+    for m in historical:
+        sid = getattr(m, 'sender_id', None)
+        if m.id in seen or (include_ids and sid not in include_ids) or (exclude_ids and sid in exclude_ids):
+            continue
+        messages.append(m); seen.add(m.id)
+        if msg_by_id is not None: msg_by_id[m.id] = m
     if not messages:
         return "В заданной глубине истории чата сообщений не найдено."
 
@@ -6299,8 +6316,10 @@ async def _run_chat_ant_search(chat_id, args: dict, msg_by_id: dict = None, incl
             for m in ch:
                 sender = _label_for(m, getattr(m, "sender", None))
                 txt = (m.raw_text or "").replace("\n", " ").strip()
+                if historical_desc.get(m.id):
+                    txt += '[indexed visual description, unverified candidate]: ' + historical_desc[m.id]
                 if txt:
-                    snippets.append(f"#{m.id} {sender}: {txt[:400]}")
+                    snippets.append(f"#{m.id} {sender}: {txt[:1000]}")
                 elif m.photo:
                     snippets.append(f"{sender}: [Фото]")
                 elif m.document:
