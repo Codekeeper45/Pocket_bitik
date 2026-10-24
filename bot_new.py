@@ -3378,15 +3378,18 @@ def _sync_generate_image(prompt: str, input_images_b64: list = None, model: str 
         raise GenTransient('CLIProxy Gemini returned no image')
 
     if target_model == 'gpt-image-2':
+        from gen_provider import gateway_dimensions
+        width, height = gateway_dimensions(aspect_ratio)
+        size = f'{width}x{height}'
         headers = {'Authorization': 'Bearer ' + cliproxy_api_key}
         if input_images_b64:
             import io
             files = [('image', ('ref%d.png' % i, io.BytesIO(base64.b64decode(image.split(',', 1)[-1])), 'image/png')) for i, image in enumerate(input_images_b64)]
             response = requests.post(CLIPROXY_BASE_URL.rstrip('/') + '/images/edits', headers=headers,
-                data={'model': target_model, 'prompt': target_prompt, 'size': '1024x1024', 'n': '1'}, files=files, timeout=(20, 600))
+                data={'model': target_model, 'prompt': target_prompt, 'size': size, 'n': '1'}, files=files, timeout=(20, 600))
         else:
             response = requests.post(CLIPROXY_BASE_URL.rstrip('/') + '/images/generations', headers=headers,
-                json={'model': target_model, 'prompt': target_prompt, 'size': '1024x1024', 'n': 1}, timeout=(20, 600))
+                json={'model': target_model, 'prompt': target_prompt, 'size': size, 'n': 1}, timeout=(20, 600))
         response.raise_for_status()
         row = response.json()['data'][0]
         if row.get('b64_json'):
@@ -16954,6 +16957,25 @@ async def _index_media_hybrid_hits(chat_id: int, query: str, count: int, for_gen
             log('GEN', f'Visual lexical supplemental candidates: {len(lexical)}')
         except Exception as exc:
             log('GEN', 'Visual lexical unavailable: ' + type(exc).__name__)
+    if for_gen:
+        # Quoted text may refer to a caption OR requested lettering. Retrieve
+        # exact caption matches as candidates only; pixel inspection decides identity.
+        from gen_visual_search import extract_query
+        for phrase in extract_query(query)['caption_candidates'][:4]:
+            if len(phrase) < 6:
+                continue
+            try:
+                rows = await db_read(
+                    'SELECT m.msg_id, m.txt, a.visual_description, a.image_description FROM messages m '
+                    'JOIN media_assets a ON a.chat_id=m.chat_id AND a.msg_id=m.msg_id '
+                    'WHERE m.chat_id=%s AND m.txt LIKE %s ORDER BY m.msg_id DESC LIMIT 12',
+                    (chat_id, '%' + phrase.replace('%', r'\%').replace('_', r'\_') + '%'))
+                for row in rows or []:
+                    mid = row['msg_id']
+                    item = combined.setdefault(mid, dict(row, key=mid))
+                    item.update(caption_match=True, message_caption=row.get('txt'), score=max(item.get('score', 0), 1.01))
+            except Exception as exc:
+                log('GEN', 'Caption candidates unavailable: ' + type(exc).__name__)
     return sorted(combined.values(), key=lambda h: h.get("score", 0), reverse=True)[:count]
 
 
