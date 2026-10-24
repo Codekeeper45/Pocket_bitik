@@ -6559,7 +6559,7 @@ async def _run_chat_inspect_image(chat_id, args: dict, msg_by_id: dict = None) -
     if not desc:
         desc = await describe_image(img_bytes, caption="" if args.get('pixels_only') else (m.raw_text or ""), detail="high", prompt=prompt)
 
-    if desc and desc != "[изображение]":
+    if desc and desc != "[изображение]" and not desc.startswith("[visual_unavailable:"):
         MEDIA_CACHE[ckey] = desc
         save_media_cache()
         return f"📷 Визуальный анализ фото из #{mid} ({_fmt_date(m.date)}):\n{desc}"
