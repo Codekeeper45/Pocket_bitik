@@ -4254,7 +4254,10 @@ async def _build_gen_prompt(user_prompt: str, context_text: str = None, image_de
                                 log("GEN", f"Осмотр референса из чата #{mid}: не удалось добавить фото ({e})")
                 except Exception as exc:
                     result = "Tool unavailable: " + type(exc).__name__ + ". Choose another source or continue with the original request."
-                messages.append({"role": "tool", "tool_call_id": tc.id, "content": (result or "")[:5000]})
+                # The bounded participant manifest is structured JSON: clipping it silently
+                # loses identities and produces invalid JSON for large ensemble planning.
+                tool_content = (result or '') if name == 'chat_list_participants' else (result or '')[:5000]
+                messages.append({"role": "tool", "tool_call_id": tc.id, "content": tool_content})
                 log("GEN", f"Инструмент {name} (chat={chat_id}) → {len(result or '')} симв")
             # refresh the prompt user turn with discovered candidates (tool results remain in their proper role order)
             new_candidates = [it for it in working_catalog if it.get("idx") not in shown_ids]
