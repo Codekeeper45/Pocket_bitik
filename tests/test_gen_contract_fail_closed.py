@@ -9,7 +9,7 @@ class ContractFailures(unittest.IsolatedAsyncioTestCase):
   create=Mock(return_value=response)
   llm=SimpleNamespace(chat=SimpleNamespace(completions=SimpleNamespace(create=create)))
   from gen_prompt import ContractError
-  with patch.object(bot,'get_active_model',return_value=(llm,'offline-model','test')),patch.object(bot,'active_model_supports_vision',return_value=False),patch.object(bot,'MODEL_TOOLS_SUPPORT',{bot.ACTIVE_MODEL:False}):
+  with patch.object(bot,'get_gen_planner_model',return_value=(llm,'offline-model','test')),patch.object(bot,'active_model_supports_vision',return_value=False),patch.object(bot,'MODEL_TOOLS_SUPPORT',{bot.ACTIVE_MODEL:False}):
    result=await bot._build_gen_prompt('Preserve Mira and exact text "OPEN"',catalog=[])
   self.assertIn('Preserve Mira and exact text "OPEN"',result[0])
   self.assertIn('Original user request (verbatim):',result[0])

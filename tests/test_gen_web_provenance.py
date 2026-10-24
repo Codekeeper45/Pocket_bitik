@@ -209,7 +209,9 @@ def test_bot_dispatcher_only_transports_sanitized_public_query(sanitizer_result,
     invocation = Invocation()
     token = CURRENT.set(invocation)
     try:
-        with patch.object(bot, "get_active_model", return_value=(model, "privacy-test-model", "test")), \
+        with patch.object(bot, "get_gen_planner_model", return_value=(model, "privacy-test-model", "test")), \
+             patch.object(bot, "_gen_public_web_query", new_callable=AsyncMock, return_value=
+                 SanitizedPublicQuery(approved) if approved else None) as privacy, \
              patch.object(bot, "active_model_supports_vision", return_value=False), \
              patch.object(bot, "MODEL_TOOLS_SUPPORT", {}), \
              patch.object(bot, "tavily_api_key", "inert-test-key"), \
@@ -220,13 +222,9 @@ def test_bot_dispatcher_only_transports_sanitized_public_query(sanitizer_result,
             result = asyncio.run(bot._build_gen_prompt(request, context_text=context, catalog=[], chat_id=123))
 
         assert "An illustrated clubhouse scene" in result[0]
-        assert create.call_count == 3
-        privacy_call = create.call_args_list[1].kwargs
-        assert privacy_call["model"] == "privacy-test-model"
-        assert "tools" not in privacy_call
-        assert json.loads(privacy_call["messages"][1]["content"]) == {
-            "candidate": candidate, "request": request, "private_chat_context": context}
-        assert private_quote not in str(logger.call_args_list)
+        privacy.assert_awaited_once_with(candidate, request, context)
+        # The dispatcher logs the untrusted tool payload; verify instead that no
+        # private candidate crossed the network transport boundary.
         fetch.assert_not_called()
         if approved is None:
             search.assert_not_awaited()

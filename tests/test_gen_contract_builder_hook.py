@@ -19,7 +19,7 @@ class BuilderContractHookTests(unittest.IsolatedAsyncioTestCase):
         invocation = Invocation()
         token = CURRENT.set(invocation)
         try:
-            with patch.object(bot, 'get_active_model', return_value=(llm, 'model-x', 'test')), \
+            with patch.object(bot, 'get_gen_planner_model', return_value=(llm, 'model-x', 'test')), \
                  patch.object(bot, 'active_model_supports_vision', return_value=False), \
                  patch.object(bot, 'MODEL_TOOLS_SUPPORT', {bot.ACTIVE_MODEL: False}):
                 result = await bot._build_gen_prompt('Mira and exact text "OPEN LATE"', catalog=[])
