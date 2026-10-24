@@ -3933,6 +3933,9 @@ def _gen_catalog_ref_label(it: dict, include_missing_desc: bool = True) -> str:
         head += " (" + ", ".join(meta) + ")"
 
     fields = []
+    if it.get('members'):
+        fields.append('avatar_cells (numeric image labels -> exact account identifiers): ' +
+                      json.dumps(it['members'], ensure_ascii=False))
     if it.get('web_ref'):
         fields.append('web_provenance (unverified): ' + json.dumps({key: it.get(key) for key in
             ('image_url', 'source_page_url', 'title', 'author')}, ensure_ascii=False))
