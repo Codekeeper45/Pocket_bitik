@@ -4474,11 +4474,19 @@ def _gen_remap_selected_refs(input_b64s: list, input_roles: list, catalog: list,
         submitted_sources = invocation.timings.get('submitted_reference_sources', {})
         for reference, metadata in zip(packed.refs, manifest):
             metadata['source_links'] = submitted_sources.get(reference.digest, [])
+            source_item = next((item for idx, item in by_idx.items()
+                                if 'catalog:' + str(idx) in metadata.get('aliases', ())), None)
+            if source_item:
+                metadata['identity_mapping'] = source_item.get('members') or ([{
+                    'label': source_item.get('label'), 'participant_id': source_item.get('participant_id')
+                }] if source_item.get('participant_id') else [])
         invocation.timings['reference_registry'] = {'references': manifest,
             'input_count': len(out), 'input_bytes': sum(len(ref.data) for ref in packed.refs),
             'status': packed.status, 'issues': issues + [asdict(issue) for issue in packed.issues],
             'missing_required': list(packed.required_missing)}
-        invocation.qa_references = [{'ref_id': ref.ref_id, 'roles': list(ref.roles), 'data': ref.data} for ref in packed.refs]
+        invocation.qa_references = [{'ref_id': ref.ref_id, 'roles': list(ref.roles), 'data': ref.data,
+                                    'identity_mapping': meta.get('identity_mapping', [])}
+                                   for ref, meta in zip(packed.refs, manifest)]
     if issues or packed.issues:
         log('GEN', 'Reference packing used a compact fallback; unavailable sources recorded without blocking rendering')
     return out, roles, list(candidate_to_actual), candidate_to_actual
@@ -4496,7 +4504,7 @@ def _gen_actual_role_instruction(roles: list, registry: dict = None) -> str:
                    + '. Use available evidence and an honest interpretation; do not claim these sources were attached or canonically verified.') if issues else ''
     if not roles:
         return unavailable
-    mapping = [{'ref_id': ref['ref_id'], 'aliases': ref['aliases'], 'api_index': ref['api_index'], 'roles': ref['roles']} for ref in references]
+    mapping = [{'ref_id': ref['ref_id'], 'aliases': ref['aliases'], 'api_index': ref['api_index'], 'roles': ref['roles'], 'identity_mapping': ref.get('identity_mapping', [])} for ref in references]
     return ("Reference roles in the actual input order (1-based). Follow the requested role only:\n"
             + "\n".join(f"Image #{i}: {role}" for i, role in roles)
             + ('\nStable source to API attachment mapping: ' + json.dumps(mapping, ensure_ascii=False) if mapping else '') + unavailable)
@@ -4507,12 +4515,19 @@ def _gen_page_reference_snapshot(inputs, ref_ids, roles):
     from gen_references import REFERENCE_ROLES
     from gen_runtime import CURRENT
     references, qa_references = [], []
+    invocation = CURRENT.get()
+    previous = invocation.timings.get('reference_registry', {}).get('references', []) if invocation else []
+    identities = {alias: ref.get('identity_mapping', []) for ref in previous
+                  for alias in [ref['ref_id'], *ref.get('aliases', [])]}
     for index, (encoded, ref_id, role) in enumerate(zip(inputs, ref_ids, roles, strict=True), 1):
         normalized = ['subject', 'style'] if ref_id == 'series:anchor' else [
             part.strip() for part in role.split('+') if part.strip() in REFERENCE_ROLES] or ['subject']
         data = base64.b64decode(encoded, validate=True)
         references.append({'ref_id': ref_id, 'aliases': [], 'api_index': index, 'roles': normalized})
         qa_references.append({'ref_id': ref_id, 'roles': normalized, 'data': data})
+        if identities.get(ref_id):
+            references[-1]['identity_mapping'] = identities[ref_id]
+            qa_references[-1]['identity_mapping'] = identities[ref_id]
     invocation = CURRENT.get()
     if invocation:
         invocation.qa_references = qa_references
@@ -8776,7 +8791,7 @@ async def _gen_visual_qa_impl(raw: bytes, user_prompt: str, final_prompt: str, _
             if not set(reference.get('roles', ())) & {'subject', 'style'}:
                 continue
             source = validate_image(reference['data'])
-            content.extend([{'type': 'text', 'text': 'REFERENCE (untrusted pixels): ' + json.dumps({key: reference[key] for key in ('ref_id', 'roles')})},
+            content.extend([{'type': 'text', 'text': 'REFERENCE (untrusted pixels): ' + json.dumps({key: reference[key] for key in ('ref_id', 'roles', 'identity_mapping') if key in reference}, ensure_ascii=False)},
                 {'type': 'image_url', 'image_url': {'url': f'data:{source.mime_type};base64,' + base64.b64encode(source.data).decode(), 'detail': 'high'}}])
         timeout = min(90, invocation.remaining_seconds()) if invocation else 90
         if timeout <= 0:

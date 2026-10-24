@@ -32,6 +32,20 @@ class PageQAScopeTests(unittest.IsolatedAsyncioTestCase):
     setUp = command_tests.GenCommandE2ETests.setUp
     _stop_patches = command_tests.GenCommandE2ETests._stop_patches
 
+    async def test_identity_cells_survive_packing_and_page_qa(self):
+        members = [{'cell': 3, 'label': 'triXXXie'}, {'cell': 7, 'label': 'Melony'}]
+        invocation = Invocation()
+        token = CURRENT.set(invocation)
+        try:
+            inputs, roles, _, _ = bot._gen_remap_selected_refs([], [],
+                [{'idx': 14, 'bytes': png('red'), 'members': members}], [(14, 'subject')])
+            self.assertEqual(invocation.qa_references[0]['identity_mapping'], members)
+            self.assertIn('Melony', bot._gen_actual_role_instruction(roles))
+            bot._gen_page_reference_snapshot(inputs, ['catalog:14'], ['subject'])
+            self.assertEqual(invocation.qa_references[0]['identity_mapping'], members)
+        finally:
+            CURRENT.reset(token)
+
     async def test_full_ensemble_prompt_reaches_visual_qa(self):
         create = Mock(return_value=response({'findings': []}))
         route = SimpleNamespace(chat=SimpleNamespace(completions=SimpleNamespace(create=create)))
