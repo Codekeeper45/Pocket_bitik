@@ -4117,7 +4117,16 @@ async def _build_gen_prompt(user_prompt: str, context_text: str = None, image_de
     def _tools_for_gen():
         from gen_participants import tool_schema as participant_tool_schema
         from gen_avatar_sheet import tool_schema as avatar_sheet_schema
-        tools = [participant_tool_schema(), avatar_sheet_schema()]
+        tools = [participant_tool_schema(), avatar_sheet_schema(), {
+            "type": "function", "function": {
+                "name": "chat_find_image",
+                "description": "Search images in the current chat's indexed media memory for a specific visual or remembered detail. Call this only when more image candidates are useful; it is optional, and you may call it again with a narrower/decomposed query if the first pool misses. Results are retrieval candidates, not verified evidence: inspect the selected candidate's image before relying on its contents. Message caption is separate from visual_desc and does not prove what is depicted.",
+                "parameters": {"type": "object", "properties": {
+                    "query": {"type": "string", "description": "A concise visual, text-on-image, or remembered-detail query; retry with a focused sub-query when needed."},
+                    "limit": {"type": "integer", "minimum": 1, "maximum": 12, "description": "Maximum candidate images to add (default 6)."}
+                }, "required": ["query"]}
+            }
+        }]
         for spec in CHAT_TOOLS:
             item = json.loads(json.dumps(spec))
             if item["function"]["name"] == "chat_search":
@@ -4267,7 +4276,7 @@ async def _build_gen_prompt(user_prompt: str, context_text: str = None, image_de
                             except Exception:
                                 continue
                         result = "Selected web refs: " + ", ".join(f"#{i} as {r}" for i, r in web_refs_selected) if web_refs_selected else "No valid fetched web refs selected."
-                    elif name not in {"chat_search", "chat_ant_search", "chat_read_context", "chat_inspect_image"}:
+                    elif name not in {"chat_search", "chat_ant_search", "chat_read_context", "chat_inspect_image", "chat_find_image"}:
                         result = "Неизвестный инструмент."
                     elif not chat_id:
                         result = "Ошибка: нет текущего чата."
@@ -4277,6 +4286,39 @@ async def _build_gen_prompt(user_prompt: str, context_text: str = None, image_de
                         result = await _run_chat_ant_search(chat_id, args, msg_by_id, include_ids, exclude_ids)
                     elif name == "chat_read_context":
                         result = await _run_chat_read_context(chat_id, args, msg_by_id, include_ids, exclude_ids)
+                    elif name == "chat_find_image":
+                        query = str(args.get("query") or "").strip()
+                        if not query:
+                            result = "Provide a non-empty query. You may retry with a narrower or decomposed query."
+                        else:
+                            try:
+                                limit = max(1, min(12, int(args.get("limit", 6))))
+                            except (TypeError, ValueError):
+                                limit = 6
+                            hits = await _index_media_hybrid_hits(chat_id, query, 32, for_gen=True)
+                            items = await _gen_fetch_ref_items(chat_id, hits, exclude_mids=used_ids,
+                                                               rerank_prompt=query, limit=limit) if hits else []
+                            added = []
+                            for item in items:
+                                mid = item.get("mid")
+                                if not mid or mid in used_ids:
+                                    continue
+                                item["idx"] = next_idx
+                                item["from_tool"] = True
+                                item["from_index"] = True
+                                item["chat"] = chat_id
+                                item.setdefault("provenance", "unknown")
+                                # Create the same stable reference identity used by the catalog serializer.
+                                _compose([item], delta=True)
+                                working_catalog.append(item)
+                                used_ids.add(mid)
+                                added.append({"ref_id": item.get("ref_id"), "alias": "catalog:" + str(next_idx),
+                                              "mid": mid, "caption": item.get("caption") or "",
+                                              "visual_desc": item.get("visual_desc") or item.get("desc") or ""})
+                                next_idx += 1
+                            result = json.dumps({"status": "candidates_retrieved", "query": query,
+                                "candidates": added,
+                                "note": "Candidates are unverified retrieval results. Inspect the chosen image; caption is post text, not image evidence."}, ensure_ascii=False)
                     else:
                         try:
                             mid = int(args.get("message_id") or 0)
