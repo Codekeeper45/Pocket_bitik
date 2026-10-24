@@ -6431,6 +6431,26 @@ async def _run_chat_read_context(chat_id, args: dict, msg_by_id: dict = None, in
         return f"Ошибка при чтении переписки вокруг #{mid}: {e}"
 
     all_msgs = list(reversed(before_msgs)) + ([target_msg] if target_msg else []) + after_msgs
+    # A reply can arrive far outside the numeric neighborhood. Preserve actual
+    # thread edges so rare uncaptioned media can be discovered without guessing.
+    linked_ids = set()
+    parent_id = (getattr(target_msg, 'reply_to_msg_id', None) or
+                 getattr(getattr(target_msg, 'reply_to', None), 'reply_to_msg_id', None))
+    if parent_id: linked_ids.add(int(parent_id))
+    try:
+        rows = await asyncio.wait_for(db_read(
+            'SELECT msg_id FROM messages WHERE chat_id=%s AND reply_to_id=%s ORDER BY msg_id LIMIT 20',
+            (chat_id, mid)), timeout=10)
+        linked_ids.update(int(row['msg_id']) for row in rows)
+    except Exception as exc:
+        log('ASK', 'Reply-thread index unavailable: ' + type(exc).__name__)
+    linked_ids.difference_update(m.id for m in all_msgs if m)
+    if linked_ids:
+        try:
+            linked = await client.get_messages(chat_id, ids=sorted(linked_ids))
+            all_msgs.extend(m for m in linked if m)
+        except Exception as exc:
+            log('ASK', 'Reply-thread fetch unavailable: ' + type(exc).__name__)
     include_ids, exclude_ids = set(include_ids or ()), set(exclude_ids or ())
     if include_ids or exclude_ids:
         all_msgs = [m for m in all_msgs if (not include_ids or getattr(m, "sender_id", None) in include_ids)
