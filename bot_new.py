@@ -2281,18 +2281,18 @@ GEN_IMAGE_MODEL = _model_state.get("gen_image_model") or OPENROUTER_IMAGE_MODEL
 GEN_IMAGE_RES = _model_state.get("gen_image_res") or []  # поддерживаемые разрешения выбранной модели (для клампа); [] → без клампа
 GEN_IMAGE_INPUT = bool(_model_state.get("gen_image_input", True))  # принимает ли ген-модель картинки на вход (реф/правка); дефолт gpt-image-2 — да
 # Независимая текстовая модель промптера /gen; provider route, не затрагивает ACTIVE_MODEL (/ask).
-GEN_PROMPT_MODEL = _model_state.get("gen_prompt_model") or "deepseek/deepseek-v4.1-flash-1017"
-GEN_PROMPT_PROVIDER = "openrouter"
-GEN_PROMPT_LABEL = "DeepSeek V4.1 Flash (OpenRouter)"
+GEN_PROMPT_MODEL = _model_state.get("gen_prompt_model") or "gemini-3.8-flash"
+GEN_PROMPT_PROVIDER = _model_state.get("gen_prompt_provider", "cliproxy")
+GEN_PROMPT_LABEL = "Gemini 3.8 Flash (CLIProxy)" if GEN_PROMPT_PROVIDER == "cliproxy" else GEN_PROMPT_MODEL
 
 
 def get_gen_prompt_model():
-    return openrouter_client, GEN_PROMPT_MODEL, GEN_PROMPT_LABEL
+    return (cliproxy_client if GEN_PROMPT_PROVIDER == "cliproxy" else openrouter_client), GEN_PROMPT_MODEL, GEN_PROMPT_LABEL
 
 
 def get_gen_planner_model():
     """Текстовый планировщик/поиск /gen: следует независимо выбранной genprompt модели."""
-    return openrouter_client, GEN_PROMPT_MODEL, GEN_PROMPT_LABEL
+    return (cliproxy_client if GEN_PROMPT_PROVIDER == "cliproxy" else openrouter_client), GEN_PROMPT_MODEL, GEN_PROMPT_LABEL
 
 
 GEN_PROMPT_TOOLS_SUPPORT = _model_state.get("gen_prompt_tools_support", {})
@@ -3376,6 +3376,25 @@ def _sync_generate_image(prompt: str, input_images_b64: list = None, model: str 
                 header, encoded = url.split(',', 1)
                 return base64.b64decode(encoded), header[5:].split(';')[0]
         raise GenTransient('CLIProxy Gemini returned no image')
+
+    if target_model == 'gpt-image-2':
+        headers = {'Authorization': 'Bearer ' + cliproxy_api_key}
+        if input_images_b64:
+            import io
+            files = [('image', ('ref%d.png' % i, io.BytesIO(base64.b64decode(image.split(',', 1)[-1])), 'image/png')) for i, image in enumerate(input_images_b64)]
+            response = requests.post(CLIPROXY_BASE_URL.rstrip('/') + '/images/edits', headers=headers,
+                data={'model': target_model, 'prompt': target_prompt, 'size': '1024x1024', 'n': '1'}, files=files, timeout=(20, 600))
+        else:
+            response = requests.post(CLIPROXY_BASE_URL.rstrip('/') + '/images/generations', headers=headers,
+                json={'model': target_model, 'prompt': target_prompt, 'size': '1024x1024', 'n': 1}, timeout=(20, 600))
+        response.raise_for_status()
+        row = response.json()['data'][0]
+        if row.get('b64_json'):
+            return base64.b64decode(row['b64_json']), 'image/png'
+        if row.get('url'):
+            fetched = requests.get(row['url'], timeout=60); fetched.raise_for_status()
+            return fetched.content, fetched.headers.get('Content-Type', 'image/png')
+        raise GenTransient('CLIProxy GPT Image 2 returned no image')
 
     # Маршрутизация на наш собственный шлюз chatgpt2api
     if "gpt-image-2.5" in target_model or "chatgpt2api" in target_model or (CHATGPT2API_AUTH_KEY and target_model.startswith("gpt-image-")):
