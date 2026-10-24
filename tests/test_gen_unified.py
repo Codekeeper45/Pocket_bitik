@@ -342,9 +342,10 @@ class TestMockedToolLoop(unittest.IsolatedAsyncioTestCase):
             return response(tool_msg if calls[0] == 1 else final_msg)
         llm = SimpleNamespace(chat=SimpleNamespace(completions=SimpleNamespace(create=create)))
         catalog = []
-        with patch.object(bot, "active_model_supports_vision", return_value=False), \
-             patch.object(bot, "get_active_model", return_value=(llm, "test-model", "test")), \
-             patch.object(bot, "MODEL_TOOLS_SUPPORT", {}), \
+        with patch.object(bot, "_model_supports_vision", return_value=False), \
+             patch.object(bot, "GEN_PROMPT_MODEL", "test-model"), \
+             patch.object(bot, "get_gen_planner_model", return_value=(llm, "test-model", "test")), \
+             patch.object(bot, "GEN_PROMPT_TOOLS_SUPPORT", {}), \
              patch.object(bot, "_run_chat_search", return_value="No photos found.") as search:
             prompt, refs, idea, aspect = await bot._build_gen_prompt(
                 "gold key", catalog=catalog, chat_id=123, msg_by_id={}
@@ -368,9 +369,10 @@ class TestMockedToolLoop(unittest.IsolatedAsyncioTestCase):
         create = Mock(side_effect=lambda **kwargs: response(tool_msg if "tools" in kwargs else final_msg))
         llm = SimpleNamespace(chat=SimpleNamespace(completions=SimpleNamespace(create=create)))
         cat = [{"idx": 1, "mid": 7, "bytes": b"img", "thumb": b"img", "desc": "photo"}]
-        with patch.object(bot, "active_model_supports_vision", return_value=True), \
-             patch.object(bot, "get_active_model", return_value=(llm, "test-model", "test")), \
-             patch.object(bot, "MODEL_TOOLS_SUPPORT", {}), \
+        with patch.object(bot, "_model_supports_vision", return_value=True), \
+             patch.object(bot, "GEN_PROMPT_MODEL", "deepseek/deepseek-v4.1-flash-1017"), \
+             patch.object(bot, "get_gen_planner_model", return_value=(llm, "test-model", "test")), \
+             patch.object(bot, "GEN_PROMPT_TOOLS_SUPPORT", {}), \
              patch.object(bot, "_run_chat_read_context", return_value="Context."):
             result = await bot._build_gen_prompt("edit", catalog=cat, chat_id=123, msg_by_id={})
         self.assertIn("Image #1 subject.", result[0])

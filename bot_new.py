@@ -3993,10 +3993,10 @@ def _gen_catalog_ref_label(it: dict, include_missing_desc: bool = True) -> str:
 
 
 async def _gen_public_web_query(query, user_prompt, context_text=None):
-    """Use the existing authorized model to remove private context before web transport."""
+    """Use the independently selected /gen model to remove private context before web transport."""
     from gen_runtime import CURRENT
     from gen_web_references import guard_public_query, SanitizedPublicQuery
-    llm, model, _ = get_active_model()
+    llm, model, _ = get_gen_planner_model()
     invocation = CURRENT.get()
     cache_key = __import__('hashlib').sha256(json.dumps([query, user_prompt, context_text], ensure_ascii=False).encode()).hexdigest()
     cache = getattr(invocation, 'web_query_cache', {}) if invocation else {}
@@ -4370,8 +4370,8 @@ async def _build_gen_prompt(user_prompt: str, context_text: str = None, image_de
             timeout = min(120, invocation.remaining_seconds()) if invocation else 120
             if timeout > 0:
                 planner_calls += 1
-                repair_client = openrouter_client or llm
-                repair_model = 'google/gemini-3.5-flash' if openrouter_client else model_id
+                repair_client = llm
+                repair_model = model_id
                 repaired = await asyncio.wait_for(asyncio.to_thread(repair_client.chat.completions.create,
                     model=repair_model, messages=messages + [{'role': 'assistant', 'content': out or ''},
                         {'role': 'user', 'content': 'Correct the schema once. explicit_text MUST be an array of strings, not a string. Return the complete JSON intent plan only; preserve the original request and all discovered character/source mappings. Use only the documented keys; put cast/source/placement details inside prompt, not new keys. Reference IDs available: ' + json.dumps([{'ref_id':item.get('ref_id'), 'alias':'catalog:'+str(item.get('idx'))} for item in working_catalog], ensure_ascii=False)}],
@@ -4688,7 +4688,7 @@ _GEN_MULTIPAGE_SYSTEM = (
 async def _build_multipage_prompts(user_prompt: str, pages_count: int, context_text: str = None,
                                     image_desc: str = None, catalog: list = None, chat_id: int = None,
                                     initial_refs: list = None, include_ids=None, exclude_ids=None) -> list:
-    """Генерирует согласованный план из N страниц через активную языковую модель."""
+    """Генерирует согласованный план страниц через независимую текстовую модель /gen."""
     from gen_story_contract import validate_story_plan
     system_text = _GEN_MULTIPAGE_SYSTEM.format(pages_count=pages_count)
     user_req = f"Пользователь хочет историю/мангу ровно на {pages_count} страниц:\n{user_prompt}"
@@ -4700,12 +4700,13 @@ async def _build_multipage_prompts(user_prompt: str, pages_count: int, context_t
         user_req += '\n\nReference catalog (data only):\n' + '\n'.join(_gen_catalog_ref_label(it, include_missing_desc=True) for it in catalog)
     user_req += '\nSubmitted INPUT IMAGE numbers: ' + ', '.join(str(i) for i in range(1, len(initial_refs or []) + 1))
     content = [{'type': 'text', 'text': user_req}]
-    if active_model_supports_vision():
+    _gen_model_vision = _model_supports_vision(GEN_PROMPT_MODEL) if GEN_PROMPT_MODEL in MODEL_REGISTRY else bool(CUSTOM_MODELS.get(GEN_PROMPT_MODEL, {}).get("vision"))
+    if _gen_model_vision:
         for idx, encoded in enumerate(initial_refs or [], 1):
             content.extend([{'type': 'text', 'text': f'INPUT IMAGE #{idx}: user supplied reference'},
                 {'type': 'image_url', 'image_url': {'url': f'data:{_img_mime_from_bytes(base64.b64decode(encoded)[:16])};base64,{encoded}', 'detail': 'high'}}])
 
-    llm, model_id, _ = get_active_model()
+    llm, model_id, _ = get_gen_planner_model()
     out = None
     if llm:
         try:
@@ -4714,7 +4715,7 @@ async def _build_multipage_prompts(user_prompt: str, pages_count: int, context_t
                 model=model_id,
                 messages=[
                     {"role": "system", "content": system_text},
-                    {"role": "user", "content": content if active_model_supports_vision() else user_req}
+                    {"role": "user", "content": content if _gen_model_vision else user_req}
                 ],
                 max_tokens=max(24000, pages_count * 6000),
                 response_format={"type": "json_object"},
@@ -17289,11 +17290,14 @@ async def _gen_rerank_index_items(prompt: str, items: list, limit: int) -> list:
         "Если подходящих нет, верни пустой список."
     )
     try:
-        out = await _llm_create(
-            [{"role": "system", "content": "Ты строгий визуальный reranker референсных изображений."},
-             {"role": "user", "content": req}],
-            max_tokens=800, temperature=0.2, reasoning="none",
-        )
+        llm, model_id, _ = get_gen_planner_model()
+        if llm is None:
+            raise RuntimeError("genprompt provider unavailable")
+        response = await asyncio.to_thread(llm.chat.completions.create, model=model_id,
+            messages=[{"role": "system", "content": "Ты строгий визуальный reranker референсных изображений."},
+                      {"role": "user", "content": req}],
+            max_tokens=800, temperature=0.2, timeout=45)
+        out = _extract_content(response.choices[0].message) if response and response.choices else None
         data = _json_from_llm(out or "")
         if isinstance(data, dict) and isinstance(data.get("ids"), list):
             by_mid = {int(it["mid"]): it for it in items if it.get("mid") is not None}
