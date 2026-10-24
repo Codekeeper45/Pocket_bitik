@@ -89,6 +89,7 @@ class OwnerCaptionTests(unittest.IsolatedAsyncioTestCase):
                 stack.enter_context(patch('gen_delivery.ROOT', Path('delivery')))
                 stack.enter_context(patch.object(bot, 'OWNER_ID', 77))
                 stack.enter_context(patch.object(bot, 'get_active_model', return_value=(route, 'offline', 'offline')))
+                stack.enter_context(patch.object(bot, 'openrouter_client', route))
                 stack.enter_context(patch.object(bot, 'active_model_supports_vision', return_value=True))
                 stack.enter_context(patch.object(bot, '_build_gen_prompt', side_effect=build))
                 stack.enter_context(patch.object(bot, '_gen_render_image', side_effect=render))

@@ -59,6 +59,7 @@ def planner(monkeypatch):
     invocation = Invocation(job_id="intent-context-offline")
     token = CURRENT.set(invocation)
     monkeypatch.setattr(bot, "get_active_model", lambda: (llm, "offline-planner", "test"))
+    monkeypatch.setattr(bot, "openrouter_client", llm)
     monkeypatch.setattr(bot, "active_model_supports_vision", lambda: True)
     monkeypatch.setattr(bot, "MODEL_TOOLS_SUPPORT", {})
     monkeypatch.setattr(bot, "log", Mock())
@@ -224,7 +225,7 @@ def test_real_handler_routes_model_file_count_with_safe_doubles(
                             sender=SimpleNamespace(first_name="Owner"), delete=AsyncMock(),
                             get_reply_message=AsyncMock(return_value=None), reply=AsyncMock(),
                             pattern_match=SimpleNamespace(group=lambda number: {1: "", 2: flags, 3: "", 4: source}[number]))
-    monkeypatch.setattr(bot, "openrouter_client", object())
+    monkeypatch.setattr(bot, "openrouter_client", SimpleNamespace(chat=SimpleNamespace(completions=SimpleNamespace(create=planner.create))))
     monkeypatch.setattr(bot, "client", SimpleNamespace(send_message=AsyncMock(return_value=status)))
     monkeypatch.setattr(bot, "_slash_for_other_bot", AsyncMock(return_value=False))
     monkeypatch.setattr(bot, "_gen_fetch_link_refs", AsyncMock(side_effect=lambda event, prompt: (prompt, [], 0)))

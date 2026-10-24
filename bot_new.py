@@ -4097,6 +4097,8 @@ async def _build_gen_prompt(user_prompt: str, context_text: str = None, image_de
         return tools
 
     llm, model_id, _label = get_active_model()
+    if openrouter_client is not None:
+        llm, model_id = openrouter_client, OPENROUTER_VISION_MODEL
     tool_budget = 16
     tool_calls_used = 0
     planner_calls = 0
@@ -4306,13 +4308,16 @@ async def _build_gen_prompt(user_prompt: str, context_text: str = None, image_de
     if diagnostic_invocation:
         diagnostic_invocation.timings['planner_response'] = out or ''
         # Keep exact response and source metadata for diagnosing schema/reference loss.
-        from pathlib import Path
-        diagnostic_dir = Path('gen_artifacts/planner')
-        diagnostic_dir.mkdir(parents=True, exist_ok=True)
-        (diagnostic_dir / (diagnostic_invocation.job_id + '.json')).write_text(json.dumps({
-            'response': out or '',
-            'sources': [{key: item.get(key) for key in ('idx', 'ref_id', 'members', 'profile_url', 'mid')}
-                        for item in working_catalog]}, ensure_ascii=False), encoding='utf-8')
+        try:
+            from pathlib import Path
+            diagnostic_dir = Path('gen_artifacts/planner')
+            diagnostic_dir.mkdir(parents=True, exist_ok=True)
+            (diagnostic_dir / (diagnostic_invocation.job_id + '.json')).write_text(json.dumps({
+                'response': out or '',
+                'sources': [{key: item.get(key) for key in ('idx', 'ref_id', 'members', 'profile_url', 'mid')}
+                            for item in working_catalog]}, ensure_ascii=False), encoding='utf-8')
+        except OSError as exc:
+            log('GEN', 'Planner diagnostic unavailable: ' + type(exc).__name__)
     plan = _gen_prompt.parse_intent_plan(out, user_prompt, edit_mode=edit_mode,
         fallback_prompt=legacy[0] if legacy_format else None,
         fallback_refs=fallback_refs)
@@ -4327,7 +4332,7 @@ async def _build_gen_prompt(user_prompt: str, context_text: str = None, image_de
                 repaired = await asyncio.wait_for(asyncio.to_thread(repair_client.chat.completions.create,
                     model=repair_model, messages=messages + [{'role': 'assistant', 'content': out or ''},
                         {'role': 'user', 'content': 'Correct the schema once. Return the complete JSON intent plan only; preserve the original request and all discovered character/source mappings. Use only the documented keys; put cast/source/placement details inside prompt, not new keys. Reference IDs available: ' + json.dumps([{'ref_id':item.get('ref_id'), 'alias':'catalog:'+str(item.get('idx'))} for item in working_catalog], ensure_ascii=False)}],
-                    max_tokens=4000, temperature=0, timeout=timeout), timeout=timeout)
+                    max_tokens=16000, response_format={'type': 'json_object'}, temperature=0, timeout=timeout), timeout=timeout)
                 plan = _gen_prompt.parse_intent_plan(_extract_content(repaired.choices[0].message), user_prompt, edit_mode=edit_mode)
         except Exception as exc:
             log('GEN', 'Intent schema repair unavailable: ' + type(exc).__name__)
