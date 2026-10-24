@@ -3399,7 +3399,8 @@ def _sync_generate_image(prompt: str, input_images_b64: list = None, model: str 
                 log('GEN', f'Gateway transport failure: {transport_error}')
                 raise transport_error
         if resp.status_code >= 500:
-            raise GenTransient(f'Image gateway HTTP {resp.status_code}: provider failed to complete generation')
+            raise requests.exceptions.HTTPError(
+                f'Image gateway HTTP {resp.status_code}: provider failed to complete generation', response=resp)
         _moderation_markers = (
             "не могу создать", "не могу сгенерировать", "не могу нарисовать",
             "нарушает", "политик", "безопасност", "ограничени", "откровенн",
@@ -4117,7 +4118,7 @@ async def _build_gen_prompt(user_prompt: str, context_text: str = None, image_de
             timeout = min(90, invocation.remaining_seconds()) if invocation else 90
             if timeout <= 0:
                 break
-            kwargs = dict(model=model_id, messages=messages, max_tokens=6000, temperature=0.35, timeout=timeout)
+            kwargs = dict(model=model_id, messages=messages, max_tokens=24000, temperature=0.35, timeout=timeout)
             if tool_budget and tool_calls_used < tool_budget:
                 kwargs["tools"] = _tools_for_gen()
                 kwargs["tool_choice"] = "auto"
@@ -9149,7 +9150,7 @@ async def _gen_one_image_impl(final_prompt, input_b64s, image_size, aspect_ratio
             log("GEN", f"Ошибка генерации ({gen_model}): {type(e).__name__}: {str(e)[:400]}")
             # 5xx от ОСНОВНОЙ модели = провайдер/адаптер лежит, ждать бессмысленно → сразу на запасную (без 2× пауз).
             _http_code = getattr(getattr(e, "response", None), "status_code", 0) or 0
-            if _http_code >= 500 and not used_fallback and not gateway_pool and OPENROUTER_IMAGE_FALLBACK and OPENROUTER_IMAGE_FALLBACK != gen_model:
+            if _http_code >= 500 and not used_fallback and openrouter_client is not None and OPENROUTER_IMAGE_FALLBACK and OPENROUTER_IMAGE_FALLBACK != gen_model:
                 used_fallback = True
                 gen_model = OPENROUTER_IMAGE_FALLBACK
                 size = image_size  # gemini-фолбэк тянет запрошенное разрешение (кламп был под primary)

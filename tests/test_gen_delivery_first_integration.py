@@ -196,6 +196,24 @@ class DeliveryFirstIntegration(unittest.IsolatedAsyncioTestCase):
         self.assertIn(prompt, context.provider.call_args.args[0])
         self.assertTrue(context.invocations[0].timings['intent_plan']['fallback_used'])
 
+    async def test_gateway_500_uses_independent_fallback_and_delivers(self):
+        import requests
+        response = requests.Response()
+        response.status_code = 500
+        error = requests.exceptions.HTTPError('unexpected EOF', response=response)
+        buffer = io.BytesIO()
+        Image.new('RGB', (64, 64), 'blue').save(buffer, format='PNG')
+        context = await self.run_handler(
+            provider_results=[error, (buffer.getvalue(), 'image/png')],
+            namespace_overrides={'requests': requests, 'GenExhausted': type('Exhausted', (Exception,), {}),
+                                 'GenRejected': type('Rejected', (Exception,), {}),
+                                 'GenTransient': type('Transient', (Exception,), {}),
+                                 'CHATGPT2API_AUTH_KEY': 'test-only',
+                                 'GEN_IMAGE_MODEL': 'gpt-image-2',
+                                 'OPENROUTER_IMAGE_FALLBACK': 'google/gemini-3.1-flash-image'})
+        self.assertEqual(context.record.status, 'delivered', context.messages)
+        self.assertEqual(context.provider.call_count, 2)
+
     async def test_ai_missing_selected_reference_still_delivers_best_effort(self):
         context = await self.run_handler(prompt='Draw the character using a source if available.',
             intent_plan=dict(output_count=1, output_kind='single_image', prompt='Character portrait',
