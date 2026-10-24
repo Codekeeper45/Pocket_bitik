@@ -260,3 +260,12 @@ def test_diagnostic_refs_are_detached():
     data = gen_prompt.intent_plan_to_dict(plan)
     data["refs"][0]["roles"].append("style")
     assert plan.refs[0]["roles"] == ["subject"]
+
+
+def test_scalar_inscription_and_identity_role_keep_sources():
+    payload = model_plan()
+    payload.update(explicit_text="Спокойной ночи", refs=[{"ref_id":"catalog:2","roles":["identity"]}])
+    plan = gen_prompt.parse_intent_plan(payload, source_prompt="original")
+    assert not plan.fallback_used
+    assert plan.explicit_text == ("Спокойной ночи",)
+    assert plan.refs[0]["roles"] == ["subject"]
