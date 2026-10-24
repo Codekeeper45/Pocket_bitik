@@ -101,8 +101,8 @@ def series_plan_from_intent(intent) -> SeriesPlan:
     from gen_prompt import IntentPlan, intent_plan_to_dict, render_intent_prompt
     if not isinstance(intent, IntentPlan):
         raise SeriesPlanError("expected an IntentPlan")
-    refs = tuple(ref["ref_id"] for ref in intent.refs)
-    pages = tuple(SeriesPage(number, render_intent_prompt(intent, output_number=number), intent.aspect, refs)
+    pages = tuple(SeriesPage(number, render_intent_prompt(intent, output_number=number), intent.aspect,
+                  tuple(ref['ref_id'] for ref in intent.refs if 'outputs' not in ref or number in ref['outputs']))
                   for number in range(1, intent.output_count + 1))
     data = intent_plan_to_dict(intent)
     bible = {"constraints": data["constraints"], "refs": data["refs"]} if intent.output_kind == "series" else {}

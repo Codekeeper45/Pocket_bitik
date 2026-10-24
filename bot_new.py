@@ -4368,7 +4368,9 @@ async def _build_gen_prompt(user_prompt: str, context_text: str = None, image_de
     if plan.output_count > 10:
         plan = replace(plan, output_count=10, scenes=())
     if reference_snapshot is not None:
-        plan = replace(plan, refs=tuple({'ref_id': ref['ref_id'], 'roles': list(ref['roles'])}
+        plan = replace(plan, refs=tuple({'ref_id': ref['ref_id'], 'roles': list(ref['roles']),
+                       **next(({'outputs': old['outputs']} for old in plan.refs
+                               if old['ref_id'] in (ref['ref_id'], *ref.get('aliases', ())) and 'outputs' in old), {})}
                        for ref in reference_snapshot.get('references', ())))
     selected = []
     unavailable_refs = []
