@@ -4301,7 +4301,7 @@ async def _build_gen_prompt(user_prompt: str, context_text: str = None, image_de
                 planner_calls += 1
                 repaired = await asyncio.wait_for(asyncio.to_thread(llm.chat.completions.create,
                     model=model_id, messages=messages + [{'role': 'assistant', 'content': out or ''},
-                        {'role': 'user', 'content': 'Correct the schema once. Return the complete JSON intent plan only; preserve the original request.'}],
+                        {'role': 'user', 'content': 'Correct the schema once. Return the complete JSON intent plan only; preserve the original request and all discovered character/source mappings. Use only the documented keys; put cast/source/placement details inside prompt, not new keys. Reference IDs available: ' + json.dumps([{'ref_id':item.get('ref_id'), 'alias':'catalog:'+str(item.get('idx'))} for item in working_catalog], ensure_ascii=False)}],
                     max_tokens=4000, temperature=0, timeout=timeout), timeout=timeout)
                 plan = _gen_prompt.parse_intent_plan(_extract_content(repaired.choices[0].message), user_prompt, edit_mode=edit_mode)
         except Exception as exc:
@@ -4322,6 +4322,7 @@ async def _build_gen_prompt(user_prompt: str, context_text: str = None, image_de
             unavailable_refs.append(ref_id)
     if plan.fallback_used:
         selected = legacy[1]
+        log('GEN', 'Intent plan remained unavailable after schema repair; source request preserved, reference selection unverified')
     selected.extend((idx, {'identity': 'subject', 'template': 'composition'}.get(role, role)) for idx, role in web_refs_selected)
     invocation = CURRENT.get()
     if invocation:
