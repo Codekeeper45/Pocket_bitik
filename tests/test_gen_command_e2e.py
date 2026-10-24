@@ -56,6 +56,7 @@ class GenCommandE2ETests(unittest.IsolatedAsyncioTestCase):
         self.client = SimpleNamespace(
             send_message=AsyncMock(return_value=self.status),
             send_file=AsyncMock(return_value=SimpleNamespace(id=700)),
+            get_me=AsyncMock(return_value=SimpleNamespace(id=77)),
         )
         self.patches = [patch.object(bot, "openrouter_client", object()),
                         patch.object(bot, "client", self.client),
@@ -126,6 +127,39 @@ class GenCommandE2ETests(unittest.IsolatedAsyncioTestCase):
         feedback = "\n".join(self.status.edits)
         self.assertIn("RuntimeError", feedback)
         self.assertNotIn(secret, feedback)
+
+    async def test_silent_mode_routes_to_saved_messages_and_skips_chat_status(self):
+        event = FakeEvent("-s -raw -sq -1k", "secret test image")
+        event.delete = AsyncMock()
+        png = png_bytes()
+        render = AsyncMock(return_value=(png, "image/png", "secret test image", False))
+        with patch.object(bot, "_gen_render_image", render), \
+             patch.object(bot, "_gen_send_image", wraps=bot._gen_send_image) as delivery:
+            await self._invoke(event)
+        render.assert_awaited_once()
+        # Status message was NEVER sent to the chat
+        self.client.send_message.assert_not_called()
+        # Triggering event message was deleted from the chat immediately
+        event.delete.assert_awaited_once()
+        # Delivered to Saved Messages ("me") without reply_to in the group chat
+        delivery.assert_awaited_once()
+        self.assertEqual(delivery.await_args.args[0], "me")
+        self.assertIsNone(delivery.await_args.args[5])
+        # Image sent to 'me' (resolved to own user_id 77)
+        self.client.send_file.assert_awaited_once()
+        self.assertEqual(self.client.send_file.await_args.args[0], 77)
+
+    async def test_silent_mode_failure_sends_error_to_saved_messages_only(self):
+        event = FakeEvent("-s -raw", "fail prompt")
+        event.delete = AsyncMock()
+        with patch.object(bot, "_gen_render_image", AsyncMock(side_effect=RuntimeError("quota exhausted"))):
+            await self._invoke(event)
+        # Deleted command from chat
+        event.delete.assert_awaited_once()
+        # Error was sent to "me" (Saved Messages), NOT to chat (chat_id=9001)
+        self.client.send_message.assert_called_once()
+        self.assertEqual(self.client.send_message.await_args.args[0], "me")
+        self.assertIn("RuntimeError", self.client.send_message.await_args.args[1])
 
 
 if __name__ == "__main__":

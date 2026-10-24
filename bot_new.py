@@ -9645,7 +9645,7 @@ async def gen_resume(event):
         await event.reply('Не удалось продолжить серию: ' + type(exc).__name__)
 
 
-@client.on(events.NewMessage(pattern=r"(?s)^[./]gen(?:\s+(\d+))?((?:\s+-(?:vertical|horizontal|square|sq|4k|2k|1k|x\d+|p\d+|pages|noimg|ni|raw|m|r|i|c|v|h|improve|creative|16:9|9:16|1:1|4:3|3:4))+)?((?:\s+!?@\w+)+)?[ \t\r\n]+(.+)$"))
+@client.on(events.NewMessage(pattern=r"(?s)^[./]gen(?:\s+(\d+))?((?:\s+-(?:-?silent|-?quiet|s|q|vertical|horizontal|square|sq|4k|2k|1k|x\d+|p\d+|pages|noimg|ni|raw|m|r|i|c|v|h|improve|creative|16:9|9:16|1:1|4:3|3:4))+)?((?:\s+!?@\w+)+)?[ \t\r\n]+(.+)$"))
 @_track_gen_activity
 async def gen_command(event):
     """Генерация изображений (GPT Image 2 via OpenRouter). Промпт как есть, либо его строит/улучшает DeepSeek
@@ -9655,11 +9655,16 @@ async def gen_command(event):
     is_owner = event.out
     if not is_owner and event.sender_id not in ALLOWED_USERS:
         return
-    if openrouter_client is None and not CHATGPT2API_AUTH_KEY:
-        await event.reply("⚠️ Ни один маршрут генерации не настроен.")
-        return
     n = int(event.pattern_match.group(1)) if event.pattern_match.group(1) else 0
     toks = (event.pattern_match.group(2) or "").split()
+    silent = is_owner and any(t.lower() in ("-s", "-silent", "--silent", "-q", "-quiet", "--quiet") for t in toks)
+    if openrouter_client is None and not CHATGPT2API_AUTH_KEY:
+        if silent:
+            try: await client.send_message("me", "⚠️ Ни один маршрут генерации не настроен.")
+            except Exception: pass
+        else:
+            await event.reply("⚠️ Ни один маршрут генерации не настроен.")
+        return
     # -i/-improve and -c/-creative remain accepted compatibility aliases; all are unified semantics.
     legacy_aliases = any(t in ("-i", "-improve", "-c", "-creative") for t in toks)
     improve = creative = False
@@ -9688,7 +9693,12 @@ async def gen_command(event):
     include_users = [t.lstrip("@") for t in user_tokens if not t.startswith("!")]
     exclude_users = [t.lstrip("!").lstrip("@") for t in user_tokens if t.startswith("!")]
     if set(include_users) & set(exclude_users):
-        await event.reply("❌ Один участник одновременно включён и исключён. Уточни фильтр.")
+        msg = "❌ Один участник одновременно включён и исключён. Уточни фильтр."
+        if silent:
+            try: await client.send_message("me", msg)
+            except Exception: pass
+        else:
+            await event.reply(msg)
         return
     include_ids, exclude_ids = set(), set()
     failed_filters = []
@@ -9700,7 +9710,12 @@ async def gen_command(event):
             failed_filters.append(u)
             log("GEN", f"Фильтр: не нашёл @{u}: {e}")
     if failed_filters or include_ids & exclude_ids:
-        await event.reply("❌ Фильтр участников не разрешён или противоречив. Генерацию не запускаю.")
+        msg = "❌ Фильтр участников не разрешён или противоречив. Генерацию не запускаю."
+        if silent:
+            try: await client.send_message("me", msg)
+            except Exception: pass
+        else:
+            await event.reply(msg)
         return
     user_prompt = event.pattern_match.group(4).strip()
     reply_msg = await event.get_reply_message() if getattr(event, "reply_to", None) else None
@@ -9713,7 +9728,7 @@ async def gen_command(event):
     if not user_prompt:  # остались одни ссылки без инструкции — даём осмысленный дефолт
         user_prompt = "combine the reference images into one cohesive scene"
     _flt = (("+@" + ",".join(include_users)) if include_users else "") + (("  -@" + ",".join(exclude_users)) if exclude_users else "")
-    log("GEN", f"Старт от {caller}: N={n or '—'} · improve={improve} · creative={creative} · {image_size}/{aspect_ratio or 'авто'} · пакет×{batch_count} · фильтр={_flt or '—'} · reply={'да' if reply_msg else 'нет'} · ссылок-реф={len(link_ref_msgs)} · «{user_prompt[:80]}»")
+    log("GEN", f"Старт от {caller}: N={n or '—'} · silent={silent} · improve={improve} · creative={creative} · {image_size}/{aspect_ratio or 'авто'} · пакет×{batch_count} · фильтр={_flt or '—'} · reply={'да' if reply_msg else 'нет'} · ссылок-реф={len(link_ref_msgs)} · «{user_prompt[:80]}»")
 
     # — референс-фото (моё сообщение + альбом, reply + альбом, ссылки) собираем ДО удаления команды —
     input_b64s, skipped_imgs = await _gen_collect_input_images(event, reply_msg, extra_msgs=link_ref_msgs)
@@ -9721,17 +9736,23 @@ async def gen_command(event):
 
     # Единая семантика: ИИ всегда точно разворачивает запрос; -i/-c только legacy aliases без переключения режима.
     status = None
-    try:
-        status = await client.send_message(event.chat_id, "🎨 Готовлю генерацию…", reply_to=reply_target_id)
-    except Exception as e:
-        log("GEN", f"Ошибка отправки статуса (reply_to={reply_target_id}): {e}")
+    if not silent:
         try:
-            status = await client.send_message(event.chat_id, "🎨 Готовлю генерацию…")
-        except Exception:
-            pass
+            status = await client.send_message(event.chat_id, "🎨 Готовлю генерацию…", reply_to=reply_target_id)
+        except Exception as e:
+            log("GEN", f"Ошибка отправки статуса (reply_to={reply_target_id}): {e}")
+            try:
+                status = await client.send_message(event.chat_id, "🎨 Готовлю генерацию…")
+            except Exception:
+                pass
 
     # Owner requested command cleanup after inputs and status are secured.
     if status and event.out:
+        try:
+            await event.delete()
+        except Exception:
+            log('GEN', 'Command cleanup failed; generation continues')
+    elif silent and event.out:
         try:
             await event.delete()
         except Exception:
@@ -9753,7 +9774,12 @@ async def gen_command(event):
         if skipped_imgs:
             await set_status(f"ℹ️ Взял {len(input_b64s)} фото, пропустил {skipped_imgs} (лимит 3 МБ суммарно / макс. 10).")
         if link_not_found:
-            await set_status(f"❌ {link_not_found} указанный референс недоступен или не содержит изображения. Проверь ссылку; генерацию не запускаю.")
+            msg = f"❌ {link_not_found} указанный референс недоступен или не содержит изображения. Проверь ссылку; генерацию не запускаю."
+            if silent:
+                try: await client.send_message("me", msg)
+                except Exception: pass
+            else:
+                await set_status(msg)
             return
 
         # — финальный промпт —
@@ -9771,7 +9797,12 @@ async def gen_command(event):
                     flt_failed.append(u)
                     log("GEN", f"Фильтр: не нашёл @{u}: {e}")
             if flt_failed:
-                await set_status(f"❌ Не удалось применить фильтр: {', '.join('@' + u for u in flt_failed)}. Генерацию не запускаю, чтобы не использовать чужой контекст.")
+                msg = f"❌ Не удалось применить фильтр: {', '.join('@' + u for u in flt_failed)}. Генерацию не запускаю, чтобы не использовать чужой контекст."
+                if silent:
+                    try: await client.send_message("me", msg)
+                    except Exception: pass
+                else:
+                    await set_status(msg)
                 return
             _, raw_msgs = await _collect_history_parallel(event.chat_id, n, 0, reply_to=topic_id)
 
@@ -9987,15 +10018,24 @@ async def gen_command(event):
                         task.cancel()
                 if tasks:
                     await asyncio.gather(*tasks, return_exceptions=True)
-            if counter["exhausted"]:
-                await set_status(f"⚠️ Отправлено {counter['ok']} вариантов. Провайдер сообщил о нехватке квоты или баланса; остальные остановлены.")
+            if silent:
+                try:
+                    if counter["exhausted"]:
+                        await client.send_message("me", f"⚠️ Отправлено {counter['ok']} вариантов. Провайдер сообщил о нехватке квоты или баланса; остальные остановлены.")
+                    else:
+                        await client.send_message("me", f"✅ {counter['ok']}/{batch_count} вариантов отправлено тебе в Избранное (Saved Messages) 📌")
+                except Exception:
+                    pass
             else:
-                await set_status(f"✅ {counter['ok']}/{batch_count} вариантов отправлено тебе в Избранное (Saved Messages) 📌")
-            await asyncio.sleep(8)
-            try:
-                await status.delete()
-            except Exception:
-                pass
+                if counter["exhausted"]:
+                    await set_status(f"⚠️ Отправлено {counter['ok']} вариантов. Провайдер сообщил о нехватке квоты или баланса; остальные остановлены.")
+                else:
+                    await set_status(f"✅ {counter['ok']}/{batch_count} вариантов отправлено тебе в Избранное (Saved Messages) 📌")
+                await asyncio.sleep(8)
+                try:
+                    await status.delete()
+                except Exception:
+                    pass
             return {'status': 'delivered' if counter['ok'] == batch_count else 'partial' if counter['ok'] else 'incomplete'}
 
         # ── многостраничная последовательная генерация (при запросе N страниц) ──
@@ -10059,7 +10099,7 @@ async def gen_command(event):
             async with series_job_lock(_job_id):
                 _series_store = _SeriesJobStore(_SeriesPath("gen_series_state") / f"{_job_id}.json")
                 _checkpoint = SeriesCheckpoint(_series_plan.plan_id)
-                _checkpoint.chat_id = str(event.chat_id)
+                _checkpoint.chat_id = "me" if silent else str(event.chat_id)
                 _checkpoint.owner_id = str(event.sender_id)
                 _checkpoint.job_id = _job_id
                 _checkpoint.pages_meta = {str(p["page"]): {"page": p["page"], "idea": p.get("idea"), "prompt": p["prompt"], "aspect": p.get("aspect"), "beat": p.get("beat"), "panels": p.get("panels")} for p in pages_plan}
@@ -10134,13 +10174,15 @@ async def gen_command(event):
                     nonlocal reply_target_id
                     p_idx = page.number
                     raw_p = _SeriesPath(result["artifact"]).read_bytes()
-                    sent = await _gen_send_image(event.chat_id, raw_p, result["mime"], result["prompt"], True,
-                        reply_target_id, refs_line=result.get('refs_line'),
+                    dest_chat = "me" if silent else event.chat_id
+                    dest_reply = None if silent else reply_target_id
+                    sent = await _gen_send_image(dest_chat, raw_p, result["mime"], result["prompt"], True,
+                        dest_reply, refs_line=result.get('refs_line'),
                         idea=f"[{p_idx}/{pages_count}] {result['idea']}", delivery_key=result.get('delivery_key'))
-                    if sent and getattr(sent, "id", None):
+                    if sent and getattr(sent, "id", None) and not silent:
                         reply_target_id = sent.id
                     result["message_id"] = getattr(sent, "id", None)
-                    if p_idx == 1 and result['message_id']:
+                    if p_idx == 1 and result['message_id'] and not silent:
                         try:
                             _generation['anchor_source'] = f"[Страница 1]({build_msg_link(await event.get_chat(), sent.id)})"
                         except Exception:
@@ -10150,16 +10192,21 @@ async def gen_command(event):
                     anchor_selector=lambda results: results.get(1) and _SeriesPath(results[1]["artifact"]).read_bytes())
                 page_results = list(_checkpoint.completed.items())
                 if not page_results:
-                    await set_status("❌ Не удалось сгенерировать страницы истории.")
+                    msg = "❌ Не удалось сгенерировать страницы истории."
+                    if silent:
+                        try: await client.send_message("me", msg)
+                        except Exception: pass
+                    else:
+                        await set_status(msg)
                     return _checkpoint
                 if _checkpoint.failures:
                     _bad_page = min(_checkpoint.failures)
                     _why = _checkpoint.failures[_bad_page]
                     try:
                         await client.send_message(
-                            event.chat_id,
+                            "me" if silent else event.chat_id,
                             f"⚠️ Серия {_job_id}: страница {_bad_page}/{pages_count}, {_why}. Продолжить: `.genresume {_job_id}`",
-                            reply_to=reply_target_id
+                            reply_to=None if silent else reply_target_id
                         )
                     except Exception as e:
                         log("GEN", f"Не удалось отправить уведомление о сбое страницы: {e}")
@@ -10200,14 +10247,14 @@ async def gen_command(event):
             (prompt_by_ai or ai_prompt), user_prompt, set_status)
         if raw is None:
             if mime == "moderation":
-                await set_status("❌ Запрос отклонён модерацией провайдера.\n"
-                                 f"Переформулируй промпт и попробуй снова: `/gen {user_prompt[:200]}`")
+                err_text = ("❌ Запрос отклонён модерацией провайдера.\n"
+                            f"Переформулируй промпт и попробуй снова: `/gen {user_prompt[:200]}`")
             elif mime == "layers_failed":
-                await set_status("❌ Отдельные слои не удалось собрать или проверить. Непрозрачные ассеты не вклеиваю прямоугольниками. Подробности в журнале.")
+                err_text = "❌ Отдельные слои не удалось собрать или проверить. Непрозрачные ассеты не вклеиваю прямоугольниками. Подробности в журнале."
             elif mime == "exhausted":
-                await set_status("❌ Провайдер сообщил о нехватке баланса или квоты.\n"
-                                 "Генерация не завершена; точная причина записана в журнале. "
-                                 "Это не обязательно дневной лимит, повтор завтра может не помочь.")
+                err_text = ("❌ Провайдер сообщил о нехватке баланса или квоты.\n"
+                            "Генерация не завершена; точная причина записана в журнале. "
+                            "Это не обязательно дневной лимит, повтор завтра может не помочь.")
             else:
                 reason = {
                     'transport': 'Соединение со шлюзом прервано. Генератор не вернул изображение.',
@@ -10217,14 +10264,24 @@ async def gen_command(event):
                     'timeout': 'Истекло время ожидания результата генератора.',
                     'quota': 'Провайдер сообщил о нехватке квоты или баланса.',
                 }.get(mime, 'Генератор не вернул изображение после ограниченных попыток.')
-                await set_status('❌ ' + reason + '\nПодробности записаны в журнале.')
+                err_text = '❌ ' + reason + '\nПодробности записаны в журнале.'
+            if silent:
+                try:
+                    await client.send_message("me", err_text)
+                except Exception:
+                    pass
+            else:
+                await set_status(err_text)
             return
         log("GEN", f"Готово за {time.time() - t0:.1f}с · {len(raw) / 1024:.0f} КБ · {mime} · prompt_by_ai={prompt_by_ai} · модель={'fast(запасная)' if used_fb else 'pro'}")
-        await _gen_send_image(event.chat_id, raw, mime, used_fp, prompt_by_ai, reply_target_id, refs_line=gen_refs_line, idea=gen_idea)
-        try:
-            await status.delete()
-        except Exception:
-            pass  # Successful delivery is not undone by status cleanup failure.
+        dest_chat = "me" if silent else event.chat_id
+        dest_reply = None if silent else reply_target_id
+        await _gen_send_image(dest_chat, raw, mime, used_fp, prompt_by_ai, dest_reply, refs_line=gen_refs_line, idea=gen_idea)
+        if status:
+            try:
+                await status.delete()
+            except Exception:
+                pass  # Successful delivery is not undone by status cleanup failure.
         return {'status': 'delivered'}
     except Exception as e:
         log("GEN", f"Ошибка /gen: {type(e).__name__}: {str(e)[:400]}")
@@ -10238,9 +10295,16 @@ async def gen_command(event):
         suffix = (' Файл сохранён. Проверить и повторить доставку: .genretry ' + saved_key) if saved_key else ''
         from gen_prompt import ContractError
         if isinstance(e, ContractError):
-            await set_status('Не удалось подготовить описание сцены. Картинка ещё не генерировалась. Причина записана в журнале; запрос можно повторить.')
+            err_msg = 'Не удалось подготовить описание сцены. Картинка ещё не генерировалась. Причина записана в журнале; запрос можно повторить.'
         else:
-            await set_status('Генерация или доставка не завершена. Тип ошибки: ' + type(e).__name__ + '.' + suffix)
+            err_msg = 'Генерация или доставка не завершена. Тип ошибки: ' + type(e).__name__ + '.' + suffix
+        if silent:
+            try:
+                await client.send_message("me", f"❌ /gen -s: {err_msg}")
+            except Exception:
+                pass
+        else:
+            await set_status(err_msg)
 
 
 @client.on(events.NewMessage(outgoing=True, pattern=r"^[./]del(?:\s+(\d+))?$", from_users="me"))
@@ -12162,9 +12226,10 @@ _HELP_SECTIONS = {
         "Разрешение подстраивается под модель (1K-only не упадёт на `-4k`); запасная всегда Gemini.\n"
         "Промпт строит **активная модель-ответчик** (`/model`); если она с vision — сама смотрит картинки чата, если текстовая — по их описаниям (медиа-модель `/media`). DeepSeek — фолбэк.\n"
         "\n"
-        "**Синтаксис:** `/gen [N] [-raw] [-noimg|-m] [-v|-h|-sq] [-2k|-4k|-1k] [-xK] [@юзер|!@юзер] <промпт>`\n"
+        "**Синтаксис:** `/gen [N] [-raw] [-noimg|-m] [-v|-h|-sq] [-2k|-4k|-1k] [-xK] [-s|-silent] [@юзер|!@юзер] <промпт>`\n"
         "   Единый режим: модель точно разворачивает пользовательский замысел и сразу генерирует изображение.\n"
         "   `-i/-improve` и `-c/-creative` остаются legacy-алиасами без смены режима.\n"
+        "   `-s/-silent/-q` — **тихий режим**: сообщение команды удаляется сразу, в чате нет статусов, а результат идёт прямо в **Избранное** (Saved Messages).\n"
         "   `/gen 100 нарисуй о чём мы спорим` — модель составит промпт по последним 100 сообщениям чата\n"
         "\n"
         "**🖼 Картинки из истории как референсы (по умолчанию для `/gen N`):** модель видит фото в окне N,\n"
