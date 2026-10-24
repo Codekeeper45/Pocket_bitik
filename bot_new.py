@@ -3186,7 +3186,7 @@ async def describe_image(image_bytes: bytes, caption: str = "", model: str = Non
         model = model or get_active_media_model()
         media_client = _client_for_media_model(model)
     if not media_client:
-        return caption or "[изображение]"
+        return "[visual_unavailable: pixels were not inspected]"
     b64 = base64.b64encode(image_bytes).decode("utf-8")
     if prompt:  # кастомная инструкция (напр. _GEN_DESC_PROMPT для каталога /gen)
         prompt_text = f"{prompt}\nПодпись к фото: \"{caption}\"" if caption else prompt
@@ -3216,7 +3216,7 @@ async def describe_image(image_bytes: bytes, caption: str = "", model: str = Non
             log("MEDIA", f"describe_image попытка {attempt + 1}/3 ошибка: {e}, жду {wait}с")
             if attempt < 2:
                 await asyncio.sleep(wait)
-    return caption or "[изображение]"
+    return "[visual_unavailable: pixels were not inspected]"
 
 
 async def describe_album(images: list, caption: str = "", model: str = None, detail: str = "high") -> str:
@@ -4314,6 +4314,9 @@ async def _build_gen_prompt(user_prompt: str, context_text: str = None, image_de
                 # loses identities and produces invalid JSON for large ensemble planning.
                 tool_content = (result or '') if name == 'chat_list_participants' else (result or '')[:5000]
                 messages.append({"role": "tool", "tool_call_id": tc.id, "content": tool_content})
+                from gen_reference_evidence import retrieval_trace
+                trace = retrieval_trace(name, args, result)
+                log("GEN", "Tool evidence: " + json.dumps(trace, ensure_ascii=False))
                 log("GEN", f"Инструмент {name} (chat={chat_id}) → {len(result or '')} симв")
             # refresh the prompt user turn with discovered candidates (tool results remain in their proper role order)
             new_candidates = [it for it in working_catalog if it.get("idx") not in shown_ids]
@@ -6152,7 +6155,7 @@ def _jev_sync_choice(state: str, instructions: str, options: dict, timeout: floa
     key = os.getenv("OPENROUTER_API_KEY", "").strip()
     if key:
         request = urllib.request.Request("https://openrouter.ai/api/alpha/decisions",
-            data=json.dumps({"model": "perplexity/pplx-decider-flash-v1.2", "state": state,
+            data=json.dumps({"model": "typesafe/jev-1.14", "state": state,
                 "questions": {"pick": {"type": "choice", "instructions": instructions,
                     "criteria": {**options, "not_found": "No supplied block contains relevant evidence"}}}}).encode(),
             headers={"Authorization": "Bearer " + key, "Content-Type": "application/json"})
@@ -6160,7 +6163,7 @@ def _jev_sync_choice(state: str, instructions: str, options: dict, timeout: floa
             with urllib.request.urlopen(request, timeout=max(timeout, 12)) as response:
                 answer = json.loads(response.read()).get("answers", {}).get("pick", {})
                 if answer.get("choice"):
-                    answer["decision_model"] = "perplexity/pplx-decider-flash-v1.2"
+                    answer["decision_model"] = "typesafe/jev-1.14"
                     return answer
         except Exception as exc:
             log("ASK", "Decider unavailable; trying Jev: " + type(exc).__name__)
@@ -16823,6 +16826,22 @@ async def _index_media_hybrid_hits(chat_id: int, query: str, count: int, for_gen
     await _merge("media_text", qv_text, "text_hit")
     qv_image = await _index_embed_query(query, image_space=True)
     await _merge("media_image", qv_image, "image_hit")
+    if for_gen:
+        from gen_visual_search import search_visual_descriptions
+        try:
+            lexical = await search_visual_descriptions(db_read, chat_id, query, limit=min(pool, 30))
+            for hit in lexical:
+                if hit['score'] < 0.12 or len(hit['diagnostics']['matched_terms']) < 2:
+                    continue
+                mid = hit['msg_id']
+                if mid in combined:
+                    combined[mid]['visual_lexical'] = hit['diagnostics']
+                    combined[mid]['score'] = max(combined[mid]['score'], hit['score'])
+                else:
+                    combined[mid] = dict(hit, visual_lexical=hit['diagnostics'])
+            log('GEN', f'Visual lexical supplemental candidates: {len(lexical)}')
+        except Exception as exc:
+            log('GEN', 'Visual lexical unavailable: ' + type(exc).__name__)
     return sorted(combined.values(), key=lambda h: h.get("score", 0), reverse=True)[:count]
 
 
