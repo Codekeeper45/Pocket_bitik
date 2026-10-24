@@ -4160,7 +4160,7 @@ async def _build_gen_prompt(user_prompt: str, context_text: str = None, image_de
             timeout = min(180, invocation.remaining_seconds()) if invocation else 180
             if timeout <= 0:
                 break
-            kwargs = dict(model=model_id, messages=messages, max_tokens=24000, temperature=0.35, timeout=timeout)
+            kwargs = dict(model=model_id, messages=messages, max_tokens=6000, temperature=0.35, timeout=timeout)
             if tool_budget and tool_calls_used < tool_budget:
                 kwargs["tools"] = _tools_for_gen()
                 kwargs["tool_choice"] = "auto"
