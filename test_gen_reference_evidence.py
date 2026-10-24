@@ -10,6 +10,23 @@ class EvidenceHelpersTests(unittest.TestCase):
         self.assertEqual(trace["tool"], "chat_search")
         self.assertEqual(trace["args"], {"query": "cat", "limit": 4})
 
+    def test_safe_retrieval_args_are_retained(self):
+        args = {"pixels_only": True, "filter": "images", "before": "yesterday", "after": "today", "source": "telegram", "secret": "drop"}
+        self.assertEqual(selected_args(args), {"pixels_only": True, "filter": "images", "before": "yesterday", "after": "today", "source": "telegram"})
+
+    def test_explicit_result_statuses_and_error(self):
+        for status in ("error", "unavailable", "rejected"):
+            self.assertEqual(retrieval_trace("x", {}, {"status": status})["status"], status)
+        self.assertEqual(retrieval_trace("x", {}, {"error": "failed"})["status"], "error")
+
+    def test_string_source_ids_are_provenance_only(self):
+        result = "Message #123 https://t.me/example/456"
+        trace = retrieval_trace("x", {}, result)
+        self.assertEqual(trace["source_ids"], ["123", "https://t.me/example/456"])
+        self.assertEqual(trace["status"], "ok")
+        record = evidence_record(source_id=trace["source_ids"][0], caption=result)
+        self.assertFalse(record["verified"])
+
     def test_secret_args_omitted(self):
         self.assertEqual(selected_args({"query": "q", "api_key": "secret", "authorization": "x"}), {"query": "q"})
 

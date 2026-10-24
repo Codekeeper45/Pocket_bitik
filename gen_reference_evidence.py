@@ -5,7 +5,7 @@ import re
 from typing import Any, Mapping
 
 _SECRET_KEYS = re.compile(r"(token|password|secret|api[_-]?key|authorization|cookie)", re.I)
-_SAFE_ARGS = {"query", "message_id", "limit", "offset", "question", "decision_only", "scope"}
+_SAFE_ARGS = {"query", "message_id", "limit", "offset", "question", "decision_only", "scope", "pixels_only", "filter", "before", "after", "source"}
 
 @dataclass(frozen=True)
 class EvidenceFailure:
@@ -33,12 +33,29 @@ def _source_ids(value: Any) -> list[str]:
             else: found.extend(_source_ids(child))
     elif isinstance(value, (list, tuple)):
         for child in value: found.extend(_source_ids(child))
+    elif isinstance(value, str):
+        found.extend(re.findall(r"#(\d+)\b", value))
+        found.extend(re.findall(r"https?://[^\s<>\"']+", value))
     return list(dict.fromkeys(found))
 
-def retrieval_trace(tool_name: str, args: Any, result: Any, *, status: str = "ok", preview_chars: int = 400) -> dict[str, Any]:
-    """Structured retrieval record with bounded preview and extracted source IDs."""
+def _result_status(result: Any) -> str:
+    """Use only explicit result status fields; never infer success from source mentions."""
+    if isinstance(result, Mapping):
+        for key in ("status", "result_status"):
+            value = result.get(key)
+            if isinstance(value, str):
+                normalized = value.strip().lower()
+                if normalized in {"error", "unavailable", "rejected", "ok"}:
+                    return normalized
+        if result.get("error"):
+            return "error"
+    return "ok"
+
+def retrieval_trace(tool_name: str, args: Any, result: Any, *, status: str | None = None, preview_chars: int = 400) -> dict[str, Any]:
+    """Structured retrieval record with bounded preview and extracted provenance IDs."""
     text = result if isinstance(result, str) else repr(result)
-    return {"tool": str(tool_name), "args": selected_args(args), "status": str(status), "source_ids": _source_ids(result), "result_preview": text[:max(0, int(preview_chars))]}
+    effective_status = str(status) if status is not None else _result_status(result)
+    return {"tool": str(tool_name), "args": selected_args(args), "status": effective_status, "source_ids": _source_ids(result), "result_preview": text[:max(0, int(preview_chars))]}
 
 def evidence_record(*, source_id: Any, caption: str = "", visual_result: Any = None, visual_status: str = "not_inspected") -> dict[str, Any]:
     """Keep caption evidence distinct from successful evidence derived from pixels."""
