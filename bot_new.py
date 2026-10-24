@@ -10357,7 +10357,7 @@ async def gen_command(event):
             final_prompt, sel, gen_idea, gen_asp = prepared
             if not _intent.fallback_used:
                 final_prompt = render_intent_prompt(_intent)
-            prompt_by_ai = True
+            prompt_by_ai = not _intent.fallback_used or final_prompt != user_prompt
             if aspect_ratio is None and gen_asp:  # ориентацию под идею выбирает модель; явный флаг -v/-h/-sq важнее
                 aspect_ratio = gen_asp
                 log("GEN", f"Ориентация от модели: {gen_asp}")
