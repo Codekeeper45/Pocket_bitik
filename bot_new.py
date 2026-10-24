@@ -4353,11 +4353,11 @@ async def _build_gen_prompt(user_prompt: str, context_text: str = None, image_de
     if plan.fallback_used and not legacy_format and llm:
         try:
             invocation = CURRENT.get()
-            timeout = min(60, invocation.remaining_seconds()) if invocation else 60
+            timeout = min(120, invocation.remaining_seconds()) if invocation else 120
             if timeout > 0:
                 planner_calls += 1
                 repair_client = openrouter_client or llm
-                repair_model = OPENROUTER_VISION_MODEL if openrouter_client else model_id
+                repair_model = 'google/gemini-3.5-flash' if openrouter_client else model_id
                 repaired = await asyncio.wait_for(asyncio.to_thread(repair_client.chat.completions.create,
                     model=repair_model, messages=messages + [{'role': 'assistant', 'content': out or ''},
                         {'role': 'user', 'content': 'Correct the schema once. explicit_text MUST be an array of strings, not a string. Return the complete JSON intent plan only; preserve the original request and all discovered character/source mappings. Use only the documented keys; put cast/source/placement details inside prompt, not new keys. Reference IDs available: ' + json.dumps([{'ref_id':item.get('ref_id'), 'alias':'catalog:'+str(item.get('idx'))} for item in working_catalog], ensure_ascii=False)}],
