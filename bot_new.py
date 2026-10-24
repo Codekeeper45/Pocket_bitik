@@ -4098,7 +4098,7 @@ async def _build_gen_prompt(user_prompt: str, context_text: str = None, image_de
 
     llm, model_id, _label = get_active_model()
     if openrouter_client is not None:
-        llm, model_id = openrouter_client, 'google/gemini-3.5-flash'
+        llm, model_id = openrouter_client, 'google/gemini-3.1-pro-preview'
     tool_budget = 16
     tool_calls_used = 0
     planner_calls = 0
