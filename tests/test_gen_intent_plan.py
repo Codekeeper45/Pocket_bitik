@@ -71,7 +71,7 @@ def test_repair_success_and_exception():
     {"output_count": True}, {"output_count": 0}, {"output_count": "3"},
     {"panels_per_image": False}, {"panels_per_image": -1},
     {"task_type": []}, {"aspect": []}, {"output_kind": "unknown"},
-    {"explicit_text": "caption"}, {"constraints": [3]},
+    {"explicit_text": [3]}, {"constraints": [3]},
     {"refs": [{"ref_id": "source:1", "roles": ["unknown"]}]},
     {"scenes": ["first", "second"]}, {"surprise": True},
 ])

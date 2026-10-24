@@ -91,7 +91,7 @@ def build_contract_prompt(user_prompt: str, *, task_type="creation", participant
 INTENT_PLAN_INSTRUCTIONS = """Return one JSON object, not a prose answer or a second contract.
 Fields: task_type (creation/edit/series), output_kind (single_image/independent_images/series),
 output_count (positive integer files), prompt (scene description), panels_per_image (positive integer or null),
-explicit_text (verbatim strings), refs ([{ref_id: stable source ID, roles: [subject/style/clothing/background/pose/composition/object]}]),
+explicit_text (JSON array of verbatim strings, e.g. ["Спокойной ночи"], never a scalar string), refs ([{ref_id: stable source ID, roles: [subject/style/clothing/background/pose/composition/object]}]),
 aspect (null/1:1/9:16/16:9/4:3/3:4), constraints (strings), layers (boolean, default false).
 idea (one concise human-readable sentence describing the scene, ideally under 180 characters; never copy the user request or rendering instructions),
 ideas (one distinct human-readable caption per file for multiple outputs).
@@ -247,8 +247,12 @@ def parse_intent_plan(out, user_request=None, explicit_count=None, edit_mode=Fal
             if count_override is None:
                 raise ContractError("scenes must match output_count")
             scenes = ()
+        explicit_text = data.get("explicit_text", ())
+        # A scalar has one unambiguous, lossless meaning: one verbatim inscription.
+        if isinstance(explicit_text, str):
+            explicit_text = [explicit_text] if explicit_text else []
         return IntentPlan(task_type=task, output_kind=kind, output_count=count, prompt=prompt,
-                          panels_per_image=panels, explicit_text=_intent_strings(data.get("explicit_text", ()), "explicit_text"),
+                          panels_per_image=panels, explicit_text=_intent_strings(explicit_text, "explicit_text"),
                           refs=_intent_refs(data.get("refs", ())), aspect=aspect,
                           constraints=_intent_strings(data.get("constraints", ()), "constraints"),
                           layers=layers, scenes=scenes, participant_count=participants, source_prompt=source,
