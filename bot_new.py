@@ -3339,6 +3339,25 @@ def _sync_generate_image(prompt: str, input_images_b64: list = None, model: str 
             pass
     target_model = model or GEN_IMAGE_MODEL or OPENROUTER_IMAGE_MODEL
 
+    if target_model in ('gemini-3.1-flash-image', 'google/gemini-3.1-flash-image'):
+        content = [{'type': 'text', 'text': target_prompt}]
+        for image in input_images_b64 or []:
+            url = image if image.startswith('data:') else 'data:image/png;base64,' + image
+            content.append({'type': 'image_url', 'image_url': {'url': url}})
+        response = requests.post(CLIPROXY_BASE_URL.rstrip('/') + '/chat/completions',
+            headers={'Authorization': 'Bearer ' + cliproxy_api_key},
+            json={'model': 'gemini-3.1-flash-image', 'messages': [{'role': 'user', 'content': content}],
+                  'modalities': ['image', 'text']}, timeout=300)
+        response.raise_for_status()
+        message = response.json()['choices'][0]['message']
+        images = message.get('images') or []
+        for image in images:
+            url = image.get('image_url', {}).get('url', '')
+            if url.startswith('data:'):
+                header, encoded = url.split(',', 1)
+                return base64.b64decode(encoded), header[5:].split(';')[0]
+        raise GenTransient('CLIProxy Gemini returned no image')
+
     # Маршрутизация на наш собственный шлюз chatgpt2api
     if "gpt-image-2.5" in target_model or "chatgpt2api" in target_model or (CHATGPT2API_AUTH_KEY and target_model.startswith("gpt-image-")):
         cg_model = target_model.split("/")[-1] if "/" in target_model else target_model
@@ -9150,7 +9169,7 @@ async def _gen_one_image_impl(final_prompt, input_b64s, image_size, aspect_ratio
             log("GEN", f"Ошибка генерации ({gen_model}): {type(e).__name__}: {str(e)[:400]}")
             # 5xx от ОСНОВНОЙ модели = провайдер/адаптер лежит, ждать бессмысленно → сразу на запасную (без 2× пауз).
             _http_code = getattr(getattr(e, "response", None), "status_code", 0) or 0
-            if _http_code >= 500 and not used_fallback and openrouter_client is not None and OPENROUTER_IMAGE_FALLBACK and OPENROUTER_IMAGE_FALLBACK != gen_model:
+            if _http_code >= 500 and not used_fallback and cliproxy_api_key and OPENROUTER_IMAGE_FALLBACK and OPENROUTER_IMAGE_FALLBACK != gen_model:
                 used_fallback = True
                 gen_model = OPENROUTER_IMAGE_FALLBACK
                 size = image_size  # gemini-фолбэк тянет запрошенное разрешение (кламп был под primary)

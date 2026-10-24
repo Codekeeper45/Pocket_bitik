@@ -208,7 +208,7 @@ class DeliveryFirstIntegration(unittest.IsolatedAsyncioTestCase):
             namespace_overrides={'requests': requests, 'GenExhausted': type('Exhausted', (Exception,), {}),
                                  'GenRejected': type('Rejected', (Exception,), {}),
                                  'GenTransient': type('Transient', (Exception,), {}),
-                                 'CHATGPT2API_AUTH_KEY': 'test-only',
+                                 'CHATGPT2API_AUTH_KEY': 'test-only', 'cliproxy_api_key': 'test-only',
                                  'GEN_IMAGE_MODEL': 'gpt-image-2',
                                  'OPENROUTER_IMAGE_FALLBACK': 'google/gemini-3.1-flash-image'})
         self.assertEqual(context.record.status, 'delivered', context.messages)
