@@ -9,6 +9,7 @@ channels.json
 allowed_users.json
 auto_reply.json
 model_state.json
+voice_chat_defaults.json
 digest_state.json
 media_cache.json
 media_cache_ts.json

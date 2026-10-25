@@ -1,3 +1,4 @@
+import sys
 from telethon import TelegramClient, events, utils
 from telethon.errors.rpcerrorlist import AuthKeyDuplicatedError, MessageNotModifiedError, FloodWaitError, MediaCaptionTooLongError
 from telethon.extensions import html as tl_html
@@ -1037,6 +1038,8 @@ REPLY_TOOL = {
                         "properties": {
                             "message_id": {"type": "integer", "description": "id сообщения из метки #id в истории"},
                             "text": {"type": "string", "description": "текст ответа именно на это сообщение"},
+                            "mode": {"type": "string", "enum": ["text", "voice"]},
+                            "voice_id": {"type": "string", "description": "Fish catalog id for this voice response"},
                             "quote": {"type": "string", "description": "НЕОБЯЗАТЕЛЬНО: точная подстрока ИЗ этого сообщения (дословно, как в тексте), чтобы подсветить в цитате именно тот фрагмент, на который отвечаешь. Если не нужен фрагмент — не указывай, ответ прикрепится ко всему сообщению."}
                         },
                         "required": ["message_id", "text"]
@@ -1047,6 +1050,12 @@ REPLY_TOOL = {
         }
     }
 }
+
+from voice_agent_tools import VOICE_TOOLS, VOICE_HINT, VoiceTurn
+_voice_chat_defaults = load_json("voice_chat_defaults.json", {}) if "load_json" in globals() else {}
+
+def _save_voice_chat_defaults():
+    save_json("voice_chat_defaults.json", _voice_chat_defaults)
 
 # --- Инструменты поиска и чтения в текущем чате (серверный поиск Telegram + чтение контекста + Vision фото) ---
 CHAT_SEARCH_TOOL = {
@@ -2274,6 +2283,7 @@ _tts_key_idx = 0  # round-robin указатель по GOOGLE_TTS_KEYS
 # TTS-движок и Fish-голоса (избранное)
 TTS_ENGINE = _model_state.get("tts_engine", "gemini")  # "gemini" | "fish"
 FISH_VOICE = _model_state.get("fish_voice")            # активный reference_id Fish (или None)
+_voice_chat_defaults = load_json("voice_chat_defaults.json", {})
 FISH_FAVORITES = _model_state.get("fish_favorites", [])  # [{"id","title"}]
 # Ген-модель /gen: OPENROUTER_IMAGE_MODEL — неизменяемый дефолт; юзер меняет через /model gen
 # (валидация по авторитетному /api/v1/images/models — тому же набору, что принимает /api/v1/images).
@@ -5366,9 +5376,10 @@ def _sync_tts_fish(text: str, reference_id: str) -> bytes:
     return r.content
 
 
-async def _tts_try_fish(text: str) -> bytes:
+async def _tts_try_fish(text: str, reference_id: str = None) -> bytes:
     """Озвучка активным Fish-голосом (FISH_VOICE) с ретраем на transient. Бросает при провале."""
-    if not FISH_VOICE:
+    reference_id = reference_id or FISH_VOICE
+    if not reference_id:
         raise RuntimeError("Fish-голос не выбран (/voice fish add/select)")
     # Fish S2 ПОНИМАЕТ [квадратные] описания подачи — сохраняем их. S1 их не понимает (у него
     # (круглые)) — для не-s2 срезаем [теги], чтобы не зачитывались; (круглые) оставляем как есть.
@@ -5376,7 +5387,7 @@ async def _tts_try_fish(text: str) -> bytes:
     last_err = None
     for attempt in range(2):
         try:
-            wav = await asyncio.to_thread(_sync_tts_fish, clean, FISH_VOICE)
+            wav = await asyncio.to_thread(_sync_tts_fish, clean, reference_id)
             return await _to_ogg_opus(wav)
         except Exception as e:
             last_err = e
@@ -5503,6 +5514,17 @@ async def synthesize_voice(text: str, voice: str = None, engine: str = None):
 
     log("TTS", f"Озвучка не удалась ({last_err}) — фолбэк на текст")
     return None
+
+
+async def _send_agent_voice(chat_id, text, voice_id, reply_to=None):
+    # Explicit Fish id stays request-local. No global voice switch or hidden TTS fallback.
+    ogg = await _tts_try_fish(text, reference_id=voice_id)
+    bio = io.BytesIO(ogg)
+    bio.name = "voice.ogg"
+    async with client.action(chat_id, "record-audio"):
+        message = await client.send_file(chat_id, bio, voice_note=True, reply_to=reply_to)
+    log("VOICE", f"Fish voice={voice_id} reply={reply_to} sent={message.id} bytes={len(ogg)}")
+    return message
 
 
 async def _ensure_voice_sample(name: str):
@@ -5737,13 +5759,55 @@ async def generate_ask_reply(context: str, question: str, caller: str = None) ->
     return result if result else "Модель не смогла ответить (пустой ответ или ошибка API)"
 
 
-async def generate_auto_reply(combined_text: str, history: list = None) -> str:
+async def generate_auto_reply(combined_text: str, history: list = None, chat_id=None, msg_by_id=None, delivery=None) -> str:
+    if chat_id is not None and fish_available:
+        return await _generate_auto_voice_reply(combined_text, history, chat_id, msg_by_id, delivery)
     messages = [{"role": "system", "content": AUTO_REPLY_SYSTEM_PROMPT}]
     if history:
         messages.extend(history)
     messages.append({"role": "user", "content": combined_text})
     result = await _llm_create(messages=messages, max_tokens=4096, temperature=1.0)
     return result if result else "Понял"
+
+
+async def _generate_auto_voice_reply(text, history, chat_id, msg_by_id, delivery):
+    llm, model_id, _label = get_active_model()
+    turn = VoiceTurn(sys.modules[__name__], chat_id, msg_by_id)
+    messages = [{"role": "system", "content": AUTO_REPLY_SYSTEM_PROMPT + "\n" + VOICE_HINT}]
+    messages.extend(history or [])
+    messages.append({"role": "user", "content": text})
+    try:
+        for _ in range(12):
+            response = await asyncio.to_thread(llm.chat.completions.create, model=model_id, messages=messages,
+                                               tools=VOICE_TOOLS, tool_choice="auto", max_tokens=4096)
+            msg = response.choices[0].message
+            calls = getattr(msg, "tool_calls", None) or []
+            if not calls:
+                return "" if turn.sent else _extract_content(msg)
+            assistant = {"role": "assistant", "content": msg.content,
+                         "tool_calls": [{"id": tc.id, "type": "function", "function": {"name": tc.function.name, "arguments": tc.function.arguments}} for tc in calls]}
+            if getattr(msg, "reasoning_content", None):
+                assistant["reasoning_content"] = msg.reasoning_content
+            messages.append(assistant)
+            for tc in calls:
+                try:
+                    args = json.loads(tc.function.arguments or "{}")
+                    if not isinstance(args, dict):
+                        raise ValueError("Object required")
+                    result = await turn.run(tc.function.name, args)
+                except Exception as e:
+                    result = json.dumps({"status": "error", "error": type(e).__name__})
+                messages.append({"role": "tool", "tool_call_id": tc.id, "content": result})
+                log("VOICE", f"auto tool={tc.function.name} result={result[:900]}")
+    except Exception as e:
+        log("AUTO", f"Voice tools unavailable: {type(e).__name__}")
+    finally:
+        if delivery is not None:
+            delivery.extend({k: v for k, v in row.items() if k != "signature"} for row in turn.sent)
+    if turn.sent:
+        return ""
+    return await _llm_create(messages=[{"role": "system", "content": AUTO_REPLY_SYSTEM_PROMPT},
+                                      *(history or []), {"role": "user", "content": text}]) or "Понял"
 
 
 # ── Веб-инструменты Tavily: выполнение tool-call'ов из agentic loop ──
@@ -6767,6 +6831,8 @@ async def ask_agentic(context: str, question: str, must_search: bool = False, ca
     elif voice_mode == "auto" or tts_available:
         system_prompt += _voice_auto_hint(TTS_ENGINE, FISH_TTS_MODEL)
 
+    if has_chat and fish_available:
+        system_prompt += "\n\n" + VOICE_HINT
     user_text = _build_ask_user_content(context, question, caller, now_str)
     if has_memory and asker_id and "memory_entity" in memory_ready_tools:  # персональная память: бот узнаёт спрашивающего и подтягивает его досье
         try:
@@ -6796,8 +6862,9 @@ async def ask_agentic(context: str, question: str, must_search: bool = False, ca
         memory_tools_list = [t for t in INDEX_MEMORY_TOOLS if t["function"]["name"] in memory_ready_tools]
     chat_tools_list = CHAT_TOOLS if has_chat else []
     tools_list = (([TELEGRAM_SEARCH_TOOL] if has_channels else []) + chat_tools_list + (WEB_TOOLS if has_web else [])
-                  + ([REPLY_TOOL] if has_reply else []) + memory_tools_list)
-    reply_sent = [0]  # счётчик отправленных реплаев (анти-спам, лимит REPLY_MAX)
+                  + ([REPLY_TOOL] if has_reply else []) + (VOICE_TOOLS if has_chat and fish_available else []) + memory_tools_list)
+    reply_sent = [0]  # shared delivery budget
+    voice_turn = VoiceTurn(sys.modules[__name__], chat_id, msg_by_id, reply_sent, force_voice=voice_mode == "force")
     sstats = {"iters": 0, "calls": 0, "posts": 0, "web": 0, "replies": 0, "memory": 0, "chat_search": 0, "chat_context": 0, "chat_images": 0}  # сводка (-c)
 
     def _log_search_summary():
@@ -6844,7 +6911,7 @@ async def ask_agentic(context: str, question: str, must_search: bool = False, ca
             if has_tools:
                 _set_tools_support(ACTIVE_MODEL, False)
             _log_search_summary()
-            return await generate_ask_reply(context, question, caller=caller)
+            return "" if voice_turn.sent else await generate_ask_reply(context, question, caller=caller)
         except Exception as e:
             log("ASK", f"Ошибка модели в agentic loop: {e}")
             # Переполнение окна — кидаем наверх для ретрая с агрессивной обрезкой
@@ -6863,7 +6930,7 @@ async def ask_agentic(context: str, question: str, must_search: bool = False, ca
                 log("MODEL", f"{ACTIVE_MODEL}: ошибочный флаг tools=False сброшен (thinking-quirk, не реальная неподдержка)")
             traceback.print_exc()
             _log_search_summary()
-            return await generate_ask_reply(context, question, caller=caller)
+            return "" if voice_turn.sent else await generate_ask_reply(context, question, caller=caller)
 
         # После первой итерации не форсируем tool call
         force_tool = False
@@ -6873,6 +6940,8 @@ async def ask_agentic(context: str, question: str, must_search: bool = False, ca
             if images:
                 log("ASK", "-g: возможна блокировка безопасности по фото — повторяю запрос без прямого vision...")
                 _log_search_summary()
+                if voice_turn.sent:
+                    return ""
                 return await ask_agentic(
                     context, question, must_search=must_search, caller=caller,
                     ctx_tokens_est=ctx_tokens_est, voice_mode=voice_mode, images=None,
@@ -6880,7 +6949,7 @@ async def ask_agentic(context: str, question: str, must_search: bool = False, ca
                     asker_id=asker_id
                 )
             _log_search_summary()
-            return await generate_ask_reply(context, question, caller=caller)
+            return "" if voice_turn.sent else await generate_ask_reply(context, question, caller=caller)
 
         choice = response.choices[0]
         msg = choice.message
@@ -6927,10 +6996,10 @@ async def ask_agentic(context: str, question: str, must_search: bool = False, ca
             if content:
                 log("ASK", f"Agentic ответ (итерация {iteration + 1}, без поиска)")
                 _log_search_summary()
-                return content
+                return "" if voice_turn.sent else content
             # Пустой ответ — fallback
             _log_search_summary()
-            return await generate_ask_reply(context, question, caller=caller)
+            return "" if voice_turn.sent else await generate_ask_reply(context, question, caller=caller)
 
         # Обрабатываем tool calls
         # Сериализуем assistant-message вручную, чтобы СОХРАНИТЬ reasoning_content —
@@ -6976,9 +7045,15 @@ async def ask_agentic(context: str, question: str, must_search: bool = False, ca
                 })
                 return
 
+            if tname in {t["function"]["name"] for t in VOICE_TOOLS}:
+                res = await voice_turn.run(tname, args)
+                messages.append({"role": "tool", "tool_call_id": tool_call.id, "content": res})
+                log("VOICE", f"tool={tname} result={res[:900]}")
+                return
+
             # — адресный реплай на сообщения истории (отправляем сразу, тредами) —
             if tname == "reply_to_messages":
-                res = await _run_reply_tool(args, chat_id, msg_by_id, reply_sent)
+                res = await voice_turn.run(tname, args) if fish_available else await _run_reply_tool(args, chat_id, msg_by_id, reply_sent)
                 sstats["replies"] = reply_sent[0]
                 messages.append({"role": "tool", "tool_call_id": tool_call.id, "content": res})
                 return
@@ -7134,7 +7209,7 @@ async def ask_agentic(context: str, question: str, must_search: bool = False, ca
         if not getattr(response, "choices", None):
             log("ASK", f"Финальный ответ {label}: пустой choices")
             _log_search_summary()
-            return await generate_ask_reply(context, question, caller=caller)
+            return "" if voice_turn.sent else await generate_ask_reply(context, question, caller=caller)
         _fchoice = response.choices[0]
         _fmsg = _fchoice.message
         content = _extract_content(_fmsg)
@@ -7168,7 +7243,7 @@ async def ask_agentic(context: str, question: str, must_search: bool = False, ca
         log("ASK", f"Ошибка финального ответа: {e}")
 
     _log_search_summary()
-    return await generate_ask_reply(context, question, caller=caller)
+    return "" if voice_turn.sent else await generate_ask_reply(context, question, caller=caller)
 
 
 def _lyric_steps(text: str, chunk_size: int):
@@ -7979,7 +8054,7 @@ async def ask_command(event):
     question = (event.pattern_match.group(4) or "").strip()
 
     # Проверяем явный запрос голоса в тексте вопроса (напр. «ответь голосом», «скажи голосовым», «озвучь»)
-    explicit_voice_req = bool(re.search(r'(?i)\b(?:ответь|скажи|запиши|пришли|отправь)?\s*(?:голосом|голосовым|голосовух[а-я]|гс|voice)\b', question or ""))
+    explicit_voice_req = bool(re.search(r'(?i)\b(?:ответь|скажи|запиши|пришли|отправь)\s+(?:мне\s+)?(?:голосом|голосовым(?:\s+сообщением)?|голосовух[а-я]*|гс)\b', question or ""))
     if explicit_voice_req:
         want_voice = True
 
@@ -8386,6 +8461,13 @@ async def ask_command(event):
             except Exception as e:
                 log("ASK", f"[DEBUG -d] Ошибка записи дампа: {e}")
 
+        if not reply:
+            if status:
+                try:
+                    await status.delete()
+                except Exception:
+                    pass
+            return
         _, _, label = get_active_model()
         notes = []
         if dropped:
@@ -10504,7 +10586,19 @@ async def flush_auto_reply_buffer(chat_id):
                 return
 
             history = AUTO_REPLY_HISTORY.get(chat_id, [])
-            reply = await generate_auto_reply(combined, history)
+            delivery = []
+            msg_by_id = {getattr(e, "id", 0): getattr(e, "message", e) for e in events_list}
+            reply_context = combined + "\n\nСообщения текущей пачки для адресных реплаев:\n" + "\n".join(
+                f"#id{mid}: {(getattr(msg, 'raw_text', None) or getattr(msg, 'message', None) or '[медиа]')[:1600]}"
+                for mid, msg in msg_by_id.items() if mid)
+            reply = await generate_auto_reply(reply_context, history, chat_id=chat_id, msg_by_id=msg_by_id, delivery=delivery)
+            if not reply and delivery:
+                spoken = "\n".join(row["text"] for row in delivery)
+                AUTO_REPLY_HISTORY[chat_id] = (history + [{"role": "user", "content": combined},
+                    {"role": "assistant", "content": spoken}])[-AUTO_REPLY_HISTORY_MAX:]
+                if AUTO_REPLY_BUFFERS.get(chat_id):
+                    AUTO_REPLY_TASKS[chat_id] = asyncio.create_task(flush_auto_reply_buffer(chat_id))
+                return
 
             async with client.action(chat_id, "typing"):
                 await asyncio.sleep(min(len(reply) * 0.04, 4.0))
