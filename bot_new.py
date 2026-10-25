@@ -4155,9 +4155,6 @@ async def _build_gen_prompt(user_prompt: str, context_text: str = None, image_de
                 "description": "Search images in the current chat's indexed media memory for a specific visual or remembered detail. Call this only when more image candidates are useful; it is optional, and you may call it again with a narrower/decomposed query if the first pool misses. Results are retrieval candidates, not verified evidence: inspect the selected candidate's image before relying on its contents. Message caption is separate from visual_desc and does not prove what is depicted.",
                 "parameters": {"type": "object", "properties": {
                     "query": {"type": "string", "description": "A concise visual, text-on-image, or remembered-detail query; retry with a focused sub-query when needed."},
-                    "appearance": {"type": "string", "description": "Concrete identity anchors: species, face, hair, outfit, colours. Required to request actual Jev image verification; names alone are insufficient."},
-                    "target_text": {"type": "string", "description": "Exact remembered lettering INSIDE the image, not its Telegram caption. Leave empty if unknown."},
-                    "verify_with_jev": {"type": "boolean", "description": "Verify downloaded source pixels with actual Jev decisions. Failure is unavailable, never a match. Default true when appearance provided."},
                     "limit": {"type": "integer", "minimum": 1, "maximum": 12, "description": "Maximum candidate images to add (default 6)."}
                 }, "required": ["query"]}
             }
@@ -4330,43 +4327,9 @@ async def _build_gen_prompt(user_prompt: str, context_text: str = None, image_de
                                 limit = max(1, min(12, int(args.get("limit", 6))))
                             except (TypeError, ValueError):
                                 limit = 6
-                            appearance = str(args.get('appearance') or '').strip()
-                            target_text = str(args.get('target_text') or '').strip()
-                            from gen_reference_search import search_reference_candidates
-                            discovery = await search_reference_candidates(
-                                chat_id, query, appearance, target_text, db_read,
-                                limit=64, include_ids=include_ids, exclude_ids=exclude_ids)
-                            lexical = discovery.get('hits', [])
-                            vector_hits = await _index_media_hybrid_hits(chat_id, query, 32, for_gen=True)
-                            seen_hits = set()
-                            hits = []
-                            for hit in lexical + vector_hits:
-                                mid_hit = hit.get('msg_id') or hit.get('mid')
-                                if mid_hit and mid_hit not in seen_hits:
-                                    seen_hits.add(mid_hit)
-                                    hits.append(hit)
+                            hits = await _index_media_hybrid_hits(chat_id, query, 32, for_gen=True)
                             items = await _gen_fetch_ref_items(chat_id, hits, exclude_mids=used_ids,
-                                                               rerank_prompt=None if appearance else query,
-                                                               limit=12 if appearance else limit) if hits else []
-                            verification = {}
-                            if appearance and args.get('verify_with_jev', True):
-                                from gen_jev_vision import verify_reference
-                                sem = asyncio.Semaphore(3)
-                                async def check_jev(item):
-                                    async with sem:
-                                        return await asyncio.to_thread(
-                                            verify_reference, item['bytes'], appearance,
-                                            target_text=target_text, caption=item.get('caption', ''),
-                                            source_id=item['mid'], api_key=openrouter_api_key)
-                                checked = await asyncio.gather(*[check_jev(it) for it in items], return_exceptions=True)
-                                for item, check in zip(items, checked):
-                                    verification[item['mid']] = check if isinstance(check, dict) else {
-                                        'status': 'unavailable', 'engine': 'jev', 'reason': type(check).__name__}
-                                # A rejected source must not become a generation reference.
-                                # Unavailable/uncertain stays unverified for explicit planner inspection.
-                                items = [it for it in items if verification[it['mid']].get('status') != 'rejected']
-                                items.sort(key=lambda it: verification[it['mid']].get('status') != 'verified')
-                            items = items[:limit]
+                                                               rerank_prompt=query, limit=limit) if hits else []
                             added = []
                             for item in items:
                                 mid = item.get("mid")
@@ -4383,13 +4346,10 @@ async def _build_gen_prompt(user_prompt: str, context_text: str = None, image_de
                                 used_ids.add(mid)
                                 added.append({"ref_id": item.get("ref_id"), "alias": "catalog:" + str(next_idx),
                                               "mid": mid, "caption": item.get("caption") or "",
-                                              "visual_desc": item.get("visual_desc") or item.get("desc") or "",
-                                              "jev_verification": verification.get(mid, {'status': 'not_requested'})})
+                                              "visual_desc": item.get("visual_desc") or item.get("desc") or ""})
                                 next_idx += 1
                             result = json.dumps({"status": "candidates_retrieved", "query": query,
-                                "candidates": added, "verification_results": list(verification.values()),
-                                "search_scope": discovery.get('scope', 'indexed_history_only'),
-                                "exhaustive": False,
+                                "candidates": added,
                                 "note": "Candidates are unverified retrieval results. Inspect the chosen image; caption is post text, not image evidence."}, ensure_ascii=False)
                     else:
                         try:
