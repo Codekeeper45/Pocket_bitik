@@ -1013,7 +1013,7 @@ WEB_MAP_TOOL = {
 WEB_TOOLS = [WEB_SEARCH_TOOL, WEB_EXTRACT_TOOL, WEB_CRAWL_TOOL, WEB_MAP_TOOL]
 
 # --- Инструмент адресного реплая: ИИ САМ отвечает реплаем на конкретные сообщения истории ---
-REPLY_MAX = 10  # анти-спам: не больше N реплаев за один /ask
+REPLY_MAX = 20  # анти-спам: не больше N реплаев за один /ask
 REPLY_COLLAPSE = 300  # реплаи длиннее — сворачиваются в раскрывающийся цитат-блок (общий ответ /ask — 700)
 REPLY_TOOL = {
     "type": "function",

@@ -24,7 +24,7 @@ def test_failed_send_no_success():
 
 def test_concurrent_different_voices_and_limit():
  async def scenario():
-  b=bot();b.REPLY_MAX=1;t=VoiceTurn(b,99)
+  b=bot();b.REPLY_MAX=0.5;t=VoiceTurn(b,99)
   await asyncio.gather(t.run('send_chat_responses',{'responses':[{'text':'one','mode':'voice','voice_id':A}]}),t.run('send_chat_responses',{'responses':[{'text':'two','mode':'voice','voice_id':B}]}))
   assert len(t.sent)==1;assert b._send_agent_voice.await_count==1
  asyncio.run(scenario())
@@ -37,3 +37,19 @@ def test_force_voice():
 
 def test_favorites():
  b=bot();r=run(VoiceTurn(b,99),'fish_voice_search',{'source':'favorites'});assert r['voices'][0]['voice_id']==A
+
+
+def test_weighted_twenty_budget_forty_voices():
+ b=bot();b.REPLY_MAX=20;t=VoiceTurn(b,99)
+ r=run(t,'send_chat_responses',{'responses':[{'text':str(i),'mode':'voice'} for i in range(40)]})
+ assert all(x['status']=='sent' for x in r['results']);assert t.counter[0]==20;assert len(t.sent)==40
+ r=run(t,'send_chat_responses',{'responses':[{'text':'overflow','mode':'voice'}]});assert r['results'][0]['status']=='error'
+
+def test_weighted_mixed_half_remaining():
+ b=bot();b.REPLY_MAX=20;t=VoiceTurn(b,99)
+ rows=[{'text':str(i),'mode':'text'} for i in range(19)]+[{'text':'half','mode':'voice'}]
+ run(t,'send_chat_responses',{'responses':rows});assert t.counter[0]==19.5
+ assert run(t,'send_chat_responses',{'responses':[{'text':'too much','mode':'text'}]})['results'][0]['status']=='error'
+ assert t.counter[0]==19.5
+ assert run(t,'send_chat_responses',{'responses':[{'text':'fits','mode':'voice'}]})['results'][0]['status']=='sent'
+ assert t.counter[0]==20
