@@ -1,4 +1,5 @@
 import sys
+from telegram_message_text import message_text
 from telethon import TelegramClient, events, utils
 from telethon.errors.rpcerrorlist import AuthKeyDuplicatedError, MessageNotModifiedError, FloodWaitError, MediaCaptionTooLongError
 from telethon.extensions import html as tl_html
@@ -6244,7 +6245,7 @@ async def _run_chat_search(chat_id, args: dict, msg_by_id: dict = None, include_
         if cached_desc:
             media_str += f" (в кэше: {_preview(cached_desc, 60)})"
 
-        txt = (m.raw_text or "").replace("\n", " ").strip()
+        txt = message_text(m).replace("\n", " ").strip()
         preview = _preview(txt, 250) if txt else "(без текста)"
         link_str = _make_msg_link(m.id)
         link_part = f" ({link_str})" if link_str else ""
@@ -6413,7 +6414,7 @@ async def _run_chat_ant_search(chat_id, args: dict, msg_by_id: dict = None, incl
             snippets = []
             for m in ch:
                 sender = _label_for(m, getattr(m, "sender", None))
-                txt = (m.raw_text or "").replace("\n", " ").strip()
+                txt = message_text(m).replace("\n", " ").strip()
                 if historical_desc.get(m.id):
                     txt += '[indexed visual description, unverified candidate]: ' + historical_desc[m.id]
                 if txt:
@@ -6480,7 +6481,7 @@ async def _run_chat_ant_search(chat_id, args: dict, msg_by_id: dict = None, incl
         author = _label_for(m, getattr(m, "sender", None))
         mtag = _media_tag(m) if hasattr(m, "voice") else ("📷 [Фото]" if getattr(m, "photo", None) else "")
         media_str = f" [{mtag}]" if mtag else ""
-        txt = (m.raw_text or "").replace("\n", " ").strip()
+        txt = message_text(m).replace("\n", " ").strip()
         preview = _preview(txt, 250) if txt else "(без текста)"
         link_str = _make_msg_link(m.id)
         link_part = f" ({link_str})" if link_str else ""
@@ -6604,7 +6605,7 @@ async def _run_chat_read_context(chat_id, args: dict, msg_by_id: dict = None, in
         if cached_desc:
             media_str += f" (описание: {_preview(cached_desc, 60)})"
 
-        txt = (m.raw_text or "").replace("\n", " ").strip()
+        txt = message_text(m).replace("\n", " ").strip()
         mark = "▶ " if m.id == mid else "  "
         link_str = _make_msg_link(m.id)
         link_part = f" ({link_str})" if link_str else ""
