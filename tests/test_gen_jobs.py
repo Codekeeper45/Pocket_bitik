@@ -14,6 +14,11 @@ class GenerationJobsTests(unittest.IsolatedAsyncioTestCase):
         self.jobs = GenerationJobs(store=JobStore(Path(self.tmp.name) / "jobs.json"), gate=GlobalRateGate(2), default_deadline=2)
         await self.jobs.startup()
 
+    async def test_none_result_is_failed_not_completed(self):
+        rec = await self.jobs.run_event('c', lambda: None)
+        self.assertEqual(rec.status, 'failed')
+        self.assertEqual(rec.error, 'RuntimeError')
+
     async def test_swallowed_provider_error_is_failed_not_completed(self):
         from gen_runtime import CURRENT, Invocation
         invocation = Invocation()
@@ -21,10 +26,13 @@ class GenerationJobsTests(unittest.IsolatedAsyncioTestCase):
         try:
             async def work():
                 CURRENT.get().error = 'upstream_500'
-                return None
-            rec = await self.jobs.run_event('c', work)
+                return b'partial-image'
+            artifacts = ArtifactStore(Path(self.tmp.name) / 'partial-artifacts')
+            rec = await self.jobs.run_event('c', work, artifact_store=artifacts)
             self.assertEqual(rec.status, 'failed')
             self.assertEqual(rec.error, 'upstream_500')
+            self.assertTrue(Path(rec.artifact_path).is_file())
+            self.assertEqual(Path(rec.artifact_path).read_bytes(), b'partial-image')
         finally:
             CURRENT.reset(token)
 

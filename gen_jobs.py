@@ -291,6 +291,8 @@ class GenerationJobs:
                 raise TimeoutError("job deadline reached")
             result = await self.gate.run(work, *args, timeout=remaining,
                                          before_start=budget.consume_call if budget else None)
+            if result is None:
+                raise RuntimeError("generation returned no artifact")
             if isinstance(result, bytes) and artifact_store:
                 rec.artifact_path = str(artifact_store.save(rec.job_id, result))
             from gen_series import SeriesCheckpoint
