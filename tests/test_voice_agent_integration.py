@@ -30,7 +30,7 @@ def setup(monkeypatch,replies):
 def test_ask_delivered_no_final_duplicate(monkeypatch):
  create=setup(monkeypatch,[response(calls=[call('send_chat_responses',{'responses':[{'text':'Hello','mode':'voice','message_id':5}]})]),response('Duplicate summary')])
  result=asyncio.run(bot.ask_agentic('source #5','answer',chat_id=99,msg_by_id={5:NS(raw_text='source')},memory_allowed=False))
- assert result=='';bot._send_agent_voice.assert_awaited_once_with(99,'Hello',A,5)
+ assert result=='Duplicate summary';bot._send_agent_voice.assert_awaited_once_with(99,'Hello',A,5)
  assert 'fish_voice_search' in [x['function']['name'] for x in create.call_args_list[0].kwargs['tools']]
 
 def test_auto_delivered_ledger_and_no_duplicate(monkeypatch):

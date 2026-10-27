@@ -3395,9 +3395,14 @@ def _sync_generate_image(prompt: str, input_images_b64: list = None, model: str 
         headers = {'Authorization': 'Bearer ' + cliproxy_api_key}
         if input_images_b64:
             import io
-            files = [('image', ('ref%d.png' % i, io.BytesIO(base64.b64decode(image.split(',', 1)[-1])), 'image/png')) for i, image in enumerate(input_images_b64)]
+            from gen_references import resize_image
+            # Keep references compact for the public proxy's bounded request-body window.
+            # Preserve every input and its order, including avatar contact sheets.
+            files = [('image', ('ref%d.jpg' % i, io.BytesIO(resize_image(
+                base64.b64decode(image.split(',', 1)[-1]), max_side=1280, max_bytes=100_000)), 'image/jpeg'))
+                for i, image in enumerate(input_images_b64)]
             response = requests.post(CLIPROXY_BASE_URL.rstrip('/') + '/images/edits', headers=headers,
-                data={'model': target_model, 'prompt': target_prompt, 'size': size, 'n': '1'}, files=files, timeout=(20, 600))
+                data={'model': target_model, 'prompt': target_prompt, 'size': size, 'n': '1'}, files=files, timeout=(120, 600))
         else:
             response = requests.post(CLIPROXY_BASE_URL.rstrip('/') + '/images/generations', headers=headers,
                 json={'model': target_model, 'prompt': target_prompt, 'size': size, 'n': 1}, timeout=(20, 600))
@@ -6804,7 +6809,7 @@ async def ask_agentic(context: str, question: str, must_search: bool = False, ca
                           "и формат, если пользователь не указал их явно. Явные требования пользователя к количеству, "
                           "формату и адресатам являются частью задачи, а не рекомендацией. Не заменяй несколько "
                           "запрошенных сообщений одним общим ответом. В поле quote можно передать дословную подстроку. "
-                          "Текстовый итог после доставленных ответов не нужен, если его не просили. "
+                          "После адресных реплаев всегда дай отдельный содержательный финальный ответ на исходный запрос, не повторяя реплаи дословно. "
                           "Если задача выполнена частично, продолжай нужными инструментами; если продолжение невозможно, "
                           "честно объясни причину, не выдавая частичный результат за полный.")
     if has_memory:
@@ -6999,7 +7004,7 @@ async def ask_agentic(context: str, question: str, must_search: bool = False, ca
             if content:
                 log("ASK", f"Agentic ответ (итерация {iteration + 1}, без поиска)")
                 _log_search_summary()
-                return "" if voice_turn.sent else content
+                return content
             # Пустой ответ — fallback
             _log_search_summary()
             return "" if voice_turn.sent else await generate_ask_reply(context, question, caller=caller)

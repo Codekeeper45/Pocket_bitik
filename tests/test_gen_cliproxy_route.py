@@ -15,6 +15,9 @@ def test_image_generation_route():
 def test_image_ref_route():
     r=Mock();r.json.return_value={'data':[{'b64_json':base64.b64encode(b'image').decode()}]}
     with patch.object(b.requests,'post',return_value=r) as p,patch.object(b,'cliproxy_api_key','test'):
-        b._sync_generate_image('cup',[base64.b64encode(b'ref').decode()],model='gpt-image-2')
+        from PIL import Image
+        import io
+        buf=io.BytesIO(); Image.new('RGB',(16,16),'red').save(buf,format='PNG')
+        b._sync_generate_image('cup',[base64.b64encode(buf.getvalue()).decode()],model='gpt-image-2')
         assert p.call_args.args[0].endswith('/images/edits')
         assert len(p.call_args.kwargs['files'])==1
