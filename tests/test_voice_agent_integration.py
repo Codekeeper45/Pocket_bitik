@@ -44,7 +44,7 @@ def test_auto_error_after_send_not_redelivered(monkeypatch):
  assert result=='';assert len(ledger)==1;assert bot._send_agent_voice.await_count==1
 
 def test_ask_error_after_send_no_fallback(monkeypatch):
- setup(monkeypatch,[response(calls=[call('send_chat_responses',{'responses':[{'text':'Hello','mode':'voice'}]})]),RuntimeError('network')])
+ setup(monkeypatch,[response(calls=[call('send_chat_responses',{'responses':[{'text':'Hello','mode':'voice'}]})]),RuntimeError('network'),RuntimeError('network')])
  fallback=AsyncMock(return_value='duplicate');monkeypatch.setattr(bot,'generate_ask_reply',fallback)
  result=asyncio.run(bot.ask_agentic('source','answer',chat_id=99,msg_by_id={},memory_allowed=False))
- assert result=='';fallback.assert_not_called()
+ assert 'Не удалось получить финальный ответ' in result;fallback.assert_not_called()

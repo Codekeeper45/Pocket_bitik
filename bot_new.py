@@ -6938,7 +6938,19 @@ async def ask_agentic(context: str, question: str, must_search: bool = False, ca
                 log("MODEL", f"{ACTIVE_MODEL}: ошибочный флаг tools=False сброшен (thinking-quirk, не реальная неподдержка)")
             traceback.print_exc()
             _log_search_summary()
-            return "" if voice_turn.sent else await generate_ask_reply(context, question, caller=caller)
+            if voice_turn.sent:
+                try:
+                    response = await asyncio.to_thread(llm.chat.completions.create,
+                        model=model_id, messages=messages + [{'role': 'user', 'content': 'Продолжи после уже доставленных реплаев и дай отдельный содержательный итоговый ответ на исходный запрос. Не повторяй отправленные сообщения. Инструменты сейчас недоступны.'}],
+                        max_tokens=ASK_MAX_TOKENS, temperature=0.7)
+                    if getattr(response, 'choices', None):
+                        result = _extract_content(response.choices[0].message)
+                        if result:
+                            return result
+                except Exception as final_error:
+                    log('ASK', f'Восстановление финального ответа недоступно: {type(final_error).__name__}')
+                return 'Не удалось получить финальный ответ модели после отправленных реплаев. Попробуй повторить запрос.'
+            return await generate_ask_reply(context, question, caller=caller)
 
         # После первой итерации не форсируем tool call
         force_tool = False
