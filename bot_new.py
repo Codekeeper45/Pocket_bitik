@@ -8016,7 +8016,16 @@ async def _collect_history_parallel(chat_id, n, base_offset_id, from_user=None, 
             log("ASK", f"Сбор: окно {k} FloodWait {e.seconds}с — жду и возвращаю частичное ({len(out)})")
             await asyncio.sleep(e.seconds + 1)
         except Exception as e:
-            log("ASK", f"Сбор: окно {k} ошибка: {e} (собрано {len(out)})")
+            if "TOPIC_ID_INVALID" in str(e) and reply_to is not None:
+                log("ASK", f"Сбор: окно {k} TOPIC_ID_INVALID для reply_to={reply_to}, повторяю без reply_to")
+                try:
+                    async for m in client.iter_messages(chat_id, offset_id=base_offset_id,
+                                                         add_offset=k * per, limit=per, from_user=from_user):
+                        out.append(m)
+                except Exception as e2:
+                    log("ASK", f"Сбор: окно {k} ошибка без reply_to: {e2} (собрано {len(out)})")
+            else:
+                log("ASK", f"Сбор: окно {k} ошибка: {e} (собрано {len(out)})")
         return out
 
     chunks = await asyncio.gather(*[_window(k) for k in range(workers)])
@@ -8316,9 +8325,18 @@ async def ask_command(event):
             if len(messages) < n:
                 tail_offset = min((m.id for m in messages), default=offset)
                 kwargs = {"reply_to": topic_id} if topic_id is not None else {}
-                async for m in client.iter_messages(event.chat_id, offset_id=tail_offset, limit=(n - len(messages)) * 2 + 50, **kwargs):
-                    if _keep(m) and len(messages) >= n:
-                        break
+                try:
+                    async for m in client.iter_messages(event.chat_id, offset_id=tail_offset, limit=(n - len(messages)) * 2 + 50, **kwargs):
+                        if _keep(m) and len(messages) >= n:
+                            break
+                except Exception as e:
+                    if "TOPIC_ID_INVALID" in str(e) and "reply_to" in kwargs:
+                        log("ASK", f"TOPIC_ID_INVALID при доборе с reply_to={topic_id}, пробую без reply_to")
+                        async for m in client.iter_messages(event.chat_id, offset_id=tail_offset, limit=(n - len(messages)) * 2 + 50):
+                            if _keep(m) and len(messages) >= n:
+                                break
+                    else:
+                        raise
                 messages.sort(key=lambda m: m.id, reverse=True)
             # Альбом в Telegram = N отдельных сообщений с общим grouped_id; обрезка ровно по N
             # рассекала бы его (напр. /ask 1 на альбоме из 9 фото видел бы только последнее).
