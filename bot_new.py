@@ -5530,7 +5530,10 @@ async def _send_agent_voice(chat_id, text, voice_id, reply_to=None):
     bio = io.BytesIO(ogg)
     bio.name = "voice.ogg"
     async with client.action(chat_id, "record-audio"):
-        message = await client.send_file(chat_id, bio, voice_note=True, reply_to=reply_to)
+        from voice_metadata import voice_duration
+        duration = await voice_duration(ogg)
+        message = await client.send_file(chat_id, bio, voice_note=True, reply_to=reply_to,
+                                         attributes=[DocumentAttributeAudio(duration=duration, voice=True)])
     log("VOICE", f"Fish voice={voice_id} reply={reply_to} sent={message.id} bytes={len(ogg)}")
     return message
 
@@ -5541,7 +5544,10 @@ async def _send_agent_voice_scene(chat_id, segments, reply_to=None):
         ogg = await render_voice_scene(segments, _tts_try_fish)
         bio = io.BytesIO(ogg)
         bio.name = "voice-scene.ogg"
-        message = await client.send_file(chat_id, bio, voice_note=True, reply_to=reply_to)
+        from voice_metadata import voice_duration
+        duration = await voice_duration(ogg)
+        message = await client.send_file(chat_id, bio, voice_note=True, reply_to=reply_to,
+                                         attributes=[DocumentAttributeAudio(duration=duration, voice=True)])
     log("VOICE", f"Scene segments={len(segments)} sent={message.id} bytes={len(ogg)}")
     return message
 
