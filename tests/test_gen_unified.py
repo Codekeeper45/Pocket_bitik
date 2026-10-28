@@ -37,7 +37,7 @@ class TestUnifiedGenPrompt(unittest.TestCase):
         for catalog in (False, True):
             for edit in (False, True):
                 system = bot._gen_unified_system(catalog, edit)
-                self.assertLess(len(system), 5000)
+                self.assertLess(len(system), 5500)  # includes shared identity grounding policy
                 self.assertIn("Ethical boundaries: never sexualize, fetishize or objectify real chat members", system)
                 self.assertIn("Preserve the scene", system)
                 self.assertEqual("keep everything else unchanged" in system, edit)
