@@ -6397,7 +6397,7 @@ async def _run_chat_ant_search(chat_id, args: dict, msg_by_id: dict = None, incl
     historical = []
     historical_desc = {}
     try:
-        hits = await asyncio.wait_for(_index_media_hybrid_hits(chat_id, query, 32, for_gen=True), timeout=25)
+        hits = [] if _index_available() else await asyncio.wait_for(_index_media_hybrid_hits(chat_id, query, 32, for_gen=True), timeout=25)
         mids = [int(h.get('msg_id') or h.get('key')) for h in hits if h.get('msg_id') or h.get('key')]
         historical_desc = {int(h.get('msg_id') or h.get('key')): str(h.get('visual_description') or h.get('image_description') or '')[:600] for h in hits if h.get('msg_id') or h.get('key')}
         if mids:
@@ -17048,6 +17048,8 @@ def _index_norm_score(score) -> float:
 async def _index_media_hybrid_hits(chat_id: int, query: str, count: int, for_gen: bool = False, qv_text=None) -> list:
     """Union media_text(text space) + media_image(image space from text query), deduped by msg_id.
     qv_text — уже посчитанный text-эмбеддинг запроса (переиспользуем, чтобы не эмбедить одно и то же дважды)."""
+    if _index_available():
+        return []
     query = (query or "").strip()
     if not query:
         return []
