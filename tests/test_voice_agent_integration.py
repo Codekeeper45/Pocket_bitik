@@ -34,14 +34,14 @@ def test_ask_delivered_no_final_duplicate(monkeypatch):
  assert 'fish_voice_search' in [x['function']['name'] for x in create.call_args_list[0].kwargs['tools']]
 
 def test_auto_delivered_ledger_and_no_duplicate(monkeypatch):
- setup(monkeypatch,[response(calls=[call('send_chat_responses',{'responses':[{'text':'Hello','mode':'voice','message_id':5}]})]),response('Duplicate')])
+ setup(monkeypatch,[response(calls=[call('send_chat_responses',{'responses':[{'text':'Hello','mode':'voice','message_id':5}]})]),response('Distinct final answer')])
  ledger=[];result=asyncio.run(bot.generate_auto_reply('source #5',chat_id=99,msg_by_id={5:NS(raw_text='source')},delivery=ledger))
- assert result=='';assert ledger[0]['text']=='Hello';assert ledger[0]['reply_to']==5
+ assert result=='Distinct final answer';assert ledger[0]['text']=='Hello';assert ledger[0]['reply_to']==5
 
 def test_auto_error_after_send_not_redelivered(monkeypatch):
- setup(monkeypatch,[response(calls=[call('send_chat_responses',{'responses':[{'text':'Hello','mode':'voice'}]})]),RuntimeError('network')])
+ setup(monkeypatch,[response(calls=[call('send_chat_responses',{'responses':[{'text':'Hello','mode':'voice'}]})]),RuntimeError('network'),RuntimeError('network')])
  ledger=[];result=asyncio.run(bot.generate_auto_reply('source',chat_id=99,msg_by_id={},delivery=ledger))
- assert result=='';assert len(ledger)==1;assert bot._send_agent_voice.await_count==1
+ assert 'Не удалось получить финальный ответ' in result;assert len(ledger)==1;assert bot._send_agent_voice.await_count==1
 
 def test_ask_error_after_send_no_fallback(monkeypatch):
  setup(monkeypatch,[response(calls=[call('send_chat_responses',{'responses':[{'text':'Hello','mode':'voice'}]})]),RuntimeError('network'),RuntimeError('network')])

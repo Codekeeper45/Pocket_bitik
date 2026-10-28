@@ -1053,6 +1053,7 @@ REPLY_TOOL = {
 }
 
 from voice_agent_tools import VOICE_TOOLS, VOICE_HINT, VoiceTurn
+from final_reply import recover_final
 _voice_chat_defaults = load_json("voice_chat_defaults.json", {}) if "load_json" in globals() else {}
 
 def _save_voice_chat_defaults():
@@ -5524,12 +5525,24 @@ async def synthesize_voice(text: str, voice: str = None, engine: str = None):
 
 async def _send_agent_voice(chat_id, text, voice_id, reply_to=None):
     # Explicit Fish id stays request-local. No global voice switch or hidden TTS fallback.
-    ogg = await _tts_try_fish(text, reference_id=voice_id)
+    from voice_scene import render_voice_scene
+    ogg = await render_voice_scene([{'text': text, 'voice_id': voice_id}], _tts_try_fish)
     bio = io.BytesIO(ogg)
     bio.name = "voice.ogg"
     async with client.action(chat_id, "record-audio"):
         message = await client.send_file(chat_id, bio, voice_note=True, reply_to=reply_to)
     log("VOICE", f"Fish voice={voice_id} reply={reply_to} sent={message.id} bytes={len(ogg)}")
+    return message
+
+
+async def _send_agent_voice_scene(chat_id, segments, reply_to=None):
+    from voice_scene import render_voice_scene
+    async with client.action(chat_id, "record-audio"):
+        ogg = await render_voice_scene(segments, _tts_try_fish)
+        bio = io.BytesIO(ogg)
+        bio.name = "voice-scene.ogg"
+        message = await client.send_file(chat_id, bio, voice_note=True, reply_to=reply_to)
+    log("VOICE", f"Scene segments={len(segments)} sent={message.id} bytes={len(ogg)}")
     return message
 
 
@@ -5785,11 +5798,12 @@ async def _generate_auto_voice_reply(text, history, chat_id, msg_by_id, delivery
     try:
         for _ in range(12):
             response = await asyncio.to_thread(llm.chat.completions.create, model=model_id, messages=messages,
-                                               tools=VOICE_TOOLS, tool_choice="auto", max_tokens=4096)
+                                               tools=VOICE_TOOLS, tool_choice="auto", max_tokens=ASK_MAX_TOKENS)
             msg = response.choices[0].message
             calls = getattr(msg, "tool_calls", None) or []
             if not calls:
-                return "" if turn.sent else _extract_content(msg)
+                content = _extract_content(msg)
+                return content if content and content.strip() else (await recover_final(llm, model_id, messages, _extract_content, ASK_MAX_TOKENS) if turn.sent else "Понял")
             assistant = {"role": "assistant", "content": msg.content,
                          "tool_calls": [{"id": tc.id, "type": "function", "function": {"name": tc.function.name, "arguments": tc.function.arguments}} for tc in calls]}
             if getattr(msg, "reasoning_content", None):
@@ -5811,7 +5825,7 @@ async def _generate_auto_voice_reply(text, history, chat_id, msg_by_id, delivery
         if delivery is not None:
             delivery.extend({k: v for k, v in row.items() if k != "signature"} for row in turn.sent)
     if turn.sent:
-        return ""
+        return await recover_final(llm, model_id, messages, _extract_content, ASK_MAX_TOKENS)
     return await _llm_create(messages=[{"role": "system", "content": AUTO_REPLY_SYSTEM_PROMPT},
                                       *(history or []), {"role": "user", "content": text}]) or "Понял"
 
@@ -6919,7 +6933,7 @@ async def ask_agentic(context: str, question: str, must_search: bool = False, ca
             if has_tools:
                 _set_tools_support(ACTIVE_MODEL, False)
             _log_search_summary()
-            return "" if voice_turn.sent else await generate_ask_reply(context, question, caller=caller)
+            return await recover_final(llm, model_id, messages, _extract_content, ASK_MAX_TOKENS) if voice_turn.sent else await generate_ask_reply(context, question, caller=caller)
         except Exception as e:
             log("ASK", f"Ошибка модели в agentic loop: {e}")
             # Переполнение окна — кидаем наверх для ретрая с агрессивной обрезкой
@@ -6939,17 +6953,7 @@ async def ask_agentic(context: str, question: str, must_search: bool = False, ca
             traceback.print_exc()
             _log_search_summary()
             if voice_turn.sent:
-                try:
-                    response = await asyncio.to_thread(llm.chat.completions.create,
-                        model=model_id, messages=messages + [{'role': 'user', 'content': 'Продолжи после уже доставленных реплаев и дай отдельный содержательный итоговый ответ на исходный запрос. Не повторяй отправленные сообщения. Инструменты сейчас недоступны.'}],
-                        max_tokens=ASK_MAX_TOKENS, temperature=0.7)
-                    if getattr(response, 'choices', None):
-                        result = _extract_content(response.choices[0].message)
-                        if result:
-                            return result
-                except Exception as final_error:
-                    log('ASK', f'Восстановление финального ответа недоступно: {type(final_error).__name__}')
-                return 'Не удалось получить финальный ответ модели после отправленных реплаев. Попробуй повторить запрос.'
+                return await recover_final(llm, model_id, messages, _extract_content, ASK_MAX_TOKENS)
             return await generate_ask_reply(context, question, caller=caller)
 
         # После первой итерации не форсируем tool call
@@ -6961,7 +6965,7 @@ async def ask_agentic(context: str, question: str, must_search: bool = False, ca
                 log("ASK", "-g: возможна блокировка безопасности по фото — повторяю запрос без прямого vision...")
                 _log_search_summary()
                 if voice_turn.sent:
-                    return ""
+                    return await recover_final(llm, model_id, messages, _extract_content, ASK_MAX_TOKENS)
                 return await ask_agentic(
                     context, question, must_search=must_search, caller=caller,
                     ctx_tokens_est=ctx_tokens_est, voice_mode=voice_mode, images=None,
@@ -6969,7 +6973,7 @@ async def ask_agentic(context: str, question: str, must_search: bool = False, ca
                     asker_id=asker_id
                 )
             _log_search_summary()
-            return "" if voice_turn.sent else await generate_ask_reply(context, question, caller=caller)
+            return await recover_final(llm, model_id, messages, _extract_content, ASK_MAX_TOKENS) if voice_turn.sent else await generate_ask_reply(context, question, caller=caller)
 
         choice = response.choices[0]
         msg = choice.message
@@ -7019,7 +7023,7 @@ async def ask_agentic(context: str, question: str, must_search: bool = False, ca
                 return content
             # Пустой ответ — fallback
             _log_search_summary()
-            return "" if voice_turn.sent else await generate_ask_reply(context, question, caller=caller)
+            return await recover_final(llm, model_id, messages, _extract_content, ASK_MAX_TOKENS) if voice_turn.sent else await generate_ask_reply(context, question, caller=caller)
 
         # Обрабатываем tool calls
         # Сериализуем assistant-message вручную, чтобы СОХРАНИТЬ reasoning_content —
@@ -7229,7 +7233,7 @@ async def ask_agentic(context: str, question: str, must_search: bool = False, ca
         if not getattr(response, "choices", None):
             log("ASK", f"Финальный ответ {label}: пустой choices")
             _log_search_summary()
-            return "" if voice_turn.sent else await generate_ask_reply(context, question, caller=caller)
+            return await recover_final(llm, model_id, messages, _extract_content, ASK_MAX_TOKENS) if voice_turn.sent else await generate_ask_reply(context, question, caller=caller)
         _fchoice = response.choices[0]
         _fmsg = _fchoice.message
         content = _extract_content(_fmsg)
@@ -7263,7 +7267,7 @@ async def ask_agentic(context: str, question: str, must_search: bool = False, ca
         log("ASK", f"Ошибка финального ответа: {e}")
 
     _log_search_summary()
-    return "" if voice_turn.sent else await generate_ask_reply(context, question, caller=caller)
+    return await recover_final(llm, model_id, messages, _extract_content, ASK_MAX_TOKENS) if voice_turn.sent else await generate_ask_reply(context, question, caller=caller)
 
 
 def _lyric_steps(text: str, chunk_size: int):
@@ -10626,16 +10630,16 @@ async def flush_auto_reply_buffer(chat_id):
                 await asyncio.sleep(min(len(reply) * 0.04, 4.0))
 
             try:
-                await client.send_message(chat_id, reply)
+                await send_long(chat_id, reply)
                 log("AUTO", f"Ответ отправлен в {chat_id}")
             except FloodWaitError as e:
                 await asyncio.sleep(e.seconds)
-                await client.send_message(chat_id, reply)
+                await send_long(chat_id, reply)
 
             # обновляем память диалога
             history = history + [
                 {"role": "user", "content": combined},
-                {"role": "assistant", "content": reply},
+                {"role": "assistant", "content": "\n".join([*(row["text"] for row in delivery), reply])},
             ]
             AUTO_REPLY_HISTORY[chat_id] = history[-AUTO_REPLY_HISTORY_MAX:]
         finally:
