@@ -1229,6 +1229,9 @@ AUTO_REPLY_SYSTEM_PROMPT = """Ты — собеседник в личной пе
 Входящие сообщения даны в формате [время автор]: текст. Метки: «↩ автор» — ответ на чьё-то сообщение, «⤷ из X» — переслано. [Фото: …]/[Аудио: …] — содержимое медиа."""
 
 from identity_policy import IDENTITY_POLICY
+from creative_boundaries import CREATIVE_BOUNDARIES
+ASK_SYSTEM_PROMPT += "\n" + CREATIVE_BOUNDARIES
+AUTO_REPLY_SYSTEM_PROMPT += "\n" + CREATIVE_BOUNDARIES
 ASK_SYSTEM_PROMPT += "\n" + IDENTITY_POLICY
 AUTO_REPLY_SYSTEM_PROMPT += "\n" + IDENTITY_POLICY
 AUTO_REPLY_SYSTEM_PROMPT += "\nКраткость 1-3 предложения относится к обычному разговору, не к явно запрошенной длинной сцене или подробному ответу."
@@ -5694,11 +5697,21 @@ async def _llm_create(messages: list, max_tokens: int = 4096, temperature: float
                     temperature=temperature,
                     max_tokens=max_tokens,
                 )
+                from response_status import response_status, refusal_text, MODERATION_MESSAGE
+                _status = response_status(response)
+                if _status == "moderation":
+                    _choices = getattr(response, "choices", None) or []
+                    _refusal = refusal_text(getattr(_choices[0], "message", None)) if _choices else None
+                    _refusal = _refusal or (getattr(getattr(_choices[0], "message", None), "content", None) if _choices else None)
+                    log("AI", f"Ответ {label}: явный отказ/блокировка провайдера")
+                    return _refusal or MODERATION_MESSAGE
                 if not getattr(response, "choices", None):
                     log("AI", f"Ответ {label} (попытка {attempt + 1}): пустой список choices")
                     continue
                 msg_obj = response.choices[0].message
                 content = _extract_content(msg_obj)
+                if not content and getattr(msg_obj, "refusal", None):
+                    return refusal_text(msg_obj)
                 from_reasoning = bool(content) and not (getattr(msg_obj, "content", None) or "").strip()
                 finish = response.choices[0].finish_reason
                 usage = getattr(response, "usage", None)
@@ -5770,23 +5783,7 @@ async def generate_ask_reply(context: str, question: str, caller: str = None) ->
         max_tokens=ASK_MAX_TOKENS,  # thinking-модели жрут на reasoning тысячи токенов
         temperature=1.0,
     )
-    if not result:
-        # Автоматический фоллбэк при пустом ответе (например, safety-фильтр Gemini на пикантный/ролевой промпт)
-        for fb_slug in ["cp-grok-4.6", "pv-glm-5.3-flash", "deepseek-pro"]:
-            if fb_slug in MODEL_REGISTRY and fb_slug != ACTIVE_MODEL:
-                log("AI", f"Модель {label} вернула пустой ответ — пробую фоллбэк на {fb_slug}...")
-                fb_res = await _llm_create(
-                    messages=[
-                        {"role": "system", "content": ASK_SYSTEM_PROMPT.replace("{model}", MODEL_REGISTRY[fb_slug][2]) + f"\n\nТекущая дата и время: {now_str} МСК."},
-                        {"role": "user", "content": _build_ask_user_content(context, question, caller)},
-                    ],
-                    max_tokens=ASK_MAX_TOKENS,
-                    temperature=1.0,
-                    model_slug=fb_slug,
-                )
-                if fb_res:
-                    return fb_res
-    return result if result else "Модель не смогла ответить (пустой ответ или ошибка API)"
+    return result if result else "Не удалось получить ответ модели: пустой ответ или ошибка API. Попробуй позже."
 
 
 async def generate_auto_reply(combined_text: str, history: list = None, chat_id=None, msg_by_id=None, delivery=None) -> str:
@@ -6977,10 +6974,19 @@ async def ask_agentic(context: str, question: str, must_search: bool = False, ca
         # После первой итерации не форсируем tool call
         force_tool = False
 
+        from response_status import response_status, refusal_text, MODERATION_MESSAGE
+        _response_status = response_status(response)
+        if _response_status == "moderation":
+            _moderation_choices = getattr(response, "choices", None) or []
+            _moderation_msg = getattr(_moderation_choices[0], "message", None) if _moderation_choices else None
+            _actual_refusal = refusal_text(_moderation_msg) if _moderation_msg else None
+            _actual_refusal = _actual_refusal or (getattr(_moderation_msg, "content", None) if _moderation_msg else None)
+            _log_search_summary()
+            return _actual_refusal or MODERATION_MESSAGE
         if not getattr(response, "choices", None):
-            log("ASK", f"Ответ {label}: пустой список choices (возможно сработал safety-фильтр или отказ модели)")
+            log("ASK", f"Ответ {label}: пустой список choices (не классифицировано провайдером)")
             if images:
-                log("ASK", "-g: возможна блокировка безопасности по фото — повторяю запрос без прямого vision...")
+                log("ASK", "-g: пустой ответ при переданном изображении; повторяю один раз на той же модели без прямого vision...")
                 _log_search_summary()
                 if voice_turn.sent:
                     return await recover_final(llm, model_id, messages, _extract_content, ASK_MAX_TOKENS)
