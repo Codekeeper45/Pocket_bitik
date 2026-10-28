@@ -5924,7 +5924,7 @@ async def _send_quote_reply(chat_id, mid: int, html_text: str, quote: str, src_t
         if len(html_text) > REPLY_COLLAPSE:  # длинный реплай — свернуть в раскрывающийся цитат-блок
             msg_text, entities = _collapsed_entities(html_text, parse_html=True)
         else:
-            msg_text, entities = client._parse_message_text(html_text, "html")
+            msg_text, entities = await client._parse_message_text(html_text, "html")
         reply_obj = InputReplyToMessage(reply_to_msg_id=mid, quote_text=quote, quote_offset=off16)
         await client(SendMessageRequest(peer=chat_id, message=msg_text, reply_to=reply_obj,
                                         entities=entities, no_webpage=True))
