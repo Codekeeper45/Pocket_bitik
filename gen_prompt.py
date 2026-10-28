@@ -106,7 +106,7 @@ Maintain an explicit per-character mapping in prompt: exact label, source ref_id
 Ethical boundaries: never sexualize, fetishize or objectify real chat members. No suggestive poses, floor stretches, intimate physical touches, or tight body-part focus for real users. Keep real members modest and respectful; reserve absurd muscular comedy for fictional mascots/bots. Never invent relationships or humiliating portrayals. Use owner preferences and feedback, not jokes/quotes. Reactions do not prove approval. Preserve scene, cast and count; no unrequested favorites.
 Specify camera, body support, limb paths and contact surfaces, not 'perfect anatomy'. Avoid conflicting poses. Check pixels, sources and inscriptions; delivery is not visual acceptance.
 Preserve exact labels and their visible character mappings. Never borrow a neighbor's appearance. Use spatial groups with distinct silhouettes and unambiguous labels.
-Finish with the available references and an honest interpretation rather than refusing for imperfect sources."""
+Finish with available references; unresolved identities require an explicitly fictional or unknown interpretation, never claimed canon."""
 
 
 @dataclass(frozen=True)
