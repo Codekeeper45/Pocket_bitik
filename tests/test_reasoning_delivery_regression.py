@@ -17,6 +17,15 @@ def test_empty_reply_preserves_tool_loop(monkeypatch):
     assert bot.send_long.await_count==1
     assert all('tools' in c.kwargs for c in create.call_args_list)
 
+def test_empty_retry_budget_is_bounded(monkeypatch):
+    create=setup(monkeypatch,[response(),response(),response()])
+    fallback=AsyncMock(return_value='Безопасный резервный ответ')
+    monkeypatch.setattr(bot,'generate_ask_reply',fallback)
+    result=asyncio.run(bot.ask_agentic('source','answer',chat_id=99,msg_by_id={},memory_allowed=False))
+    assert result=='Безопасный резервный ответ'
+    assert create.call_count==3
+    fallback.assert_awaited_once()
+
 def test_plain_tool_preamble_is_not_final(monkeypatch):
     create=setup(monkeypatch,[response('Сейчас найду',calls=[call('chat_search',{'query':'test'})]),response('Готовый ответ')])
     result=asyncio.run(bot._llm_create(messages=[{'role':'user','content':'test'}]))
