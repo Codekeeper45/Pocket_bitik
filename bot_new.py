@@ -5598,11 +5598,9 @@ def _strip_think(text: str) -> str:
 
 
 def _extract_content(message) -> str:
-    # Финальный ответ в .content; у reasoning-моделей при пустом .content берём .reasoning_content / .reasoning
-    content = _strip_think((getattr(message, "content", None) or "").strip())
-    if content:
-        return content
-    return (getattr(message, "reasoning_content", None) or getattr(message, "reasoning", None) or "").strip()
+    # reasoning_content / reasoning — приватный ход мысли, никогда не является пользовательским ответом.
+    # При пустом финальном content возвращаем пустую строку, чтобы вызывающая сторона запустила recovery.
+    return _strip_think((getattr(message, "content", None) or "").strip())
 
 
 def _parse_dsml_tool_calls(text: str):
@@ -5723,6 +5721,10 @@ async def _llm_create(messages: list, max_tokens: int = 4096, temperature: float
                 if from_reasoning and finish == "length":
                     log("AI", f"{label}: только обрезанный reasoning без ответа — не выдаём CoT, ретрай")
                     content = ""
+                if getattr(msg_obj, "tool_calls", None) or finish == "tool_calls":
+                    # Текст рядом с вызовом инструмента является преамбулой, а не готовым ответом.
+                    content = ""
+                    messages = list(messages) + [{"role": "user", "content": "Сейчас нужен готовый ответ обычным текстом на русском по имеющимся данным. Инструменты здесь недоступны. Не выводи вызовы функций или внутренние рассуждения."}]
                 if content:
                     return content
                 log("AI", f"Пустой ответ {label} (попытка {attempt + 1}/2) finish={finish}")
@@ -6914,6 +6916,7 @@ async def ask_agentic(context: str, question: str, must_search: bool = False, ca
             log("ASK", f"Поиск: {sstats['iters']} итер., {sstats['calls']} запросов к каналам, найдено {sstats['posts']} постов, "
                        f"веб-вызовов {sstats['web']}, память /index {sstats['memory']}{c_str}")
 
+    empty_retries = 0
     for iteration in range(max_iterations):
         log("ASK", f"Agentic итерация {iteration + 1}/{max_iterations}")
 
@@ -7036,18 +7039,23 @@ async def ask_agentic(context: str, question: str, must_search: bool = False, ca
         # Если нет tool_calls — это финальный ответ
         if not msg.tool_calls:
             content = _extract_content(msg)
-            # Обрезанный CoT (finish=length, видимого content нет) — НЕ ответ; сырой reasoning наружу не выдаём.
-            _from_reasoning = bool(content) and not (getattr(msg, "content", None) or "").strip()
-            if _from_reasoning and choice.finish_reason == "length":
-                log("ASK", "Agentic: только обрезанный reasoning без ответа — не выдаём CoT, fallback")
-                content = ""
+            if not content and (getattr(msg, "reasoning_content", None) or getattr(msg, "reasoning", None)):
+                log("ASK", f"Agentic: reasoning-only (finish={choice.finish_reason}) — не публикуем, recovery")
             if content:
                 log("ASK", f"Agentic ответ (итерация {iteration + 1}, без поиска)")
                 _log_search_summary()
                 return content
-            # Пустой ответ — fallback
+            # Сохраняем результаты инструментов и продолжаем тот же цикл, а не начинаем поиск заново.
+            if not voice_turn.sent and empty_retries < 2:
+                empty_retries += 1
+                messages.append({"role": "user", "content": "Предыдущий ответ не содержал готового текста. Продолжи работу с уже собранными данными: вызови нужные инструменты или дай итоговый ответ на русском. Не выводи внутренние рассуждения."})
+                continue
             _log_search_summary()
-            return await recover_final(llm, model_id, messages, _extract_content, ASK_MAX_TOKENS) if voice_turn.sent else await generate_ask_reply(context, question, caller=caller)
+            if voice_turn.sent:
+                recovered = await recover_final(llm, model_id, messages, _extract_content, ASK_MAX_TOKENS)
+                if recovered and recovered.strip():
+                    return recovered
+            return await generate_ask_reply(context, question, caller=caller)
 
         # Обрабатываем tool calls
         # Сериализуем assistant-message вручную, чтобы СОХРАНИТЬ reasoning_content —
